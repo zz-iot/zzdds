@@ -457,6 +457,7 @@ pub fn build(b: *std.Build) void {
     }
     if (target.result.os.tag == .windows) {
         zzdds_mod.linkSystemLibrary("ws2_32", .{});
+        zzdds_mod.linkSystemLibrary("bcryptprimitives", .{});
     }
 
     // ── gen-only step (debug code generation output) ──────────────────────────
@@ -718,6 +719,7 @@ pub fn build(b: *std.Build) void {
         }
         if (target.result.os.tag == .windows) {
             zzdds_lib.root_module.linkSystemLibrary("ws2_32", .{});
+            zzdds_lib.root_module.linkSystemLibrary("bcryptprimitives", .{});
         }
 
         // Compile in the plain-struct CDR functions (serialize/deserialize/
@@ -2024,6 +2026,7 @@ pub fn build(b: *std.Build) void {
     zzdds_mod_llvm_safe.link_libc = true;
     if (target_llvm_safe.result.os.tag == .windows) {
         zzdds_mod_llvm_safe.linkSystemLibrary("ws2_32", .{});
+        zzdds_mod_llvm_safe.linkSystemLibrary("bcryptprimitives", .{});
     }
 
     const emit_tests_llvm_step = b.step("emit-tests-llvm", "Build test binaries (LLVM backend, baseline CPU) for Valgrind and kcov");

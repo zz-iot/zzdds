@@ -22,6 +22,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   (and the stress tests) read arguments through the portable
   `std.process.Args.Iterator.initAllocator`, their C/C++ ports build with MSVC, and the
   runners find `.exe` binaries and CMake's `Debug/` outputs.
+- Windows GUID prefixes now come from the system RNG (`ProcessPrng`) instead of a
+  fallback PRNG seeded only from the performance counter, and `host_based` GUIDs carry
+  the real process ID on Windows instead of 0.
 
 ## 2026-10-28
 

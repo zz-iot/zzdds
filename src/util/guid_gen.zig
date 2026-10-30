@@ -81,9 +81,13 @@ fn tryOsEntropy(buf: []u8) bool {
             std.c.arc4random_buf(buf.ptr, buf.len);
             return true;
         },
+        .windows => return ProcessPrng(buf.ptr, buf.len) != 0,
         else => return false,
     }
 }
+
+/// Windows 10+ system RNG (bcryptprimitives.dll); documented to always succeed.
+extern "bcryptprimitives" fn ProcessPrng(data: [*]u8, len: usize) callconv(.winapi) c_int;
 
 // ── host_based strategy ───────────────────────────────────────────────────────
 
@@ -136,6 +140,7 @@ fn currentPid() u32 {
     return switch (builtin.os.tag) {
         .linux => @intCast(std.os.linux.getpid()),
         .macos, .ios, .watchos, .tvos, .freebsd, .openbsd, .netbsd, .dragonfly => @intCast(std.c.getpid()),
+        .windows => std.os.windows.GetCurrentProcessId(),
         else => 0,
     };
 }
@@ -166,6 +171,15 @@ test "spec_random prefix has correct vendor bytes" {
     const p = generate(.spec_random);
     try std.testing.expectEqual(VENDOR_ID[0], p.bytes[0]);
     try std.testing.expectEqual(VENDOR_ID[1], p.bytes[1]);
+}
+
+test "OS entropy is used on Linux, macOS and Windows" {
+    switch (builtin.os.tag) {
+        .linux, .macos, .windows => {},
+        else => return error.SkipZigTest,
+    }
+    var buf: [10]u8 = undefined;
+    try std.testing.expect(tryOsEntropy(&buf));
 }
 
 test "spec_random strategy produces unique prefixes" {
