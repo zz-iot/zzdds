@@ -442,6 +442,9 @@ pub const WritableWaiter = struct {
     // The transport's, under its lock.
     next: ?*WritableWaiter = null,
     queued: bool = false,
+    /// What the transport's count of drained outputs was when it last ran
+    /// this waiter, for a transport whose outputs drain separately.
+    drains_seen: u64 = 0,
 };
 
 // ── Transport callbacks ───────────────────────────────────────────────────────

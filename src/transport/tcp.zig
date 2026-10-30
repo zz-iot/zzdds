@@ -527,6 +527,8 @@ pub const TcpTransport = struct {
     writable_waiters: ?*WritableWaiter = null,
     /// Connections whose `blocked` is set.
     blocked_count: usize = 0,
+    /// Times a blocked connection drained or closed.
+    drains: u64 = 0,
     /// Sends that returned `would_block`, for diagnostics and tests.
     sends_would_block: std.atomic.Value(u64) = .init(0),
 
@@ -1157,6 +1159,7 @@ pub const TcpTransport = struct {
         if (!conn.blocked) return;
         conn.blocked = false;
         self.blocked_count -= 1;
+        self.drains += 1;
         self.runWritableLocked();
     }
 
@@ -1168,16 +1171,25 @@ pub const TcpTransport = struct {
             it = w.next;
             w.next = null;
             w.queued = false;
+            w.drains_seen = self.drains;
             w.on_writable(w);
         }
     }
 
     /// Queues `waiter` until a connection that blocked drains or closes,
-    /// or runs it now if none is blocked.
+    /// or runs it now if none is blocked, or if one drained or closed since
+    /// it last ran: the connection that blocked its send may be that one,
+    /// with no waiter to run then, while another stays blocked.
     fn vtNotifyWritable(ctx: *anyopaque, waiter: *WritableWaiter) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.writable_mu.lock();
         defer self.writable_mu.unlock();
+        if (waiter.drains_seen != self.drains) {
+            self.cancelWritableLocked(waiter);
+            waiter.drains_seen = self.drains;
+            waiter.on_writable(waiter);
+            return;
+        }
         if (!waiter.queued) {
             waiter.next = self.writable_waiters;
             self.writable_waiters = waiter;
@@ -1190,6 +1202,10 @@ pub const TcpTransport = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.writable_mu.lock();
         defer self.writable_mu.unlock();
+        self.cancelWritableLocked(waiter);
+    }
+
+    fn cancelWritableLocked(self: *Self, waiter: *WritableWaiter) void {
         if (!waiter.queued) return;
         var link = &self.writable_waiters;
         while (link.*) |w| : (link = &w.next) {

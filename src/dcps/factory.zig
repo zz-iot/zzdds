@@ -311,6 +311,7 @@ pub const DomainParticipantFactoryImpl = struct {
                 log_mod.dcps.warn("create_participant: the TCP transport cannot run on this runtime ({s})", .{@errorName(err)});
                 p.deinit();
                 r.releaseOwner();
+                self.releaseRuntimeUse();
                 return null;
             };
             p.attachRuntime(r);

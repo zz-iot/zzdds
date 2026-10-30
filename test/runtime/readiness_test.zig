@@ -1457,6 +1457,7 @@ const Stalled = struct {
     listener: posix.socket_t,
     peer: posix.socket_t,
     to: Locator,
+    conn: *TcpConnection,
     /// Every frame sent, as the peer should read them.
     sent: std.ArrayListUnmanaged(u8) = .empty,
 
@@ -1470,10 +1471,17 @@ const Stalled = struct {
         const first = [_]IoVec{.{ .base = "hi", .len = 2 }};
         _ = try t.sendGather(&self.to, &first);
         try self.record(&first);
-        try n.serviceUntil(n, noLongerConnecting);
+        self.conn = n.tr.live_connections.items[n.tr.live_connections.items.len - 1];
+        try n.serviceUntil(self, dialed);
         self.peer = try Raw.accept(self.listener);
         const small: c_int = 4096;
-        _ = c.setsockopt(n.conn().fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&small), @sizeOf(c_int));
+        _ = c.setsockopt(self.conn.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&small), @sizeOf(c_int));
+    }
+
+    fn dialed(self: *Stalled) bool {
+        self.conn.send_mu.lock();
+        defer self.conn.send_mu.unlock();
+        return !self.conn.connecting and self.conn.tail.len == 0;
     }
 
     fn deinit(self: *Stalled) void {
@@ -1507,7 +1515,7 @@ const Stalled = struct {
                 .completed => try self.record(&parts),
                 .would_block => return error.BlockedWithoutTail,
             }
-            if (n.conn().tail.len > 0) return i + 1;
+            if (self.conn.tail.len > 0) return i + 1;
         }
         return error.NeverFull;
     }
@@ -1552,6 +1560,55 @@ test "a frame the socket takes only part of is finished once it drains, before a
     try testing.expectEqual(@as(usize, 0), n.tr.blocked_count);
     // Sends go ahead again.
     try testing.expectEqual(SendOutcome.completed, try t.sendGather(&s.to, &gather));
+}
+
+test "a waiter registered after its connection drained runs at once, though another connection stays blocked" {
+    if (!rt.poll_backend.supported) return error.SkipZigTest;
+    var n: TcpNode = undefined;
+    try n.init();
+    defer n.deinit();
+    var a: Stalled = undefined;
+    try a.init(&n);
+    defer a.deinit();
+    var b: Stalled = undefined;
+    try b.init(&n);
+    defer b.deinit();
+    const scratch = try alloc.alloc(u8, 60_001);
+    defer alloc.free(scratch);
+    const t = n.tr.transport();
+
+    _ = try a.fill(&n, scratch);
+    _ = try b.fill(&n, scratch);
+    try testing.expectEqual(SendOutcome.would_block, try t.sendGather(&a.to, &gather));
+    try testing.expectEqual(SendOutcome.would_block, try t.sendGather(&b.to, &gather));
+    try testing.expectEqual(@as(usize, 2), n.tr.blocked_count);
+
+    // a's peer reads, and a drains before its writer waits: no waiter runs.
+    var got: std.ArrayListUnmanaged(u8) = .empty;
+    defer got.deinit(alloc);
+    const Drain = struct {
+        node: *TcpNode,
+        peer: posix.socket_t,
+        got: *std.ArrayListUnmanaged(u8),
+        want: usize,
+        fn f(self: *const @This()) bool {
+            Raw.readAvailable(self.peer, self.got) catch return true;
+            return self.got.items.len >= self.want and self.node.tr.blocked_count == 1;
+        }
+    };
+    try n.serviceUntil(&Drain{ .node = &n, .peer = a.peer, .got = &got, .want = a.sent.items.len }, Drain.f);
+    try testing.expectEqualSlices(u8, a.sent.items, got.items);
+
+    // Its waiter, registered now, runs at once rather than waiting for b.
+    var w: Waited = .{};
+    t.notifyWritable(&w.waiter);
+    try testing.expectEqual(@as(u32, 1), w.runs);
+    // Tried again, a takes the frame and b still blocks: now it waits.
+    try testing.expectEqual(SendOutcome.completed, try t.sendGather(&a.to, &gather));
+    try testing.expectEqual(SendOutcome.would_block, try t.sendGather(&b.to, &gather));
+    t.notifyWritable(&w.waiter);
+    try testing.expectEqual(@as(u32, 1), w.runs);
+    t.cancelWritable(&w.waiter);
 }
 
 test "a connection that closes with part of a frame unwritten frees it, runs its waiters, and its channel fails" {

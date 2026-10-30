@@ -179,6 +179,38 @@ test "a transport or discovery plugin with threads of its own fails creation" {
     try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
 }
 
+test "a participant whose TCP transport cannot run on the runtime fails creation, and leaves the factory free to use another" {
+    const prev_log_level = quietRefusals();
+    defer std.testing.log_level = prev_log_level;
+    var delivery = try IntraProcessDelivery.init(alloc);
+    defer delivery.deinit();
+    var node = try Node.init(&delivery);
+    defer node.deinit();
+    var m: Manual = undefined;
+    m.init();
+    defer m.runtime.deinit();
+    var other: Manual = undefined;
+    other.init();
+    defer other.runtime.deinit();
+
+    // The scripted backend waits on no sockets, so TCP cannot run on it,
+    // though the in-process transport can.
+    var config: zzdds.config.Config = .{};
+    config.transport.tcp = .{ .enabled = true, .bind_address = "127.0.0.1" };
+    try node.factory.selectRuntime(&m.runtime);
+    try testing.expectEqual(nil_participant.ptr, node.factory.createParticipantWithConfig(0, &.{}, null, 0, config).ptr);
+
+    try node.factory.selectRuntime(&other.runtime);
+    const dp = node.create();
+    try testing.expect(dp.ptr != nil_participant.ptr);
+    try node.factory.selectRuntime(null);
+    try node.delete(dp);
+    m.runtime.releaseOwner();
+    other.runtime.releaseOwner();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    try testing.expectEqual(rt.State.backend_stopped, other.runtime.getState());
+}
+
 test "participants keep the runtime operating, and deleting the last retires it" {
     var delivery = try IntraProcessDelivery.init(alloc);
     defer delivery.deinit();

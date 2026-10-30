@@ -234,9 +234,11 @@ output readiness, and then the waiters run. A dial is nonblocking: a frame sent 
 it is in progress becomes the tail, and the dial completes or fails on output readiness.
 A failed dial or write closes the connection, dropping its tail, and its waiters run so
 that their next send dials again. Waiters run when any connection that blocked drains or
-closes, so a producer may try again and find its own connection still blocked. A writer
-replays its history to a best-effort reader whose connection is new as that reader's
-resume, so a dial in progress delays the replay rather than losing it.
+closes, so a producer may try again and find its own connection still blocked. A waiter
+registered after such a drain or closure, which may have been its own connection's, runs
+at once, even while another connection is still blocked. A writer replays its history to
+a best-effort reader whose connection is new as that reader's resume, so a dial in
+progress delays the replay rather than losing it.
 
 <a id="channels-and-lifetimes"></a>
 ### Channels and lifetimes
