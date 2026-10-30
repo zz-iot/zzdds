@@ -192,7 +192,9 @@ jobs:
   self-interop:
     name: self-interop (dds-rtps)
     needs: [prepare, test]
-    runs-on: ubuntu-latest
+    # Pinned like ci.yml's interop jobs: setup-python has no 3.11.4 build for
+    # the newer Ubuntu that ubuntu-latest now resolves to.
+    runs-on: ubuntu-24.04
     env:
       INTEROP_RTPS_REF: zenzen-44d6146
 

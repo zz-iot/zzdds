@@ -228,6 +228,9 @@ def run_hello_world_pair(build_dir: Path, prefix: Path, domain: int) -> None:
 # ── step 6: pkg-config ──────────────────────────────────────────────────────
 
 def check_pkgconfig(prefix: Path, work: Path) -> None:
+    if sys.platform == "win32":
+        log("pkg-config: not exercised on Windows (zzdds.pc targets Unix toolchains) -- skipping")
+        return
     if not shutil.which("pkg-config"):
         log("pkg-config: not installed on this runner -- skipping (CMake path already covered)")
         return
