@@ -101,6 +101,11 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-10-30
 
+- Add bounded incremental resource construction with owner-scoped, generation-checked
+  handles, explicit dependencies, leaf deletion and retryable cleanup. Share topic,
+  registration and endpoint construction with whole-graph Instances. Add checked
+  provider writes for incremental writers; no XRCE session policy is introduced.
+
 - Build the prebuilt C/C++ library bundles `-Doptimize=ReleaseSafe` on all platforms
   instead of Zig's default Debug, and run the test suite in ReleaseSafe in the release
   workflow. A Debug `zzdds.dll` overflowed the 1 MiB default main-thread stack of an
@@ -116,6 +121,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 - Windows GUID prefixes now come from the system RNG (`ProcessPrng`) instead of a
   fallback PRNG seeded only from the performance counter, and `host_based` GUIDs carry
   the real process ID on Windows instead of 0.
+
+## 2026-10-29
+
+- Add explicit XCDR1/XCDR2 resource endpoint representation, retaining XCDR1
+  defaults. Carry selection through generated authoring, profiles, inspection,
+  DDS QoS and provider capability checks; no sample conversion is implied.
 
 ## 2026-10-28
 

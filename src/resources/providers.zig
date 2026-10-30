@@ -20,7 +20,8 @@ pub const Binding = struct {
     type_name: []const u8,
     source: union(enum) { provider: Export, compiled: Static },
     expected_identifier: ?Identifier = null,
-    required_representations: u32 = 1,
+    /// Additional capabilities beyond those required by endpoints; zero infers from the plan.
+    required_representations: u32 = 0,
     require_wire_validation: bool = false,
 };
 pub const Options = struct { max_bindings: usize = 1024, max_artifact_bytes: usize = 64 * 1024 * 1024 };
@@ -39,7 +40,7 @@ pub fn validate(plan: *const R.Plan, bindings: []const Binding, options: Options
     if (bindings.len > options.max_bindings) return error.BindingLimit;
     for (bindings, 0..) |binding, i| {
         if (!validName(binding.participant) or !validName(binding.type_name)) return error.InvalidBinding;
-        if (binding.required_representations == 0 or binding.required_representations & ~@as(u32, 3) != 0) return error.InvalidCapabilities;
+        if (binding.required_representations & ~@as(u32, 3) != 0) return error.InvalidCapabilities;
         if (binding.expected_identifier) |id| if (id[0] != 0xf1) return error.InvalidIdentifier;
         for (bindings[0..i]) |other| if (matches(other, binding.participant, binding.type_name)) return error.DuplicateBinding;
         var found = false;
@@ -57,7 +58,7 @@ pub fn validate(plan: *const R.Plan, bindings: []const Binding, options: Options
             .compiled => |source| {
                 if (!same(source.binding.type_name, binding.type_name)) return error.RegisteredNameAliasUnsupported;
                 if (source.binding.participant) |p| if (!same(p, binding.participant)) return error.InvalidBinding;
-                try capabilities(binding, source.minimal_identifier, source.representations, source.wire_validation);
+                try capabilities(binding, source.minimal_identifier, source.representations, source.wire_validation, endpointRepresentations(plan, binding));
             },
         }
     }
@@ -69,11 +70,26 @@ pub fn validate(plan: *const R.Plan, bindings: []const Binding, options: Options
         if (!found) return error.MissingBinding;
     };
 }
-fn capabilities(binding: Binding, identifier: ?Identifier, representations: u32, validation: bool) !void {
+// A type used by mixed endpoints must support every selected representation.
+fn endpointRepresentations(plan: *const R.Plan, binding: Binding) u32 {
+    var required: u32 = 0;
+    for (plan.application.participants) |p| if (same(p.name, binding.participant)) {
+        for (p.topics) |topic| if (same(topic.type_ref, binding.type_name)) {
+            for (p.writers) |e| if (same(e.topic_ref, topic.name)) {
+                required |= e.qos.data_representation.capability();
+            };
+            for (p.readers) |e| if (same(e.topic_ref, topic.name)) {
+                required |= e.qos.data_representation.capability();
+            };
+        };
+    };
+    return required;
+}
+fn capabilities(binding: Binding, identifier: ?Identifier, representations: u32, validation: bool, endpoints: u32) !void {
     if (identifier) |id| if (id[0] != 0xf1) return error.InvalidIdentifier;
     if (representations == 0 or representations & ~@as(u32, 3) != 0) return error.InvalidCapabilities;
-    // Current resource endpoints use XCDR1, irrespective of additional requirements.
-    if ((representations & (binding.required_representations | 1)) != (binding.required_representations | 1)) return error.UnsupportedRepresentation;
+    const required = binding.required_representations | endpoints;
+    if ((representations & required) != required) return error.UnsupportedRepresentation;
     if (binding.require_wire_validation and !validation) return error.MissingWireValidation;
     if (binding.expected_identifier) |expected| {
         const actual = identifier orelse return error.MissingTypeIdentity;
@@ -175,7 +191,7 @@ pub const Prepared = struct {
                     entry.selection = try captured.?.provider.select(source.name);
                     const selection = entry.selection.?;
                     const descriptor = selection.descriptor();
-                    try capabilities(request, descriptor.minimal_identifier.value, descriptor.representations, true);
+                    try capabilities(request, descriptor.minimal_identifier.value, descriptor.representations, true, endpointRepresentations(plan, request));
                     entry.info.provider = try a.dupe(u8, source.provider);
                     entry.info.generation = selection.generation.id;
                     entry.info.artifact = try a.dupe(u8, selection.generation.artifact);
@@ -197,6 +213,16 @@ pub const Prepared = struct {
     pub fn instantiate(self: *const Prepared, alloc: std.mem.Allocator, factory: DDS.DomainParticipantFactory) !R.Instance {
         return R.Instance.init(alloc, &self.plan, factory);
     }
+    /// Borrows this preparation through successful owner.deinit(). Keep both
+    /// owners at stable addresses once construction begins.
+    pub fn incremental(self: *const Prepared, alloc: std.mem.Allocator, factory: DDS.DomainParticipantFactory, capacity: usize) !R.Incremental {
+        return R.Incremental.init(alloc, &self.plan, factory, self.bindings, capacity);
+    }
+    pub fn writeIncremental(self: *const Prepared, owner: *R.Incremental, handle: R.Incremental.Handle, kind: ts_write_kind, data: []const u8) !void {
+        if (owner.plan != &self.plan) return error.WrongPreparedPlan;
+        const writer = try owner.writer(handle);
+        return self.writeSelected(writer, try owner.participantName(handle), kind, data);
+    }
     /// build never consults the manager again, even after provider replacement/removal.
     pub fn build(self: *const Prepared, instance: *R.Instance) !void {
         if (instance.plan != &self.plan) return error.WrongPreparedPlan;
@@ -207,6 +233,9 @@ pub const Prepared = struct {
     pub fn write(self: *const Prepared, instance: *R.Instance, participant: []const u8, endpoint: []const u8, kind: ts_write_kind, data: []const u8) !void {
         if (instance.plan != &self.plan) return error.WrongPreparedPlan;
         const writer = try instance.writer(participant, endpoint);
+        return self.writeSelected(writer, participant, kind, data);
+    }
+    fn writeSelected(self: *const Prepared, writer: DDS.DataWriter, participant: []const u8, kind: ts_write_kind, data: []const u8) !void {
         const topic = writer.get_topic();
         for (self.entries) |entry| if (same(entry.info.participant, participant) and same(entry.info.type_name, topic.get_type_name())) {
             const selection = entry.selection orelse return error.CompiledAdapterWriteUnavailable;

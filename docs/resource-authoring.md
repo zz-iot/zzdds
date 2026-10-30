@@ -228,3 +228,22 @@ shipped small-file bootstrap examples retain their 4 KiB allocation-block limit;
 it does not guarantee every accepted file fits that allocator. Include this bounded
 stack cost when sizing embedded tasks. Custom nesting limits also apply while
 parsing conditional sections, even if those sections are later skipped.
+
+## Endpoint encoding
+
+Writer and reader QoS accept `data_representation = "XCDR1"` or `"XCDR2"`.
+Absence preserves the XCDR1 default. Profiles can supply this setting, derived
+profiles can override it, and endpoint QoS wins over the selected profile, just
+like reliability and resource limits. The inspector prints the resolved choice.
+
+```toml
+[profiles.XRCE.writer_qos]
+data_representation = "XCDR2"
+[profiles.XRCE.reader_qos]
+data_representation = "XCDR2"
+```
+
+The choice controls DDS endpoint QoS and required provider capabilities. It does
+not transcode samples. Direct XRCE forwarding will select XCDR2; supporting an
+XCDR1 DDS destination later requires conversion in the agent. Existing authoring
+files and programmatic definitions continue to select XCDR1 unless overridden.

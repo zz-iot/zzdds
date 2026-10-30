@@ -1,7 +1,9 @@
 // Authored DDS resources; separate from application sample IDL and native handles.
 // Optional QoS fields preserve absence through profile resolution.
 enum ResourceReliability { BEST_EFFORT_RELIABILITY_QOS, RELIABLE_RELIABILITY_QOS };
+enum ResourceDataRepresentation { XCDR1, XCDR2 };
 struct ResourceQos {
+    @optional ResourceDataRepresentation data_representation;
     @optional ResourceReliability reliability;
     @optional long history_depth;
     @optional long max_samples;

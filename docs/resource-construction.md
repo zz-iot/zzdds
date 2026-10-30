@@ -128,8 +128,9 @@ transmission under memory exhaustion on the current threaded implementation.
 ## QoS and scope
 
 The concrete endpoint QoS subset has a reliability choice, positive finite history
-and resource limits, VOLATILE durability, KEEP_LAST history and explicit XCDR1
-representation. This experimental module requires the default `-Dxtypes=true` build:
+and resource limits, VOLATILE durability, KEEP_LAST history and an explicit
+`data_representation` choice (`.XCDR1` by default, or `.XCDR2`). Each endpoint
+selects one representation; this does not convert serialized samples. This experimental module requires the default `-Dxtypes=true` build:
 existing core representation storage does not compile with XTypes disabled, and
 this slice does not repair that separate configuration. Default history
 depth is 1; limits are 32 samples, one instance and 32 samples per instance.
@@ -173,3 +174,56 @@ it is not evidence of UDP interoperability, broker readiness or manual runtime s
 For explicit multi-library sources, generation-pinned preparation and participant-
 scoped bindings, see [resource provider bindings](resource-providers.md). Ordinary
 compiled registrations can continue using this API without the loadable library ABI.
+
+## Incremental construction
+
+`resources.Incremental` constructs one requested object at a time from an owned
+Plan. It shares binding validation, registration, topic construction and endpoint
+QoS translation with whole-graph Instances. Initialize it with a borrowed factory,
+bindings and an explicit live-object capacity (1–65,536 slots). Initialization
+allocates bookkeeping but creates no DDS entities.
+
+```zig
+var graph = try R.Incremental.init(allocator, &plan, factory, bindings, 32);
+// Call try graph.deinit() before releasing the plan/factory/binding contexts.
+const participant = try graph.createParticipant("main");
+const topic = try graph.createTopic(participant, "reading");
+const publisher = try graph.createPublisher(participant, "pub");
+const writer = try graph.createWriter(publisher, topic, "reading");
+const borrowed_writer = try graph.writer(writer);
+_ = borrowed_writer;
+try graph.delete(writer);
+```
+
+A participant installs its selected type registrations, but creates no topics or
+endpoints. Publisher/subscriber creation requires an existing participant. Writer/
+reader creation requires an existing container and topic matching the definition,
+in the same participant instance. Missing dependencies are rejected; the builder
+does not create them implicitly. Each participant creation yields a distinct
+instance, even when it uses the same definition. Duplicate topic creation within
+one participant is rejected to avoid two deletion owners for one DDS Topic.
+
+Handles belong to the graph's address and a slot generation. Cross-owner, wrong-kind
+and deleted/reused handles are rejected. The owner can move before first use but
+must remain at a stable address afterward. Do not copy it, mutate its bookkeeping,
+delete borrowed DDS handles externally, or use handles after successful deinit.
+The Plan, factory, binding array and registration contexts must outlive the graph.
+Operations are serialized by the caller; this API adds no concurrent mutation or
+XRCE object-ID/session policy. DDS callbacks may request cancel/destroy reentrantly
+on that same owner thread, but must not free the owner or mutate its entities.
+
+Deletion is leaf-only and checks both parent ownership and endpoint-to-topic
+references. Destroy follows resource dependencies rather than slot order, which
+may change after reuse. A failed create rolls back only its own candidate, leaving
+unrelated resources intact. If rollback fails, `cleanup_error` retains the secondary
+error and all remaining handles stay owned; new operations are blocked. Retry
+`destroy`/`deinit`, keeping the allocator and dependencies alive until success.
+Explicit failed deletion similarly retains the object for whole-owner cleanup.
+Reentrant destroy during construction requests cancellation and returns
+`ConstructionInProgress`; actual cleanup follows after the callback returns.
+
+Construction uses the factory's existing enable behavior. Disabled DDS parents
+currently reject some child deletion operations; using disabled construction does
+not establish atomic staging, automatic enablement or announcement rollback.
+These backend limitations also apply to incremental ownership. Successful logical
+cleanup is subject to the existing deferred-retirement allocator lifetime rules.

@@ -1,12 +1,14 @@
 schema_version = 1
 name = "MultiProvider"
 [profiles.Bounded.writer_qos]
+data_representation = "XCDR2"
 reliability = "RELIABLE_RELIABILITY_QOS"
 history_depth = 3
 max_samples = 24
 max_instances = 4
 max_samples_per_instance = 6
 [profiles.Bounded.reader_qos]
+data_representation = "XCDR2"
 reliability = "BEST_EFFORT_RELIABILITY_QOS"
 history_depth = 2
 max_samples = 30
