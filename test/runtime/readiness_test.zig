@@ -452,7 +452,7 @@ test "unregistering a source returns only once a running service of it has" {
     try testing.expect(h.unregistered.load(.acquire));
 }
 
-test "a source's own service may unregister it, and is not called on it again" {
+test "a source's own service may unregister it, and is not called on it again, also for two in one service" {
     if (!rt.poll_backend.supported) return error.SkipZigTest;
     var b: Backend = undefined;
     try b.init();
@@ -476,31 +476,35 @@ test "a source's own service may unregister it, and is not called on it again" {
             return n;
         }
     };
-    var closing: Closing = .{ .bk = &b };
-    try closing.sock.init();
-    defer closing.sock.deinit();
-    closing.sock.source.ctx = &closing;
-    closing.sock.source.service = Closing.service;
+    // The second to unregister passes the first's place in the service's
+    // list, which must not be read either.
+    var closing: [2]Closing = .{ .{ .bk = &b }, .{ .bk = &b } };
+    for (&closing) |*cl| {
+        try cl.sock.init();
+        cl.sock.source.ctx = cl;
+        cl.sock.source.service = Closing.service;
+    }
+    defer for (&closing) |*cl| cl.sock.deinit();
     // Another ready source keeps the service going round after the first.
     var other: Sock = undefined;
     try other.init();
     defer other.deinit();
-    try b.backend().register(&closing.sock.source);
+    for (&closing) |*cl| try b.backend().register(&cl.sock.source);
     try b.backend().register(&other.source);
     for (0..3) |_| {
-        try tx.sendTo(&closing.sock);
+        for (&closing) |*cl| try tx.sendTo(&cl.sock);
         try tx.sendTo(&other);
     }
-    try awaitReadable(&closing.sock);
+    for (&closing) |*cl| try awaitReadable(&cl.sock);
     try awaitReadable(&other);
 
     // Returns at once, rather than waiting for the service it runs in.
     _ = b.backend().service(16);
-    try testing.expectEqual(@as(u32, 1), closing.calls);
+    for (&closing) |*cl| try testing.expectEqual(@as(u32, 1), cl.calls);
     try testing.expectEqual(@as(u32, 3), other.received);
     try testing.expectEqual(@as(usize, 1), b.pb.sourceCount());
     _ = b.backend().service(16);
-    try testing.expectEqual(@as(u32, 1), closing.calls);
+    for (&closing) |*cl| try testing.expectEqual(@as(u32, 1), cl.calls);
     b.backend().unregister(&other.source);
 }
 
@@ -1578,10 +1582,7 @@ test "a waiter registered after its connection drained runs at once, though anot
     const t = n.tr.transport();
 
     _ = try a.fill(&n, scratch);
-    _ = try b.fill(&n, scratch);
     try testing.expectEqual(SendOutcome.would_block, try t.sendGather(&a.to, &gather));
-    try testing.expectEqual(SendOutcome.would_block, try t.sendGather(&b.to, &gather));
-    try testing.expectEqual(@as(usize, 2), n.tr.blocked_count);
 
     // a's peer reads, and a drains before its writer waits: no waiter runs.
     var got: std.ArrayListUnmanaged(u8) = .empty;
@@ -1593,13 +1594,19 @@ test "a waiter registered after its connection drained runs at once, though anot
         want: usize,
         fn f(self: *const @This()) bool {
             Raw.readAvailable(self.peer, self.got) catch return true;
-            return self.got.items.len >= self.want and self.node.tr.blocked_count == 1;
+            return self.got.items.len >= self.want and self.node.tr.blocked_count == 0;
         }
     };
     try n.serviceUntil(&Drain{ .node = &n, .peer = a.peer, .got = &got, .want = a.sent.items.len }, Drain.f);
     try testing.expectEqualSlices(u8, a.sent.items, got.items);
 
-    // Its waiter, registered now, runs at once rather than waiting for b.
+    // Meanwhile b blocks, with nothing serviced before the waiter registers,
+    // so b cannot drain first, however much its peer's buffers grow.
+    _ = try b.fill(&n, scratch);
+    try testing.expectEqual(SendOutcome.would_block, try t.sendGather(&b.to, &gather));
+    try testing.expectEqual(@as(usize, 1), n.tr.blocked_count);
+
+    // The waiter, registered now, runs at once rather than waiting for b.
     var w: Waited = .{};
     t.notifyWritable(&w.waiter);
     try testing.expectEqual(@as(u32, 1), w.runs);

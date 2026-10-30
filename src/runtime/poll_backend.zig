@@ -313,6 +313,8 @@ pub const PollBackend = struct {
             // This thread runs the service: once out of its list, `source`
             // is not touched again, so its owner may free it at once.
             for (self.service_sources.items, self.service_fds.items) |*s, *fd| {
+                // A place already taken out holds no source.
+                if (fd.fd == -1) continue;
                 if (s.* == source) {
                     s.* = undefined;
                     fd.revents = 0;
