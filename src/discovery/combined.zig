@@ -182,6 +182,7 @@ pub const SpdpSedpDiscovery = struct {
         if (self.runtime != null) {
             self.ingress.deinit();
             self.timers.deinit();
+            self.ingress_budget.deinit();
         }
     }
 
@@ -207,6 +208,7 @@ pub const SpdpSedpDiscovery = struct {
         if (self.runtime != null) {
             self.ingress.deinit();
             self.timers.deinit();
+            self.ingress_budget.deinit();
         }
         self.runtime = null;
         self.ingress_latch = .{};

@@ -506,6 +506,7 @@ pub const AsyncRingSink = struct {
             t.join();
         }
         self.drainAll(); // final flush
+        self.drain_mu.deinit();
         self.alloc.free(self.slots);
         self.alloc.destroy(self);
     }

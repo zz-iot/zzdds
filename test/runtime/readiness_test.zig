@@ -551,6 +551,46 @@ test "a source whose input is paused is not serviced, and once resumed is servic
     try testing.expectEqual(calls + 1, Counted.calls);
 }
 
+test "resumed sources past the service's budget keep their wakeup for the next service" {
+    if (!rt.poll_backend.supported) return error.SkipZigTest;
+    var b: Backend = undefined;
+    try b.init();
+    defer b.deinit();
+    // Each holds input already read, so a service always handles one.
+    const Held = struct {
+        sock: Sock = undefined,
+        calls: u32 = 0,
+        fn service(ctx: *anyopaque, _: u32) u32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return 1;
+        }
+    };
+    var held: [2]Held = .{ .{}, .{} };
+    for (&held) |*h| {
+        try h.sock.init();
+        h.sock.source.ctx = h;
+        h.sock.source.service = Held.service;
+        try b.backend().register(&h.sock.source);
+    }
+    defer for (&held) |*h| {
+        b.backend().unregister(&h.sock.source);
+        h.sock.deinit();
+    };
+    for (&held) |*h| {
+        b.backend().pauseInput(&h.sock.source);
+        b.backend().resumeInput(&h.sock.source);
+    }
+
+    // Budget for one: one is serviced, then the other, then neither.
+    try testing.expectEqual(@as(u32, 1), b.backend().service(1).serviced);
+    try testing.expectEqual(@as(u32, 1), held[0].calls + held[1].calls);
+    try testing.expectEqual(@as(u32, 1), b.backend().service(1).serviced);
+    try testing.expectEqual(@as(u32, 1), held[0].calls);
+    try testing.expectEqual(@as(u32, 1), held[1].calls);
+    try testing.expectEqual(@as(u32, 0), b.backend().service(1).serviced);
+}
+
 // ── UDP on the runtime ────────────────────────────────────────────────────────
 
 /// Threads in this process, where the platform reports it.
@@ -956,7 +996,7 @@ fn advertises(udp: *UdpTransport, ip: [4]u8) !bool {
 }
 
 test "on a runtime, a UDP transport re-polls its interfaces on a timer while a port is listened, and reports only a change" {
-    if (!rt.poll_backend.supported) return error.SkipZigTest;
+    if (!rt.poll_backend.supported or !UdpTransport.repolls_interfaces) return error.SkipZigTest;
     // Binding to the added address fails, as it is not this host's: expected.
     const prev = std.testing.log_level;
     std.testing.log_level = .err;
@@ -1340,6 +1380,8 @@ const Frames = struct {
     room: ?usize = null,
     refused: u32 = 0,
     waiter: ?*transport_iface.RoomWaiter = null,
+    /// Unlistened: nothing may call it.
+    gone: bool = false,
 
     fn onReceive(ctx: *anyopaque, data: []const u8, _: Locator, channel: Channel) void {
         const self: *Frames = @ptrCast(@alignCast(ctx));
@@ -1355,6 +1397,7 @@ const Frames = struct {
 
     fn tryReceive(ctx: *anyopaque, data: []const u8, src: Locator, channel: Channel) bool {
         const self: *Frames = @ptrCast(@alignCast(ctx));
+        if (self.gone) @panic("handler called after unlisten");
         if (self.room) |*r| {
             if (r.* == 0) {
                 self.refused += 1;
@@ -1368,6 +1411,7 @@ const Frames = struct {
 
     fn notifyRoom(ctx: *anyopaque, w: *transport_iface.RoomWaiter, _: []const u8, _: Locator) void {
         const self: *Frames = @ptrCast(@alignCast(ctx));
+        if (self.gone) @panic("handler called after unlisten");
         if (self.room == null or self.room.? > 0) return w.on_room(w);
         self.waiter = w;
         w.queued = true;
@@ -1375,6 +1419,7 @@ const Frames = struct {
 
     fn cancelRoom(ctx: *anyopaque, w: *transport_iface.RoomWaiter) void {
         const self: *Frames = @ptrCast(@alignCast(ctx));
+        if (self.gone) @panic("handler called after unlisten");
         if (self.waiter == w) self.waiter = null;
         w.queued = false;
     }
@@ -1587,6 +1632,105 @@ test "a frame its handler has no room for is held and reading stops, until the h
     }.f);
     for (payloads, n.frames.got.items) |want, got| try testing.expectEqualSlices(u8, want, got);
     try testing.expectEqual(@as(usize, 0), n.conn().held.len);
+}
+
+/// Sends `payload` as one frame on `peer`.
+fn sendFrame(peer: posix.socket_t, payload: []const u8) !void {
+    const f = try Raw.frame(payload);
+    defer alloc.free(f);
+    try Raw.writeAll(peer, f);
+}
+
+test "a held frame goes once to each handler that has not taken it, though the handlers change meanwhile" {
+    if (!rt.poll_backend.supported) return error.SkipZigTest;
+    var n: TcpNode = undefined;
+    try n.init();
+    defer n.deinit();
+    var b: Frames = .{ .room = 0 };
+    defer b.deinit();
+    const t = n.tr.transport();
+    const at_node = Locator.tcp4(.{ 127, 0, 0, 1 }, n.port);
+    try t.listen(&at_node, b.handler());
+    const peer = try Raw.connect(n.port);
+    defer _ = c.close(peer);
+
+    // The first handler takes it; the second has no room.
+    try sendFrame(peer, "one");
+    try n.serviceUntil(&b, struct {
+        fn f(fr: *Frames) bool {
+            return fr.refused == 1;
+        }
+    }.f);
+    b.give(1);
+    try n.serviceUntil(&b, struct {
+        fn f(fr: *Frames) bool {
+            return fr.got.items.len == 1;
+        }
+    }.f);
+    try testing.expectEqual(@as(usize, 1), n.frames.got.items.len);
+    try testing.expect(n.conn().room_handler == null);
+
+    // Held again, and the first handler is unlistened meanwhile, so the
+    // second moves to its place in the list.
+    try sendFrame(peer, "two");
+    try n.serviceUntil(&b, struct {
+        fn f(fr: *Frames) bool {
+            return fr.refused == 2;
+        }
+    }.f);
+    t.unlisten(&at_node, n.frames.handler());
+    b.give(null);
+    try n.serviceUntil(&b, struct {
+        fn f(fr: *Frames) bool {
+            return fr.got.items.len == 2;
+        }
+    }.f);
+    try testing.expectEqual(@as(usize, 2), n.frames.got.items.len);
+    try testing.expectEqualStrings("two", b.got.items[1]);
+}
+
+test "unlistening the handler a held frame waits on cancels the wait, and the handler is not called again" {
+    if (!rt.poll_backend.supported) return error.SkipZigTest;
+    var n: TcpNode = undefined;
+    try n.init();
+    defer n.deinit();
+    var b: Frames = .{ .room = 0 };
+    defer b.deinit();
+    const t = n.tr.transport();
+    const at_node = Locator.tcp4(.{ 127, 0, 0, 1 }, n.port);
+    try t.listen(&at_node, b.handler());
+    const peer = try Raw.connect(n.port);
+
+    try sendFrame(peer, "one");
+    try n.serviceUntil(&b, struct {
+        fn f(fr: *Frames) bool {
+            return fr.refused == 1;
+        }
+    }.f);
+    try testing.expect(b.waiter != null);
+
+    // Unlistened: its wait is cancelled before unlisten returns, and the
+    // frame, which the other handler has, is done with.
+    t.unlisten(&at_node, b.handler());
+    try testing.expect(b.waiter == null);
+    b.gone = true;
+    try n.serviceUntil(&n, struct {
+        fn f(node: *TcpNode) bool {
+            return node.conn().held.len == 0;
+        }
+    }.f);
+    try testing.expectEqual(@as(usize, 1), n.frames.got.items.len);
+    try testing.expectEqual(@as(usize, 0), b.got.items.len);
+
+    // Reading went on, and the connection closes without calling it.
+    try sendFrame(peer, "two");
+    _ = c.close(peer);
+    try n.serviceUntil(&n, struct {
+        fn f(node: *TcpNode) bool {
+            return node.live() == 0;
+        }
+    }.f);
+    try testing.expectEqual(@as(usize, 2), n.frames.got.items.len);
 }
 
 test "a TCP connection on a backend reassembles frames split across reads and several in one, and closes on a bad length" {

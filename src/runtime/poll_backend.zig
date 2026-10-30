@@ -371,9 +371,10 @@ pub const PollBackend = struct {
         const fds = self.service_fds.items;
         if (fds.len == 0) return .{};
         var ready = posix.poll(fds, 0) catch return .{};
-        // A resumed source runs as if it had input. Others are only read.
+        // A resumed source runs as if it had input, until it is serviced.
+        // Others are only read.
         for (self.service_sources.items, fds) |s, *fd| {
-            if (!s.kicked.load(.seq_cst) or !s.kicked.swap(false, .seq_cst)) continue;
+            if (!s.kicked.load(.seq_cst)) continue;
             if (fd.revents == 0) ready += 1;
             fd.revents |= posix.POLL.IN;
         }
@@ -405,6 +406,7 @@ pub const PollBackend = struct {
                     progressed = true;
                     continue;
                 }
+                if (s.kicked.load(.seq_cst)) s.kicked.store(false, .seq_cst);
                 if (fds[i].revents & posix.POLL.NVAL != 0 or s.service(s.ctx, 1) == 0) {
                     fds[i].revents = 0;
                     continue;

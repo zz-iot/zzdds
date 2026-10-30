@@ -758,6 +758,10 @@ pub const UdpTransport = struct {
 
     const Self = @This();
 
+    /// Whether interfaces are re-polled after startup: off in a build
+    /// without the interface monitor, which enumerates them once.
+    pub const repolls_interfaces = build_opts.interface_monitor;
+
     // ── Init / deinit ─────────────────────────────────────────────────────────
 
     pub fn init(
@@ -1992,7 +1996,7 @@ pub const UdpTransport = struct {
     /// monitor's thread would, unless already polling or configured not to
     /// (docs/design/concurrency/runtime.md#thread-mapping).
     fn startIfacePollLocked(self: *Self) void {
-        if (comptime !build_opts.interface_monitor) return;
+        if (comptime !repolls_interfaces) return;
         if (self.iface_poll != null or !self.monitor_owned) return;
         const interval_ms = self.config.interface_poll_interval_ms;
         if (interval_ms == 0) return;
