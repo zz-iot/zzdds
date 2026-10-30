@@ -1135,7 +1135,7 @@ pub fn build(b: *std.Build) void {
             \\    unset(_ZZDDS_CDR_LIB CACHE)
             \\endif()
             \\
-            \\set(ZZDDS_ZIDL_EXECUTABLE "${{_ZZDDS_PREFIX}}/bin/zidl")
+            \\set(ZZDDS_ZIDL_EXECUTABLE "${{_ZZDDS_PREFIX}}/bin/{s}")
             \\set(ZZDDS_DCPS_IMPL_CPP   "${{_ZZDDS_PREFIX}}/src/dcps_impl.cpp")
             \\set(ZZDDS_ZZDDS_IMPL_CPP  "${{_ZZDDS_PREFIX}}/src/zzdds_impl.cpp")
             \\set(ZZDDS_VERSION         "{s}")
@@ -1144,7 +1144,7 @@ pub fn build(b: *std.Build) void {
             \\unset(_ZZDDS_DIR)
             \\unset(_ZZDDS_PREFIX)
             \\
-        , .{zzdds_version});
+        , .{ zidl_exe.out_filename, zzdds_version });
         const cmake_wf = b.addWriteFiles();
         const cmake_lp = cmake_wf.add("zzdds-config.cmake", cmake_cfg_content);
         const install_cmake = b.addInstallFileWithDir(cmake_lp, .{ .custom = "lib/cmake/ZZDDS" }, "zzdds-config.cmake");

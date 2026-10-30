@@ -8,6 +8,17 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-10-30
+
+- Build the prebuilt C/C++ library bundles `-Doptimize=ReleaseSafe` on all platforms
+  instead of Zig's default Debug, and run the test suite in ReleaseSafe in the release
+  workflow. A Debug `zzdds.dll` overflowed the 1 MiB default main-thread stack of an
+  MSVC-built consumer inside `zzdds_create_factory()`.
+- The bundle's `zzdds-config.cmake` names `bin/zidl.exe` on Windows, so
+  `find_package(ZZDDS)` configures there. The release workflow now runs the full
+  bundle consume check on Windows: CMake consumer and C/C++ hello_world built with MSVC
+  against the relocated bundle, and the hello_world pairs run.
+
 ## 2026-10-28
 
 - Add optional resource provider bindings: explicit per-participant selections,

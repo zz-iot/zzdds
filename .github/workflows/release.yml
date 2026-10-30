@@ -117,6 +117,10 @@ jobs:
       - name: Test
         run: zig build test
 
+      # The mode package-libs ships the prebuilt bundles in.
+      - name: Test (ReleaseSafe)
+        run: zig build test -Doptimize=ReleaseSafe
+
       - name: Test (ReleaseFast)
         run: zig build test -Doptimize=ReleaseFast
 
@@ -265,22 +269,20 @@ jobs:
   # pkgconfig + CMake package files) on each release platform and uploads it
   # as a per-platform tarball; `publish` attaches them to the GitHub release.
   #
-  # Beyond confirming the tree is complete, this job (Linux + macOS) also
-  # extracts the finished tarball into an unrelated directory and drives a real
-  # downstream consume of it -- `find_package(ZZDDS)` + pkg-config, building
+  # Bundles are built ReleaseSafe: optimized, with Zig's safety checks and debug
+  # info kept. A Debug libzzdds also overflowed an MSVC consumer's default 1 MiB
+  # main-thread stack inside zzdds_create_factory() (Zig's Debug-mode Windows
+  # file-open frames); the zig-built tests run on 16 MiB and never saw it.
+  #
+  # Beyond confirming the tree is complete, this job also extracts the finished
+  # tarball into an unrelated directory and drives a real downstream consume of
+  # it -- `find_package(ZZDDS)` + pkg-config, building
   # examples/{c,cpp}/hello_world and a minimal consumer against the *relocated*
   # prefix (scripts/verify_release_bundle.py). That catches broken CMake
   # package files / pkg-config relocatability / rpath|install-name that the
   # `test` job's in-tree `test-bindings` step (which points CMAKE_PREFIX_PATH
-  # straight at the live zig-out) cannot see.
-  #
-  # Windows gets the structural check only: the generated zzdds-config.cmake /
-  # zzdds.pc are POSIX-shaped today (search `lib/` for the shared lib, no
-  # IMPORTED_IMPLIB, `bin/zidl` not `bin/zidl.exe`), so `find_package(ZZDDS)`
-  # can't configure there yet. Making the generated package Windows-correct is
-  # tracked in docs/roadmap.md "CI / Release Platform Coverage"; until then the
-  # Windows tarball ships as-is (its libraries are still functionally covered by
-  # the `test` job's `test-bindings` step).
+  # straight at the live zig-out) cannot see. On Windows the consumers are
+  # built with MSVC (CMake's default Visual Studio generator).
   package-libs:
     name: package-libs (${{ matrix.name }})
     needs: [prepare, test]
@@ -310,7 +312,7 @@ jobs:
       # the "verify" false-negative below (a shell bug, not a build bug)
       # obvious once package-libs finally ran for real.
       - name: Build install tree (C + C++ bindings)
-        run: zig build -Dc-binding=true -Dcpp-binding=true install --summary all
+        run: zig build -Dc-binding=true -Dcpp-binding=true -Doptimize=ReleaseSafe install --summary all
 
       - name: Verify install tree is complete
         shell: bash
@@ -354,7 +356,6 @@ jobs:
           tar -czf "${dir}.tar.gz" "$dir"
 
       - name: Install Python (for verify_release_bundle.py)
-        if: runner.os != 'Windows'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -365,16 +366,21 @@ jobs:
       # pub/sub pair. macOS: same but --skip-example-run (the hello_world pair
       # needs live UDP discovery, flaky on hosted macOS; cmake_consumer still
       # links + runs against libzzdds.dylib, so install-name relocatability is
-      # still covered). Windows is skipped -- see the job-header comment.
+      # still covered). Windows: full path, consumers built with MSVC; the
+      # hello_world pair loads zzdds.dll from the relocated bin/ via PATH.
+      - name: Allow inbound UDP (Windows)
+        if: runner.os == 'Windows'
+        run: netsh advfirewall firewall add rule name="zzdds-test-udp" protocol=UDP dir=in action=allow
+
+      # `python`, not `python3`: setup-python provides the former on every OS.
       - name: Verify prebuilt bundle is consumable
-        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           tarball="zzdds-${{ needs.prepare.outputs.full_version }}-${{ matrix.name }}.tar.gz"
           args=""
           [ "${{ runner.os }}" = "macOS" ] && args="--skip-example-run"
-          python3 scripts/verify_release_bundle.py --bundle "$tarball" $args
+          python scripts/verify_release_bundle.py --bundle "$tarball" $args
 
       - name: Upload bundle
         uses: actions/upload-artifact@v4

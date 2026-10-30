@@ -2,8 +2,8 @@
 # find_package(ZZDDS). Driven by scripts/verify_release_bundle.py:
 #
 #   cmake -S . -B build -DCMAKE_PREFIX_PATH=<extracted-bundle-prefix>
-#   cmake --build build      # skipped with --configure-only (Windows)
-#   ./build/zzdds_bundle_cmake_consumer
+#   cmake --build build      # skipped with --configure-only
+#   ./build/zzdds_bundle_cmake_consumer   (build/Debug/ with the Visual Studio generator)
 #
 # It asserts the generated lib/cmake/ZZDDS/zzdds-config.cmake defines
 # everything a real consumer (see examples/{c,cpp}/hello_world) depends on,
