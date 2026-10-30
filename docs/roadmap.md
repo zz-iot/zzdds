@@ -184,13 +184,38 @@ Forward-looking only: known gaps, planned features, and open design questions.
   current state. On TCP, a frame the socket takes only part of is kept as the
   connection's tail and written before anything else, so a later send would block
   until it drains. Left: Windows, whose UDP sends still block.
-- **TCP on the shared runtime does not pause reading when ingress is full.** The
-  [ingress rules](design/concurrency/runtime.md#ingress) have a TCP connection stop
-  reading at a frame boundary while its destination cannot take more. On a backend the
-  connection reads on, and the participant's ingress drops whole frames past its bounds,
-  as it drops UDP datagrams; framing stays intact, and reliable writers repair the loss.
-  Pausing needs the receive handler to report that it is full, and the connection's
-  source to stop waiting for input until ingress drains.
+- **Ingress limits are per peer, not per writer or per channel, and not configurable.**
+  On the shared runtime each ingress queue (a participant's user data; its discovery
+  plugin's SPDP and SEDP) is bounded by records and bytes in aggregate and per peer
+  (`IngressBudget`): no peer holds more than three quarters of either bound, and past
+  half of either, each peer with data queued is held to an equal share. A peer is the
+  GuidPrefix in the RTPS header, or the source without one, hashed into 32 buckets. The
+  [ingress rules](design/concurrency/runtime.md#ingress) also name per-channel limits,
+  and fairness between the writers of one peer would need each message's submessages
+  parsed before it is admitted. The bounds are placeholders until measured, and are not
+  yet in the configuration.
+- **Ingress under DDS Security (investigation).** With message protection, a message's
+  submessages, and so its entity IDs, are encrypted, so admission before decoding can
+  only rest on what is in clear (the RTPS header and the source), and none of that is
+  authenticated. To settle: what an ingress queue may classify by before decoding,
+  whether a security plugin supplies its own key (an authenticated session, say), and
+  per-writer fairness after decoding, in each remote writer's state, rather than at the
+  transport boundary.
+- **One discovery plugin for a factory's participants (investigation).** A
+  `SpdpSedpDiscovery` serves one participant at a time, and the public factory builds a
+  transport and a plugin per participant. Sharing one plugin among a process's
+  participants could save memory and discovery traffic when there are many; DDS Security
+  gives each participant its own identity and keys, which may rule it out or shape it.
+  The internal Zig factory's limit of one started participant per plugin is not
+  documented or tested.
+- **Configurable ports, and participants sharing a port (investigation).** Each
+  participant has its own unicast port pair, from the RTPS formula or the port overrides;
+  several participants in one process could share one transport and its ports (the UDP
+  transport already hands a port's datagrams to every handler on it), which would help
+  with firewalls. Across processes a unicast port cannot be shared, since the kernel
+  gives each datagram to one socket. Related sharp edge: unicast sockets are bound with
+  `SO_REUSEADDR`, so two transports given the same fixed `participant_id` or port
+  overrides both bind, and one of them silently stops receiving; that should fail loudly.
 - **A local endpoint's announcement is not ordered against its creation and deletion.**
   The rules are in
   [local endpoint publication, announcement and disposal](design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal).
@@ -1059,7 +1084,7 @@ migration switch, off by default): a factory may select the runtime, each partic
 an owner reference, and creation fails for transports or discovery plugins that run their
 own threads (the in-process memory transport, direct discovery, RTPS discovery and, on
 POSIX, UDP qualify so far). Received datagrams are copied into each participant's ingress context,
-bounded by count and bytes, and processed in runtime turns (which is what makes a RELIABLE
+bounded by count and bytes, in aggregate and per peer, and processed in runtime turns (which is what makes a RELIABLE
 pair over the memory transport work there); deleting a participant drops what is still
 queued. On POSIX the default runtime, and any runtime built on the readiness backend
 (`PollBackend`), waits on sockets as well as for work: a UDP transport's sockets become
@@ -1069,8 +1094,9 @@ and servicing receives what is ready without blocking, round robin across socket
 its budget. A factory's transport and discovery serve all its participants, so they share
 one runtime: creation on another runtime while any of them exists, even disabled, or on one
 whose backend waits on no sockets, fails; once they are all deleted, the next participant's
-runtime takes over. On the runtime, UDP does not yet
-re-poll interfaces (no poll thread is started). RTPS messages go to the transport as the
+runtime takes over. On the runtime, UDP re-polls its interfaces on a runtime timer at the
+configured interval, while any of its ports is listened, rather than on the monitor's
+thread, and reports only a change. RTPS messages go to the transport as the
 builder's gather list, which UDP passes to `sendmsg` without copying it into one buffer,
 and on the runtime a UDP send never blocks: a full send buffer drops the datagram, counts
 it (`sends_would_block`) and reports `would_block`. A writer then holds that reader's
@@ -1148,7 +1174,9 @@ once the socket drains. In every build, a UDP socket or TCP connection that clos
 freed once nothing uses it, rather than kept until its transport closes, and a channel
 naming it fails as closed. TCP runs there too: its listen socket and connections are
 sources of the same backend, so a reliable pair over loopback TCP also runs through
-`drive()` alone, and dials and sends never block. Next is Windows. Outside that build,
+`drive()` alone, and dials and sends never block. TCP frames go through the participant's
+ingress as UDP datagrams do, and a connection whose frame does not fit stops reading until
+it does. Next is Windows. Outside that build,
 the UDP and TCP transports still call their handlers from their own receive threads. Now specified as the
 [ManualDriver/external-loop contract](design/concurrency/runtime.md#manual-runtime-driving-and-external-loop-integration)
 (`drive(budget, max_wait)` plus prepare-to-wait integration) and the cooperative

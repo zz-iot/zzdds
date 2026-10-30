@@ -179,6 +179,21 @@ asking for read readiness on a paused source, and the kernel queues or drops fur
 input. The completion adapter stops posting receives. The MCU adapter stops taking buffers
 from the driver, which drops at its own limit.
 
+TCP on POSIX does this on a backend. A frame its receive handler has no room for
+(`ReceiveHandler.try_receive`) is held whole, with the bytes read after it, and the
+connection's source stops waiting for input (`pause_input`). The participant runs the
+connection's waiter once it has processed a queued datagram and the frame fits, and
+`resume_input` services the source again whether or not the socket has input, so the held
+frame goes first. A frame larger than any one peer may hold is dropped.
+
+Each ingress queue (a participant's user data, and its discovery plugin's SPDP and SEDP
+together) accounts what it holds with an `IngressBudget`: records and bytes, in aggregate
+and per peer. No peer holds more than three quarters of either bound, so a peer with
+nothing queued always finds room, and past half of either bound each peer with data
+queued is held to an equal share. A peer is the GuidPrefix in the RTPS header, or the
+source without one, read before anything is parsed or authenticated and hashed into a
+fixed table, so nothing is allocated per peer. Per-channel limits are not implemented yet.
+
 **Conforming approach.** The readiness adapter receives into one scratch buffer per
 executor and copies only what it retains, so its buffer memory does not grow with the
 socket count. The completion adapter must post buffers before data arrives, so its

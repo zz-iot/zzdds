@@ -179,6 +179,7 @@ pub const DomainParticipantFactoryImpl = struct {
             log_mod.dcps.warn("create_participant: the transport cannot run on this runtime ({s})", .{@errorName(err)});
             return err;
         };
+        self.transport.attachRuntime(rt);
         self.discovery.attachRuntime(rt) catch |err| {
             log_mod.dcps.warn("create_participant: the discovery plugin cannot run on this runtime ({s})", .{@errorName(err)});
             return err;

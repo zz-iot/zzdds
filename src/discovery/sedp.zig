@@ -40,6 +40,7 @@ const build_opts = @import("build_options");
 const header_mod = @import("../rtps/message/header.zig");
 const runtime_mod = @import("../runtime/core.zig");
 const QueuedReceive = @import("../transport/queued_receive.zig").QueuedReceive;
+const IngressBudget = @import("../transport/ingress_budget.zig").IngressBudget;
 
 const Transport = tr_iface.Transport;
 const Locator = tr_iface.Locator;
@@ -426,9 +427,9 @@ pub const SedpEndpoints = struct {
 
     /// Runs on `rt`: received datagrams are processed in `ingress`. Call
     /// once, before `start`.
-    pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime, ingress: *runtime_mod.Context) void {
+    pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime, ingress: *runtime_mod.Context, budget: *IngressBudget) void {
         self.runtime = rt;
-        self.rx = QueuedReceive.init(self.alloc, ingress, .{ .ctx = self, .on_receive = onReceive });
+        self.rx = QueuedReceive.init(self.alloc, ingress, budget, .{ .ctx = self, .on_receive = onReceive });
     }
 
     fn receiveHandler(self: *Self) ReceiveHandler {

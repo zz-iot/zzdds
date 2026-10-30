@@ -37,6 +37,11 @@ pub const Source = struct {
     writable: ?*const fn (ctx: *anyopaque) void = null,
     /// The backend's: output is armed and `writable` has not run since.
     output_armed: bool = false,
+    /// The backend's: input is paused (`pause_input`).
+    input_paused: bool = false,
+    /// The backend's: resumed with input already read, so the next service
+    /// runs `service` whether or not the handle has input.
+    kicked: std.atomic.Value(bool) = .init(false),
 };
 
 pub const ProgressBackend = struct {
@@ -71,6 +76,14 @@ pub const ProgressBackend = struct {
         /// `writable`. Callable from any thread; arming an armed source
         /// does nothing.
         arm_output: ?*const fn (ctx: *anyopaque, source: *Source) void = null,
+        /// Readiness backends only: stops waiting on `source` for input, and
+        /// calls its `service` only once it is resumed: its owner holds
+        /// input it cannot hand on yet. `source` is registered.
+        pause_input: ?*const fn (ctx: *anyopaque, source: *Source) void = null,
+        /// Readiness backends only: waits on `source` for input again, and
+        /// runs its `service` at the next service, for the input its owner
+        /// held. Callable from any thread; never runs DDS work.
+        resume_input: ?*const fn (ctx: *anyopaque, source: *Source) void = null,
     };
 
     pub fn wake(self: ProgressBackend) void {
@@ -101,6 +114,12 @@ pub const ProgressBackend = struct {
     }
     pub fn armOutput(self: ProgressBackend, source: *Source) void {
         self.vtable.arm_output.?(self.ctx, source);
+    }
+    pub fn pauseInput(self: ProgressBackend, source: *Source) void {
+        self.vtable.pause_input.?(self.ctx, source);
+    }
+    pub fn resumeInput(self: ProgressBackend, source: *Source) void {
+        self.vtable.resume_input.?(self.ctx, source);
     }
 };
 

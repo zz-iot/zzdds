@@ -302,7 +302,7 @@ pub const PollingMonitor = struct {
         }
     }
 
-    fn addrListChanged(a: *const std.ArrayListUnmanaged(IfAddr), b: *const std.ArrayListUnmanaged(IfAddr)) bool {
+    pub fn addrListChanged(a: *const std.ArrayListUnmanaged(IfAddr), b: *const std.ArrayListUnmanaged(IfAddr)) bool {
         if (a.items.len != b.items.len) return true;
         outer: for (a.items) |ai| {
             for (b.items) |bi| {

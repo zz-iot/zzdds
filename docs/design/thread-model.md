@@ -17,7 +17,8 @@ The default UDP/SPDP path is multi-threaded:
   calls `checkTimers()` to enforce DEADLINE and LIVELINESS QoS.
 - `StatefulWriter` starts a heartbeat thread when the first matched reader is added.
 - The polling `InterfaceMonitor` owns a polling thread when interface monitoring is enabled.
-- `trace.AsyncRingSink` owns an optional flush thread when the application starts it.
+- `trace.AsyncRingSink` owns an optional flush thread when the application starts it;
+  without one, the application drains it with `flush()`.
 
 `DomainParticipantImpl.checkTimers()` walks active writers and readers and fires
 deadline/liveliness status updates. In the default path the participant's own timer

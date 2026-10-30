@@ -35,6 +35,7 @@ const sn_mod = @import("../rtps/sequence_number.zig");
 const header_mod = @import("../rtps/message/header.zig");
 const runtime_mod = @import("../runtime/core.zig");
 const QueuedReceive = @import("../transport/queued_receive.zig").QueuedReceive;
+const IngressBudget = @import("../transport/ingress_budget.zig").IngressBudget;
 const zidl_rt = @import("zidl_rt");
 const Disc = @import("zzdds_disc_generated");
 
@@ -294,10 +295,10 @@ pub const SpdpEndpoints = struct {
     /// Runs on `rt`, on its clock: received datagrams are processed in
     /// `ingress`, and announcements and lease checks are timers in `timers`.
     /// Call once, before `start`.
-    pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime, ingress: *runtime_mod.Context, timers: *runtime_mod.Context) void {
+    pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime, ingress: *runtime_mod.Context, budget: *IngressBudget, timers: *runtime_mod.Context) void {
         self.runtime = rt;
         self.clock = rt.clock;
-        self.rx = QueuedReceive.init(self.alloc, ingress, .{ .ctx = self, .on_receive = onReceive });
+        self.rx = QueuedReceive.init(self.alloc, ingress, budget, .{ .ctx = self, .on_receive = onReceive });
         self.announce_timer = runtime_mod.Timer.init(timers, onAnnounceTimer);
         self.lease_timer = runtime_mod.Timer.init(timers, onLeaseTimer);
     }

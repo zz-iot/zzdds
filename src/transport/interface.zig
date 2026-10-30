@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const ProgressBackend = @import("../runtime/backend.zig").ProgressBackend;
+const Runtime = @import("../runtime/core.zig").Runtime;
 
 // ── LocatorKind ───────────────────────────────────────────────────────────────
 
@@ -472,6 +473,36 @@ pub const ReceiveHandler = struct {
     /// and ignore an on_channel_closed for one never seen). See
     /// docs/design/transport-channel.md §5.
     on_channel_closed: ?*const fn (ctx: *anyopaque, channel: Channel) void = null,
+    /// Optional, for a stream transport on the shared runtime: as
+    /// `on_receive`, but returns false, keeping nothing, when the handler
+    /// has no room for `data` now. The transport then holds it, stops
+    /// reading, and offers it again once `notify_room`'s waiter runs, so
+    /// framing survives a full ingress
+    /// (docs/design/concurrency/runtime.md#ingress). Data that could never
+    /// fit is dropped and reported taken.
+    try_receive: ?*const fn (ctx: *anyopaque, data: []const u8, src: Locator, channel: Channel) bool = null,
+    /// With `try_receive`: runs `waiter` once there is room for `data`,
+    /// which it refused, at once if there is already. A queued waiter is not
+    /// queued again.
+    notify_room: ?*const fn (ctx: *anyopaque, waiter: *RoomWaiter, data: []const u8, src: Locator) void = null,
+    /// With `try_receive`: dequeues `waiter`. Once it returns, the waiter
+    /// is not running and does not run.
+    cancel_room: ?*const fn (ctx: *anyopaque, waiter: *RoomWaiter) void = null,
+};
+
+/// A transport connection waiting for its receive handler to have room
+/// (`ReceiveHandler.notify_room`).
+pub const RoomWaiter = struct {
+    /// Runs once per `notify_room`, under the handler's lock, on whatever
+    /// thread makes room. Must not block or call into the handler; it
+    /// hands the event to the transport.
+    on_room: *const fn (waiter: *RoomWaiter) void,
+    // The handler's, set by `notify_room`: the data it waits room for.
+    len: usize = 0,
+    key: u64 = 0,
+    // The handler's, under its lock.
+    next: ?*RoomWaiter = null,
+    queued: bool = false,
 };
 
 /// Callback invoked when the transport's set of reachable unicast locators changes
@@ -513,6 +544,14 @@ pub const Transport = struct {
         /// retired. Null: the transport has no sockets (memory, mock, lossy)
         /// (docs/design/concurrency/transport-adapters.md#progress-backend).
         attach_backend: ?*const fn (ctx: *anyopaque, backend: ProgressBackend) anyerror!void = null,
+
+        /// For a transport with timed work of its own, on the shared
+        /// runtime: called after `attach_backend`, for each participant
+        /// before it listens, with that participant's runtime, whose timers
+        /// run the work from then on in place of a thread. Null: the
+        /// transport has none
+        /// (docs/design/concurrency/runtime.md#thread-mapping).
+        attach_runtime: ?*const fn (ctx: *anyopaque, rt: *Runtime) void = null,
 
         /// Returns true if this transport can send to / receive from the given locator.
         can_reach: *const fn (ctx: *anyopaque, locator: *const Locator) bool,
@@ -602,6 +641,9 @@ pub const Transport = struct {
     }
     pub fn attachBackend(self: Transport, backend: ProgressBackend) anyerror!void {
         if (self.vtable.attach_backend) |f| return f(self.ctx, backend);
+    }
+    pub fn attachRuntime(self: Transport, rt: *Runtime) void {
+        if (self.vtable.attach_runtime) |f| f(self.ctx, rt);
     }
     pub fn canReach(self: Transport, locator: *const Locator) bool {
         return self.vtable.can_reach(self.ctx, locator);
