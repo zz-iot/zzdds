@@ -3,6 +3,11 @@ project(zzdds_integration_wait_for_historical_data_cpp CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    add_link_options(/STACK:8388608)
+endif()
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 

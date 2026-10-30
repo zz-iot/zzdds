@@ -77,8 +77,9 @@ fn onDataAvailable(state: *SubState, dr: DDS.DataReader) void {
     }
 }
 
-fn parseDomain(process_args: std.process.Args) u32 {
-    var it = std.process.Args.Iterator.init(process_args);
+fn parseDomain(process_args: std.process.Args, arena: std.mem.Allocator) u32 {
+    var it = std.process.Args.Iterator.initAllocator(process_args, arena) catch return 0;
+    defer it.deinit();
     _ = it.skip();
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--domain")) {
@@ -95,7 +96,7 @@ pub fn main(init: std.process.Init) !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    const domain_id = parseDomain(init.minimal.args);
+    const domain_id = parseDomain(init.minimal.args, init.arena.allocator());
 
     var factory = zzdds.createFactory() catch {
         std.debug.print("FAIL: createFactory() failed\n", .{});

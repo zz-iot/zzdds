@@ -130,6 +130,15 @@ DDS tests belong in the PR gate at all (they clearly already do, twice over). St
 one scenario so the job's initial cost is small, and let it grow the way `stress-tests/`
 did (one scenario at a time, each its own PR).
 
+As built, `integration-tests` is a matrix of one job per scenario on both `ubuntu-latest`
+and `windows-latest` (Windows since 2026-10-30). A scenario's ports must build and run on
+Windows too: the Windows leg builds the C/C++ ports with MSVC. That means each C/C++
+`CMakeLists.txt` keeps its `if(MSVC)` block (`/experimental:c11atomics` for C's
+`<stdatomic.h>`, `/STACK:8388608` as in `examples/`), sources include `<unistd.h>`
+only under `#ifndef _WIN32` (the existing ports map `usleep`/`sleep` onto `Sleep()`),
+Zig ports read arguments with `std.process.Args.Iterator.initAllocator`, and runners
+resolve native binaries through `_common.executable_path` (`.exe`, CMake's `Debug/`).
+
 ## Scenario backlog (from `dcps-api-coverage-audit.md`, reordered)
 
 Proposed build order — highest-value first:

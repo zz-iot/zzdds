@@ -98,8 +98,9 @@ fn usage() noreturn {
     std.process.exit(2);
 }
 
-fn parseArgs(raw: std.process.Args) Config {
-    var it = std.process.Args.Iterator.init(raw);
+fn parseArgs(raw: std.process.Args, arena: std.mem.Allocator) !Config {
+    var it = try std.process.Args.Iterator.initAllocator(raw, arena);
+    defer it.deinit();
     _ = it.skip();
     var scenario: ?Scenario = null;
     var cfg = Config{ .scenario = undefined };
@@ -150,7 +151,7 @@ pub fn main(init: std.process.Init) !void {
     g_alloc = gpa.allocator();
     g_ts_alloc = g_alloc;
 
-    const cfg = parseArgs(init.minimal.args);
+    const cfg = try parseArgs(init.minimal.args, init.arena.allocator());
 
     switch (cfg.scenario) {
         .entities => try runEntities(io, cfg),

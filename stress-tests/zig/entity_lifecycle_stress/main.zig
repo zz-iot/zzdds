@@ -76,8 +76,9 @@ fn usage() noreturn {
     std.process.exit(2);
 }
 
-fn parseArgs(raw: std.process.Args) Config {
-    var it = std.process.Args.Iterator.init(raw);
+fn parseArgs(raw: std.process.Args, arena: std.mem.Allocator) !Config {
+    var it = try std.process.Args.Iterator.initAllocator(raw, arena);
+    defer it.deinit();
     _ = it.skip(); // program name
     var role: ?Role = null;
     var cfg = Config{ .role = undefined };
@@ -221,7 +222,7 @@ pub fn main(init: std.process.Init) !void {
     }
     const alloc = gpa.allocator();
 
-    const cfg = parseArgs(init.minimal.args);
+    const cfg = try parseArgs(init.minimal.args, init.arena.allocator());
     switch (cfg.role) {
         .writer => try runPub(io, alloc, cfg),
         .reader => try runSub(io, alloc, cfg),
