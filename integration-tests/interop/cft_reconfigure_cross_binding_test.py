@@ -35,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples"))
 from _common import (
     LiveProcess,
+    executable_path,
     java_cmd,
     print_fail,
     require_tool,
@@ -98,7 +99,7 @@ def build_all(zig_out: Path) -> bool:
         if not run_build(["cmake", f"-DCMAKE_PREFIX_PATH={zig_out}", "-B", str(build_dir), "-S", str(dir_)], cwd=dir_, log_path=log_path):
             print(f"FAIL: {name} build -- see {log_path}", file=sys.stderr)
             return False
-        if not run_build(["cmake", "--build", str(build_dir)], cwd=dir_, log_path=log_path):
+        if not run_build(["cmake", "--build", str(build_dir), "--config", "Debug"], cwd=dir_, log_path=log_path):
             print(f"FAIL: {name} build -- see {log_path}", file=sys.stderr)
             return False
 
@@ -112,12 +113,12 @@ def build_all(zig_out: Path) -> bool:
         return False
 
     for bin_ in (
-        ZIG_DIR / "zig-out" / "bin" / "cft_reconfigure_publisher",
-        ZIG_DIR / "zig-out" / "bin" / "cft_reconfigure_subscriber",
-        C_DIR / "build" / "cft_reconfigure_publisher",
-        C_DIR / "build" / "cft_reconfigure_subscriber",
-        CPP_DIR / "build" / "cft_reconfigure_publisher",
-        CPP_DIR / "build" / "cft_reconfigure_subscriber",
+        executable_path(ZIG_DIR / "zig-out" / "bin" / "cft_reconfigure_publisher"),
+        executable_path(ZIG_DIR / "zig-out" / "bin" / "cft_reconfigure_subscriber"),
+        executable_path(C_DIR / "build" / "cft_reconfigure_publisher"),
+        executable_path(C_DIR / "build" / "cft_reconfigure_subscriber"),
+        executable_path(CPP_DIR / "build" / "cft_reconfigure_publisher"),
+        executable_path(CPP_DIR / "build" / "cft_reconfigure_subscriber"),
     ):
         if not bin_.is_file():
             print(f"FAIL: expected binary not found: {bin_}", file=sys.stderr)
@@ -130,18 +131,18 @@ def build_all(zig_out: Path) -> bool:
 
 def publisher_cmd(lang: str, zig_out: Path) -> list[str]:
     return {
-        "zig": [str(ZIG_DIR / "zig-out" / "bin" / "cft_reconfigure_publisher")],
-        "c": [str(C_DIR / "build" / "cft_reconfigure_publisher")],
-        "cpp": [str(CPP_DIR / "build" / "cft_reconfigure_publisher")],
+        "zig": [str(executable_path(ZIG_DIR / "zig-out" / "bin" / "cft_reconfigure_publisher"))],
+        "c": [str(executable_path(C_DIR / "build" / "cft_reconfigure_publisher"))],
+        "cpp": [str(executable_path(CPP_DIR / "build" / "cft_reconfigure_publisher"))],
         "java": java_cmd(zig_out, JAVA_CP, "Publisher"),
     }[lang]
 
 
 def subscriber_cmd(lang: str, zig_out: Path) -> list[str]:
     return {
-        "zig": [str(ZIG_DIR / "zig-out" / "bin" / "cft_reconfigure_subscriber")],
-        "c": [str(C_DIR / "build" / "cft_reconfigure_subscriber")],
-        "cpp": [str(CPP_DIR / "build" / "cft_reconfigure_subscriber")],
+        "zig": [str(executable_path(ZIG_DIR / "zig-out" / "bin" / "cft_reconfigure_subscriber"))],
+        "c": [str(executable_path(C_DIR / "build" / "cft_reconfigure_subscriber"))],
+        "cpp": [str(executable_path(CPP_DIR / "build" / "cft_reconfigure_subscriber"))],
         "java": java_cmd(zig_out, JAVA_CP, "Subscriber"),
     }[lang]
 

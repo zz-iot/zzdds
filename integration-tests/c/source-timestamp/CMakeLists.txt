@@ -4,6 +4,14 @@ project(zzdds_integration_source_timestamp_c C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+if(MSVC)
+    # MSVC gates <stdatomic.h> behind this flag (error C1189 "C atomic support
+    # is not enabled"); it needs /std:c11, which CMAKE_C_STANDARD 11 sets.
+    add_compile_options(/experimental:c11atomics)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    add_link_options(/STACK:8388608)
+endif()
+
 find_package(ZZDDS REQUIRED)
 
 if(NOT DEFINED ZIDL_EXECUTABLE)

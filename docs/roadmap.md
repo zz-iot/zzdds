@@ -1371,9 +1371,20 @@ release notes).
   CMake package files / pkg-config relocatability / rpath|install-name that the in-tree
   `test-bindings` step (CMAKE_PREFIX_PATH pointed straight at the live `zig-out`) can't see.
   Linux runs the full path; macOS skips only the live-UDP hello_world pair run
-  (`--skip-example-run`). Windows gets the structural check only — the generated
-  `zzdds-config.cmake` / `zzdds.pc` are POSIX-shaped, so `find_package(ZZDDS)` can't
-  configure there yet (see "Still open" below).
+  (`--skip-example-run`). Windows runs the full path too (2026-10-30), consumers built
+  with MSVC — see "Windows bundle consume check" below.
+- **Windows bundle consume check; ReleaseSafe bundles** (2026-10-30) — the generated
+  `zzdds-config.cmake` points `ZZDDS_ZIDL_EXECUTABLE` at the installed zidl's real name
+  (`bin/zidl.exe` on Windows); its `IMPORTED_IMPLIB` handling was already in place.
+  `verify_release_bundle.py` accepts `lib/zidl_cdr.lib`, finds Visual Studio
+  generator outputs under `Debug/` and puts the bundle's `bin/` on PATH for the DLL,
+  and `package-libs` now runs it on Windows. Bundles on all platforms are built
+  `-Doptimize=ReleaseSafe` (previously Zig's default, Debug), and `release.yml`'s
+  `test` job gained a ReleaseSafe run of the suite. A Debug `zzdds.dll` overflowed an
+  MSVC consumer's default 1 MiB main stack in `zzdds_create_factory()`: Zig 0.17's
+  Debug-mode Windows file-open path (`wToPrefixedFileW` and callers, reached by the
+  `./zzdds.toml` probe) needs ~1.3 MiB of frames; ~260 KiB optimized, still worth
+  knowing for consumers calling from small-stack threads.
 - **musl / static Linux target lane** (2026-09-02) — `zig build test -Dtarget=x86_64-linux-musl`
   now runs in `run_deterministic_matrix.py` (so `ci.yml`'s `test-linux-matrix` covers it) and
   `release.yml`'s `test` job (Linux x86_64 only). A `-linux-musl` binary is statically linked
@@ -1415,13 +1426,10 @@ release notes).
    qemu to execute. Separately, `build.zig` still only builds `libzzdds` as a shared library
    (`.linkage = .dynamic`, no `-Dlinkage` option), so there's no static-archive/musl variant
    in `package-libs`' bundle set — deferred until a concrete consumer asks for one.
-4. **The generated CMake/pkg-config package is POSIX-only** — `build.zig`'s
-   `zzdds-config.cmake` searches `lib/` for the shared library (the Windows DLL installs to
-   `bin/`), sets no `IMPORTED_IMPLIB` for the import lib, and hard-codes `bin/zidl` (not
-   `bin/zidl.exe`); `zzdds.pc` is likewise `-l`-style. So a Windows consumer can't
-   `find_package(ZZDDS)` a bundle yet — `package-libs` ships the Windows tarball with the
-   structural check only, and `verify_release_bundle.py` is not run there. Fix: platform-aware
-   generation in `build.zig` + turn the Windows arm of the consume check back on.
+4. **`zzdds.pc` on Windows is unverified** — the CMake path is covered there (see *Landed*,
+   2026-10-30), but the `-l`-style `zzdds.pc` has not been linked with a MinGW/clang
+   toolchain against `lib/zzdds.lib`; `verify_release_bundle.py` runs that step only where
+   `pkg-config` and a `cc` are on PATH. MSVC consumers do not use pkg-config.
 5. **Valgrind has no viable non-Linux equivalent** — treat as Linux-only unless a specific
    non-Linux memory bug motivates revisiting.
 

@@ -12,7 +12,7 @@ Steps:
   1. Structural completeness -- every file `find_package(ZZDDS)` / pkg-config /
      the C++ "three-artifact" build path needs is present (a superset of
      `package-libs`' inline check: also `bin/zidl`, `src/*.cpp`, `zzdds_c.h`,
-     `zidl_allocator.h`, `libzidl_cdr.a`).
+     `zidl_allocator.h`, the static `zidl_cdr` library).
   2. Relocatability -- `zzdds.pc` and `zzdds-config.cmake` derive their prefix
      from their own location, with no absolute build path baked in.
   3. The bundled `bin/zidl` code generator runs on this platform.
@@ -29,11 +29,11 @@ Steps:
 
 `--configure-only` stops after step 4's `cmake` *configure* of the small
 consumer (no compiler, no run, no examples). It is a local-debugging aid for a
-host without a usable C/C++ toolchain; `release.yml` does not use it. In
-particular it is NOT run on Windows -- the generated `zzdds-config.cmake` /
-`zzdds.pc` are POSIX-shaped today (search `lib/` for the shared lib, no
-`IMPORTED_IMPLIB`, `bin/zidl` not `bin/zidl.exe`), so `find_package(ZZDDS)`
-does not configure there yet (tracked in `docs/roadmap.md`).
+host without a usable C/C++ toolchain; `release.yml` does not use it.
+
+On Windows the static library is `lib/zidl_cdr.lib`, the DLL is `bin/zzdds.dll`
+(found at run time through PATH: there is no rpath), and CMake's default Visual
+Studio generator puts executables under `<build>/Debug/`.
 """
 
 from __future__ import annotations
@@ -73,6 +73,29 @@ def run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None =
     )
 
 
+def runtime_env(prefix: Path) -> dict[str, str]:
+    """Environment for running a binary linked against the bundle's libzzdds.
+    Linux/macOS find it in lib/ via LD_LIBRARY_PATH/DYLD_LIBRARY_PATH; Windows
+    has no rpath and resolves the DLL (installed to bin/) through PATH."""
+    env = dict(os.environ)
+    for var, d in (("LD_LIBRARY_PATH", "lib"), ("DYLD_LIBRARY_PATH", "lib"), ("PATH", "bin")):
+        if var == "PATH" and sys.platform != "win32":
+            continue
+        env[var] = str(prefix / d) + (os.pathsep + env[var] if env.get(var) else "")
+    return env
+
+
+def find_exe(build_dir: Path, name: str) -> str:
+    """A CMake-built executable: directly in build_dir for single-config
+    generators (Makefiles, Ninja), under <config>/ for multi-config ones (the
+    Visual Studio generator, CMake's default on Windows, builds Debug)."""
+    for d in (build_dir, build_dir / "Debug", build_dir / "Release"):
+        for cand in (d / name, d / f"{name}.exe"):
+            if cand.is_file():
+                return str(cand)
+    fail(f"{name} not found under {build_dir}")
+
+
 # ── step 1: structure ───────────────────────────────────────────────────────
 
 def find_prefix(extract_root: Path) -> Path:
@@ -88,7 +111,6 @@ def check_structure(prefix: Path) -> None:
         "include/zidl_cdr.h", "include/zidl_allocator.h",
         "include/dcps.hpp", "include/dcps_impl.hpp",
         "include/zzdds.hpp", "include/zzdds_impl.hpp",
-        "lib/libzidl_cdr.a",
         "lib/pkgconfig/zzdds.pc",
         "lib/cmake/ZZDDS/zzdds-config.cmake",
         "src/dcps_impl.cpp", "src/zzdds_impl.cpp",
@@ -99,6 +121,9 @@ def check_structure(prefix: Path) -> None:
 
     if not any((prefix / rel).is_file() for rel in ("bin/zidl", "bin/zidl.exe")):
         fail("bundle has no bin/zidl code generator")
+
+    if not any((prefix / rel).is_file() for rel in ("lib/libzidl_cdr.a", "lib/zidl_cdr.lib")):
+        fail("bundle has no static zidl_cdr library (looked for lib/libzidl_cdr.a, lib/zidl_cdr.lib)")
 
     shared = ["lib/libzzdds.so", "lib/libzzdds.dylib", "bin/zzdds.dll", "lib/zzdds.dll"]
     if not any((prefix / rel).is_file() for rel in shared):
@@ -173,21 +198,11 @@ def run_hello_world_pair(build_dir: Path, prefix: Path, domain: int) -> None:
     require both to exit 0 with their success markers. The pair is designed
     for a clean handshake shutdown (see the example sources), so this does
     not need a settle timer -- just a generous ceiling."""
-    def exe(name: str) -> str:
-        for cand in (build_dir / name, build_dir / f"{name}.exe"):
-            if cand.is_file():
-                return str(cand)
-        fail(f"{name} not found under {build_dir}")
-
-    env = dict(os.environ)
-    libdir = str(prefix / "lib")
-    for var in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
-        env[var] = libdir + (os.pathsep + env[var] if env.get(var) else "")
-
-    sub = subprocess.Popen([exe("hello_world_sub"), "--domain", str(domain)],
+    env = runtime_env(prefix)
+    sub = subprocess.Popen([find_exe(build_dir, "hello_world_sub"), "--domain", str(domain)],
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     time.sleep(0.5)
-    pub = subprocess.Popen([exe("hello_world_pub"), "--domain", str(domain)],
+    pub = subprocess.Popen([find_exe(build_dir, "hello_world_pub"), "--domain", str(domain)],
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
 
     deadline = time.monotonic() + 60
@@ -213,6 +228,9 @@ def run_hello_world_pair(build_dir: Path, prefix: Path, domain: int) -> None:
 # ── step 6: pkg-config ──────────────────────────────────────────────────────
 
 def check_pkgconfig(prefix: Path, work: Path) -> None:
+    if sys.platform == "win32":
+        log("pkg-config: not exercised on Windows (zzdds.pc targets Unix toolchains) -- skipping")
+        return
     if not shutil.which("pkg-config"):
         log("pkg-config: not installed on this runner -- skipping (CMake path already covered)")
         return
@@ -243,11 +261,7 @@ def check_pkgconfig(prefix: Path, work: Path) -> None:
     if proc.returncode != 0:
         fail(f"compiling consumer.c with pkg-config flags failed:\n{proc.stdout}")
 
-    run_env = dict(os.environ)
-    libdir = str(prefix / "lib")
-    for var in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
-        run_env[var] = libdir + (os.pathsep + run_env[var] if run_env.get(var) else "")
-    proc = subprocess.run([str(out_bin)], env=run_env, text=True,
+    proc = subprocess.run([str(out_bin)], env=runtime_env(prefix), text=True,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
     if proc.returncode != 0:
         fail(f"pkg-config consumer binary exited {proc.returncode}:\n{proc.stdout}")
@@ -264,7 +278,7 @@ def main() -> int:
     ap.add_argument("--configure-only", action="store_true",
                     help="stop after cmake-configuring the small consumer (no compiler / no run / "
                          "no examples). Local-debugging aid for a host without a C/C++ toolchain; "
-                         "not used by release.yml, and not usable on Windows yet (see module docstring)")
+                         "not used by release.yml")
     ap.add_argument("--skip-example-run", action="store_true",
                     help="build examples/{c,cpp}/hello_world against the bundle but do not run the "
                          "pub/sub pair (link coverage only; use where live UDP DDS discovery is flaky, "
@@ -308,11 +322,9 @@ def main() -> int:
             log("PASS")
             return 0
         cmake_build(cc_build)
-        proc = subprocess.run([str(next(p for p in (cc_build / "zzdds_bundle_cmake_consumer",
-                                                    cc_build / "zzdds_bundle_cmake_consumer.exe") if p.is_file()))],
+        proc = subprocess.run([find_exe(cc_build, "zzdds_bundle_cmake_consumer")],
                               text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
-                              env={**os.environ, "LD_LIBRARY_PATH": str(prefix / "lib"),
-                                   "DYLD_LIBRARY_PATH": str(prefix / "lib")})
+                              env=runtime_env(prefix))
         if proc.returncode != 0:
             fail(f"cmake_consumer binary exited {proc.returncode}:\n{proc.stdout}")
         log(f"cmake_consumer: ran -- {proc.stdout.strip()}")

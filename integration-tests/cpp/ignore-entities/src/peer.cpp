@@ -16,7 +16,20 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
+/* No <unistd.h> on Windows: the usleep()/sleep() this file uses, on Sleep(). */
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+static inline void usleep(unsigned long us) { Sleep((DWORD)(us / 1000)); }
+static inline void sleep(unsigned s) { Sleep((DWORD)s * 1000); }
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 

@@ -380,12 +380,14 @@ jobs:
   # before pushing, or by CMake itself the moment two scenarios' subdirectories
   # are ever built together again.
   integration-tests:
-    name: integration-tests / ${{ matrix.scenario }}
+    name: integration-tests / ${{ matrix.scenario }} (${{ matrix.os }})
     needs: test-linux
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        # Windows builds the C/C++ ports with MSVC (CMake's default generator).
+        os: [ubuntu-latest, windows-latest]
         scenario:
           - coherent-sets
           - delete-contained-entities
@@ -420,6 +422,10 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      - name: Allow inbound UDP (Windows)
+        if: runner.os == 'Windows'
+        run: netsh advfirewall firewall add rule name="zzdds-test-udp" protocol=UDP dir=in action=allow
+
       - name: Install Python (integration-tests/'s build/run/interop scripts)
         uses: actions/setup-python@v5
         with:
@@ -448,6 +454,7 @@ jobs:
 
       - name: Run ${{ matrix.scenario }} cross-binding interop
         working-directory: integration-tests/interop
+        shell: bash
         # Below the job's 20 min (the slowest scenario takes ~7 min), so a hang
         # fails this step and leaves time for the diagnostics steps below.
         timeout-minutes: 15
@@ -455,7 +462,7 @@ jobs:
           SCENARIO: ${{ matrix.scenario }}
           ZZDDS_TEST_LOG_STUCK_STACKS: "1"
         run: |
-          ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" python3 "${SCENARIO//-/_}_cross_binding_test.py"
+          ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" python "${SCENARIO//-/_}_cross_binding_test.py"
 
       - name: Stop network diagnostics
         if: always()
@@ -466,7 +473,7 @@ jobs:
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
-          name: diagnostics-integration-${{ matrix.scenario }}
+          name: diagnostics-integration-${{ matrix.scenario }}-${{ matrix.os }}
           path: |
             ${{ runner.temp }}/net-diagnostics
             integration-tests/interop/.smoke-logs
