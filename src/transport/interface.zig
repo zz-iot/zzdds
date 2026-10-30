@@ -389,17 +389,17 @@ pub const InterfaceMonitor = struct {
 ///
 /// See docs/design/transport-channel.md §4.1 for the full design.
 pub const Channel = struct {
-    /// Opaque, transport-private identity.
-    ///   TCP: @intFromPtr(*TcpConnection) for the connection this arrived on
-    ///        (accepted or dialed — both are valid targets for a reply).
-    ///   UDP: @intFromPtr(*SocketEntry) for the socket this arrived on.
+    /// Opaque, transport-private identity: one more than the index of the
+    /// slot in the transport's channel table (channel_table.zig) holding
+    /// the TCP connection (accepted or dialed — both are valid targets for
+    /// a reply) or UDP socket this arrived on.
     token: u64,
-    /// Staleness generation, transport-assigned. Distinct from
-    /// Transport.connectionGeneration(), which is keyed by Locator ("has
-    /// this peer's connection been re-established") — this is keyed by
-    /// Channel identity ("is this specific handle still the same underlying
-    /// connection/socket, or has the slot been torn down and possibly
-    /// reused").
+    /// The slot's generation, which moves on when the slot is freed.
+    /// Distinct from Transport.connectionGeneration(), which is keyed by
+    /// Locator ("has this peer's connection been re-established") — this is
+    /// keyed by Channel identity ("is this specific handle still the same
+    /// underlying connection/socket, or has the slot been torn down and
+    /// possibly reused").
     generation: u32,
 
     pub const none: Channel = .{ .token = 0, .generation = 0 };
@@ -442,6 +442,9 @@ pub const WritableWaiter = struct {
     // The transport's, under its lock.
     next: ?*WritableWaiter = null,
     queued: bool = false,
+    /// What the transport's count of drained outputs was when it last ran
+    /// this waiter, for a transport whose outputs drain separately.
+    drains_seen: u64 = 0,
 };
 
 // ── Transport callbacks ───────────────────────────────────────────────────────

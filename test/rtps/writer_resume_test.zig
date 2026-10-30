@@ -68,6 +68,8 @@ const Outbox = struct {
     waiter: ?*WritableWaiter = null,
     cancels: usize = 0,
     notifies: bool = true,
+    /// Every port's connection generation: raising it is a reconnect.
+    generation: u32 = 0,
 
     /// `frag`: the DATA_FRAG's fragment number; 0 for DATA.
     const Sent = struct { port: u16, sn: SequenceNumber, frag: u32 = 0 };
@@ -176,6 +178,10 @@ const Outbox = struct {
         self.cancels += 1;
     }
 
+    fn connectionGeneration(ctx: *anyopaque, _: *const Locator) u32 {
+        return of(ctx).generation;
+    }
+
     fn canReach(_: *anyopaque, _: *const Locator) bool {
         return true;
     }
@@ -203,6 +209,7 @@ const Outbox = struct {
         .unicast_locators = unicastLocators,
         .set_locator_change_handler = setLocatorChangeHandler,
         .close = close,
+        .connection_generation = connectionGeneration,
     };
 
     const vtable_no_notify: Transport.Vtable = blk: {
@@ -635,6 +642,28 @@ test "a best-effort history replay whose send would block is finished by the res
     f.outbox.drain();
     try f.run();
     try expectSns(&range(1, 4), &f.outbox, PORT_A);
+}
+
+test "a reconnect's history replay whose send would block is finished by the resume, ahead of live data" {
+    var f: Fixture = undefined;
+    try f.init(.{});
+    defer f.deinit();
+    const a = makeGuid(0xa1);
+    try f.match(a, PORT_A, false);
+    try f.write(3);
+
+    // The reader's connection is new, and its sends would block (as while
+    // a dial is in progress): the history goes out once output is ready.
+    f.outbox.generation = 1;
+    f.outbox.full = true;
+    f.w.checkConnectionGenerations();
+    try testing.expectEqual(@as(?SequenceNumber, 1), f.held(a));
+
+    try f.write(1);
+    f.outbox.drain();
+    try f.run();
+    try expectSns(&.{ 1, 2, 3, 1, 2, 3, 4 }, &f.outbox, PORT_A);
+    try testing.expectEqual(@as(?SequenceNumber, null), f.held(a));
 }
 
 test "a coherent set's end marker reaches a held reader after the set" {

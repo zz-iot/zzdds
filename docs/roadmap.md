@@ -162,14 +162,15 @@ Forward-looking only: known gaps, planned features, and open design questions.
   so it waits on a "TCP for discovery too" mode (above) or the discovery broker; do it
   after the shared runtime's channel ownership exists
   ([channel integration requirements](design/concurrency/runtime.md#channel-integration-requirements)).
-- **Transport scatter-gather (`sendmsg`)** — done for UDP on POSIX: the `Transport`
-  vtable's `send_gather` takes `MessageBuilder`'s iovec list, which UDP passes to
-  `sendmsg`. TCP, UDP on Windows and the in-process transports still flatten it into a
-  `[65536]u8` stack buffer (`Transport.sendGather` does that for a transport without
-  `send_gather`). See `design/rtps-message-builder.md` and
+- **Transport scatter-gather (`sendmsg`)** — done for UDP on POSIX and for TCP: the
+  `Transport` vtable's `send_gather` takes `MessageBuilder`'s iovec list, which UDP
+  passes to `sendmsg`, and TCP too behind its length prefix (on a backend; on its own
+  threads it writes each piece in turn). UDP on Windows and the in-process transports
+  still flatten it into a `[65536]u8` stack buffer (`Transport.sendGather` does that for
+  a transport without `send_gather`). See `design/rtps-message-builder.md` and
   [output submission](design/concurrency/transport-adapters.md#output-submission).
-- **A writer resumes when a full send buffer drains** — done for UDP on POSIX, on the
-  shared runtime, as the
+- **A writer resumes when a full send buffer drains** — done for UDP and TCP on POSIX,
+  on the shared runtime, as the
   [output contract](design/concurrency/runtime.md#output-submission-and-completion)
   has it. A reader whose DATA would block is held (`ReaderProxy.unsent_from_sn`): live
   data to it waits, the history keeps what it has yet to be sent, and the writer waits
@@ -180,8 +181,16 @@ Forward-looking only: known gaps, planned features, and open design questions.
   included. A best-effort history replay that would block finishes the same way, and a
   write made while a send to the reader is under way waits for it rather than overtaking
   it. HEARTBEAT, GAP and repair replies are not held: a lost one is regenerated from
-  current state. Left: TCP, whose partial frame is accepted-pending rather than would-block,
-  and Windows, whose UDP sends still block.
+  current state. On TCP, a frame the socket takes only part of is kept as the
+  connection's tail and written before anything else, so a later send would block
+  until it drains. Left: Windows, whose UDP sends still block.
+- **TCP on the shared runtime does not pause reading when ingress is full.** The
+  [ingress rules](design/concurrency/runtime.md#ingress) have a TCP connection stop
+  reading at a frame boundary while its destination cannot take more. On a backend the
+  connection reads on, and the participant's ingress drops whole frames past its bounds,
+  as it drops UDP datagrams; framing stays intact, and reliable writers repair the loss.
+  Pausing needs the receive handler to report that it is full, and the connection's
+  source to stop waiting for input until ingress drains.
 - **A local endpoint's announcement is not ordered against its creation and deletion.**
   The rules are in
   [local endpoint publication, announcement and disposal](design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal).
@@ -1135,9 +1144,12 @@ loopback UDP through `drive()` alone, with no thread started by zzdds, and hoste
 service the same sockets in place of a thread per socket, and RTPS discovery runs there
 too, its announcements, lease checks and heartbeats on runtime timers. Sends take the
 builder's gather list and never block there, and a writer whose send would block resumes
-once the socket drains. Next are channel slots in place of the retained socket
-graveyards, TCP, and Windows. Outside that build, the UDP and TCP
-transports still call their handlers from their own receive threads. Now specified as the
+once the socket drains. In every build, a UDP socket or TCP connection that closes is
+freed once nothing uses it, rather than kept until its transport closes, and a channel
+naming it fails as closed. TCP runs there too: its listen socket and connections are
+sources of the same backend, so a reliable pair over loopback TCP also runs through
+`drive()` alone, and dials and sends never block. Next is Windows. Outside that build,
+the UDP and TCP transports still call their handlers from their own receive threads. Now specified as the
 [ManualDriver/external-loop contract](design/concurrency/runtime.md#manual-runtime-driving-and-external-loop-integration)
 (`drive(budget, max_wait)` plus prepare-to-wait integration) and the cooperative
 measurement profile in the concurrency architecture; implementation follows the

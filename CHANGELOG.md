@@ -66,6 +66,24 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   cleanup. Includes generated-type writer/reader acceptance fixtures and native CI;
   configuration frontends, provider libraries and XRCE integration remain follow-ons.
 
+## 2026-10-24
+
+- Run TCP user data on the shared runtime (`-Dshared-runtime`, POSIX). A participant
+  with TCP enabled no longer fails creation there: its listen socket and connections
+  are sources of the runtime's readiness backend, so `drive()` alone runs a reliable
+  pair over TCP with no thread started by zzdds, and hosted workers service the
+  connections in place of an accept thread and a thread per connection. Dials and sends
+  never block there, and a writer whose connection fills resumes once it drains. TCP
+  sends now take the message builder's gather list without flattening it, in every
+  build.
+
+## 2026-10-23
+
+- Free a UDP socket or TCP connection that closes once nothing uses it, rather than
+  keeping it until its transport closes, so a long-running process no longer grows with
+  interface changes or reconnecting TCP peers. A channel naming a freed socket or
+  connection still fails with `ChannelClosed`, also after its slot is reused.
+
 ## 2026-10-22
 
 - Keep a writer operation reference across typesupport validation and hashing;

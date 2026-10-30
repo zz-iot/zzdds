@@ -142,6 +142,7 @@ test {
     _ = @import("factory.zig");
     _ = @import("runtime/core.zig");
     _ = @import("transport/interface.zig");
+    _ = @import("transport/channel_table.zig");
     _ = @import("transport/udp.zig");
     _ = @import("transport/tcp.zig");
     _ = @import("transport/mock.zig");

@@ -22,6 +22,7 @@ const clock_registry_mod = @import("../util/clock_registry.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const runtime_mod = @import("../runtime/core.zig");
 const default_registry = @import("../runtime/default_registry.zig");
+const tcp_transport = @import("../transport/tcp.zig");
 const log_mod = @import("../log.zig");
 const build_opts = @import("build_options");
 
@@ -134,7 +135,9 @@ pub const DomainParticipantFactoryImpl = struct {
     /// threaded path
     /// (docs/design/concurrency/runtime.md#coexistence-during-migration).
     fn acquireRuntimeFor(self: *Self, config: config_mod.Config) ?*runtime_mod.Runtime {
-        if (!self.transport.vtable.shared_runtime_ready or config.transport.tcp.enabled) {
+        if (!self.transport.vtable.shared_runtime_ready or
+            (config.transport.tcp.enabled and !tcp_transport.shared_runtime_ready))
+        {
             log_mod.dcps.warn("create_participant: the transport is not supported on the shared runtime yet", .{});
             return null;
         }
@@ -301,7 +304,18 @@ pub const DomainParticipantFactoryImpl = struct {
             }
             return null;
         };
-        if (rt) |r| p.attachRuntime(r);
+        if (rt) |r| {
+            // The participant's own TCP transport, for user data, runs on
+            // the runtime too.
+            if (p.owned_tcp_transport) |t| t.transport().attachBackend(r.backend) catch |err| {
+                log_mod.dcps.warn("create_participant: the TCP transport cannot run on this runtime ({s})", .{@errorName(err)});
+                p.deinit();
+                r.releaseOwner();
+                self.releaseRuntimeUse();
+                return null;
+            };
+            p.attachRuntime(r);
+        }
         // config_deinit_allocator is set AFTER participants.append so that p.deinit()
         // on any failure path below doesn't free config — the caller retains ownership
         // and handles cleanup on error.

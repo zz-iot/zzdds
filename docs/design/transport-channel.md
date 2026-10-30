@@ -7,6 +7,12 @@ runtime's [channel integration requirements](concurrency/runtime.md#channel-inte
 govern how channels change once they have users. MUST / SHOULD / MAY express requirements of the
 change, not additional OMG requirements.
 
+Superseded in part: a `Channel` now names a slot and its generation in the transport's
+channel table, and closed sockets and connections are freed once unreferenced
+([channels and lifetimes](concurrency/transport-adapters.md#channels-and-lifetimes)). The
+pointer tokens and retention until transport close in §2.2, §4.2 and §4.3, and the two
+retention risks in §9, describe the design before that change.
+
 One-line goal: give the `Transport` interface an optional notion of "the channel this
 message arrived on" so a reply can be sent back down that exact channel, instead of the
 transport always resolving a destination `Locator` to an outbound socket/connection of its
