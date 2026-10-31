@@ -216,38 +216,23 @@ Forward-looking only: known gaps, planned features, and open design questions.
   gives each datagram to one socket. Related sharp edge: unicast sockets are bound with
   `SO_REUSEADDR`, so two transports given the same fixed `participant_id` or port
   overrides both bind, and one of them silently stops receiving; that should fail loudly.
-- **A local endpoint's announcement is not ordered against its creation and deletion.**
-  The rules are in
-  [local endpoint publication, announcement and disposal](design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal).
-  Fixed on 2026-10-18: an endpoint joins its parent before it is announced, an
-  announcement is written from its own copy (a deletion meanwhile used to free what it
-  read), only the `enable` call that enables an endpoint announces it, and in-process
-  discovery keeps its own copy of what it stores. Two departures remain on the threaded
-  path, for the shared runtime to close:
-  - An announcement captured before a deletion and written after the deletion's disposal
-    is followed by a second disposal (`pubAnnounceProtoWriter`/`subAnnounceProtoReader`
-    check that the endpoint still exists once the announcement is written). Peers end
-    with the endpoint disposed, but can briefly see it announced again. Ordering it
-    strictly means holding a lock across the SEDP write, which synchronous in-process
-    delivery can re-enter from a listener.
-  - Announcement storage isn't reserved: a failed SEDP announcement is only logged, and
-    the endpoint is never announced; a disposal whose payload can't be encoded is dropped
-    silently.
-- **A remote endpoint that becomes incompatible stays matched.** When a matched remote
-  endpoint is announced again with QoS or partitions that no longer match a local
-  endpoint, `onWriterDiscovered`/`onReaderDiscovered` record the incompatibility (or, for a
-  partition, skip the pair) and `continue`: they never remove the existing match. The
-  reader keeps receiving from the writer, and `current_count` still counts it. Since the
-  match-generation work (2026-10-17), each announcement gets a new discovery generation,
-  so a refresh that no longer matches should unmatch with that generation, as a loss
-  does for that one local endpoint, then report `*_INCOMPATIBLE_QOS` as for a first
-  announcement. Both sides need it, and so do the retroactive matches in
-  `pubAnnounceProtoWriter`/`subAnnounceProtoReader` once local QoS and partition changes
-  re-announce (today `set_qos` doesn't re-announce, so only a remote change reaches this).
+- **A local endpoint's QoS or partition change is not announced.** A local endpoint is
+  announced once, when enabled, with the partitions and presentation its Publisher or
+  Subscriber has then; `set_qos` on it or on its parent changes nothing peers see.
+  [Local endpoint publication, announcement and disposal](design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal)
+  has a change that alters the announcement refresh it: the setter prepares the new
+  announcement through discovery (`prepare_writer`/`prepare_reader`) before the change
+  commits and fails with OUT_OF_RESOURCES if it cannot, and the refresh carries the
+  endpoint's announcement generation, so a refresh decided earlier commits nothing after
+  a later one. The participant's retroactive matches (`pubAnnounceProtoWriter`/
+  `subAnnounceProtoReader`) then also need to unmatch the remote endpoints a refresh no
+  longer matches, as `onWriterDiscovered`/`onReaderDiscovered` do for a remote refresh.
   The QoS that can change this way are the mutable ones DDS checks: DEADLINE and
-  LATENCY_BUDGET, plus PARTITION. Tests: a writer refreshed with a longer deadline period
-  than its reader requests, and one moved to a non-matching partition, are both unmatched;
-  the first is counted once as incompatible.
+  LATENCY_BUDGET, plus PARTITION.
+- **In-process discovery can miss a peer when out of memory.** `DirectDiscovery`
+  commits an announcement into the bus without allocating, but telling the other
+  participants copies it for each of them, and a copy that fails is skipped; nothing
+  repairs it, as reliable SEDP repairs a lost announcement.
 
 ### Entity cleanup lock order
 

@@ -983,8 +983,10 @@ pub const SpdpEndpoints = struct {
     const vtable = Discovery.Vtable{
         .start = vtStart,
         .stop = vtStop,
+        .prepare_writer = vtPrepareWriter,
         .announce_writer = vtAnnounceWriter,
         .retract_writer = vtRetractWriter,
+        .prepare_reader = vtPrepareReader,
         .announce_reader = vtAnnounceReader,
         .retract_reader = vtRetractReader,
         .deinit = vtDeinit,
@@ -1008,9 +1010,11 @@ pub const SpdpEndpoints = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.stop();
     }
-    fn vtAnnounceWriter(_: *anyopaque, _: *const iface.WriterAnnouncement) anyerror!void {}
+    fn vtPrepareWriter(_: *anyopaque, _: *const iface.WriterAnnouncement) anyerror!void {}
+    fn vtAnnounceWriter(_: *anyopaque, _: Guid) void {}
     fn vtRetractWriter(_: *anyopaque, _: Guid) void {}
-    fn vtAnnounceReader(_: *anyopaque, _: *const iface.ReaderAnnouncement) anyerror!void {}
+    fn vtPrepareReader(_: *anyopaque, _: *const iface.ReaderAnnouncement) anyerror!void {}
+    fn vtAnnounceReader(_: *anyopaque, _: Guid) void {}
     fn vtRetractReader(_: *anyopaque, _: Guid) void {}
     fn vtDeinit(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));

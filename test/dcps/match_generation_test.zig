@@ -44,9 +44,11 @@ const CapturingDisc = struct {
     const vtable = Discovery.Vtable{
         .start = start,
         .stop = noop,
-        .announce_writer = noopAW,
+        .prepare_writer = noopAW,
+        .announce_writer = noopGuid,
         .retract_writer = noopGuid,
-        .announce_reader = noopAR,
+        .prepare_reader = noopAR,
+        .announce_reader = noopGuid,
         .retract_reader = noopGuid,
         .deinit = noop,
         .wlp_tick = noopWlpTick,
@@ -100,6 +102,10 @@ const Remote = struct {
     ownership_strength: ?i32 = null,
     /// Finite liveliness lease, in seconds; null for infinite.
     lease_s: ?i32 = null,
+    /// Offered (writer) or requested (reader) DEADLINE period, in seconds;
+    /// null for infinite.
+    deadline_s: ?i32 = null,
+    partitions: []const []const u8 = &.{},
 };
 
 const Harness = struct {
@@ -166,6 +172,7 @@ const Harness = struct {
             .ownershipKind = remote.ownership_kind,
             .ownershipStrength = remote.ownership_strength,
             .liveliness = if (remote.lease_s) |l| .{ .kind = 0, .lease_duration = .{ .seconds = l, .fraction = 0 } } else null,
+            .deadline = if (remote.deadline_s) |d| .{ .seconds = d, .fraction = 0 } else null,
             .dataRepresentation = .{ ._maximum = 1, ._length = 1, ._buffer = &repr, ._release = false },
         };
         const data = iface.WriterData{
@@ -174,6 +181,7 @@ const Harness = struct {
             .topic_name = TOPIC,
             .type_name = "T",
             .qos = &q,
+            .partition_names = remote.partitions,
             .unicast_locators = &.{},
             .multicast_locators = &.{},
             .type_object = &.{},
@@ -182,9 +190,15 @@ const Harness = struct {
     }
 
     fn announceReader(h: *Harness, guid: Guid) void {
+        h.announceReaderWith(guid, .{});
+    }
+
+    /// Of `remote`, only `deadline_s` and `partitions` are announced.
+    fn announceReaderWith(h: *Harness, guid: Guid, remote: Remote) void {
         var repr = [_]i16{2};
         var q = iface.DiscoveredReaderData{
             .reliability = .{ .kind = 2, .max_blocking_time = .{} },
+            .deadline = if (remote.deadline_s) |d| .{ .seconds = d, .fraction = 0 } else null,
             .dataRepresentation = .{ ._maximum = 1, ._length = 1, ._buffer = &repr, ._release = false },
         };
         const data = iface.ReaderData{
@@ -193,6 +207,7 @@ const Harness = struct {
             .topic_name = TOPIC,
             .type_name = "T",
             .qos = &q,
+            .partition_names = remote.partitions,
             .unicast_locators = &.{},
             .multicast_locators = &.{},
         };
@@ -242,6 +257,20 @@ fn subMatched(r: *DataReaderImpl) DDS.SubscriptionMatchedStatus {
     var s: DDS.SubscriptionMatchedStatus = .{};
     const dr = r.toDDSDataReader();
     _ = dr.vtable.get_subscription_matched_status(dr.ptr, &s);
+    return s;
+}
+
+fn requestedIncompatible(r: *DataReaderImpl) DDS.RequestedIncompatibleQosStatus {
+    var s: DDS.RequestedIncompatibleQosStatus = .{};
+    const dr = r.toDDSDataReader();
+    _ = dr.vtable.get_requested_incompatible_qos_status(dr.ptr, &s);
+    return s;
+}
+
+fn offeredIncompatible(w: *DataWriterImpl) DDS.OfferedIncompatibleQosStatus {
+    var s: DDS.OfferedIncompatibleQosStatus = .{};
+    const dw = w.toDDSDataWriter();
+    _ = dw.vtable.get_offered_incompatible_qos_status(dw.ptr, &s);
     return s;
 }
 
@@ -500,4 +529,81 @@ test "a reader discovered while its writer is being created is counted" {
     h.loseReader(rd);
     s = pubMatched(w);
     try testing.expectEqual(@as(i32, 0), s.current_count);
+}
+
+// ── A refresh that no longer matches ──────────────────────────────────────────
+
+test "a writer refreshed with a longer deadline than its reader requests is unmatched, and counted once as incompatible" {
+    var clock = ManualClock.init(0);
+    var h: Harness = undefined;
+    try h.init(&clock);
+    defer h.deinit();
+    var qos = DDS.DataReaderQos{};
+    qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
+    const r = h.reader(qos, null);
+    const w = endpointGuid(0x70, 1, WRITER_KIND);
+
+    h.announceWriter(w, .{ .deadline_s = 1 });
+    try testing.expectEqual(@as(i32, 1), subMatched(r).current_count);
+    h.announceWriter(w, .{ .deadline_s = 2 });
+    try testing.expectEqual(@as(i32, 0), subMatched(r).current_count);
+    try testing.expectEqual(@as(usize, 0), r.proto_reader.matchedWriterCount());
+    try testing.expectEqual(@as(i32, 1), requestedIncompatible(r).total_count);
+    // Matching again, it is matched again.
+    h.announceWriter(w, .{ .deadline_s = 1 });
+    try testing.expectEqual(@as(i32, 1), subMatched(r).current_count);
+    try testing.expectEqual(@as(i32, 1), requestedIncompatible(r).total_count);
+}
+
+test "a writer refreshed into a partition its reader is not in is unmatched" {
+    var clock = ManualClock.init(0);
+    var h: Harness = undefined;
+    try h.init(&clock);
+    defer h.deinit();
+    const r = h.reader(.{}, null);
+    const w = endpointGuid(0x71, 1, WRITER_KIND);
+
+    h.announceWriter(w, .{});
+    try testing.expectEqual(@as(i32, 1), subMatched(r).current_count);
+    h.announceWriter(w, .{ .partitions = &.{"elsewhere"} });
+    try testing.expectEqual(@as(i32, 0), subMatched(r).current_count);
+    try testing.expectEqual(@as(usize, 0), r.proto_reader.matchedWriterCount());
+    try testing.expectEqual(@as(i32, 0), requestedIncompatible(r).total_count);
+}
+
+test "a reader refreshed with a shorter deadline than its writer offers is unmatched, and counted once as incompatible" {
+    var clock = ManualClock.init(0);
+    var h: Harness = undefined;
+    try h.init(&clock);
+    defer h.deinit();
+    var qos = DDS.DataWriterQos{};
+    qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    qos.deadline.period = .{ .sec = 2, .nanosec = 0 };
+    const w = h.writer(qos, null);
+    const rd = endpointGuid(0x72, 1, READER_KIND);
+
+    h.announceReaderWith(rd, .{ .deadline_s = 3 });
+    try testing.expectEqual(@as(i32, 1), pubMatched(w).current_count);
+    h.announceReaderWith(rd, .{ .deadline_s = 1 });
+    try testing.expectEqual(@as(i32, 0), pubMatched(w).current_count);
+    try testing.expectEqual(@as(usize, 0), w.proto_writer.matchedReaderCount());
+    try testing.expectEqual(@as(i32, 1), offeredIncompatible(w).total_count);
+}
+
+test "a reader refreshed into a partition its writer is not in is unmatched" {
+    var clock = ManualClock.init(0);
+    var h: Harness = undefined;
+    try h.init(&clock);
+    defer h.deinit();
+    var reliable = DDS.DataWriterQos{};
+    reliable.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    const w = h.writer(reliable, null);
+    const rd = endpointGuid(0x73, 1, READER_KIND);
+
+    h.announceReaderWith(rd, .{});
+    try testing.expectEqual(@as(i32, 1), pubMatched(w).current_count);
+    h.announceReaderWith(rd, .{ .partitions = &.{"elsewhere"} });
+    try testing.expectEqual(@as(i32, 0), pubMatched(w).current_count);
+    try testing.expectEqual(@as(usize, 0), w.proto_writer.matchedReaderCount());
+    try testing.expectEqual(@as(i32, 0), offeredIncompatible(w).total_count);
 }

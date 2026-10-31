@@ -77,6 +77,7 @@ const Harness = struct {
             .destroy_proto_reader = destroyProtoReader,
             .register_incompat_qos = registerIncompatQos,
             .register_matched_notify = registerMatchedNotify,
+            .prepare_reader = prepareReader,
             .announce_reader = announceReader,
             .timer_clock = clock.clock(),
             .register_timer_notify = registerTimerNotify,
@@ -152,7 +153,8 @@ const Harness = struct {
     fn destroyProtoReader(_: *anyopaque, _: DDS.InstanceHandle_t) void {}
     fn registerIncompatQos(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i32) void) void {}
     fn registerMatchedNotify(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, DDS.InstanceHandle_t, bool) void) void {}
-    fn announceReader(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const []const u8, _: DDS.PresentationQosPolicy) void {}
+    fn prepareReader(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const []const u8, _: DDS.PresentationQosPolicy) anyerror!void {}
+    fn announceReader(_: *anyopaque, _: DDS.InstanceHandle_t) void {}
     fn registerTimerNotify(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i64) void, _: *const fn (*anyopaque) ?i64, _: *const fn (*anyopaque) bool, _: *const fn (*anyopaque) void) void {}
     fn registerGetFieldRefresh(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const u8, _: *anyopaque, _: *const fn (*anyopaque, ?filter_mod.CdrFieldGetter) void) void {
         // unchanged: no field lookups exercised by these tests

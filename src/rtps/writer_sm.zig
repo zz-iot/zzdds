@@ -1962,6 +1962,45 @@ pub const StatefulWriter = struct {
         return sn;
     }
 
+    /// Makes room in the history for `n` changes, written later with
+    /// `writeReserved`.
+    pub fn reserveChanges(self: *Self, n: usize) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        try self.cache.reserve(n);
+    }
+
+    /// Gives back room for `n` reserved changes never written.
+    pub fn releaseChanges(self: *Self, n: usize) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.cache.release(n);
+    }
+
+    /// `write`, without allocating: stores a change that owns `data` (from
+    /// this writer's allocator) and sends it. With `uses_reservation`, the
+    /// change takes a slot `reserveChanges` made; without, it must replace
+    /// its instance's change under KEEP_LAST 1. Not for coherent sets.
+    pub fn writeReserved(
+        self: *Self,
+        kind: ChangeKind,
+        source_timestamp: RtpsTimestamp,
+        instance_handle: InstanceHandle,
+        key_hash: [16]u8,
+        data: []u8,
+        uses_reservation: bool,
+    ) SequenceNumber {
+        self.mu.lock();
+        defer self.mu.unlock();
+        std.debug.assert(!self.coherent_active);
+        const sn = self.cache.addReservedWriterChange(kind, self.guid, source_timestamp, instance_handle, key_hash, data, uses_reservation);
+        if (self.cache.getChange(sn)) |ch| {
+            self.sendChangeToAllLocked(ch, true);
+            self.trimAckedLocked();
+        }
+        return sn;
+    }
+
     /// Send a Heartbeat to all matched readers.
     /// `final = true` means readers need not reply; `false` requires an ACKNACK.
     /// Uses per-proxy start_sn as the floor for first_sn so VOLATILE readers

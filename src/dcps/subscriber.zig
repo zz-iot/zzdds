@@ -73,10 +73,18 @@ pub const ParticipantCbs = struct {
         notify_fn: *const fn (notify_ctx: *anyopaque, remote_handle: DDS.InstanceHandle_t, added: bool) void,
     ) void,
 
-    /// Announce the reader identified by handle to the discovery layer.
-    /// Called after register_incompat_qos so that synchronous discovery
-    /// callbacks (e.g. DirectDiscovery) fire with the incompat callback already set.
-    announce_reader: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void,
+    /// Have discovery prepare the announcement of the reader identified by
+    /// handle, with this Subscriber's partitions and presentation: reserve
+    /// what announcing it and later disposing of it needs. Does nothing when
+    /// one with them is prepared already. Called at creation, before the
+    /// reader joins this Subscriber, and again before it is enabled.
+    prepare_reader: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void,
+
+    /// Announce the reader identified by handle, prepared already, to the
+    /// discovery layer. Called after register_incompat_qos so that
+    /// synchronous discovery callbacks (e.g. DirectDiscovery) fire with the
+    /// incompat callback already set.
+    announce_reader: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t) void,
 
     /// Clock passed to DataReaderImpl for DEADLINE interval timers.
     timer_clock: time_mod.Clock,
@@ -409,6 +417,12 @@ pub const SubscriberImpl = struct {
             &subscription_handle,
             &guid,
         ) catch return nil.nil_datareader;
+        // Before the reader is published, so a reader whose announcement
+        // cannot be reserved is never created.
+        self.prepareDataReader(subscription_handle) catch {
+            self.cbs.destroy_proto_reader(self.cbs.ctx, subscription_handle);
+            return nil.nil_datareader;
+        };
         const dr = reader_mod.DataReaderImpl.init(
             self.alloc,
             a_topic,
@@ -522,11 +536,9 @@ pub const SubscriberImpl = struct {
         return dr.toDDSDataReader();
     }
 
-    /// The outbound SEDP subscription announcement -- the one part of
-    /// create_datareader's discovery wiring that's actually deferred while a
-    /// reader is disabled (see vtCreateDataReader and reader.zig's vtEnable,
-    /// which calls this directly once the app enables the reader).
-    pub fn announceDataReader(self: *Self, subscription_handle: DDS.InstanceHandle_t) void {
+    /// Prepares the reader's announcement with this Subscriber's current
+    /// partitions and presentation (see ParticipantCbs.prepare_reader).
+    pub fn prepareDataReader(self: *Self, subscription_handle: DDS.InstanceHandle_t) !void {
         const pname_seq = &self.qos.partition.name;
         const pname_count: u32 = if (pname_seq._buffer != null) pname_seq._length else 0;
         var pname_buf: [64][]const u8 = undefined;
@@ -534,7 +546,16 @@ pub const SubscriberImpl = struct {
         if (pname_seq._buffer) |b| for (pname_slice, 0..) |*s, i| {
             s.* = std.mem.span(b[i]);
         };
-        self.cbs.announce_reader(self.cbs.ctx, subscription_handle, pname_slice, self.qos.presentation);
+        try self.cbs.prepare_reader(self.cbs.ctx, subscription_handle, pname_slice, self.qos.presentation);
+    }
+
+    /// The outbound SEDP subscription announcement -- the one part of
+    /// create_datareader's discovery wiring that's actually deferred while a
+    /// reader is disabled (see vtCreateDataReader and reader.zig's vtEnable,
+    /// which calls this directly once the app enables the reader). Cannot
+    /// fail: `prepareDataReader` reserved what it needs.
+    pub fn announceDataReader(self: *Self, subscription_handle: DDS.InstanceHandle_t) void {
+        self.cbs.announce_reader(self.cbs.ctx, subscription_handle);
     }
 
     fn vtDeleteDataReader(ctx: *anyopaque, a_datareader: DDS.DataReader) DDS.ReturnCode_t {
