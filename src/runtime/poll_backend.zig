@@ -1,6 +1,6 @@
-//! The readiness progress backend for hosted POSIX platforms: waits on the
+//! The readiness progress backend for hosted platforms: waits on the
 //! registered I/O sources (for input, and for output where armed) and a wake
-//! descriptor with `poll`, and services the ready sources
+//! descriptor with `poll` (`WSAPoll` on Windows), and services the ready sources
 //! (docs/design/concurrency/transport-adapters.md#progress-backend).
 //!
 //! One waiter at a time polls. The others wait on a futex, and a poller that
@@ -18,6 +18,7 @@ const posix = std.posix;
 const c = std.c;
 const Clock = @import("../util/time.zig").Clock;
 const Mutex = @import("../util/mutex.zig").Mutex;
+const sock = @import("../util/sock.zig");
 const backend_mod = @import("backend.zig");
 const ProgressBackend = backend_mod.ProgressBackend;
 const ServiceResult = backend_mod.ServiceResult;
@@ -25,7 +26,7 @@ const Source = backend_mod.Source;
 
 /// Whether this platform has the backend.
 pub const supported = switch (builtin.os.tag) {
-    .windows, .wasi, .freestanding => false,
+    .wasi, .freestanding => false,
     else => true,
 };
 
@@ -43,9 +44,11 @@ pub const PollBackend = struct {
     /// Threads inside `wait`, for diagnostics and tests.
     waiters: std.atomic.Value(u32) = .init(0),
     /// Read end and write end of the wake descriptor (the same eventfd on
-    /// Linux, a pipe elsewhere). Both nonblocking.
-    wake_rd: posix.fd_t,
-    wake_wr: posix.fd_t,
+    /// Linux; on Windows, where WSAPoll waits only on sockets, the same
+    /// loopback UDP socket, connected to itself; a pipe elsewhere). Both
+    /// nonblocking.
+    wake_rd: posix.socket_t,
+    wake_wr: posix.socket_t,
 
     mu: Mutex = .{},
     // Guarded by `mu`, with each source's `output_armed`.
@@ -54,14 +57,14 @@ pub const PollBackend = struct {
     version: u64 = 0,
 
     // The poller's: rebuilt from `sources` when `version` moves.
-    wait_fds: std.ArrayListUnmanaged(posix.pollfd) = .empty,
+    wait_fds: std.ArrayListUnmanaged(sock.PollFd) = .empty,
     wait_version: u64 = std.math.maxInt(u64),
 
     service_mu: Mutex = .{},
     // Guarded by `service_mu`: the sources as of `service_version`, and where
     // the next round starts, so one busy source cannot starve the others.
     service_sources: std.ArrayListUnmanaged(*Source) = .empty,
-    service_fds: std.ArrayListUnmanaged(posix.pollfd) = .empty,
+    service_fds: std.ArrayListUnmanaged(sock.PollFd) = .empty,
     service_version: u64 = std.math.maxInt(u64),
     next: usize = 0,
 
@@ -76,8 +79,11 @@ pub const PollBackend = struct {
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io) error{SystemResources}!PollBackend {
         comptime std.debug.assert(supported);
-        var fds: [2]posix.fd_t = undefined;
-        if (builtin.os.tag == .linux) {
+        var fds: [2]posix.socket_t = undefined;
+        if (builtin.os.tag == .windows) {
+            const fd = try openLoopbackWake();
+            fds = .{ fd, fd };
+        } else if (builtin.os.tag == .linux) {
             const fd = c.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
             if (fd < 0) return error.SystemResources;
             fds = .{ fd, fd };
@@ -98,11 +104,32 @@ pub const PollBackend = struct {
         return .{ .io = io, .alloc = alloc, .wake_rd = fds[0], .wake_wr = fds[1] };
     }
 
+    /// A nonblocking UDP socket on 127.0.0.1 connected to itself: a datagram
+    /// it sends makes it readable.
+    fn openLoopbackWake() error{SystemResources}!posix.socket_t {
+        const fd = sock.open(posix.AF.INET, posix.SOCK.DGRAM) catch return error.SystemResources;
+        errdefer sock.close(fd);
+        var addr = posix.sockaddr.in{ .family = posix.AF.INET, .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+        var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+        if (c.bind(fd, @ptrCast(&addr), len) != 0 or
+            c.getsockname(fd, @ptrCast(&addr), &len) != 0 or
+            c.connect(fd, @ptrCast(&addr), len) != 0)
+        {
+            return error.SystemResources;
+        }
+        sock.setNonblocking(fd) catch return error.SystemResources;
+        return fd;
+    }
+
     /// Once no thread waits or services, and every source is unregistered.
     pub fn deinit(self: *PollBackend) void {
         std.debug.assert(self.sources.items.len == 0);
-        _ = c.close(self.wake_rd);
-        if (self.wake_wr != self.wake_rd) _ = c.close(self.wake_wr);
+        if (builtin.os.tag == .windows) {
+            sock.close(self.wake_rd);
+        } else {
+            _ = c.close(self.wake_rd);
+            if (self.wake_wr != self.wake_rd) _ = c.close(self.wake_wr);
+        }
         self.sources.deinit(self.alloc);
         self.wait_fds.deinit(self.alloc);
         self.service_sources.deinit(self.alloc);
@@ -168,8 +195,10 @@ pub const PollBackend = struct {
 
     fn signal(self: *PollBackend) void {
         const one: u64 = 1;
-        // A full counter or pipe is already signaled.
-        if (builtin.os.tag == .linux) {
+        // A full counter, pipe or socket buffer is already signaled.
+        if (builtin.os.tag == .windows) {
+            _ = c.send(self.wake_wr, std.mem.asBytes(&one), 1, 0);
+        } else if (builtin.os.tag == .linux) {
             _ = c.write(self.wake_wr, std.mem.asBytes(&one), 8);
         } else {
             _ = c.write(self.wake_wr, std.mem.asBytes(&one), 1);
@@ -178,6 +207,10 @@ pub const PollBackend = struct {
 
     fn drain(self: *PollBackend) void {
         var buf: [64]u8 = undefined;
+        if (builtin.os.tag == .windows) {
+            while (c.recv(self.wake_rd, &buf, buf.len, 0) > 0) {}
+            return;
+        }
         while (c.read(self.wake_rd, &buf, buf.len) > 0) {}
     }
 
@@ -220,20 +253,20 @@ pub const PollBackend = struct {
         const timeout = self.timeoutMs(deadline_ns);
         // Without memory for the descriptors, wait a moment and retry.
         const fds = self.waitFds() orelse return vtSleep(self, std.time.ns_per_ms);
-        _ = posix.poll(fds, timeout) catch {};
+        _ = sock.poll(fds, timeout);
     }
 
     /// The poller's descriptors: the wake descriptor, then every source.
-    fn waitFds(self: *PollBackend) ?[]posix.pollfd {
+    fn waitFds(self: *PollBackend) ?[]sock.PollFd {
         self.mu.lock();
         defer self.mu.unlock();
         if (self.wait_version != self.version) {
             self.wait_fds.ensureTotalCapacity(self.alloc, self.sources.items.len + 1) catch return null;
             self.wait_fds.clearRetainingCapacity();
-            self.wait_fds.appendAssumeCapacity(.{ .fd = self.wake_rd, .events = posix.POLL.IN, .revents = 0 });
+            self.wait_fds.appendAssumeCapacity(.{ .fd = sock.pollHandle(self.wake_rd), .events = sock.POLL.IN, .revents = 0 });
             for (self.sources.items) |s| {
                 const events = waitEvents(s);
-                if (events != 0) self.wait_fds.appendAssumeCapacity(.{ .fd = s.handle, .events = events, .revents = 0 });
+                if (events != 0) self.wait_fds.appendAssumeCapacity(.{ .fd = sock.pollHandle(s.handle), .events = events, .revents = 0 });
             }
             self.wait_version = self.version;
         }
@@ -244,8 +277,8 @@ pub const PollBackend = struct {
     /// left out, since poll would still report its errors.
     fn waitEvents(s: *const Source) i16 {
         var events: i16 = 0;
-        if (s.input and !s.input_paused) events |= posix.POLL.IN;
-        if (s.output_armed) events |= posix.POLL.OUT;
+        if (s.input and !s.input_paused) events |= sock.POLL.IN;
+        if (s.output_armed) events |= sock.POLL.OUT;
         return events;
     }
 
@@ -342,11 +375,11 @@ pub const PollBackend = struct {
             // is not touched again, so its owner may free it at once.
             for (self.service_sources.items, self.service_fds.items) |*s, *fd| {
                 // A place already taken out holds no source.
-                if (fd.fd == -1) continue;
+                if (fd.fd == sock.no_poll_handle) continue;
                 if (s.* == source) {
                     s.* = undefined;
                     fd.revents = 0;
-                    fd.fd = -1;
+                    fd.fd = sock.no_poll_handle;
                 }
             }
             return;
@@ -370,13 +403,13 @@ pub const PollBackend = struct {
         if (!self.rebuildServiceList()) return .{};
         const fds = self.service_fds.items;
         if (fds.len == 0) return .{};
-        var ready = posix.poll(fds, 0) catch return .{};
+        var ready = sock.poll(fds, 0);
         // A resumed source runs as if it had input, until it is serviced.
         // Others are only read.
         for (self.service_sources.items, fds) |s, *fd| {
             if (!s.kicked.load(.seq_cst)) continue;
             if (fd.revents == 0) ready += 1;
-            fd.revents |= posix.POLL.IN;
+            fd.revents |= sock.POLL.IN;
         }
         if (ready == 0) return .{};
 
@@ -399,15 +432,15 @@ pub const PollBackend = struct {
                 const s = self.service_sources.items[i];
                 // Without input, an error or hangup also ends the wait for
                 // output: the next send reports it.
-                if (fds[i].revents & posix.POLL.OUT != 0 or !s.input) {
-                    fds[i].revents = if (s.input) fds[i].revents & ~@as(i16, posix.POLL.OUT) else 0;
+                if (fds[i].revents & sock.POLL.OUT != 0 or !s.input) {
+                    fds[i].revents = if (s.input) fds[i].revents & ~sock.POLL.OUT else 0;
                     if (self.disarmOutput(s)) s.writable.?(s.ctx);
                     result.serviced += 1;
                     progressed = true;
                     continue;
                 }
                 if (s.kicked.load(.seq_cst)) s.kicked.store(false, .seq_cst);
-                if (fds[i].revents & posix.POLL.NVAL != 0 or s.service(s.ctx, 1) == 0) {
+                if (fds[i].revents & sock.POLL.NVAL != 0 or s.service(s.ctx, 1) == 0) {
                     fds[i].revents = 0;
                     continue;
                 }
@@ -433,7 +466,7 @@ pub const PollBackend = struct {
             const events = waitEvents(s);
             if (events == 0) continue;
             self.service_sources.appendAssumeCapacity(s);
-            self.service_fds.appendAssumeCapacity(.{ .fd = s.handle, .events = events, .revents = 0 });
+            self.service_fds.appendAssumeCapacity(.{ .fd = sock.pollHandle(s.handle), .events = events, .revents = 0 });
         }
         self.service_version = self.version;
         return true;

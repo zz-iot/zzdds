@@ -74,6 +74,8 @@ const backend_mod = @import("../runtime/backend.zig");
 const ProgressBackend = backend_mod.ProgressBackend;
 const Source = backend_mod.Source;
 const poll_backend = @import("../runtime/poll_backend.zig");
+const sock = @import("../util/sock.zig");
+const MAX_GATHER = @import("../rtps/message/builder.zig").MAX_IOVECS;
 const runtime_mod = @import("../runtime/core.zig");
 const CloseLatch = @import("../runtime/close_latch.zig").CloseLatch;
 const schema = @import("../config/schema.zig");
@@ -92,46 +94,15 @@ const WritableWaiter = iface.WritableWaiter;
 pub const SendOutcome = iface.SendOutcome;
 const MAX_RECEIVE_HANDLERS = iface.MAX_RECEIVE_HANDLERS;
 
-// ── Windows Winsock initialisation ───────────────────────────────────────────
-// Winsock requires WSAStartup before any socket call. We call it once lazily.
-
-const wsa = if (builtin.os.tag == .windows) struct {
-    extern "ws2_32" fn closesocket(s: posix.socket_t) callconv(.winapi) c_int;
-    // WSADATA layout varies by platform but is ≤ 408 bytes; we only need storage.
-    const WSADATA = [408]u8;
-    extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *WSADATA) c_int;
-
-    var initiated: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-    var data: WSADATA = undefined;
-
-    fn ensure() void {
-        if (initiated.load(.acquire)) return;
-        _ = WSAStartup(0x0202, &data);
-        initiated.store(true, .release);
-    }
-} else void;
-
 // ── POSIX socket API (std.c in Zig 0.16+) ────────────────────────────────────
 
 const c = std.c;
 
-// On Windows, posix.socket_t = fd_t = windows.HANDLE = *anyopaque.
-// INVALID_SOCKET = ~0 cast to a pointer (same pattern as INVALID_HANDLE_VALUE).
-// On POSIX, posix.socket_t = i32 (invalid fd = -1).
-const INVALID_SOCKET: posix.socket_t = if (builtin.os.tag == .windows)
-    @ptrFromInt(std.math.maxInt(usize))
-else
-    @as(posix.socket_t, -1);
+const INVALID_SOCKET: posix.socket_t = sock.invalid;
 
 /// Thin wrappers that convert libc return codes to Zig errors.
 fn socketCreate(family: u32, sock_type: u32) !posix.socket_t {
-    if (comptime builtin.os.tag == .windows) wsa.ensure();
-    const fd = c.socket(@intCast(family), @intCast(sock_type), 0);
-    if (fd < 0) return error.SocketCreateFailed;
-    if (comptime builtin.os.tag == .windows) {
-        return @ptrFromInt(@as(usize, @intCast(fd)));
-    }
-    return @intCast(fd);
+    return sock.open(family, sock_type);
 }
 
 fn socketBind(fd: posix.socket_t, addr: *const posix.sockaddr, len: posix.socklen_t) !void {
@@ -139,20 +110,19 @@ fn socketBind(fd: posix.socket_t, addr: *const posix.sockaddr, len: posix.sockle
 }
 
 /// Sends the concatenation of `iovecs` as one datagram. With `flags`
-/// MSG_DONTWAIT a full send buffer is `would_block`.
+/// MSG_DONTWAIT, or on a nonblocking socket, a full send buffer is
+/// `would_block`.
 fn socketSendMsg(fd: posix.socket_t, iovecs: []const IoVec, addr: *const posix.sockaddr, len: posix.socklen_t, flags: u32) error{SendFailed}!SendOutcome {
     if (comptime builtin.os.tag == .windows) {
-        // No sendmsg in the socket API used here: flatten.
-        var buf: [Transport.max_flattened_send]u8 = undefined;
-        var pos: usize = 0;
-        for (iovecs) |iov| {
-            if (pos + iov.len > buf.len) return error.SendFailed;
-            @memcpy(buf[pos..][0..iov.len], iov.base[0..iov.len]);
-            pos += iov.len;
-        }
-        const n = c.sendto(fd, buf[0..pos].ptr, pos, flags, addr, len);
-        if (n < 0) {
-            log.transport.warn("udp: sendto fd={} failed", .{fd});
+        // WSASendTo is Winsock's sendmsg; a WSABUF puts the length first.
+        var bufs: [MAX_GATHER]sock.ws.WSABUF = undefined;
+        if (iovecs.len > bufs.len) return error.SendFailed;
+        for (iovecs, bufs[0..iovecs.len]) |iov, *b| b.* = .{ .len = @intCast(iov.len), .buf = iov.base };
+        var sent: u32 = 0;
+        if (sock.ws.WSASendTo(fd, &bufs, @intCast(iovecs.len), &sent, flags, addr, @intCast(len), null, null) != 0) {
+            const e = sock.lastError();
+            if (e == .would_block) return .would_block;
+            log.transport.warn("udp: WSASendTo fd={} failed: {t}", .{ fd, e });
             return error.SendFailed;
         }
         return .completed;
@@ -182,23 +152,18 @@ fn socketRecvFrom(fd: posix.socket_t, buf: []u8, src: *posix.sockaddr, src_len: 
 
 fn socketRecvFromFlags(fd: posix.socket_t, buf: []u8, src: *posix.sockaddr, src_len: *posix.socklen_t, flags: u32) !usize {
     const n = c.recvfrom(fd, buf.ptr, buf.len, flags, src, src_len);
-    if (n < 0) {
-        const err = posix.errno(n);
-        if (err == .AGAIN) return error.WouldBlock;
-        if (err == .INTR) return error.Interrupted;
-        return error.RecvFailed;
-    }
+    if (n < 0) return switch (sock.lastError()) {
+        .would_block => error.WouldBlock,
+        .interrupted => error.Interrupted,
+        // An ICMP report of an earlier send (Windows reports it here).
+        .connection_reset => error.ConnectionResetByPeer,
+        else => error.RecvFailed,
+    };
     return @intCast(n);
 }
 
 fn socketClose(fd: posix.socket_t) void {
-    if (builtin.os.tag == .windows) {
-        // Winsock handles are not CRT file descriptors. close() invokes the
-        // CRT invalid-parameter handler (and can terminate the host process).
-        _ = wsa.closesocket(fd);
-    } else {
-        _ = c.close(fd);
-    }
+    sock.close(fd);
 }
 
 test "socketClose releases a bound UDP port" {
@@ -356,6 +321,7 @@ const SocketEntry = struct {
     /// transport's `mu`.
     fn start(self: *SocketEntry) !void {
         if (self.transport.backend) |b| {
+            if (builtin.os.tag == .windows) try sock.setNonblocking(self.fd);
             self.receiver = .{ .source = .{ .handle = self.fd, .ctx = self, .service = serviceSource } };
             b.register(&self.receiver.source) catch |err| {
                 self.receiver = .none;
@@ -2034,6 +2000,8 @@ pub const UdpTransport = struct {
         const fds = [2]posix.socket_t{ self.owned_send_fd_v4, self.owned_send_fd_v6 };
         for (&self.send_sources, fds) |*ss, fd| {
             if (fd == INVALID_SOCKET) continue;
+            // Windows has no MSG_DONTWAIT for sendMsg: the socket is.
+            if (builtin.os.tag == .windows) try sock.setNonblocking(fd);
             ss.* = .{ .transport = self, .fd = fd, .source = .{
                 .handle = fd,
                 .ctx = ss,
@@ -2147,7 +2115,9 @@ fn serviceSource(ctx: *anyopaque, budget: u32) u32 {
     var handled: u32 = 0;
     while (handled < budget) {
         var src_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-        const dontwait = if (poll_backend.supported) posix.MSG.DONTWAIT else unreachable;
+        // A socket on a backend is nonblocking on Windows, which has no
+        // MSG_DONTWAIT.
+        const dontwait: u32 = if (builtin.os.tag == .windows) 0 else posix.MSG.DONTWAIT;
         const n = socketRecvFromFlags(entry.fd, &buf, @ptrCast(&src_store), &src_len, dontwait) catch |err| switch (err) {
             error.WouldBlock => break,
             error.Interrupted => continue,

@@ -18,6 +18,10 @@ const rt = zzdds.runtime;
 
 const posix = std.posix;
 const c = std.c;
+const zsock = zzdds.util.sock;
+/// Windows has no MSG_DONTWAIT: a test socket read this way is nonblocking
+/// there instead.
+const DONTWAIT: u32 = if (builtin.os.tag == .windows) 0 else posix.MSG.DONTWAIT;
 const UdpTransport = zzdds.udp_transport.UdpTransport;
 const IntraProcessDelivery = zzdds.intraprocess.IntraProcessDelivery;
 const DirectDiscovery = zzdds.intraprocess.DirectDiscovery;
@@ -50,9 +54,9 @@ const Sock = struct {
     received: u32 = 0,
 
     fn init(self: *Sock) !void {
-        const fd = c.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
-        if (fd < 0) return error.SocketFailed;
-        errdefer _ = c.close(fd);
+        const fd = try zsock.open(posix.AF.INET, posix.SOCK.DGRAM);
+        errdefer zsock.close(fd);
+        if (builtin.os.tag == .windows) try zsock.setNonblocking(fd);
         var addr: posix.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
         if (c.bind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) != 0) return error.BindFailed;
         var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
@@ -62,7 +66,7 @@ const Sock = struct {
     }
 
     fn deinit(self: *Sock) void {
-        _ = c.close(self.fd);
+        zsock.close(self.fd);
     }
 
     fn sendTo(self: *Sock, to: *const Sock) !void {
@@ -75,7 +79,7 @@ const Sock = struct {
         var handled: u32 = 0;
         var buf: [16]u8 = undefined;
         while (handled < budget) : (handled += 1) {
-            if (c.recv(self.fd, &buf, buf.len, posix.MSG.DONTWAIT) < 0) break;
+            if (c.recv(self.fd, &buf, buf.len, DONTWAIT) < 0) break;
         }
         self.received += handled;
         return handled;
@@ -111,8 +115,8 @@ const Backend = struct {
 /// Waits until `sock` has input queued. Loopback delivery is complete when
 /// `sendto` returns, so every datagram sent to it before is then queued.
 fn awaitReadable(sock: *Sock) !void {
-    var fds = [1]posix.pollfd{.{ .fd = sock.fd, .events = posix.POLL.IN, .revents = 0 }};
-    if (try posix.poll(&fds, 10_000) == 0) return error.Timeout;
+    var fds = [1]zsock.PollFd{.{ .fd = zsock.pollHandle(sock.fd), .events = zsock.POLL.IN, .revents = 0 }};
+    if (zsock.poll(&fds, 10_000) == 0) return error.Timeout;
 }
 
 // ── The backend ───────────────────────────────────────────────────────────────
@@ -307,22 +311,22 @@ const FullPair = struct {
     }
 
     fn deinit(self: *FullPair) void {
-        _ = c.close(self.tx);
-        _ = c.close(self.rx);
+        zsock.close(self.tx);
+        zsock.close(self.rx);
     }
 
     /// Sends until the sender would block.
     fn fill(self: *FullPair) !void {
         var sent: usize = 0;
         while (sent < 100_000) : (sent += 1) {
-            if (c.send(self.tx, "x", 1, posix.MSG.DONTWAIT) < 0) return;
+            if (c.send(self.tx, "x", 1, DONTWAIT) < 0) return;
         }
         return error.NeverFull;
     }
 
     fn drain(self: *FullPair) void {
         var buf: [16]u8 = undefined;
-        while (c.recv(self.rx, &buf, buf.len, posix.MSG.DONTWAIT) >= 0) {}
+        while (c.recv(self.rx, &buf, buf.len, DONTWAIT) >= 0) {}
     }
 
     fn noInput(_: *anyopaque, _: u32) u32 {
@@ -900,17 +904,18 @@ test "a UDP transport sends a gather list as one datagram without flattening it,
 
     // Not on a runtime: a blocking send, as on the threaded path.
     try testing.expectEqual(SendOutcome.completed, try t.sendGather(&to, &gather));
-    try testing.expectEqual(@as(u32, 0), SendSpy.last_flags & posix.MSG.DONTWAIT);
+    // Windows has no MSG_DONTWAIT: there the socket itself is nonblocking.
+    if (builtin.os.tag != .windows) try testing.expectEqual(@as(u32, 0), SendSpy.last_flags & posix.MSG.DONTWAIT);
 
     try t.attachBackend(b.backend());
     try testing.expectEqual(SendOutcome.completed, try t.sendGather(&to, &gather));
-    try testing.expect(SendSpy.last_flags & posix.MSG.DONTWAIT != 0);
+    if (builtin.os.tag != .windows) try testing.expect(SendSpy.last_flags & posix.MSG.DONTWAIT != 0);
     // The list reached the syscall as given.
     try testing.expectEqual(gather.len, SendSpy.last_iovecs);
     try awaitReadable(&sock);
     var buf: [16]u8 = undefined;
     for (0..2) |_| {
-        const n = c.recv(sock.fd, &buf, buf.len, posix.MSG.DONTWAIT);
+        const n = c.recv(sock.fd, &buf, buf.len, DONTWAIT);
         try testing.expectEqualStrings("abcde", buf[0..@intCast(n)]);
     }
     try testing.expectEqual(@as(u64, 0), udp.sends_would_block.load(.monotonic));
@@ -1502,16 +1507,14 @@ const TcpNode = struct {
 /// A plain loopback TCP socket the test drives itself.
 const Raw = struct {
     fn socket() !posix.socket_t {
-        const fd = c.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-        if (fd < 0) return error.SocketFailed;
-        return fd;
+        return zsock.open(posix.AF.INET, posix.SOCK.STREAM);
     }
 
     /// A listener on an ephemeral port, with a receive buffer of
     /// `rcvbuf` bytes for the connections it accepts, if set.
     fn listen(port: *u16, rcvbuf: ?c_int) !posix.socket_t {
         const fd = try socket();
-        errdefer _ = c.close(fd);
+        errdefer zsock.close(fd);
         if (rcvbuf) |n| _ = c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&n), @sizeOf(c_int));
         var addr: posix.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
         if (c.bind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) != 0) return error.BindFailed;
@@ -1526,13 +1529,13 @@ const Raw = struct {
     fn closedPort() !u16 {
         var port: u16 = 0;
         const fd = try listen(&port, null);
-        _ = c.close(fd);
+        zsock.close(fd);
         return port;
     }
 
     fn connect(port: u16) !posix.socket_t {
         const fd = try socket();
-        errdefer _ = c.close(fd);
+        errdefer zsock.close(fd);
         const addr: posix.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
         if (c.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) != 0) return error.ConnectFailed;
         return fd;
@@ -1540,11 +1543,11 @@ const Raw = struct {
 
     /// Accepts the connection queued on `fd`.
     fn accept(fd: posix.socket_t) !posix.socket_t {
-        var fds = [1]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-        if (try posix.poll(&fds, 10_000) == 0) return error.Timeout;
+        var fds = [1]zsock.PollFd{.{ .fd = zsock.pollHandle(fd), .events = zsock.POLL.IN, .revents = 0 }};
+        if (zsock.poll(&fds, 10_000) == 0) return error.Timeout;
         const conn = c.accept(fd, null, null);
         if (conn < 0) return error.AcceptFailed;
-        return conn;
+        return zsock.handle(conn);
     }
 
     fn writeAll(fd: posix.socket_t, bytes: []const u8) !void {
@@ -1560,7 +1563,11 @@ const Raw = struct {
     fn readAvailable(fd: posix.socket_t, out: *std.ArrayListUnmanaged(u8)) !void {
         var buf: [64 * 1024]u8 = undefined;
         while (true) {
-            const n = c.recv(fd, &buf, buf.len, posix.MSG.DONTWAIT);
+            // Polled first: on Windows, without MSG_DONTWAIT, a recv on
+            // this blocking socket would wait.
+            var fds = [1]zsock.PollFd{.{ .fd = zsock.pollHandle(fd), .events = zsock.POLL.IN, .revents = 0 }};
+            if (zsock.poll(&fds, 0) == 0) return;
+            const n = c.recv(fd, &buf, buf.len, 0);
             if (n <= 0) return;
             try out.appendSlice(alloc, buf[0..@intCast(n)]);
         }
@@ -1581,7 +1588,7 @@ test "a frame its handler has no room for is held and reading stops, until the h
     try n.init();
     defer n.deinit();
     const peer = try Raw.connect(n.port);
-    defer _ = c.close(peer);
+    defer zsock.close(peer);
 
     // Three frames in one write, then one longer than a read.
     const big = try alloc.alloc(u8, 100_000);
@@ -1652,7 +1659,7 @@ test "a held frame goes once to each handler that has not taken it, though the h
     const at_node = Locator.tcp4(.{ 127, 0, 0, 1 }, n.port);
     try t.listen(&at_node, b.handler());
     const peer = try Raw.connect(n.port);
-    defer _ = c.close(peer);
+    defer zsock.close(peer);
 
     // The first handler takes it; the second has no room.
     try sendFrame(peer, "one");
@@ -1724,7 +1731,7 @@ test "unlistening the handler a held frame waits on cancels the wait, and the ha
 
     // Reading went on, and the connection closes without calling it.
     try sendFrame(peer, "two");
-    _ = c.close(peer);
+    zsock.close(peer);
     try n.serviceUntil(&n, struct {
         fn f(node: *TcpNode) bool {
             return node.live() == 0;
@@ -1739,7 +1746,7 @@ test "a TCP connection on a backend reassembles frames split across reads and se
     try n.init();
     defer n.deinit();
     const peer = try Raw.connect(n.port);
-    defer _ = c.close(peer);
+    defer zsock.close(peer);
     try n.serviceUntil(&n, struct {
         fn f(node: *TcpNode) bool {
             return node.live() == 1;
@@ -1818,7 +1825,7 @@ test "a send while its dial is in progress is kept, and written once the dial co
     defer n.deinit();
     var port: u16 = 0;
     const l = try Raw.listen(&port, null);
-    defer _ = c.close(l);
+    defer zsock.close(l);
 
     // Completed at once, though the dial has yet to: the frame waits for it.
     try testing.expectEqual(SendOutcome.completed, try n.tr.transport().sendGather(&at(port), &gather));
@@ -1833,7 +1840,7 @@ test "a send while its dial is in progress is kept, and written once the dial co
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 5, 'a', 'b', 'c', 'd', 'e' }, got.items);
 
     // The peer hangs up: the end of the stream closes and frees it.
-    _ = c.close(peer);
+    zsock.close(peer);
     try n.serviceUntil(&n, struct {
         fn f(node: *TcpNode) bool {
             return node.live() == 0;
@@ -1876,6 +1883,11 @@ test "a dial that fails with a frame waiting closes the connection, runs its wai
     try testing.expectEqual(@as(u32, 2), w.runs);
 }
 
+/// Whether a nonblocking stream send can take only part of what it is
+/// given. Winsock takes all of it or none (WSAEWOULDBLOCK), so a frame is
+/// never left partly written there.
+const partial_sends = builtin.os.tag != .windows;
+
 /// A connection from `n` to a peer that does not read, with small buffers
 /// on both ends, so that it fills after a few frames.
 const Stalled = struct {
@@ -1889,7 +1901,7 @@ const Stalled = struct {
     fn init(self: *Stalled, n: *TcpNode) !void {
         var port: u16 = 0;
         self.listener = try Raw.listen(&port, 4096);
-        errdefer _ = c.close(self.listener);
+        errdefer zsock.close(self.listener);
         self.to = at(port);
         self.sent = .empty;
         const t = n.tr.transport();
@@ -1910,8 +1922,8 @@ const Stalled = struct {
     }
 
     fn deinit(self: *Stalled) void {
-        _ = c.close(self.peer);
-        _ = c.close(self.listener);
+        zsock.close(self.peer);
+        zsock.close(self.listener);
         self.sent.deinit(alloc);
     }
 
@@ -1948,6 +1960,7 @@ const Stalled = struct {
 
 test "a frame the socket takes only part of is finished once it drains, before any other" {
     if (!rt.poll_backend.supported) return error.SkipZigTest;
+    if (!partial_sends) return error.SkipZigTest;
     var n: TcpNode = undefined;
     try n.init();
     defer n.deinit();
@@ -1989,6 +2002,7 @@ test "a frame the socket takes only part of is finished once it drains, before a
 
 test "a waiter registered after its connection drained runs at once, though another connection stays blocked" {
     if (!rt.poll_backend.supported) return error.SkipZigTest;
+    if (!partial_sends) return error.SkipZigTest;
     var n: TcpNode = undefined;
     try n.init();
     defer n.deinit();
@@ -2041,6 +2055,7 @@ test "a waiter registered after its connection drained runs at once, though anot
 
 test "a connection that closes with part of a frame unwritten frees it, runs its waiters, and its channel fails" {
     if (!rt.poll_backend.supported) return error.SkipZigTest;
+    if (!partial_sends) return error.SkipZigTest;
     var n: TcpNode = undefined;
     try n.init();
     defer n.deinit();
@@ -2059,7 +2074,7 @@ test "a connection that closes with part of a frame unwritten frees it, runs its
 
     // The peer goes away without reading: its unread data resets the
     // connection.
-    _ = c.close(s.peer);
+    zsock.close(s.peer);
     s.peer = try Raw.socket();
     try n.serviceUntil(&n, struct {
         fn f(node: *TcpNode) bool {
