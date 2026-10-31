@@ -132,7 +132,7 @@ pub const WriterAnnouncement = struct {
     /// DataWriter QoS).
     presentation: DDS.PresentationQosPolicy = .{},
     /// The parent Publisher's PARTITION names. Empty = default partition ("").
-    /// Borrowed for the duration of the `announce_writer` call.
+    /// Borrowed for the duration of the `prepare_writer` call.
     partition_names: []const []const u8 = &.{},
     /// TypeObject bytes (zidl-generated), or empty slice if not available.
     type_object: []const u8,
@@ -405,17 +405,32 @@ pub const Discovery = struct {
         /// this returns. Called only after a successful `start`.
         stop: *const fn (ctx: *anyopaque) void,
 
-        /// Announce a new local DataWriter. Discovery propagates this to remote peers.
-        announce_writer: *const fn (ctx: *anyopaque, info: *const WriterAnnouncement) anyerror!void,
+        /// Reserves what announcing the local DataWriter `info` describes
+        /// needs, and what disposing it once announced needs, so neither
+        /// `announce_writer` nor `retract_writer` can fail for lack of local
+        /// resources (docs/design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal).
+        /// Called again for the same GUID, replaces what will be announced.
+        /// May be called before `start`. Fails changing nothing.
+        prepare_writer: *const fn (ctx: *anyopaque, info: *const WriterAnnouncement) anyerror!void,
 
-        /// Retract a local DataWriter (e.g. on delete_datawriter). Remote peers will
-        /// be notified.
+        /// Commits the prepared announcement of the local DataWriter `guid`
+        /// to the discovery record, from which it reaches remote peers. Does
+        /// nothing for a writer not prepared. The participant never calls it
+        /// for a writer it has retracted, nor `retract_writer` while it runs.
+        announce_writer: *const fn (ctx: *anyopaque, guid: Guid) void,
+
+        /// Disposes of the local DataWriter `guid` (e.g. on
+        /// delete_datawriter) if announced, and releases what
+        /// `prepare_writer` reserved. Does nothing for a writer not prepared.
         retract_writer: *const fn (ctx: *anyopaque, guid: Guid) void,
 
-        /// Announce a new local DataReader.
-        announce_reader: *const fn (ctx: *anyopaque, info: *const ReaderAnnouncement) anyerror!void,
+        /// `prepare_writer`, for a local DataReader.
+        prepare_reader: *const fn (ctx: *anyopaque, info: *const ReaderAnnouncement) anyerror!void,
 
-        /// Retract a local DataReader.
+        /// `announce_writer`, for a local DataReader.
+        announce_reader: *const fn (ctx: *anyopaque, guid: Guid) void,
+
+        /// `retract_writer`, for a local DataReader.
         retract_reader: *const fn (ctx: *anyopaque, guid: Guid) void,
 
         /// Free the discovery plugin instance.
@@ -449,16 +464,24 @@ pub const Discovery = struct {
         self.vtable.stop(self.ctx);
     }
 
-    pub fn announceWriter(self: Discovery, info: *const WriterAnnouncement) anyerror!void {
-        return self.vtable.announce_writer(self.ctx, info);
+    pub fn prepareWriter(self: Discovery, info: *const WriterAnnouncement) anyerror!void {
+        return self.vtable.prepare_writer(self.ctx, info);
+    }
+
+    pub fn announceWriter(self: Discovery, guid: Guid) void {
+        self.vtable.announce_writer(self.ctx, guid);
     }
 
     pub fn retractWriter(self: Discovery, guid: Guid) void {
         self.vtable.retract_writer(self.ctx, guid);
     }
 
-    pub fn announceReader(self: Discovery, info: *const ReaderAnnouncement) anyerror!void {
-        return self.vtable.announce_reader(self.ctx, info);
+    pub fn prepareReader(self: Discovery, info: *const ReaderAnnouncement) anyerror!void {
+        return self.vtable.prepare_reader(self.ctx, info);
+    }
+
+    pub fn announceReader(self: Discovery, guid: Guid) void {
+        self.vtable.announce_reader(self.ctx, guid);
     }
 
     pub fn retractReader(self: Discovery, guid: Guid) void {

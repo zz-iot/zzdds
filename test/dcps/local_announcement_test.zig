@@ -29,18 +29,22 @@ const Op = enum { announce_writer, retract_writer, announce_reader, retract_read
 
 /// Forwards to `inner`, recording each local endpoint operation, and runs
 /// `before_announce` once, just before forwarding the next announcement.
+/// With `fail_prepare`, preparing fails as for lack of memory.
 const Recorder = struct {
     inner: disc.Discovery,
     ops: [16]Op = undefined,
     n: usize = 0,
+    fail_prepare: bool = false,
     before_announce: ?*const fn (ctx: *anyopaque) void = null,
     before_ctx: *anyopaque = undefined,
 
     const vtable: disc.Discovery.Vtable = .{
         .start = start,
         .stop = stop,
+        .prepare_writer = prepareWriter,
         .announce_writer = announceWriter,
         .retract_writer = retractWriter,
+        .prepare_reader = prepareReader,
         .announce_reader = announceReader,
         .retract_reader = retractReader,
         .deinit = deinit,
@@ -66,8 +70,8 @@ const Recorder = struct {
         f(self.before_ctx);
     }
 
-    fn last(self: *const Recorder) Op {
-        return self.ops[self.n - 1];
+    fn recorded(self: *const Recorder) []const Op {
+        return self.ops[0..self.n];
     }
 
     fn start(ctx: *anyopaque, local: *const disc.ParticipantAnnouncement, callbacks: *const disc.Callbacks) anyerror!void {
@@ -76,21 +80,29 @@ const Recorder = struct {
     fn stop(ctx: *anyopaque) void {
         of(ctx).inner.stop();
     }
-    fn announceWriter(ctx: *anyopaque, info: *const disc.WriterAnnouncement) anyerror!void {
+    fn prepareWriter(ctx: *anyopaque, info: *const disc.WriterAnnouncement) anyerror!void {
+        if (of(ctx).fail_prepare) return error.OutOfMemory;
+        return of(ctx).inner.prepareWriter(info);
+    }
+    fn announceWriter(ctx: *anyopaque, guid: Guid) void {
         const self = of(ctx);
         self.runBeforeAnnounce();
         self.record(.announce_writer);
-        return self.inner.announceWriter(info);
+        self.inner.announceWriter(guid);
     }
     fn retractWriter(ctx: *anyopaque, guid: Guid) void {
         of(ctx).record(.retract_writer);
         of(ctx).inner.retractWriter(guid);
     }
-    fn announceReader(ctx: *anyopaque, info: *const disc.ReaderAnnouncement) anyerror!void {
+    fn prepareReader(ctx: *anyopaque, info: *const disc.ReaderAnnouncement) anyerror!void {
+        if (of(ctx).fail_prepare) return error.OutOfMemory;
+        return of(ctx).inner.prepareReader(info);
+    }
+    fn announceReader(ctx: *anyopaque, guid: Guid) void {
         const self = of(ctx);
         self.runBeforeAnnounce();
         self.record(.announce_reader);
-        return self.inner.announceReader(info);
+        self.inner.announceReader(guid);
     }
     fn retractReader(ctx: *anyopaque, guid: Guid) void {
         of(ctx).record(.retract_reader);
@@ -228,7 +240,8 @@ test "a writer deleted while its announcement is written is disposed after it" {
     rec.before_announce = Delete.f;
 
     try testing.expectEqual(DDS.RETCODE_OK, dw_a.vtable.enable(dw_a.ptr));
-    try testing.expectEqual(Op.retract_writer, rec.last());
+    // The deletion's disposal waits for the announcement, and is its only one.
+    try testing.expectEqualSlices(Op, &.{ .announce_writer, .retract_writer }, rec.recorded());
     try testing.expectEqual(@as(i32, 0), try subscriptionMatchedCount(dr_b));
 }
 
@@ -252,7 +265,7 @@ test "a reader deleted while its announcement is written is disposed after it" {
     rec.before_announce = Delete.f;
 
     try testing.expectEqual(DDS.RETCODE_OK, dr_a.vtable.enable(dr_a.ptr));
-    try testing.expectEqual(Op.retract_reader, rec.last());
+    try testing.expectEqualSlices(Op, &.{ .announce_reader, .retract_reader }, rec.recorded());
     try testing.expectEqual(@as(i32, 0), try publicationMatchedCount(dw_b));
 }
 
@@ -324,4 +337,81 @@ test "a reader its announcement's match callback deletes is not returned by crea
     const dr = sub.create_datareader(topicDesc(fx.topic_a), .{}, .{ .on_subscription_matched = Probe.onMatched }, DDS.SUBSCRIPTION_MATCHED_STATUS);
     try testing.expectEqual(DDS.RETCODE_OK, Probe.rc);
     try testing.expect(dr.ptr == zzdds.dcps.NIL_PTR);
+}
+
+test "a writer whose announcement cannot be reserved is not created" {
+    var rec: Recorder = undefined;
+    var fx = try Fixture.init(testing.allocator, &rec);
+    defer fx.deinit();
+
+    rec.fail_prepare = true;
+    const pub_ = fx.dp_a.create_publisher(.{}, null, 0);
+    const dw = pub_.create_datawriter(fx.topic_a, .{}, null, 0);
+    try testing.expect(dw.ptr == zzdds.dcps.NIL_PTR);
+    try testing.expect(pub_.lookup_datawriter(TOPIC).ptr == zzdds.dcps.NIL_PTR);
+    // Only the rollback's retract, which finds nothing prepared.
+    try testing.expectEqualSlices(Op, &.{.retract_writer}, rec.recorded());
+}
+
+test "a reader whose announcement cannot be reserved is not created" {
+    var rec: Recorder = undefined;
+    var fx = try Fixture.init(testing.allocator, &rec);
+    defer fx.deinit();
+
+    rec.fail_prepare = true;
+    const sub = fx.dp_a.create_subscriber(.{}, null, 0);
+    const dr = sub.create_datareader(topicDesc(fx.topic_a), .{}, null, 0);
+    try testing.expect(dr.ptr == zzdds.dcps.NIL_PTR);
+    try testing.expect(sub.lookup_datareader(TOPIC).ptr == zzdds.dcps.NIL_PTR);
+    try testing.expectEqualSlices(Op, &.{.retract_reader}, rec.recorded());
+}
+
+test "a writer whose announcement cannot be reserved again for new partitions stays disabled" {
+    var rec: Recorder = undefined;
+    var fx = try Fixture.init(testing.allocator, &rec);
+    defer fx.deinit();
+
+    const dr_b = fx.sub_b.create_datareader(topicDesc(fx.topic_b), .{}, null, 0);
+    const dw_a = fx.pub_a.create_datawriter(fx.topic_a, .{}, null, 0);
+    // Prepared at creation with the default partition; the Publisher's
+    // partitions change before it is enabled.
+    var names = [1][*:0]const u8{""};
+    var q = DDS.PublisherQos{};
+    q.entity_factory.autoenable_created_entities = false;
+    q.partition.name = .{ ._buffer = &names, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_a.vtable.set_qos(fx.pub_a.ptr, &q));
+
+    rec.fail_prepare = true;
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, dw_a.vtable.enable(dw_a.ptr));
+    try testing.expectEqual(@as(usize, 0), rec.recorded().len);
+    try testing.expectEqual(@as(i32, 0), try subscriptionMatchedCount(dr_b));
+
+    rec.fail_prepare = false;
+    try testing.expectEqual(DDS.RETCODE_OK, dw_a.vtable.enable(dw_a.ptr));
+    try testing.expectEqualSlices(Op, &.{.announce_writer}, rec.recorded());
+    try testing.expectEqual(@as(i32, 1), try subscriptionMatchedCount(dr_b));
+}
+
+test "a reader whose announcement cannot be reserved again for new partitions stays disabled" {
+    var rec: Recorder = undefined;
+    var fx = try Fixture.init(testing.allocator, &rec);
+    defer fx.deinit();
+
+    const dw_b = fx.pub_b.create_datawriter(fx.topic_b, .{}, null, 0);
+    const dr_a = fx.sub_a.create_datareader(topicDesc(fx.topic_a), .{}, null, 0);
+    var names = [1][*:0]const u8{""};
+    var q = DDS.SubscriberQos{};
+    q.entity_factory.autoenable_created_entities = false;
+    q.partition.name = .{ ._buffer = &names, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, fx.sub_a.vtable.set_qos(fx.sub_a.ptr, &q));
+
+    rec.fail_prepare = true;
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, dr_a.vtable.enable(dr_a.ptr));
+    try testing.expectEqual(@as(usize, 0), rec.recorded().len);
+    try testing.expectEqual(@as(i32, 0), try publicationMatchedCount(dw_b));
+
+    rec.fail_prepare = false;
+    try testing.expectEqual(DDS.RETCODE_OK, dr_a.vtable.enable(dr_a.ptr));
+    try testing.expectEqualSlices(Op, &.{.announce_reader}, rec.recorded());
+    try testing.expectEqual(@as(i32, 1), try publicationMatchedCount(dw_b));
 }

@@ -77,10 +77,18 @@ pub const ParticipantCbs = struct {
         notify_fn: *const fn (notify_ctx: *anyopaque, remote_handle: DDS.InstanceHandle_t, added: bool) void,
     ) void,
 
-    /// Announce the writer identified by handle to the discovery layer.
-    /// Called after register_incompat_qos so that synchronous discovery
-    /// callbacks (e.g. DirectDiscovery) fire with the incompat callback already set.
-    announce_writer: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void,
+    /// Have discovery prepare the announcement of the writer identified by
+    /// handle, with this Publisher's partitions and presentation: reserve
+    /// what announcing it and later disposing of it needs. Does nothing when
+    /// one with them is prepared already. Called at creation, before the
+    /// writer joins this Publisher, and again before it is enabled.
+    prepare_writer: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void,
+
+    /// Announce the writer identified by handle, prepared already, to the
+    /// discovery layer. Called after register_incompat_qos so that
+    /// synchronous discovery callbacks (e.g. DirectDiscovery) fire with the
+    /// incompat callback already set.
+    announce_writer: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t) void,
 
     /// Clock passed to DataWriterImpl for DEADLINE and LIVELINESS interval timers.
     timer_clock: time_mod.Clock,
@@ -433,6 +441,12 @@ pub const PublisherImpl = struct {
             &parts.publication_handle,
             &parts.guid,
         );
+        // Before the writer is published, so a writer whose announcement
+        // cannot be reserved is never created.
+        self.prepareDataWriter(parts.publication_handle) catch |err| {
+            self.cbs.destroy_proto_writer(self.cbs.ctx, parts.publication_handle);
+            return err;
+        };
         return parts;
     }
 
@@ -557,11 +571,9 @@ pub const PublisherImpl = struct {
         return dw.toDDSDataWriter();
     }
 
-    /// The outbound SEDP publication announcement -- the one part of
-    /// create_datawriter's discovery wiring that's actually deferred while a
-    /// writer is disabled (see vtCreateDataWriter and writer.zig's vtEnable,
-    /// which calls this directly once the app enables the writer).
-    pub fn announceDataWriter(self: *Self, publication_handle: DDS.InstanceHandle_t) void {
+    /// Prepares the writer's announcement with this Publisher's current
+    /// partitions and presentation (see ParticipantCbs.prepare_writer).
+    pub fn prepareDataWriter(self: *Self, publication_handle: DDS.InstanceHandle_t) !void {
         const pname_seq = &self.qos.partition.name;
         const pname_count: u32 = if (pname_seq._buffer != null) pname_seq._length else 0;
         var pname_buf: [64][]const u8 = undefined;
@@ -569,7 +581,16 @@ pub const PublisherImpl = struct {
         if (pname_seq._buffer) |b| for (pname_slice, 0..) |*s, i| {
             s.* = std.mem.span(b[i]);
         };
-        self.cbs.announce_writer(self.cbs.ctx, publication_handle, self.instance_handle, pname_slice, self.qos.presentation);
+        try self.cbs.prepare_writer(self.cbs.ctx, publication_handle, self.instance_handle, pname_slice, self.qos.presentation);
+    }
+
+    /// The outbound SEDP publication announcement -- the one part of
+    /// create_datawriter's discovery wiring that's actually deferred while a
+    /// writer is disabled (see vtCreateDataWriter and writer.zig's vtEnable,
+    /// which calls this directly once the app enables the writer). Cannot
+    /// fail: `prepareDataWriter` reserved what it needs.
+    pub fn announceDataWriter(self: *Self, publication_handle: DDS.InstanceHandle_t) void {
+        self.cbs.announce_writer(self.cbs.ctx, publication_handle);
     }
 
     fn vtDeleteDataWriter(ctx: *anyopaque, a_datawriter: DDS.DataWriter) DDS.ReturnCode_t {

@@ -258,8 +258,11 @@ const BuiltinSubscriberState = struct {
             .register_matched_notify = struct {
                 fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, DDS.InstanceHandle_t, bool) void) void {}
             }.f,
+            .prepare_reader = struct {
+                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const []const u8, _: DDS.PresentationQosPolicy) anyerror!void {}
+            }.f,
             .announce_reader = struct {
-                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const []const u8, _: DDS.PresentationQosPolicy) void {}
+                fn f(_: *anyopaque, _: DDS.InstanceHandle_t) void {}
             }.f,
             .timer_clock = participant.timer_clock,
             .register_timer_notify = struct {
@@ -858,6 +861,9 @@ const ActiveWriter = struct {
     qos: DDS.DataWriterQos,
     partition_names: []const []const u8 = &.{}, // heap-owned copy via dupePartitionNames
     presentation: DDS.PresentationQosPolicy = .{},
+    /// Discovery holds an announcement prepared with `partition_names` and
+    /// `presentation`.
+    prepared: bool = false,
     incompat_qos: ?IncompatQosNotify = null,
     incompat_pending: IncompatQosPending = .{},
     matched_notify: ?MatchedNotify = null,
@@ -877,6 +883,9 @@ const ActiveReader = struct {
     qos: DDS.DataReaderQos,
     partition_names: []const []const u8 = &.{}, // heap-owned copy via dupePartitionNames
     presentation: DDS.PresentationQosPolicy = .{},
+    /// Discovery holds an announcement prepared with `partition_names` and
+    /// `presentation`.
+    prepared: bool = false,
     incompat_qos: ?IncompatQosNotify = null,
     incompat_pending: IncompatQosPending = .{},
     matched_notify: ?MatchedNotify = null,
@@ -1044,6 +1053,14 @@ pub const DomainParticipantImpl = struct {
     timer_clock: time_mod.Clock,
 
     mu: Mutex,
+
+    /// Serializes preparing local endpoints' announcements, so what discovery
+    /// has prepared for an endpoint and the partitions and presentation
+    /// recorded for it agree. Held across no call that delivers.
+    prepare_mu: Mutex = .{},
+    /// Guarded by `mu`: local endpoints whose announcement is being committed
+    /// to discovery. Has room for one per local endpoint.
+    announcing: std.ArrayListUnmanaged(Announcing) = .empty,
 
     /// Background thread periodically calling checkTimers() to enforce
     /// DEADLINE and LIVELINESS QoS -- previously nothing called checkTimers()
@@ -1755,6 +1772,7 @@ pub const DomainParticipantImpl = struct {
             freeUserData(self.alloc, ar.qos.user_data);
         }
         self.active_readers.deinit(self.alloc);
+        self.announcing.deinit(self.alloc);
 
         // Drop participant-owned provider pins outside the lock. Protocol
         // readers hold independent pins through deferred/quiescent teardown.
@@ -2093,13 +2111,17 @@ pub const DomainParticipantImpl = struct {
                 break;
             }
         }
-        if (found_guid) |g| _ = self.active_writers.remove(entityIdKey(g.entity_id));
+        var handed_off = false;
+        if (found_guid) |g| {
+            _ = self.active_writers.remove(entityIdKey(g.entity_id));
+            handed_off = self.handOffDisposalLocked(g);
+        }
         self.mu.unlock();
 
         freePartitionNames(self.alloc, found_parts);
         found_repr.deinit(self.alloc);
         freeUserData(self.alloc, found_user_data);
-        if (found_guid) |g| self.discovery.retractWriter(g);
+        if (found_guid) |g| if (!handed_off) self.retractDeleted(.writer, g);
         if (found_proto) |p| p.deinit();
     }
 
@@ -2211,13 +2233,17 @@ pub const DomainParticipantImpl = struct {
                 break;
             }
         }
-        if (found_guid) |g| _ = self.active_readers.remove(entityIdKey(g.entity_id));
+        var handed_off = false;
+        if (found_guid) |g| {
+            _ = self.active_readers.remove(entityIdKey(g.entity_id));
+            handed_off = self.handOffDisposalLocked(g);
+        }
         self.mu.unlock();
 
         freePartitionNames(self.alloc, found_parts);
         found_repr.deinit(self.alloc);
         freeUserData(self.alloc, found_user_data);
-        if (found_guid) |g| self.discovery.retractReader(g);
+        if (found_guid) |g| if (!handed_off) self.retractDeleted(.reader, g);
         if (found_proto) |p| p.deinit();
     }
 
@@ -3238,6 +3264,12 @@ pub const DomainParticipantImpl = struct {
         // current generation. Unless settled already, data from the writer
         // is held until every match below is made (see settleWriterLocked).
         const gen = self.newDiscoveryGenLocked(data.guid);
+        // A refresh a matched reader no longer matches unmatches it, as a
+        // loss does for that reader. Room is made first, as in onWriterLost;
+        // without it, no match is removed.
+        var removed: std.ArrayListUnmanaged(RemovedWriterJob) = .empty;
+        defer removed.deinit(self.alloc);
+        const can_unmatch = if (removed.ensureTotalCapacityPrecise(self.alloc, self.active_readers.count())) |_| true else |_| false;
         var ar_it = self.active_readers.valueIterator();
         while (ar_it.next()) |ar| {
             if (!std.mem.eql(u8, ar.topic_name, data.topic_name)) continue;
@@ -3260,10 +3292,14 @@ pub const DomainParticipantImpl = struct {
             const result = qm_mod.checkDiscovered(data.qos, &local_rd);
             if (!result.isCompatible()) {
                 ar.incompat_pending.record(result.incompatible);
+                if (can_unmatch) unmatchWriterLocked(ar, data.guid, &removed);
                 continue;
             }
             const part_result = qm_mod.checkPartition(data.partition_names, ar.partition_names);
-            if (!part_result.isCompatible()) continue;
+            if (!part_result.isCompatible()) {
+                if (can_unmatch) unmatchWriterLocked(ar, data.guid, &removed);
+                continue;
+            }
             const g = gen orelse continue;
             // Defer the actual addMatchedWriter (and its initial ACKNACK/
             // replay send) until after self.mu is released below: it
@@ -3319,6 +3355,7 @@ pub const DomainParticipantImpl = struct {
             if (self.builtin_sub) |bs| push_topic_dr = bs.topic_dr;
         }
         self.mu.unlock();
+        fireRemovedWriterJobs(removed.items, data.guid);
         self.raiseIncompatQos(.readers);
         for (jobs.items) |job| {
             // Only a new protocol-level match changes the matched status:
@@ -3410,30 +3447,7 @@ pub const DomainParticipantImpl = struct {
         // writer entry that nothing will ever clean up (Greptile review).
         const swept = if (jobs.ensureTotalCapacityPrecise(self.alloc, self.active_readers.count())) |_| blk: {
             var ar_it2 = self.active_readers.valueIterator();
-            while (ar_it2.next()) |ar| {
-                const before = ar.proto.matchedWriterCount();
-                const deferred = ar.proto.removeMatchedWriterDeferred(guid);
-                const matched_changed = ar.proto.matchedWriterCount() < before;
-                if (deferred.ready == null and deferred.unmatched_fn == null and deferred.lost == null and !matched_changed) continue;
-                const notify: ?MatchedNotify = if (matched_changed) ar.matched_notify else null;
-                const nq = if (notify) |cb| cb.quiesceAcquire() else false;
-                // ar.proto is provably still alive and not yet tearing
-                // down here (its removal from active_readers requires
-                // self.mu, which this thread holds), so this can't fail
-                // in practice; still handled defensively rather than
-                // asserted -- see RemovedWriterJob.proto_quiesced's doc
-                // comment for why this is needed at all.
-                const pq = ar.proto.quiesceAcquire();
-                jobs.appendAssumeCapacity(.{
-                    .ready_cb = deferred.ready,
-                    .notify = notify,
-                    .notify_quiesced = nq,
-                    .unmatched_ctx = deferred.unmatched_ctx,
-                    .unmatched_fn = deferred.unmatched_fn,
-                    .lost = deferred.lost,
-                    .proto_quiesced = if (pq) ar.proto else null,
-                });
-            }
+            while (ar_it2.next()) |ar| unmatchWriterLocked(ar, guid, &jobs);
             break :blk true;
         } else |_| false;
         if (swept) removeDiscoveredWriter(self, guid);
@@ -3444,8 +3458,43 @@ pub const DomainParticipantImpl = struct {
         if (self.builtin_sub) |bs| push_dr = bs.pub_dr;
         self.mu.unlock();
 
+        fireRemovedWriterJobs(jobs.items, guid);
+        if (swept) if (push_dr) |dr| pushBuiltinEndpointDisposed(dr, guid);
+    }
+
+    /// Removes the remote writer `guid`'s match from the local reader `ar`
+    /// now, and adds the callbacks the removal produces to `jobs`, which has
+    /// room, for `fireRemovedWriterJobs` once `mu` is released. With `mu`
+    /// held.
+    fn unmatchWriterLocked(ar: *ActiveReader, guid: Guid, jobs: *std.ArrayListUnmanaged(RemovedWriterJob)) void {
+        const before = ar.proto.matchedWriterCount();
+        const deferred = ar.proto.removeMatchedWriterDeferred(guid);
+        const matched_changed = ar.proto.matchedWriterCount() < before;
+        if (deferred.ready == null and deferred.unmatched_fn == null and deferred.lost == null and !matched_changed) return;
+        const notify: ?MatchedNotify = if (matched_changed) ar.matched_notify else null;
+        const nq = if (notify) |cb| cb.quiesceAcquire() else false;
+        // ar.proto is provably still alive and not yet tearing
+        // down here (its removal from active_readers requires
+        // self.mu, which this thread holds), so this can't fail
+        // in practice; still handled defensively rather than
+        // asserted -- see RemovedWriterJob.proto_quiesced's doc
+        // comment for why this is needed at all.
+        const pq = ar.proto.quiesceAcquire();
+        jobs.appendAssumeCapacity(.{
+            .ready_cb = deferred.ready,
+            .notify = notify,
+            .notify_quiesced = nq,
+            .unmatched_ctx = deferred.unmatched_ctx,
+            .unmatched_fn = deferred.unmatched_fn,
+            .lost = deferred.lost,
+            .proto_quiesced = if (pq) ar.proto else null,
+        });
+    }
+
+    /// Fires what `unmatchWriterLocked` collected, with `mu` released.
+    fn fireRemovedWriterJobs(jobs: []const RemovedWriterJob, guid: Guid) void {
         const remote_handle = writer_mod.guidToHandle(guid);
-        for (jobs.items) |job| {
+        for (jobs) |job| {
             if (job.lost) |l| l.on_lost(l.ctx, l.count);
             if (job.ready_cb) |cb| cb.on_ready(cb.ctx, guid, false);
             if (job.unmatched_fn) |f| f(job.unmatched_ctx.?, guid);
@@ -3453,7 +3502,6 @@ pub const DomainParticipantImpl = struct {
             if (job.notify_quiesced) job.notify.?.quiesceRelease();
             if (job.proto_quiesced) |p| p.quiesceRelease();
         }
-        if (swept) if (push_dr) |dr| pushBuiltinEndpointDisposed(dr, guid);
     }
 
     /// Looks up the VendorId of a previously-discovered participant by GUID
@@ -3519,6 +3567,9 @@ pub const DomainParticipantImpl = struct {
         }
         // As in onWriterDiscovered.
         const gen = self.newDiscoveryGenLocked(data.guid);
+        var removed: std.ArrayListUnmanaged(RemovedReaderJob) = .empty;
+        defer removed.deinit(self.alloc);
+        const can_unmatch = if (removed.ensureTotalCapacityPrecise(self.alloc, self.active_writers.count())) |_| true else |_| false;
         var aw_it = self.active_writers.valueIterator();
         while (aw_it.next()) |aw| {
             if (!std.mem.eql(u8, aw.topic_name, data.topic_name)) continue;
@@ -3546,10 +3597,14 @@ pub const DomainParticipantImpl = struct {
             const result = qm_mod.checkDiscovered(&local_wd, data.qos);
             if (!result.isCompatible()) {
                 aw.incompat_pending.record(result.incompatible);
+                if (can_unmatch) unmatchReaderLocked(aw, data.guid, &removed);
                 continue;
             }
             const part_result = qm_mod.checkPartition(aw.partition_names, data.partition_names);
-            if (!part_result.isCompatible()) continue;
+            if (!part_result.isCompatible()) {
+                if (can_unmatch) unmatchReaderLocked(aw, data.guid, &removed);
+                continue;
+            }
             const g = gen orelse continue;
             // See onWriterDiscovered's matching comment: defer the actual
             // addMatchedReader (and its initial HEARTBEAT/replay send)
@@ -3597,6 +3652,7 @@ pub const DomainParticipantImpl = struct {
             if (self.builtin_sub) |bs| push_topic_dr = bs.topic_dr;
         }
         self.mu.unlock();
+        fireRemovedReaderJobs(removed.items, data.guid);
         self.raiseIncompatQos(.writers);
         for (jobs.items) |job| {
             // Only a new protocol-level match changes the matched status:
@@ -3645,35 +3701,44 @@ pub const DomainParticipantImpl = struct {
         self.withdrawDiscoveryGenLocked(guid);
         const swept = if (jobs.ensureTotalCapacityPrecise(self.alloc, self.active_writers.count())) |_| blk: {
             var aw_it = self.active_writers.valueIterator();
-            while (aw_it.next()) |aw| {
-                const before = aw.proto.matchedReaderCount();
-                const ready_cb = aw.proto.removeMatchedReaderDeferred(guid);
-                const matched_changed = aw.proto.matchedReaderCount() < before;
-                if (ready_cb == null and !matched_changed) continue;
-                const notify: ?MatchedNotify = if (matched_changed) aw.matched_notify else null;
-                const nq = if (notify) |cb| cb.quiesceAcquire() else false;
-                const pq = aw.proto.quiesceAcquire();
-                jobs.appendAssumeCapacity(.{
-                    .ready_cb = ready_cb,
-                    .notify = notify,
-                    .notify_quiesced = nq,
-                    .proto_quiesced = if (pq) aw.proto else null,
-                });
-            }
+            while (aw_it.next()) |aw| unmatchReaderLocked(aw, guid, &jobs);
             break :blk true;
         } else |_| false;
         if (swept) removeDiscoveredReader(self, guid);
         if (self.builtin_sub) |bs| push_dr = bs.sub_dr;
         self.mu.unlock();
 
+        fireRemovedReaderJobs(jobs.items, guid);
+        if (swept) if (push_dr) |dr| pushBuiltinEndpointDisposed(dr, guid);
+    }
+
+    /// `unmatchWriterLocked`, for the remote reader `guid` and the local
+    /// writer `aw`.
+    fn unmatchReaderLocked(aw: *ActiveWriter, guid: Guid, jobs: *std.ArrayListUnmanaged(RemovedReaderJob)) void {
+        const before = aw.proto.matchedReaderCount();
+        const ready_cb = aw.proto.removeMatchedReaderDeferred(guid);
+        const matched_changed = aw.proto.matchedReaderCount() < before;
+        if (ready_cb == null and !matched_changed) return;
+        const notify: ?MatchedNotify = if (matched_changed) aw.matched_notify else null;
+        const nq = if (notify) |cb| cb.quiesceAcquire() else false;
+        const pq = aw.proto.quiesceAcquire();
+        jobs.appendAssumeCapacity(.{
+            .ready_cb = ready_cb,
+            .notify = notify,
+            .notify_quiesced = nq,
+            .proto_quiesced = if (pq) aw.proto else null,
+        });
+    }
+
+    /// `fireRemovedWriterJobs`, for `unmatchReaderLocked`.
+    fn fireRemovedReaderJobs(jobs: []const RemovedReaderJob, guid: Guid) void {
         const remote_handle = writer_mod.guidToHandle(guid);
-        for (jobs.items) |job| {
+        for (jobs) |job| {
             if (job.ready_cb) |cb| cb.on_ready(cb.ctx, guid, false);
             if (job.notify) |cb| if (job.notify_quiesced) cb.notify(cb.ctx, remote_handle, false);
             if (job.notify_quiesced) job.notify.?.quiesceRelease();
             if (job.proto_quiesced) |p| p.quiesceRelease();
         }
-        if (swept) if (push_dr) |dr| pushBuiltinEndpointDisposed(dr, guid);
     }
 
     // ── Discovered writer/reader registry (retroactive matching) ─────────────
@@ -3811,6 +3876,26 @@ pub const DomainParticipantImpl = struct {
 
     // ── ParticipantCbs factory helpers ────────────────────────────────────────
 
+    /// `dupePartitionNames`, failing rather than dropping the names.
+    fn dupePartitionNamesOrFail(alloc: std.mem.Allocator, names: []const []const u8) ![]const []const u8 {
+        if (names.len == 0) return &.{};
+        const copy = try alloc.alloc([]const u8, names.len);
+        for (copy, names, 0..) |*dst, src, i| {
+            dst.* = alloc.dupe(u8, src) catch |err| {
+                for (copy[0..i]) |s| alloc.free(s);
+                alloc.free(copy);
+                return err;
+            };
+        }
+        return copy;
+    }
+
+    fn partitionNamesEql(a: []const []const u8, b: []const []const u8) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+        return true;
+    }
+
     fn dupePartitionNames(alloc: std.mem.Allocator, names: []const []const u8) []const []const u8 {
         if (names.len == 0) return &.{};
         const copy = alloc.alloc([]const u8, names.len) catch return &.{};
@@ -3839,8 +3924,75 @@ pub const DomainParticipantImpl = struct {
         multicast_locs: []const Locator,
     };
 
-    fn pubAnnounceProtoWriter(ctx: *anyopaque, handle: DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void {
+    /// A local endpoint whose announcement is being committed to discovery
+    /// (docs/design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal).
+    const Announcing = struct {
+        guid: Guid,
+        count: u32,
+        /// It was deleted meanwhile: the last commit disposes of it, after
+        /// itself, so no announcement follows its disposal.
+        dispose: bool = false,
+    };
+
+    /// Makes room in `announcing` for every local endpoint. With `mu` held.
+    fn reserveAnnouncingLocked(self: *Self) !void {
+        const n = self.announcing.items.len + self.active_writers.count() + self.active_readers.count();
+        try self.announcing.ensureTotalCapacity(self.alloc, n);
+    }
+
+    /// Records a commit of `guid`'s announcement as under way. With `mu` held.
+    fn beginAnnouncingLocked(self: *Self, guid: Guid) void {
+        for (self.announcing.items) |*a| if (a.guid.eql(guid)) {
+            a.count += 1;
+            return;
+        };
+        self.announcing.appendAssumeCapacity(.{ .guid = guid, .count = 1 });
+    }
+
+    /// Ends a commit of `guid`'s announcement. Returns whether the endpoint
+    /// was deleted meanwhile and its disposal now falls to the caller.
+    fn finishAnnouncing(self: *Self, guid: Guid) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.announcing.items, 0..) |*a, i| if (a.guid.eql(guid)) {
+            a.count -= 1;
+            if (a.count > 0) return false;
+            const dispose = a.dispose;
+            _ = self.announcing.swapRemove(i);
+            return dispose;
+        };
+        return false;
+    }
+
+    /// For the deletion of `guid`: leaves its disposal to a commit of its
+    /// announcement under way, if there is one. With `mu` held.
+    fn handOffDisposalLocked(self: *Self, guid: Guid) bool {
+        for (self.announcing.items) |*a| if (a.guid.eql(guid)) {
+            a.dispose = true;
+            return true;
+        };
+        return false;
+    }
+
+    /// Disposes of the deleted local endpoint `guid` once no preparation
+    /// of its announcement is under way, so none is left behind.
+    fn retractDeleted(self: *Self, comptime kind: enum { writer, reader }, guid: Guid) void {
+        self.prepare_mu.lock();
+        self.prepare_mu.unlock();
+        switch (kind) {
+            .writer => self.discovery.retractWriter(guid),
+            .reader => self.discovery.retractReader(guid),
+        }
+    }
+
+    /// Has discovery prepare the writer `handle`'s announcement with the
+    /// Publisher's `partition_names` and `presentation`, unless it holds
+    /// one with them already. Fails, changing nothing, when discovery cannot
+    /// reserve what announcing and later disposing the writer needs.
+    fn pubPrepareProtoWriter(ctx: *anyopaque, handle: DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void {
         const self = cast(ctx);
+        self.prepare_mu.lock();
+        defer self.prepare_mu.unlock();
         // Derive group GUID for GROUP-scope coherent publishers (PID_GROUP_GUID).
         // All writers in the same publisher share this GUID so that remote GROUP
         // subscribers can associate them into the same coherent group.
@@ -3860,103 +4012,136 @@ pub const DomainParticipantImpl = struct {
                 },
             };
         } else null;
-        // Find the writer and copy its announcement, for writing after the
-        // lock is released: a deletion in between frees the writer's own
-        // storage (pubDestroyProtoWriter) and can let its topic be deleted.
+        var owned_names: []const []const u8 = &.{};
+        errdefer freePartitionNames(self.alloc, owned_names);
+        // Copied, for preparing after the lock is released: a deletion in
+        // between frees the writer's own storage and can let its topic be
+        // deleted.
+        var ann: ?disc.WriterAnnouncement = null;
+        defer if (ann) |*a| a.deinit(self.alloc);
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            const aw = self.findActiveWriterLocked(handle) orelse return;
+            if (aw.prepared and partitionNamesEql(aw.partition_names, partition_names) and
+                std.meta.eql(aw.presentation, presentation)) return;
+            try self.reserveAnnouncingLocked();
+            owned_names = try dupePartitionNamesOrFail(self.alloc, partition_names);
+            const borrowed: disc.WriterAnnouncement = .{
+                .guid = aw.guid,
+                .participant_guid = self.guid,
+                .group_guid = group_guid,
+                .topic_name = aw.topic_name,
+                .type_name = aw.type_name,
+                .qos = aw.qos,
+                .presentation = presentation,
+                .partition_names = owned_names,
+                .type_object = &.{},
+                .type_info_cdr = self.type_info_registry.get(aw.type_name) orelse &.{},
+            };
+            ann = try borrowed.clone(self.alloc);
+        }
+        try self.discovery.prepareWriter(&ann.?);
+        self.mu.lock();
+        defer self.mu.unlock();
+        // Deleted meanwhile: its deletion retracts what was prepared.
+        const aw = self.active_writers.getPtr(entityIdKey(ann.?.guid.entity_id)) orelse {
+            freePartitionNames(self.alloc, owned_names);
+            return;
+        };
+        freePartitionNames(self.alloc, aw.partition_names);
+        aw.partition_names = owned_names;
+        aw.presentation = presentation;
+        aw.prepared = true;
+    }
+
+    fn findActiveWriterLocked(self: *Self, handle: DDS.InstanceHandle_t) ?*ActiveWriter {
+        var it = self.active_writers.valueIterator();
+        while (it.next()) |aw| if (aw.handle == handle) return aw;
+        return null;
+    }
+
+    fn findActiveReaderLocked(self: *Self, handle: DDS.InstanceHandle_t) ?*ActiveReader {
+        var it = self.active_readers.valueIterator();
+        while (it.next()) |ar| if (ar.handle == handle) return ar;
+        return null;
+    }
+
+    /// Announces the writer `handle`, prepared already, matching it with the
+    /// readers discovered before it, and commits its announcement to
+    /// discovery. A deletion while it is committed leaves the disposal to
+    /// this, after the announcement.
+    fn pubAnnounceProtoWriter(ctx: *anyopaque, handle: DDS.InstanceHandle_t) void {
+        const self = cast(ctx);
         var guid_opt: ?Guid = null;
-        var ann_opt: ?disc.WriterAnnouncement = null;
-        defer if (ann_opt) |*a| a.deinit(self.alloc);
-        const owned_names = dupePartitionNames(self.alloc, partition_names);
         var jobs: std.ArrayListUnmanaged(AnnounceMatchedReaderJob) = .empty;
         defer jobs.deinit(self.alloc);
         {
             self.mu.lock();
             defer self.mu.unlock();
-            var aw_it3 = self.active_writers.valueIterator();
-            while (aw_it3.next()) |aw| {
-                if (aw.handle == handle) {
-                    freePartitionNames(self.alloc, aw.partition_names);
-                    aw.partition_names = owned_names;
-                    aw.presentation = presentation;
-                    guid_opt = aw.guid;
-                    const ann: disc.WriterAnnouncement = .{
-                        .guid = aw.guid,
-                        .participant_guid = self.guid,
-                        .group_guid = group_guid,
-                        .topic_name = aw.topic_name,
-                        .type_name = aw.type_name,
-                        .qos = aw.qos,
-                        .presentation = presentation,
-                        .partition_names = owned_names,
-                        .type_object = &.{},
-                        .type_info_cdr = self.type_info_registry.get(aw.type_name) orelse &.{},
-                    };
-                    ann_opt = ann.clone(self.alloc) catch |err| blk: {
-                        log_mod.dcps.warn("participant: failed to announce writer through SEDP: {s}", .{@errorName(err)});
-                        break :blk null;
-                    };
-                    // Retroactively match against readers discovered before this
-                    // writer existed (or before it announced final partition/
-                    // presentation QoS) — onReaderDiscovered only scans writers
-                    // that already exist at the moment a reader is discovered, so
-                    // without this a reader discovered first would never be matched.
-                    const local_wd = disc_adapter.writerDiscoveredData(aw.qos, aw.presentation);
-                    reader_scan: for (self.discovered_readers.items) |*dr| {
-                        // Mirrors onReaderDiscovered's own ignore-list guards (see that
-                        // function, above) -- see subAnnounceProtoReader's matching
-                        // comment (the symmetric fix on the reader side) for why this
-                        // is needed: a reader ignored before this writer existed still
-                        // sits in self.discovered_readers, and without these checks a
-                        // writer created *after* the ignore call would retroactively
-                        // re-match it here.
-                        for (self.ignored_prefixes.items) |p| {
-                            if (p.eql(dr.guid.prefix)) continue :reader_scan;
-                        }
-                        const dr_sub_handle = writer_mod.guidToHandle(dr.guid);
-                        for (self.ignored_subscription_handles.items) |h| {
-                            if (h == dr_sub_handle) continue :reader_scan;
-                        }
-                        for (self.ignored_topic_names.items) |n| {
-                            if (std.mem.eql(u8, n, dr.topic_name)) continue :reader_scan;
-                        }
-                        if (!std.mem.eql(u8, dr.topic_name, aw.topic_name)) continue;
-                        if (!std.mem.eql(u8, dr.type_name, aw.type_name)) continue;
-                        const result = qm_mod.checkDiscovered(&local_wd, &dr.qos);
-                        if (!result.isCompatible()) continue;
-                        const part_result = qm_mod.checkPartition(aw.partition_names, dr.partition_names);
-                        if (!part_result.isCompatible()) continue;
-                        // Installed only while the reader's current generation
-                        // is, as for a match made by its announcement.
-                        const g = self.currentDiscoveryGenLocked(dr.guid) orelse continue;
-                        // See onWriterDiscovered's matching comment: defer the
-                        // actual addMatchedReader send until after self.mu is
-                        // released below. dr.unicast_locators/multicast_locators
-                        // are borrowed from self.discovered_readers, which a
-                        // concurrent discovery callback could mutate/reallocate
-                        // once unlocked -- dupe them into job-owned memory now,
-                        // under the lock, rather than deferring that too.
-                        if (!aw.proto.quiesceAcquire()) continue;
-                        const uloc = dupeLocators(self.alloc, dr.unicast_locators);
-                        const mloc = dupeLocators(self.alloc, dr.multicast_locators);
-                        var info = self.buildMatchedReaderInfo(dr.guid, &dr.qos, uloc, mloc);
-                        info.currency = self.matchCurrency(g);
-                        const nq = if (aw.matched_notify) |cb| cb.quiesceAcquire() else false;
-                        jobs.append(self.alloc, .{
-                            .proto = aw.proto,
-                            .info = info,
-                            .notify = aw.matched_notify,
-                            .notify_quiesced = nq,
-                            .remote_guid = dr.guid,
-                            .unicast_locs = uloc,
-                            .multicast_locs = mloc,
-                        }) catch {
-                            aw.proto.quiesceRelease();
-                            if (nq) aw.matched_notify.?.quiesceRelease();
-                            self.alloc.free(uloc);
-                            self.alloc.free(mloc);
-                        };
+            if (self.findActiveWriterLocked(handle)) |aw| {
+                guid_opt = aw.guid;
+                self.beginAnnouncingLocked(aw.guid);
+                // Retroactively match against readers discovered before this
+                // writer existed (or before it announced final partition/
+                // presentation QoS) — onReaderDiscovered only scans writers
+                // that already exist at the moment a reader is discovered, so
+                // without this a reader discovered first would never be matched.
+                const local_wd = disc_adapter.writerDiscoveredData(aw.qos, aw.presentation);
+                reader_scan: for (self.discovered_readers.items) |*dr| {
+                    // Mirrors onReaderDiscovered's own ignore-list guards (see that
+                    // function, above) -- see subAnnounceProtoReader's matching
+                    // comment (the symmetric fix on the reader side) for why this
+                    // is needed: a reader ignored before this writer existed still
+                    // sits in self.discovered_readers, and without these checks a
+                    // writer created *after* the ignore call would retroactively
+                    // re-match it here.
+                    for (self.ignored_prefixes.items) |p| {
+                        if (p.eql(dr.guid.prefix)) continue :reader_scan;
                     }
-                    break;
+                    const dr_sub_handle = writer_mod.guidToHandle(dr.guid);
+                    for (self.ignored_subscription_handles.items) |h| {
+                        if (h == dr_sub_handle) continue :reader_scan;
+                    }
+                    for (self.ignored_topic_names.items) |n| {
+                        if (std.mem.eql(u8, n, dr.topic_name)) continue :reader_scan;
+                    }
+                    if (!std.mem.eql(u8, dr.topic_name, aw.topic_name)) continue;
+                    if (!std.mem.eql(u8, dr.type_name, aw.type_name)) continue;
+                    const result = qm_mod.checkDiscovered(&local_wd, &dr.qos);
+                    if (!result.isCompatible()) continue;
+                    const part_result = qm_mod.checkPartition(aw.partition_names, dr.partition_names);
+                    if (!part_result.isCompatible()) continue;
+                    // Installed only while the reader's current generation
+                    // is, as for a match made by its announcement.
+                    const g = self.currentDiscoveryGenLocked(dr.guid) orelse continue;
+                    // See onWriterDiscovered's matching comment: defer the
+                    // actual addMatchedReader send until after self.mu is
+                    // released below. dr.unicast_locators/multicast_locators
+                    // are borrowed from self.discovered_readers, which a
+                    // concurrent discovery callback could mutate/reallocate
+                    // once unlocked -- dupe them into job-owned memory now,
+                    // under the lock, rather than deferring that too.
+                    if (!aw.proto.quiesceAcquire()) continue;
+                    const uloc = dupeLocators(self.alloc, dr.unicast_locators);
+                    const mloc = dupeLocators(self.alloc, dr.multicast_locators);
+                    var info = self.buildMatchedReaderInfo(dr.guid, &dr.qos, uloc, mloc);
+                    info.currency = self.matchCurrency(g);
+                    const nq = if (aw.matched_notify) |cb| cb.quiesceAcquire() else false;
+                    jobs.append(self.alloc, .{
+                        .proto = aw.proto,
+                        .info = info,
+                        .notify = aw.matched_notify,
+                        .notify_quiesced = nq,
+                        .remote_guid = dr.guid,
+                        .unicast_locs = uloc,
+                        .multicast_locs = mloc,
+                    }) catch {
+                        aw.proto.quiesceRelease();
+                        if (nq) aw.matched_notify.?.quiesceRelease();
+                        self.alloc.free(uloc);
+                        self.alloc.free(mloc);
+                    };
                 }
             }
         }
@@ -3973,32 +4158,9 @@ pub const DomainParticipantImpl = struct {
             self.alloc.free(job.unicast_locs);
             self.alloc.free(job.multicast_locs);
         }
-        const guid = guid_opt orelse {
-            freePartitionNames(self.alloc, owned_names);
-            return;
-        };
-        const ann = ann_opt orelse return;
-        self.discovery.announceWriter(&ann) catch |err| {
-            log_mod.dcps.warn("participant: failed to announce writer through SEDP: {s}", .{@errorName(err)});
-        };
-        // A deletion while this was written may have disposed of the writer
-        // first; dispose again so the announcement doesn't outlive it.
-        if (!self.hasActiveWriter(guid)) self.discovery.retractWriter(guid);
-    }
-
-    /// Whether the local writer `guid` is still in `active_writers`, i.e.
-    /// not yet deleted (`pubDestroyProtoWriter` removes it before disposing).
-    fn hasActiveWriter(self: *Self, guid: Guid) bool {
-        self.mu.lock();
-        defer self.mu.unlock();
-        return self.active_writers.contains(entityIdKey(guid.entity_id));
-    }
-
-    /// The reader counterpart of `hasActiveWriter`.
-    fn hasActiveReader(self: *Self, guid: Guid) bool {
-        self.mu.lock();
-        defer self.mu.unlock();
-        return self.active_readers.contains(entityIdKey(guid.entity_id));
+        const guid = guid_opt orelse return;
+        self.discovery.announceWriter(guid);
+        if (self.finishAnnouncing(guid)) self.retractDeleted(.writer, guid);
     }
 
     const AnnounceMatchedWriterJob = struct {
@@ -4011,113 +4173,133 @@ pub const DomainParticipantImpl = struct {
         multicast_locs: []const Locator,
     };
 
-    fn subAnnounceProtoReader(ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void {
+    /// `pubPrepareProtoWriter`, for the reader `handle` and its
+    /// Subscriber's `partition_names` and `presentation`.
+    fn subPrepareProtoReader(ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void {
         const self = cast(ctx);
-        // As in pubAnnounceProtoWriter.
+        self.prepare_mu.lock();
+        defer self.prepare_mu.unlock();
+        var owned_names: []const []const u8 = &.{};
+        errdefer freePartitionNames(self.alloc, owned_names);
+        var ann: ?disc.ReaderAnnouncement = null;
+        defer if (ann) |*a| a.deinit(self.alloc);
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            const ar = self.findActiveReaderLocked(handle) orelse return;
+            if (ar.prepared and partitionNamesEql(ar.partition_names, partition_names) and
+                std.meta.eql(ar.presentation, presentation)) return;
+            try self.reserveAnnouncingLocked();
+            owned_names = try dupePartitionNamesOrFail(self.alloc, partition_names);
+            const borrowed: disc.ReaderAnnouncement = .{
+                .guid = ar.guid,
+                .participant_guid = self.guid,
+                .topic_name = ar.topic_name,
+                .type_name = ar.type_name,
+                .qos = ar.qos,
+                .presentation = presentation,
+                .partition_names = owned_names,
+                .type_info_cdr = self.type_info_registry.get(ar.type_name) orelse &.{},
+            };
+            ann = try borrowed.clone(self.alloc);
+        }
+        try self.discovery.prepareReader(&ann.?);
+        self.mu.lock();
+        defer self.mu.unlock();
+        const ar = self.active_readers.getPtr(entityIdKey(ann.?.guid.entity_id)) orelse {
+            freePartitionNames(self.alloc, owned_names);
+            return;
+        };
+        freePartitionNames(self.alloc, ar.partition_names);
+        ar.partition_names = owned_names;
+        ar.presentation = presentation;
+        ar.prepared = true;
+    }
+
+    /// `pubAnnounceProtoWriter`, for the reader `handle`.
+    fn subAnnounceProtoReader(ctx: *anyopaque, handle: DDS.InstanceHandle_t) void {
+        const self = cast(ctx);
         var guid_opt: ?Guid = null;
-        var ann_opt: ?disc.ReaderAnnouncement = null;
-        defer if (ann_opt) |*a| a.deinit(self.alloc);
-        const owned_names = dupePartitionNames(self.alloc, partition_names);
         var jobs: std.ArrayListUnmanaged(AnnounceMatchedWriterJob) = .empty;
         defer jobs.deinit(self.alloc);
         {
             self.mu.lock();
             defer self.mu.unlock();
-            var ar_it3 = self.active_readers.valueIterator();
-            while (ar_it3.next()) |ar| {
-                if (ar.handle == handle) {
-                    freePartitionNames(self.alloc, ar.partition_names);
-                    ar.partition_names = owned_names;
-                    ar.presentation = presentation;
-                    guid_opt = ar.guid;
-                    const ann: disc.ReaderAnnouncement = .{
-                        .guid = ar.guid,
-                        .participant_guid = self.guid,
-                        .topic_name = ar.topic_name,
-                        .type_name = ar.type_name,
-                        .qos = ar.qos,
-                        .presentation = presentation,
-                        .partition_names = owned_names,
-                        .type_info_cdr = self.type_info_registry.get(ar.type_name) orelse &.{},
-                    };
-                    ann_opt = ann.clone(self.alloc) catch |err| blk: {
-                        log_mod.dcps.warn("participant: failed to announce reader through SEDP: {s}", .{@errorName(err)});
-                        break :blk null;
-                    };
-                    // Retroactively match against writers discovered before this
-                    // reader existed (or before it announced final partition/
-                    // presentation QoS) — onWriterDiscovered only scans readers
-                    // that already exist at the moment a writer is discovered, so
-                    // without this a writer discovered first would never be matched.
-                    const local_rd = disc_adapter.readerDiscoveredData(ar.qos, ar.presentation);
-                    writer_scan: for (self.discovered_writers.items) |*dw| {
-                        // Mirrors onWriterDiscovered's own ignore-list guards (see that
-                        // function, above): a writer ignored (by prefix, handle, or
-                        // topic name) *before* this reader existed still sits in
-                        // self.discovered_writers -- ignore_*() never retroactively
-                        // purges the cache, only blocks future live discoveries -- so
-                        // without these checks a reader created *after* the ignore
-                        // call would retroactively re-match it here. Found building
-                        // integration-tests/ignore-entities -- see
-                        // docs/design/integration-test-tier.md.
-                        for (self.ignored_prefixes.items) |p| {
-                            if (p.eql(dw.guid.prefix)) continue :writer_scan;
-                        }
-                        const dw_pub_handle = writer_mod.guidToHandle(dw.guid);
-                        for (self.ignored_publication_handles.items) |h| {
-                            if (h == dw_pub_handle) continue :writer_scan;
-                        }
-                        for (self.ignored_topic_names.items) |n| {
-                            if (std.mem.eql(u8, n, dw.topic_name)) continue :writer_scan;
-                        }
-                        if (!std.mem.eql(u8, dw.topic_name, ar.topic_name)) continue;
-                        if (!std.mem.eql(u8, dw.type_name, ar.type_name)) continue;
-                        const result = qm_mod.checkDiscovered(&dw.qos, &local_rd);
-                        if (!result.isCompatible()) {
-                            // Mirrors onWriterDiscovered's live-discovery path below --
-                            // without this, a writer whose (incompatible) SEDP
-                            // announcement won the race against this reader's own
-                            // creation was silently skipped here with no
-                            // REQUESTED_INCOMPATIBLE_QOS notification at all, ever
-                            // (onWriterDiscovered never gets a second chance to see
-                            // this reader, since it only scans readers that already
-                            // exist at discovery time -- this retroactive path is the
-                            // only place that ever looks at this pairing again).
-                            ar.incompat_pending.record(result.incompatible);
-                            continue;
-                        }
-                        const part_result = qm_mod.checkPartition(dw.partition_names, ar.partition_names);
-                        if (!part_result.isCompatible()) continue;
-                        // Installed only while the writer's current generation
-                        // is, as for a match made by its announcement.
-                        const g = self.currentDiscoveryGenLocked(dw.guid) orelse continue;
-                        // See onWriterDiscovered's matching comment: defer the
-                        // actual addMatchedWriter send until after self.mu is
-                        // released below, duping dw's locators (borrowed from
-                        // self.discovered_writers) into job-owned memory now.
-                        if (!ar.proto.quiesceAcquire()) continue;
-                        const uloc = dupeLocators(self.alloc, dw.unicast_locators);
-                        const mloc = dupeLocators(self.alloc, dw.multicast_locators);
-                        var info = buildMatchedWriterInfo(dw.guid, &dw.qos, uloc, mloc);
-                        info.prematch = self.prematchFor(ar);
-                        info.currency = self.matchCurrency(g);
-                        const nq = if (ar.matched_notify) |cb| cb.quiesceAcquire() else false;
-                        jobs.append(self.alloc, .{
-                            .proto = ar.proto,
-                            .info = info,
-                            .notify = ar.matched_notify,
-                            .notify_quiesced = nq,
-                            .remote_guid = dw.guid,
-                            .unicast_locs = uloc,
-                            .multicast_locs = mloc,
-                        }) catch {
-                            ar.proto.quiesceRelease();
-                            if (nq) ar.matched_notify.?.quiesceRelease();
-                            self.alloc.free(uloc);
-                            self.alloc.free(mloc);
-                        };
+            if (self.findActiveReaderLocked(handle)) |ar| {
+                guid_opt = ar.guid;
+                self.beginAnnouncingLocked(ar.guid);
+                // Retroactively match against writers discovered before this
+                // reader existed (or before it announced final partition/
+                // presentation QoS) — onWriterDiscovered only scans readers
+                // that already exist at the moment a writer is discovered, so
+                // without this a writer discovered first would never be matched.
+                const local_rd = disc_adapter.readerDiscoveredData(ar.qos, ar.presentation);
+                writer_scan: for (self.discovered_writers.items) |*dw| {
+                    // Mirrors onWriterDiscovered's own ignore-list guards (see that
+                    // function, above): a writer ignored (by prefix, handle, or
+                    // topic name) *before* this reader existed still sits in
+                    // self.discovered_writers -- ignore_*() never retroactively
+                    // purges the cache, only blocks future live discoveries -- so
+                    // without these checks a reader created *after* the ignore
+                    // call would retroactively re-match it here. Found building
+                    // integration-tests/ignore-entities -- see
+                    // docs/design/integration-test-tier.md.
+                    for (self.ignored_prefixes.items) |p| {
+                        if (p.eql(dw.guid.prefix)) continue :writer_scan;
                     }
-                    break;
+                    const dw_pub_handle = writer_mod.guidToHandle(dw.guid);
+                    for (self.ignored_publication_handles.items) |h| {
+                        if (h == dw_pub_handle) continue :writer_scan;
+                    }
+                    for (self.ignored_topic_names.items) |n| {
+                        if (std.mem.eql(u8, n, dw.topic_name)) continue :writer_scan;
+                    }
+                    if (!std.mem.eql(u8, dw.topic_name, ar.topic_name)) continue;
+                    if (!std.mem.eql(u8, dw.type_name, ar.type_name)) continue;
+                    const result = qm_mod.checkDiscovered(&dw.qos, &local_rd);
+                    if (!result.isCompatible()) {
+                        // Mirrors onWriterDiscovered's live-discovery path below --
+                        // without this, a writer whose (incompatible) SEDP
+                        // announcement won the race against this reader's own
+                        // creation was silently skipped here with no
+                        // REQUESTED_INCOMPATIBLE_QOS notification at all, ever
+                        // (onWriterDiscovered never gets a second chance to see
+                        // this reader, since it only scans readers that already
+                        // exist at discovery time -- this retroactive path is the
+                        // only place that ever looks at this pairing again).
+                        ar.incompat_pending.record(result.incompatible);
+                        continue;
+                    }
+                    const part_result = qm_mod.checkPartition(dw.partition_names, ar.partition_names);
+                    if (!part_result.isCompatible()) continue;
+                    // Installed only while the writer's current generation
+                    // is, as for a match made by its announcement.
+                    const g = self.currentDiscoveryGenLocked(dw.guid) orelse continue;
+                    // See onWriterDiscovered's matching comment: defer the
+                    // actual addMatchedWriter send until after self.mu is
+                    // released below, duping dw's locators (borrowed from
+                    // self.discovered_writers) into job-owned memory now.
+                    if (!ar.proto.quiesceAcquire()) continue;
+                    const uloc = dupeLocators(self.alloc, dw.unicast_locators);
+                    const mloc = dupeLocators(self.alloc, dw.multicast_locators);
+                    var info = buildMatchedWriterInfo(dw.guid, &dw.qos, uloc, mloc);
+                    info.prematch = self.prematchFor(ar);
+                    info.currency = self.matchCurrency(g);
+                    const nq = if (ar.matched_notify) |cb| cb.quiesceAcquire() else false;
+                    jobs.append(self.alloc, .{
+                        .proto = ar.proto,
+                        .info = info,
+                        .notify = ar.matched_notify,
+                        .notify_quiesced = nq,
+                        .remote_guid = dw.guid,
+                        .unicast_locs = uloc,
+                        .multicast_locs = mloc,
+                    }) catch {
+                        ar.proto.quiesceRelease();
+                        if (nq) ar.matched_notify.?.quiesceRelease();
+                        self.alloc.free(uloc);
+                        self.alloc.free(mloc);
+                    };
                 }
             }
         }
@@ -4135,16 +4317,9 @@ pub const DomainParticipantImpl = struct {
             self.alloc.free(job.unicast_locs);
             self.alloc.free(job.multicast_locs);
         }
-        const guid = guid_opt orelse {
-            freePartitionNames(self.alloc, owned_names);
-            return;
-        };
-        const ann = ann_opt orelse return;
-        self.discovery.announceReader(&ann) catch |err| {
-            log_mod.dcps.warn("participant: failed to announce reader through SEDP: {s}", .{@errorName(err)});
-        };
-        // As in pubAnnounceProtoWriter.
-        if (!self.hasActiveReader(guid)) self.discovery.retractReader(guid);
+        const guid = guid_opt orelse return;
+        self.discovery.announceReader(guid);
+        if (self.finishAnnouncing(guid)) self.retractDeleted(.reader, guid);
     }
 
     fn pubRegisterWriterIncompatQos(
@@ -4358,6 +4533,7 @@ pub const DomainParticipantImpl = struct {
             .destroy_proto_writer = pubDestroyProtoWriter,
             .register_incompat_qos = pubRegisterWriterIncompatQos,
             .register_matched_notify = pubRegisterWriterMatchedNotify,
+            .prepare_writer = pubPrepareProtoWriter,
             .announce_writer = pubAnnounceProtoWriter,
             .timer_clock = self.timer_clock,
             .register_timer_notify = pubRegisterWriterTimerNotify,
@@ -4376,6 +4552,7 @@ pub const DomainParticipantImpl = struct {
             .destroy_proto_reader = subDestroyProtoReader,
             .register_incompat_qos = subRegisterReaderIncompatQos,
             .register_matched_notify = subRegisterReaderMatchedNotify,
+            .prepare_reader = subPrepareProtoReader,
             .announce_reader = subAnnounceProtoReader,
             .timer_clock = self.timer_clock,
             .register_timer_notify = subRegisterReaderTimerNotify,

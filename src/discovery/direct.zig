@@ -54,6 +54,10 @@ pub const DiscoveryBus = struct {
         data_locators: []Locator,
         writers: std.ArrayListUnmanaged(WriterAnnouncement),
         readers: std.ArrayListUnmanaged(ReaderAnnouncement),
+        /// Endpoints prepared and not yet announced: `writers` and `readers`
+        /// keep capacity for them on top of their items.
+        reserved_writers: usize = 0,
+        reserved_readers: usize = 0,
 
         fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
             alloc.free(self.data_locators);
@@ -225,44 +229,68 @@ pub const DiscoveryBus = struct {
         }
     }
 
-    fn busAnnounceWriter(self: *DiscoveryBus, participant_guid: Guid, info: *const WriterAnnouncement) !void {
+    const Kind = enum { writers, readers };
+
+    /// Makes room in participant `participant_guid`'s entry for `n` endpoints
+    /// of `kind`, announced later without allocating.
+    fn busReserve(self: *DiscoveryBus, participant_guid: Guid, comptime kind: Kind, n: usize) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const e = self.findLocked(participant_guid) orelse return;
+        const list = &@field(e, @tagName(kind));
+        const reserved = &@field(e, "reserved_" ++ @tagName(kind));
+        try list.ensureTotalCapacity(self.alloc, list.items.len + reserved.* + n);
+        reserved.* += n;
+    }
+
+    /// Gives back room for `n` endpoints of `kind` never announced.
+    fn busRelease(self: *DiscoveryBus, participant_guid: Guid, comptime kind: Kind, n: usize) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const e = self.findLocked(participant_guid) orelse return;
+        @field(e, "reserved_" ++ @tagName(kind)) -= n;
+    }
+
+    /// Stores `owned` in its participant's entry, in the room `busReserve`
+    /// made when `first` (otherwise in place of its earlier copy), and tells
+    /// the other participants. Telling them needs copies, so out of memory
+    /// it may miss some, which in-process delivery cannot repair.
+    fn busAnnounceWriter(self: *DiscoveryBus, participant_guid: Guid, owned: WriterAnnouncement, first: bool) void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         var snapshots: [64]EntrySnapshot = undefined;
         var snap_count: usize = 0;
         var writer_data_locs: []const Locator = &.{};
         var own_callbacks: ?Callbacks = null;
+        var info: ?WriterAnnouncement = null;
 
         {
             self.mu.lock();
             defer self.mu.unlock();
-            const own = self.findLocked(participant_guid);
-            const own_domain_id = if (own) |e| e.domain_id else 0;
-            // Same-domain peers, copied before the writer is stored so a
-            // failed copy stores nothing.
-            for (self.entries.items) |*e| {
-                if (e == own or e.domain_id != own_domain_id) continue;
+            const e = self.findLocked(participant_guid) orelse {
+                var o = owned;
+                o.deinit(self.alloc);
+                return;
+            };
+            storeEndpoint(WriterAnnouncement, self.alloc, &e.writers, &e.reserved_writers, owned, first);
+            // A copy to tell from: the stored one is the entry's.
+            info = owned.clone(arena.allocator()) catch null;
+            writer_data_locs = arena.allocator().dupe(Locator, e.data_locators) catch &.{};
+            own_callbacks = e.callbacks;
+            // Same-domain peers.
+            for (self.entries.items) |*peer| {
+                if (peer == e or peer.domain_id != e.domain_id) continue;
                 if (snap_count < snapshots.len) {
-                    snapshots[snap_count] = try EntrySnapshot.copy(e, arena.allocator(), .{ .writers = false, .readers = true });
+                    snapshots[snap_count] = EntrySnapshot.copy(peer, arena.allocator(), .{ .writers = false, .readers = true }) catch continue;
                     snap_count += 1;
                 }
             }
-            if (own) |e| {
-                writer_data_locs = try arena.allocator().dupe(Locator, e.data_locators);
-                // Kept until retracted: the announcement's slices are only
-                // borrowed for this call.
-                var owned = try info.clone(self.alloc);
-                e.writers.append(self.alloc, owned) catch |err| {
-                    owned.deinit(self.alloc);
-                    return err;
-                };
-                own_callbacks = e.callbacks;
-            }
         }
+        const ann = info orelse return;
 
         // Tell other participants about this new writer.
-        var wq = disc_adapter.writerDiscoveredData(info.qos, info.presentation);
-        const wd = makeWriterData(info, &wq, writer_data_locs);
+        var wq = disc_adapter.writerDiscoveredData(ann.qos, ann.presentation);
+        const wd = makeWriterData(&ann, &wq, writer_data_locs);
         for (snapshots[0..snap_count]) |snap| {
             snap.callbacks.on_writer_discovered(snap.callbacks.ctx, &wd);
         }
@@ -320,37 +348,37 @@ pub const DiscoveryBus = struct {
         }
     }
 
-    fn busAnnounceReader(self: *DiscoveryBus, participant_guid: Guid, info: *const ReaderAnnouncement) !void {
+    /// `busAnnounceWriter`, for a reader.
+    fn busAnnounceReader(self: *DiscoveryBus, participant_guid: Guid, owned: ReaderAnnouncement, first: bool) void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         var snapshots: [64]EntrySnapshot = undefined;
         var snap_count: usize = 0;
         var reader_data_locs: []const Locator = &.{};
         var own_callbacks: ?Callbacks = null;
+        var info: ?ReaderAnnouncement = null;
 
-        // As in busAnnounceWriter.
         {
             self.mu.lock();
             defer self.mu.unlock();
-            const own = self.findLocked(participant_guid);
-            const own_domain_id = if (own) |e| e.domain_id else 0;
-            for (self.entries.items) |*e| {
-                if (e == own or e.domain_id != own_domain_id) continue;
+            const e = self.findLocked(participant_guid) orelse {
+                var o = owned;
+                o.deinit(self.alloc);
+                return;
+            };
+            storeEndpoint(ReaderAnnouncement, self.alloc, &e.readers, &e.reserved_readers, owned, first);
+            info = owned.clone(arena.allocator()) catch null;
+            reader_data_locs = arena.allocator().dupe(Locator, e.data_locators) catch &.{};
+            own_callbacks = e.callbacks;
+            for (self.entries.items) |*peer| {
+                if (peer == e or peer.domain_id != e.domain_id) continue;
                 if (snap_count < snapshots.len) {
-                    snapshots[snap_count] = try EntrySnapshot.copy(e, arena.allocator(), .{ .writers = true, .readers = false });
+                    snapshots[snap_count] = EntrySnapshot.copy(peer, arena.allocator(), .{ .writers = true, .readers = false }) catch continue;
                     snap_count += 1;
                 }
             }
-            if (own) |e| {
-                reader_data_locs = try arena.allocator().dupe(Locator, e.data_locators);
-                var owned = try info.clone(self.alloc);
-                e.readers.append(self.alloc, owned) catch |err| {
-                    owned.deinit(self.alloc);
-                    return err;
-                };
-                own_callbacks = e.callbacks;
-            }
         }
+        const ann = info orelse return;
 
         // Tell the announcing participant about all existing writers on other
         // participants FIRST so it has WriterProxies in place before the writer
@@ -366,8 +394,8 @@ pub const DiscoveryBus = struct {
             }
         }
         // Tell other participants about this new reader.
-        var rq = disc_adapter.readerDiscoveredData(info.qos, info.presentation);
-        const rd = makeReaderData(info, &rq, reader_data_locs);
+        var rq = disc_adapter.readerDiscoveredData(ann.qos, ann.presentation);
+        const rd = makeReaderData(&ann, &rq, reader_data_locs);
         for (snapshots[0..snap_count]) |snap| {
             snap.callbacks.on_reader_discovered(snap.callbacks.ctx, &rd);
         }
@@ -415,6 +443,27 @@ pub const DiscoveryBus = struct {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// Puts `owned` in `list` without allocating: in a reserved slot when
+    /// `first`, else in place of the copy with its GUID.
+    fn storeEndpoint(
+        comptime T: type,
+        alloc: std.mem.Allocator,
+        list: *std.ArrayListUnmanaged(T),
+        reserved: *usize,
+        owned: T,
+        first: bool,
+    ) void {
+        if (!first) for (list.items) |*item| {
+            if (item.guid.eql(owned.guid)) {
+                item.deinit(alloc);
+                item.* = owned;
+                return;
+            }
+        };
+        reserved.* -= 1;
+        list.appendAssumeCapacity(owned);
+    }
 
     fn findLocked(self: *DiscoveryBus, participant_guid: Guid) ?*Entry {
         for (self.entries.items) |*e| {
@@ -510,6 +559,24 @@ pub const DirectDiscovery = struct {
     bus: *DiscoveryBus,
     participant_guid: Guid,
     started: bool,
+    mu: mutex_mod.Mutex = .{},
+    /// Guarded by `mu`: the bus has this participant's entry, in which each
+    /// prepared endpoint has room reserved.
+    joined: bool = false,
+    /// Guarded by `mu`: the local endpoints prepared and not yet retracted
+    /// (docs/design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal).
+    writers: std.AutoHashMapUnmanaged(Guid, Prepared(WriterAnnouncement)) = .empty,
+    readers: std.AutoHashMapUnmanaged(Guid, Prepared(ReaderAnnouncement)) = .empty,
+
+    fn Prepared(comptime T: type) type {
+        return struct {
+            /// To store on the next announce, until stored.
+            pending: ?T,
+            /// Room is reserved for it in the bus entry.
+            slot: bool,
+            announced: bool = false,
+        };
+    }
 
     pub fn init(alloc: std.mem.Allocator, bus: *DiscoveryBus) !*DirectDiscovery {
         const self = try alloc.create(DirectDiscovery);
@@ -523,6 +590,12 @@ pub const DirectDiscovery = struct {
     }
 
     pub fn deinit(self: *DirectDiscovery) void {
+        inline for (.{ &self.writers, &self.readers }) |map| {
+            var it = map.valueIterator();
+            while (it.next()) |p| if (p.pending) |*a| a.deinit(self.alloc);
+            map.deinit(self.alloc);
+        }
+        self.mu.deinit();
         self.alloc.destroy(self);
     }
 
@@ -540,39 +613,142 @@ pub const DirectDiscovery = struct {
         const self: *DirectDiscovery = @ptrCast(@alignCast(ctx));
         // Another participant's: one at a time.
         if (self.started) return error.AlreadyStarted;
-        self.participant_guid = local.guid;
         self.started = true;
         // The participant stops only what started.
         errdefer self.started = false;
         try self.bus.busStart(local, callbacks);
+        errdefer self.bus.busStop(local.guid);
+        try self.join(local.guid);
+    }
+
+    /// Reserves room in the new bus entry for what was prepared before it.
+    fn join(self: *DirectDiscovery, participant_guid: Guid) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const n_w = unslotted(&self.writers);
+        const n_r = unslotted(&self.readers);
+        try self.bus.busReserve(participant_guid, .writers, n_w);
+        errdefer self.bus.busRelease(participant_guid, .writers, n_w);
+        try self.bus.busReserve(participant_guid, .readers, n_r);
+        inline for (.{ &self.writers, &self.readers }) |map| {
+            var it = map.valueIterator();
+            while (it.next()) |p| p.slot = true;
+        }
+        self.participant_guid = participant_guid;
+        self.joined = true;
+    }
+
+    fn unslotted(map: anytype) usize {
+        var n: usize = 0;
+        var it = map.valueIterator();
+        while (it.next()) |p| n += @intFromBool(!p.slot);
+        return n;
     }
 
     fn vtStop(ctx: *anyopaque) void {
         const self: *DirectDiscovery = @ptrCast(@alignCast(ctx));
         if (self.started) {
             self.bus.busStop(self.participant_guid);
+            self.mu.lock();
+            defer self.mu.unlock();
+            // Its room went with the entry.
+            self.joined = false;
+            inline for (.{ &self.writers, &self.readers }) |map| {
+                var it = map.valueIterator();
+                while (it.next()) |p| p.slot = false;
+            }
             self.started = false;
         }
     }
 
-    fn vtAnnounceWriter(ctx: *anyopaque, info: *const WriterAnnouncement) anyerror!void {
+    fn prepare(self: *DirectDiscovery, comptime kind: DiscoveryBus.Kind, info: anytype) !void {
+        var owned = try info.clone(self.alloc);
+        errdefer owned.deinit(self.alloc);
+        self.mu.lock();
+        defer self.mu.unlock();
+        const map = &@field(self, @tagName(kind));
+        const gop = try map.getOrPut(self.alloc, info.guid);
+        if (gop.found_existing) {
+            if (gop.value_ptr.pending) |*old| old.deinit(self.alloc);
+            gop.value_ptr.pending = owned;
+            return;
+        }
+        if (self.joined) self.bus.busReserve(self.participant_guid, kind, 1) catch |err| {
+            map.removeByPtr(gop.key_ptr);
+            return err;
+        };
+        gop.value_ptr.* = .{ .pending = owned, .slot = self.joined };
+    }
+
+    fn announce(self: *DirectDiscovery, comptime kind: DiscoveryBus.Kind, guid: Guid) void {
+        const map = &@field(self, @tagName(kind));
+        var first = false;
+        var participant_guid = Guid.unknown;
+        var owned = blk: {
+            self.mu.lock();
+            defer self.mu.unlock();
+            const p = map.getPtr(guid) orelse return;
+            const a = p.pending orelse return;
+            p.pending = null;
+            // Not joined: there is no one to tell.
+            if (!p.slot) break :blk a;
+            first = !p.announced;
+            p.announced = true;
+            participant_guid = self.participant_guid;
+            break :blk a;
+        };
+        if (participant_guid.eql(Guid.unknown)) return owned.deinit(self.alloc);
+        switch (kind) {
+            .writers => self.bus.busAnnounceWriter(participant_guid, owned, first),
+            .readers => self.bus.busAnnounceReader(participant_guid, owned, first),
+        }
+    }
+
+    fn retract(self: *DirectDiscovery, comptime kind: DiscoveryBus.Kind, guid: Guid) void {
+        const map = &@field(self, @tagName(kind));
+        var participant_guid = Guid.unknown;
+        const kv = blk: {
+            self.mu.lock();
+            defer self.mu.unlock();
+            participant_guid = self.participant_guid;
+            break :blk map.fetchRemove(guid);
+        } orelse return;
+        var p = kv.value;
+        if (p.pending) |*a| a.deinit(self.alloc);
+        if (p.announced) switch (kind) {
+            .writers => self.bus.busRetractWriter(participant_guid, guid),
+            .readers => self.bus.busRetractReader(participant_guid, guid),
+        } else if (p.slot) self.bus.busRelease(participant_guid, kind, 1);
+    }
+
+    fn vtPrepareWriter(ctx: *anyopaque, info: *const WriterAnnouncement) anyerror!void {
         const self: *DirectDiscovery = @ptrCast(@alignCast(ctx));
-        try self.bus.busAnnounceWriter(self.participant_guid, info);
+        try self.prepare(.writers, info);
+    }
+
+    fn vtAnnounceWriter(ctx: *anyopaque, guid: Guid) void {
+        const self: *DirectDiscovery = @ptrCast(@alignCast(ctx));
+        self.announce(.writers, guid);
     }
 
     fn vtRetractWriter(ctx: *anyopaque, guid: Guid) void {
         const self: *DirectDiscovery = @ptrCast(@alignCast(ctx));
-        self.bus.busRetractWriter(self.participant_guid, guid);
+        self.retract(.writers, guid);
     }
 
-    fn vtAnnounceReader(ctx: *anyopaque, info: *const ReaderAnnouncement) anyerror!void {
+    fn vtPrepareReader(ctx: *anyopaque, info: *const ReaderAnnouncement) anyerror!void {
         const self: *DirectDiscovery = @ptrCast(@alignCast(ctx));
-        try self.bus.busAnnounceReader(self.participant_guid, info);
+        try self.prepare(.readers, info);
+    }
+
+    fn vtAnnounceReader(ctx: *anyopaque, guid: Guid) void {
+        const self: *DirectDiscovery = @ptrCast(@alignCast(ctx));
+        self.announce(.readers, guid);
     }
 
     fn vtRetractReader(ctx: *anyopaque, guid: Guid) void {
         const self: *DirectDiscovery = @ptrCast(@alignCast(ctx));
-        self.bus.busRetractReader(self.participant_guid, guid);
+        self.retract(.readers, guid);
     }
 
     fn vtDeinit(ctx: *anyopaque) void {
@@ -585,8 +761,10 @@ const direct_vtable = Discovery.Vtable{
     .shared_runtime_ready = true,
     .start = DirectDiscovery.vtStart,
     .stop = DirectDiscovery.vtStop,
+    .prepare_writer = DirectDiscovery.vtPrepareWriter,
     .announce_writer = DirectDiscovery.vtAnnounceWriter,
     .retract_writer = DirectDiscovery.vtRetractWriter,
+    .prepare_reader = DirectDiscovery.vtPrepareReader,
     .announce_reader = DirectDiscovery.vtAnnounceReader,
     .retract_reader = DirectDiscovery.vtRetractReader,
     .deinit = DirectDiscovery.vtDeinit,
@@ -601,6 +779,18 @@ fn noopWlpTick(_: *anyopaque, _: i64, _: disc_iface.WlpTickInfo) void {}
 
 const testing = std.testing;
 const guid_mod = @import("../rtps/guid.zig");
+
+/// Prepares and commits a local writer's announcement.
+fn announceWriterNow(d: Discovery, ann: *const WriterAnnouncement) !void {
+    try d.prepareWriter(ann);
+    d.announceWriter(ann.guid);
+}
+
+/// Prepares and commits a local reader's announcement.
+fn announceReaderNow(d: Discovery, ann: *const ReaderAnnouncement) !void {
+    try d.prepareReader(ann);
+    d.announceReader(ann.guid);
+}
 
 fn makeGuid(prefix_byte: u8) guid_mod.Guid {
     var bytes: [12]u8 = std.mem.zeroes([12]u8);
@@ -736,7 +926,7 @@ test "announce writer notifies other participant immediately" {
     try disc2.toDiscovery().start(&ann2, &cbs2);
 
     const writer_guid = makeWriterGuid(1, 1);
-    try disc1.toDiscovery().announceWriter(&WriterAnnouncement{
+    try announceWriterNow(disc1.toDiscovery(), &WriterAnnouncement{
         .guid = writer_guid,
         .participant_guid = makeGuid(1),
         .topic_name = "TestTopic",
@@ -785,7 +975,7 @@ test "late joiner receives existing writers and readers" {
     // Announce writer on disc1 BEFORE disc2 joins.
     const writer_guid = makeWriterGuid(1, 1);
     const reader_guid = makeReaderGuid(1, 1);
-    try disc1.toDiscovery().announceWriter(&WriterAnnouncement{
+    try announceWriterNow(disc1.toDiscovery(), &WriterAnnouncement{
         .guid = writer_guid,
         .participant_guid = makeGuid(1),
         .topic_name = "T",
@@ -794,7 +984,7 @@ test "late joiner receives existing writers and readers" {
         .type_object = &.{},
         .type_info_cdr = &.{},
     });
-    try disc1.toDiscovery().announceReader(&ReaderAnnouncement{
+    try announceReaderNow(disc1.toDiscovery(), &ReaderAnnouncement{
         .guid = reader_guid,
         .participant_guid = makeGuid(1),
         .topic_name = "T",
@@ -867,7 +1057,7 @@ test "retract writer fires on_writer_lost on peers" {
     try disc2.toDiscovery().start(&ann2, &cbs2);
 
     const writer_guid = makeWriterGuid(1, 1);
-    try disc1.toDiscovery().announceWriter(&WriterAnnouncement{
+    try announceWriterNow(disc1.toDiscovery(), &WriterAnnouncement{
         .guid = writer_guid,
         .participant_guid = makeGuid(1),
         .topic_name = "T",
@@ -928,7 +1118,7 @@ test "participants on different domains do not discover each other" {
 
     // Writer on domain 0 — domain-1 participant must not see it.
     const writer_guid = makeWriterGuid(1, 1);
-    try disc0.toDiscovery().announceWriter(&WriterAnnouncement{
+    try announceWriterNow(disc0.toDiscovery(), &WriterAnnouncement{
         .guid = writer_guid,
         .participant_guid = makeGuid(1),
         .topic_name = "T",
@@ -941,7 +1131,7 @@ test "participants on different domains do not discover each other" {
 
     // Reader on domain 1 — domain-0 participant must not see it.
     const reader_guid = makeReaderGuid(2, 1);
-    try disc1.toDiscovery().announceReader(&ReaderAnnouncement{
+    try announceReaderNow(disc1.toDiscovery(), &ReaderAnnouncement{
         .guid = reader_guid,
         .participant_guid = makeGuid(2),
         .topic_name = "T",
@@ -996,7 +1186,7 @@ test "a plugin serving a participant refuses another's start, and serves the nex
     try testing.expectError(error.AlreadyStarted, disc1.toDiscovery().start(&anns[2], &cbs1));
 
     // Still the first participant's: its writer reaches the peer.
-    try disc1.toDiscovery().announceWriter(&WriterAnnouncement{
+    try announceWriterNow(disc1.toDiscovery(), &WriterAnnouncement{
         .guid = makeWriterGuid(1, 1),
         .participant_guid = makeGuid(1),
         .topic_name = "T",
@@ -1055,7 +1245,7 @@ test "stop retracts all local endpoints from peers" {
     try disc1.toDiscovery().start(&ann1, &cbs1);
     try disc2.toDiscovery().start(&ann2, &cbs2);
 
-    try disc1.toDiscovery().announceWriter(&WriterAnnouncement{
+    try announceWriterNow(disc1.toDiscovery(), &WriterAnnouncement{
         .guid = makeWriterGuid(1, 1),
         .participant_guid = makeGuid(1),
         .topic_name = "T",
@@ -1064,7 +1254,7 @@ test "stop retracts all local endpoints from peers" {
         .type_object = &.{},
         .type_info_cdr = &.{},
     });
-    try disc1.toDiscovery().announceReader(&ReaderAnnouncement{
+    try announceReaderNow(disc1.toDiscovery(), &ReaderAnnouncement{
         .guid = makeReaderGuid(1, 1),
         .participant_guid = makeGuid(1),
         .topic_name = "T",
@@ -1144,7 +1334,7 @@ test "a peer's reader retracted from an announcement's callback is still reporte
     try disc2.toDiscovery().start(&ann2, &cbs2);
 
     for ([_][]const u8{ "TopicA", "TopicB" }, 1..) |topic, key| {
-        try disc2.toDiscovery().announceReader(&ReaderAnnouncement{
+        try announceReaderNow(disc2.toDiscovery(), &ReaderAnnouncement{
             .guid = makeReaderGuid(2, @intCast(key)),
             .participant_guid = makeGuid(2),
             .topic_name = topic,
@@ -1156,7 +1346,7 @@ test "a peer's reader retracted from an announcement's callback is still reporte
     }
 
     probe.armed = true;
-    try disc1.toDiscovery().announceWriter(&WriterAnnouncement{
+    try announceWriterNow(disc1.toDiscovery(), &WriterAnnouncement{
         .guid = makeWriterGuid(1, 1),
         .participant_guid = makeGuid(1),
         .topic_name = "TopicA",
@@ -1193,7 +1383,7 @@ test "an announcement's snapshot copies only the peer endpoint list it reports" 
         .builtin_endpoint_set = 0,
     };
     try disc.toDiscovery().start(&ann, &cbs);
-    try disc.toDiscovery().announceWriter(&WriterAnnouncement{
+    try announceWriterNow(disc.toDiscovery(), &WriterAnnouncement{
         .guid = makeWriterGuid(2, 1),
         .participant_guid = makeGuid(2),
         .topic_name = "T",
@@ -1202,7 +1392,7 @@ test "an announcement's snapshot copies only the peer endpoint list it reports" 
         .type_object = &.{},
         .type_info_cdr = &.{},
     });
-    try disc.toDiscovery().announceReader(&ReaderAnnouncement{
+    try announceReaderNow(disc.toDiscovery(), &ReaderAnnouncement{
         .guid = makeReaderGuid(2, 1),
         .participant_guid = makeGuid(2),
         .topic_name = "T",
@@ -1224,4 +1414,56 @@ test "an announcement's snapshot copies only the peer endpoint list it reports" 
     const for_reader = try DiscoveryBus.EntrySnapshot.copy(e, arena.allocator(), .{ .writers = true, .readers = false });
     try testing.expectEqual(@as(usize, 1), for_reader.writers.len);
     try testing.expectEqual(@as(usize, 0), for_reader.readers.len);
+}
+
+test "a prepared writer is stored and removed with no memory left, prepared before or after the start" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing.allocator();
+    const bus = try DiscoveryBus.init(alloc);
+    defer bus.deinit();
+    const disc = try DirectDiscovery.init(alloc, bus);
+    defer disc.deinit();
+    var cb = TestCallbacks.init(testing.allocator);
+    defer cb.deinit();
+    var cbs = cb.callbacks();
+
+    const before = makeWriterGuid(1, 1);
+    const after = makeWriterGuid(1, 2);
+    const ann = WriterAnnouncement{
+        .guid = before,
+        .participant_guid = makeGuid(1),
+        .topic_name = "T",
+        .type_name = "TT",
+        .qos = .{},
+        .partition_names = &.{"p"},
+        .type_object = &.{},
+        .type_info_cdr = &.{},
+    };
+    try disc.toDiscovery().prepareWriter(&ann);
+    try disc.toDiscovery().start(&.{
+        .guid = makeGuid(1),
+        .domain_id = 0,
+        .name = "p1",
+        .metatraffic_unicast_locators = &.{},
+        .metatraffic_multicast_locators = &.{},
+        .default_unicast_locators = &.{},
+        .default_multicast_locators = &.{},
+        .lease_duration_ms = 30000,
+        .builtin_endpoint_set = 0,
+    }, &cbs);
+    defer disc.toDiscovery().stop();
+    var later = ann;
+    later.guid = after;
+    try disc.toDiscovery().prepareWriter(&later);
+
+    // Every allocation fails from here.
+    failing.fail_index = failing.alloc_index;
+    const e = bus.findLocked(makeGuid(1)).?;
+    disc.toDiscovery().announceWriter(before);
+    disc.toDiscovery().announceWriter(after);
+    try testing.expectEqual(@as(usize, 2), e.writers.items.len);
+    disc.toDiscovery().retractWriter(before);
+    disc.toDiscovery().retractWriter(after);
+    try testing.expectEqual(@as(usize, 0), e.writers.items.len);
+    try testing.expectEqual(@as(usize, 0), e.reserved_writers);
 }

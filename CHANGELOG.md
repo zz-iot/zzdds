@@ -8,6 +8,23 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-10-31
+
+- A local DataWriter's or DataReader's SEDP announcement and disposal can no longer fail
+  once it exists. Discovery reserves what both need when the endpoint is created (and
+  again at `enable()`, should its Publisher's or Subscriber's partitions or presentation
+  have changed): creation returns nil, and `enable()` RETCODE_OUT_OF_RESOURCES, when it
+  cannot. A failed announcement used to be only logged, and the endpoint never announced;
+  a disposal that could not be encoded was dropped.
+- An endpoint deleted while its announcement is being written is disposed of once, after
+  the announcement. Peers used to be able to see it announced again after its disposal,
+  then disposed a second time.
+- A matched remote endpoint announced again with QoS or partitions that no longer match a
+  local endpoint is unmatched from it (`on_*_matched`, with REQUESTED/OFFERED
+  _INCOMPATIBLE_QOS for a QoS mismatch). It used to stay matched.
+- The discovery plugin interface's `announce_writer`/`announce_reader` are split into a
+  fallible `prepare_*` and an infallible `announce_*(guid)`.
+
 ## 2026-10-30
 
 - Build the prebuilt C/C++ library bundles `-Doptimize=ReleaseSafe` on all platforms
