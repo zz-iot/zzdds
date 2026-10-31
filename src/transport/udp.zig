@@ -1514,10 +1514,20 @@ pub const UdpTransport = struct {
         }
     }
 
+    /// A socket for one send, nonblocking as `sendMsg` makes the owned ones
+    /// once attached to a backend: on Windows, which has no MSG_DONTWAIT,
+    /// the socket itself is.
+    fn temporarySendSocket(self: *Self, family: u32) !posix.socket_t {
+        const fd = try socketCreate(family, posix.SOCK.DGRAM);
+        errdefer socketClose(fd);
+        if (builtin.os.tag == .windows and self.send_nonblocking.load(.acquire)) try sock.setNonblocking(fd);
+        return fd;
+    }
+
     /// A send on a temporary socket, when the shared send socket is missing
     /// or failed.
     fn sendUdp4(self: *Self, dest_ip: [4]u8, port: u16, iovecs: []const IoVec) !SendOutcome {
-        const fd = try socketCreate(posix.AF.INET, posix.SOCK.DGRAM);
+        const fd = try self.temporarySendSocket(posix.AF.INET);
         defer socketClose(fd);
         // For multicast destinations, set IP_MULTICAST_IF to loopback so that this
         // fallback path works on macOS VMs where the real interface has no multicast
@@ -1537,7 +1547,7 @@ pub const UdpTransport = struct {
     }
 
     fn sendUdp6(self: *Self, dest_ip: [16]u8, port: u16, iovecs: []const IoVec) !SendOutcome {
-        const fd = try socketCreate(posix.AF.INET6, posix.SOCK.DGRAM);
+        const fd = try self.temporarySendSocket(posix.AF.INET6);
         defer socketClose(fd);
         // For multicast (ff00::/8), use loopback (interface index 1) as the outgoing
         // interface so this fallback path works on macOS VMs without multicast routing.
