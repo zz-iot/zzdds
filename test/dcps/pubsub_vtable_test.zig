@@ -35,14 +35,20 @@ const noop_vtable = iface.Discovery.Vtable{
     .stop = struct {
         fn f(_: *anyopaque) void {}
     }.f,
-    .announce_writer = struct {
+    .prepare_writer = struct {
         fn f(_: *anyopaque, _: *const iface.WriterAnnouncement) anyerror!void {}
+    }.f,
+    .announce_writer = struct {
+        fn f(_: *anyopaque, _: iface.Guid) void {}
     }.f,
     .retract_writer = struct {
         fn f(_: *anyopaque, _: iface.Guid) void {}
     }.f,
-    .announce_reader = struct {
+    .prepare_reader = struct {
         fn f(_: *anyopaque, _: *const iface.ReaderAnnouncement) anyerror!void {}
+    }.f,
+    .announce_reader = struct {
+        fn f(_: *anyopaque, _: iface.Guid) void {}
     }.f,
     .retract_reader = struct {
         fn f(_: *anyopaque, _: iface.Guid) void {}

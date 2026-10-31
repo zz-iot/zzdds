@@ -3030,6 +3030,9 @@ pub const DataReaderImpl = struct {
         if (nil.isNil(self.subscriber)) return DDS.RETCODE_PRECONDITION_NOT_MET;
         const sub_: *subscriber_mod.SubscriberImpl = @ptrCast(@alignCast(self.subscriber.ptr));
         if (!sub_.enabled.load(.acquire)) return DDS.RETCODE_PRECONDITION_NOT_MET;
+        // Again, should the Subscriber's partitions or presentation have
+        // changed since creation: once enabled, its announcement cannot fail.
+        sub_.prepareDataReader(self.instance_handle) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         // Only the call that enables it announces it.
         if (self.enabled.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return DDS.RETCODE_OK;
         sub_.announceDataReader(self.instance_handle);

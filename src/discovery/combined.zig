@@ -269,8 +269,10 @@ pub const SpdpSedpDiscovery = struct {
         .shared_runtime_ready = true,
         .start = vtStart,
         .stop = vtStop,
+        .prepare_writer = vtPrepareWriter,
         .announce_writer = vtAnnounceWriter,
         .retract_writer = vtRetractWriter,
+        .prepare_reader = vtPrepareReader,
         .announce_reader = vtAnnounceReader,
         .retract_reader = vtRetractReader,
         .deinit = vtDeinit,
@@ -408,9 +410,14 @@ pub const SpdpSedpDiscovery = struct {
     /// A queued fire is the timer's own embedded request: nothing to free.
     fn discardTimer(_: *runtime_mod.Request) void {}
 
-    fn vtAnnounceWriter(ctx: *anyopaque, info: *const iface.WriterAnnouncement) anyerror!void {
+    fn vtPrepareWriter(ctx: *anyopaque, info: *const iface.WriterAnnouncement) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.sedp.announceWriter(info);
+        return self.sedp.prepareWriter(info);
+    }
+
+    fn vtAnnounceWriter(ctx: *anyopaque, guid: Guid) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.sedp.announceWriter(guid);
     }
 
     fn vtRetractWriter(ctx: *anyopaque, guid: Guid) void {
@@ -418,9 +425,14 @@ pub const SpdpSedpDiscovery = struct {
         self.sedp.retractWriter(guid);
     }
 
-    fn vtAnnounceReader(ctx: *anyopaque, info: *const iface.ReaderAnnouncement) anyerror!void {
+    fn vtPrepareReader(ctx: *anyopaque, info: *const iface.ReaderAnnouncement) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.sedp.announceReader(info);
+        return self.sedp.prepareReader(info);
+    }
+
+    fn vtAnnounceReader(ctx: *anyopaque, guid: Guid) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.sedp.announceReader(guid);
     }
 
     fn vtRetractReader(ctx: *anyopaque, guid: Guid) void {

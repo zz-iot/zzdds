@@ -27,6 +27,18 @@ const ParticipantAnnouncement = iface.ParticipantAnnouncement;
 const ParticipantData = iface.ParticipantData;
 const WriterAnnouncement = iface.WriterAnnouncement;
 const ReaderAnnouncement = iface.ReaderAnnouncement;
+
+/// Prepares and commits a local writer's announcement.
+fn announceWriterNow(se: *SedpEndpoints, ann: *const WriterAnnouncement) !void {
+    try se.prepareWriter(ann);
+    se.announceWriter(ann.guid);
+}
+
+/// Prepares and commits a local reader's announcement.
+fn announceReaderNow(se: *SedpEndpoints, ann: *const ReaderAnnouncement) !void {
+    try se.prepareReader(ann);
+    se.announceReader(ann.guid);
+}
 const WriterData = iface.WriterData;
 const ReaderData = iface.ReaderData;
 
@@ -336,7 +348,7 @@ test "SEDP: WriterAnnouncement encode/decode round-trip" {
     remote.discoverPeer(0x01);
 
     const writer_guid = makeGuid(0x01, 0x10);
-    try local.sedp.announceWriter(&.{
+    try announceWriterNow(local.sedp, &.{
         .guid = writer_guid,
         .participant_guid = makeGuid(0x01, 0x01),
         .topic_name = "HelloWorldTopic",
@@ -368,7 +380,7 @@ test "SEDP: announcements are processed after the built-in reader's lock is rele
     local.discoverPeer(0x02);
     remote.discoverPeer(0x01);
 
-    try local.sedp.announceWriter(&.{
+    try announceWriterNow(local.sedp, &.{
         .guid = makeGuid(0x01, 0x10),
         .participant_guid = makeGuid(0x01, 0x01),
         .topic_name = "T",
@@ -377,7 +389,7 @@ test "SEDP: announcements are processed after the built-in reader's lock is rele
         .type_object = &.{},
         .type_info_cdr = &.{},
     });
-    try local.sedp.announceReader(&.{
+    try announceReaderNow(local.sedp, &.{
         .guid = makeGuid(0x01, 0x11),
         .participant_guid = makeGuid(0x01, 0x01),
         .topic_name = "T",
@@ -405,7 +417,7 @@ test "SEDP: ReaderAnnouncement encode/decode round-trip" {
     remote.discoverPeer(0x03);
 
     const reader_guid = makeGuid(0x03, 0x20);
-    try local.sedp.announceReader(&.{
+    try announceReaderNow(local.sedp, &.{
         .guid = reader_guid,
         .participant_guid = makeGuid(0x03, 0x01),
         .topic_name = "SensorData",
@@ -439,7 +451,7 @@ test "SEDP: retractWriter fires on_writer_lost on remote" {
     remote.discoverPeer(0x05);
 
     const writer_guid = makeGuid(0x05, 0x10);
-    try local.sedp.announceWriter(&.{
+    try announceWriterNow(local.sedp, &.{
         .guid = writer_guid,
         .participant_guid = makeGuid(0x05, 0x01),
         .topic_name = "T",
@@ -459,7 +471,7 @@ test "SEDP: retractWriter fires on_writer_lost on remote" {
     try testing.expect(remote.rec.writers_lost.items[0].eql(writer_guid));
 
     const later_writer_guid = makeGuid(0x05, 0x11);
-    try local.sedp.announceWriter(&.{
+    try announceWriterNow(local.sedp, &.{
         .guid = later_writer_guid,
         .participant_guid = makeGuid(0x05, 0x01),
         .topic_name = "LaterT",
@@ -489,7 +501,7 @@ test "SEDP: retractReader fires on_reader_lost on remote" {
     remote.discoverPeer(0x07);
 
     const reader_guid = makeGuid(0x07, 0x20);
-    try local.sedp.announceReader(&.{
+    try announceReaderNow(local.sedp, &.{
         .guid = reader_guid,
         .participant_guid = makeGuid(0x07, 0x01),
         .topic_name = "T",
@@ -508,7 +520,7 @@ test "SEDP: retractReader fires on_reader_lost on remote" {
     try testing.expect(remote.rec.readers_lost.items[0].eql(reader_guid));
 
     const later_reader_guid = makeGuid(0x07, 0x21);
-    try local.sedp.announceReader(&.{
+    try announceReaderNow(local.sedp, &.{
         .guid = later_reader_guid,
         .participant_guid = makeGuid(0x07, 0x01),
         .topic_name = "LaterT",
@@ -539,7 +551,7 @@ test "SEDP: announcement before peer discovery is replayed after onParticipantDi
 
     // Announce before cross-wiring — no proxies yet, so nothing is delivered.
     const writer_guid = makeGuid(0x09, 0x10);
-    try local.sedp.announceWriter(&.{
+    try announceWriterNow(local.sedp, &.{
         .guid = writer_guid,
         .participant_guid = makeGuid(0x09, 0x01),
         .topic_name = "RT",
@@ -577,7 +589,7 @@ test "SEDP: WriterAnnouncement with non-default PRESENTATION round-trips correct
     local.discoverPeer(0x12);
     remote.discoverPeer(0x11);
 
-    try local.sedp.announceWriter(&.{
+    try announceWriterNow(local.sedp, &.{
         .guid = makeGuid(0x11, 0x10),
         .participant_guid = makeGuid(0x11, 0x01),
         .topic_name = "T",
@@ -608,7 +620,7 @@ test "SEDP: WriterAnnouncement USER_DATA round-trips as binary octets" {
     remote.discoverPeer(0x31);
 
     const user_data = [_]u8{ 't', 'y', 'p', 'e', 0, 0xff };
-    try local.sedp.announceWriter(&.{
+    try announceWriterNow(local.sedp, &.{
         .guid = makeGuid(0x31, 0x10),
         .participant_guid = makeGuid(0x31, 0x01),
         .topic_name = "T",
@@ -635,7 +647,7 @@ test "SEDP: ReaderAnnouncement with non-default PRESENTATION round-trips correct
     local.discoverPeer(0x14);
     remote.discoverPeer(0x13);
 
-    try local.sedp.announceReader(&.{
+    try announceReaderNow(local.sedp, &.{
         .guid = makeGuid(0x13, 0x20),
         .participant_guid = makeGuid(0x13, 0x01),
         .topic_name = "T",
@@ -671,7 +683,7 @@ test "SEDP: second onParticipantDiscovered replaces proxy without adding a dupli
     remote.discoverPeer(0x0b);
 
     const writer_guid = makeGuid(0x0b, 0x10);
-    try local.sedp.announceWriter(&.{
+    try announceWriterNow(local.sedp, &.{
         .guid = writer_guid,
         .participant_guid = makeGuid(0x0b, 0x01),
         .topic_name = "Idem",
@@ -713,7 +725,7 @@ test "SEDP: WriterAnnouncement with group_guid encodes and delivers without erro
     remote.discoverPeer(0x15);
 
     const writer_guid = makeGuid(0x15, 0x10);
-    try local.sedp.announceWriter(&.{
+    try announceWriterNow(local.sedp, &.{
         .guid = writer_guid,
         .participant_guid = makeGuid(0x15, 0x01),
         .group_guid = makeGuid(0x15, 0x01), // publisher participant GUID as group GUID
@@ -744,7 +756,7 @@ test "SEDP: WriterAnnouncement with lifespan and deadline QoS round-trips correc
     local.discoverPeer(0x18);
     remote.discoverPeer(0x17);
 
-    try local.sedp.announceWriter(&.{
+    try announceWriterNow(local.sedp, &.{
         .guid = makeGuid(0x17, 0x10),
         .participant_guid = makeGuid(0x17, 0x01),
         .topic_name = "T",
@@ -782,7 +794,7 @@ test "SEDP: a writer with >32 PARTITION names delivers all of them (no truncatio
     var storage: [40][16]u8 = undefined;
     for (0..40) |i| names[i] = std.fmt.bufPrint(&storage[i], "partition-{d}", .{i}) catch unreachable;
 
-    try local.sedp.announceWriter(&.{
+    try announceWriterNow(local.sedp, &.{
         .guid = makeGuid(0x19, 0x10),
         .participant_guid = makeGuid(0x19, 0x01),
         .topic_name = "T",
@@ -813,7 +825,7 @@ test "SEDP: a peer lost and rediscovered on one side has its endpoints delivered
     remote.discoverPeer(0x1B);
 
     const reader_guid = makeGuid(0x1C, 0x20);
-    try remote.sedp.announceReader(&.{
+    try announceReaderNow(remote.sedp, &.{
         .guid = reader_guid,
         .participant_guid = makeGuid(0x1C, 0x01),
         .topic_name = "Again",
@@ -822,7 +834,7 @@ test "SEDP: a peer lost and rediscovered on one side has its endpoints delivered
         .type_info_cdr = &.{},
     });
     const writer_guid = makeGuid(0x1B, 0x10);
-    try local.sedp.announceWriter(&.{
+    try announceWriterNow(local.sedp, &.{
         .guid = writer_guid,
         .participant_guid = makeGuid(0x1B, 0x01),
         .topic_name = "Again",
@@ -878,7 +890,7 @@ test "SEDP: peers that lose and rediscover each other exchange their endpoints a
     a.discoverPeer(0x1E);
     b.discoverPeer(0x1D);
 
-    try a.sedp.announceWriter(&.{
+    try announceWriterNow(a.sedp, &.{
         .guid = makeGuid(0x1D, 0x10),
         .participant_guid = makeGuid(0x1D, 0x01),
         .topic_name = "Both",
@@ -887,7 +899,7 @@ test "SEDP: peers that lose and rediscover each other exchange their endpoints a
         .type_object = &.{},
         .type_info_cdr = &.{},
     });
-    try b.sedp.announceReader(&.{
+    try announceReaderNow(b.sedp, &.{
         .guid = makeGuid(0x1E, 0x20),
         .participant_guid = makeGuid(0x1E, 0x01),
         .topic_name = "Both",
@@ -914,4 +926,150 @@ test "SEDP: peers that lose and rediscover each other exchange their endpoints a
     }
     try testing.expectEqual(@as(usize, 2), b.rec.writers_found.items.len);
     try testing.expectEqual(@as(usize, 2), a.rec.readers_found.items.len);
+}
+
+// ── Announcement reservations ─────────────────────────────────────────────────
+// docs/design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal:
+// once prepared, an endpoint's announcement and disposal cannot fail for
+// lack of local resources.
+
+/// SEDP on a FailingAllocator, started or not, with no peer.
+const Reserving = struct {
+    failing: std.testing.FailingAllocator,
+    net: *MockNetwork,
+    transport: *MockTransport,
+    sedp: *SedpEndpoints,
+    rec: Recorder,
+    cbs: Callbacks,
+
+    fn init(self: *Reserving) !void {
+        self.failing = .init(testing.allocator, .{});
+        const alloc = self.failing.allocator();
+        self.net = try MockNetwork.init(testing.allocator);
+        const meta_locs = [_]Locator{Locator.udp4(.{ 127, 0, 0, 0x30 }, metaPort(0x30))};
+        self.transport = try MockTransport.init(testing.allocator, self.net, &meta_locs);
+        self.sedp = try SedpEndpoints.init(alloc, self.transport.transport());
+        self.rec = .{ .alloc = testing.allocator };
+        self.cbs = self.rec.callbacks();
+    }
+
+    fn start(self: *Reserving) !void {
+        const meta_locs = [_]Locator{Locator.udp4(.{ 127, 0, 0, 0x30 }, metaPort(0x30))};
+        try self.sedp.start(&.{
+            .guid = makeGuid(0x30, 0x01),
+            .domain_id = 0,
+            .name = "",
+            .metatraffic_unicast_locators = &meta_locs,
+            .metatraffic_multicast_locators = &.{},
+            .default_unicast_locators = &.{},
+            .default_multicast_locators = &.{},
+            .lease_duration_ms = 10_000,
+            .builtin_endpoint_set = ALL_SEDP_ENDPOINTS,
+        }, &self.cbs);
+    }
+
+    fn deinit(self: *Reserving) void {
+        self.sedp.stop();
+        self.sedp.deinit();
+        self.transport.deinit();
+        self.net.deinit();
+        self.rec.deinit();
+    }
+
+    /// Every allocation from now on fails.
+    fn exhaust(self: *Reserving) void {
+        self.failing.fail_index = self.failing.alloc_index;
+    }
+
+    fn writerAnnouncement(guid: Guid) WriterAnnouncement {
+        return .{
+            .guid = guid,
+            .participant_guid = makeGuid(0x30, 0x01),
+            .topic_name = "Reserved",
+            .type_name = "ReservedType",
+            .qos = .{},
+            .partition_names = &.{ "p1", "p2" },
+            .type_object = &.{},
+            .type_info_cdr = &.{},
+        };
+    }
+
+    /// The kinds of the publications writer's history, oldest first.
+    fn history(self: *Reserving, buf: []history_kind) []history_kind {
+        const changes = self.sedp.pub_writer.?.cache.changes.items;
+        for (changes, buf[0..changes.len]) |ch, *k| k.* = ch.kind;
+        return buf[0..changes.len];
+    }
+};
+
+const history_kind = zzdds.rtps.history.ChangeKind;
+
+test "SEDP: a prepared writer is announced and disposed with no memory left" {
+    var r: Reserving = undefined;
+    try r.init();
+    defer r.deinit();
+    try r.start();
+
+    const guid = makeGuid(0x30, 0x10);
+    try r.sedp.prepareWriter(&Reserving.writerAnnouncement(guid));
+    r.exhaust();
+    var buf: [4]history_kind = undefined;
+    r.sedp.announceWriter(guid);
+    try testing.expectEqualSlices(history_kind, &.{.alive}, r.history(&buf));
+    r.sedp.retractWriter(guid);
+    // The disposal replaces the announcement.
+    try testing.expectEqualSlices(history_kind, &.{.not_alive_disposed}, r.history(&buf));
+}
+
+test "SEDP: a writer prepared before start is reserved by the start" {
+    var r: Reserving = undefined;
+    try r.init();
+    defer r.deinit();
+
+    const a = makeGuid(0x30, 0x11);
+    const b = makeGuid(0x30, 0x12);
+    try r.sedp.prepareWriter(&Reserving.writerAnnouncement(a));
+    try r.sedp.prepareWriter(&Reserving.writerAnnouncement(b));
+    try r.start();
+    r.exhaust();
+    var buf: [4]history_kind = undefined;
+    r.sedp.announceWriter(a);
+    r.sedp.announceWriter(b);
+    try testing.expectEqualSlices(history_kind, &.{ .alive, .alive }, r.history(&buf));
+    r.sedp.retractWriter(a);
+    r.sedp.retractWriter(b);
+    try testing.expectEqualSlices(history_kind, &.{ .not_alive_disposed, .not_alive_disposed }, r.history(&buf));
+}
+
+test "SEDP: a writer that cannot be prepared leaves nothing to announce or dispose" {
+    var r: Reserving = undefined;
+    try r.init();
+    defer r.deinit();
+    try r.start();
+
+    const guid = makeGuid(0x30, 0x13);
+    r.exhaust();
+    try testing.expectError(error.OutOfMemory, r.sedp.prepareWriter(&Reserving.writerAnnouncement(guid)));
+    r.failing.fail_index = std.math.maxInt(usize);
+    var buf: [4]history_kind = undefined;
+    r.sedp.announceWriter(guid);
+    r.sedp.retractWriter(guid);
+    try testing.expectEqual(@as(usize, 0), r.history(&buf).len);
+    // Nothing stays reserved: the history's spare room is all that is left.
+    try testing.expectEqual(@as(usize, 0), r.sedp.pub_writer.?.cache.reserved);
+}
+
+test "SEDP: a writer retracted unannounced gives back its reservation" {
+    var r: Reserving = undefined;
+    try r.init();
+    defer r.deinit();
+    try r.start();
+
+    const guid = makeGuid(0x30, 0x14);
+    try r.sedp.prepareWriter(&Reserving.writerAnnouncement(guid));
+    try testing.expectEqual(@as(usize, 1), r.sedp.pub_writer.?.cache.reserved);
+    r.sedp.retractWriter(guid);
+    try testing.expectEqual(@as(usize, 0), r.sedp.pub_writer.?.cache.reserved);
+    var buf: [4]history_kind = undefined;
+    try testing.expectEqual(@as(usize, 0), r.history(&buf).len);
 }

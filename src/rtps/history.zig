@@ -107,6 +107,9 @@ pub const HistoryCache = struct {
     changes: std.ArrayListUnmanaged(CacheChange),
     /// Writer-side: next sequence number to assign (starts at 1).
     next_sn: SequenceNumber,
+    /// Writer-side: changes `reserve` has made room for that are not yet
+    /// added. `changes` always has capacity for them on top of its items.
+    reserved: usize = 0,
 
     const Self = @This();
 
@@ -140,24 +143,64 @@ pub const HistoryCache = struct {
         key_hash: [16]u8,
         data: []const u8,
     ) !SequenceNumber {
-        const sn = self.next_sn;
-        self.next_sn += 1;
-
         const data_copy = try self.alloc.dupe(u8, data);
         errdefer self.alloc.free(data_copy);
+        // Before the trim, so a failure leaves the instance's last change.
+        try self.changes.ensureTotalCapacity(self.alloc, self.changes.items.len + self.reserved + 1);
+        return self.addOwnedLocked(kind, writer_guid, source_timestamp, instance_handle, key_hash, data_copy);
+    }
 
-        const ch = CacheChange{
+    /// Makes room for `n` changes, added later with `addReservedWriterChange`.
+    pub fn reserve(self: *Self, n: usize) !void {
+        try self.changes.ensureTotalCapacity(self.alloc, self.changes.items.len + self.reserved + n);
+        self.reserved += n;
+    }
+
+    /// Gives back room for `n` reserved changes never added.
+    pub fn release(self: *Self, n: usize) void {
+        self.reserved -= n;
+    }
+
+    /// Adds a change without allocating, taking ownership of `data`, which
+    /// must come from this cache's allocator. With `uses_reservation`, the
+    /// change takes one reserved slot; without, it must replace a change of
+    /// its instance under KEEP_LAST 1, and takes that change's slot.
+    pub fn addReservedWriterChange(
+        self: *Self,
+        kind: ChangeKind,
+        writer_guid: Guid,
+        source_timestamp: RtpsTimestamp,
+        instance_handle: InstanceHandle,
+        key_hash: [16]u8,
+        data: []u8,
+        uses_reservation: bool,
+    ) SequenceNumber {
+        if (uses_reservation) self.reserved -= 1;
+        return self.addOwnedLocked(kind, writer_guid, source_timestamp, instance_handle, key_hash, data);
+    }
+
+    /// Adds a change owning `data`, into capacity already made.
+    fn addOwnedLocked(
+        self: *Self,
+        kind: ChangeKind,
+        writer_guid: Guid,
+        source_timestamp: RtpsTimestamp,
+        instance_handle: InstanceHandle,
+        key_hash: [16]u8,
+        data: []u8,
+    ) SequenceNumber {
+        const sn = self.next_sn;
+        self.next_sn += 1;
+        self.trimForKeepLast(instance_handle);
+        self.changes.appendAssumeCapacity(.{
             .kind = kind,
             .writer_guid = writer_guid,
             .sequence_number = sn,
             .source_timestamp = source_timestamp,
             .instance_handle = instance_handle,
             .key_hash = key_hash,
-            .data = data_copy,
-        };
-
-        self.trimForKeepLast(instance_handle);
-        try self.changes.append(self.alloc, ch);
+            .data = data,
+        });
         return sn;
     }
 
