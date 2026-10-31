@@ -162,15 +162,15 @@ Forward-looking only: known gaps, planned features, and open design questions.
   so it waits on a "TCP for discovery too" mode (above) or the discovery broker; do it
   after the shared runtime's channel ownership exists
   ([channel integration requirements](design/concurrency/runtime.md#channel-integration-requirements)).
-- **Transport scatter-gather (`sendmsg`)** — done for UDP on POSIX and for TCP: the
+- **Transport scatter-gather (`sendmsg`)** — done for UDP and TCP: the
   `Transport` vtable's `send_gather` takes `MessageBuilder`'s iovec list, which UDP
-  passes to `sendmsg`, and TCP too behind its length prefix (on a backend; on its own
-  threads it writes each piece in turn). UDP on Windows and the in-process transports
-  still flatten it into a `[65536]u8` stack buffer (`Transport.sendGather` does that for
+  passes to `sendmsg` (`WSASendTo` on Windows), and TCP too behind its length prefix (on
+  a backend, `WSASend` on Windows; on its own threads it writes each piece in turn). The
+  in-process transports still flatten it into a `[65536]u8` stack buffer (`Transport.sendGather` does that for
   a transport without `send_gather`). See `design/rtps-message-builder.md` and
   [output submission](design/concurrency/transport-adapters.md#output-submission).
-- **A writer resumes when a full send buffer drains** — done for UDP and TCP on POSIX,
-  on the shared runtime, as the
+- **A writer resumes when a full send buffer drains** — done for UDP and TCP, on the
+  shared runtime, as the
   [output contract](design/concurrency/runtime.md#output-submission-and-completion)
   has it. A reader whose DATA would block is held (`ReaderProxy.unsent_from_sn`): live
   data to it waits, the history keeps what it has yet to be sent, and the writer waits
@@ -183,7 +183,8 @@ Forward-looking only: known gaps, planned features, and open design questions.
   it. HEARTBEAT, GAP and repair replies are not held: a lost one is regenerated from
   current state. On TCP, a frame the socket takes only part of is kept as the
   connection's tail and written before anything else, so a later send would block
-  until it drains. Left: Windows, whose UDP sends still block.
+  until it drains. Windows has no partial nonblocking stream send, so there a frame is
+  taken whole or not at all.
 - **Ingress limits are per peer, not per writer or per channel, and not configurable.**
   On the shared runtime each ingress queue (a participant's user data; its discovery
   plugin's SPDP and SEDP) is bounded by records and bytes in aggregate and per peer
@@ -1077,12 +1078,12 @@ timers, the progress backend, the manual `drive` and hosted workers on `std.Io.T
 and retirement. Participants use it only in a `-Dshared-runtime` build (a contributor
 migration switch, off by default): a factory may select the runtime, each participant holds
 an owner reference, and creation fails for transports or discovery plugins that run their
-own threads (the in-process memory transport, direct discovery, RTPS discovery and, on
-POSIX, UDP qualify so far). Received datagrams are copied into each participant's ingress context,
+own threads (the in-process memory transport, direct discovery, RTPS discovery, UDP and
+TCP qualify so far). Received datagrams are copied into each participant's ingress context,
 bounded by count and bytes, in aggregate and per peer, and processed in runtime turns (which is what makes a RELIABLE
 pair over the memory transport work there); deleting a participant drops what is still
-queued. On POSIX the default runtime, and any runtime built on the readiness backend
-(`PollBackend`), waits on sockets as well as for work: a UDP transport's sockets become
+queued. The default runtime, and any runtime built on the readiness backend
+(`PollBackend`, over `poll`, or `WSAPoll` on Windows), waits on sockets as well as for work: a UDP transport's sockets become
 sources of its participant's runtime instead of running receive threads. One waiter polls
 them with the runtime's wake descriptor and hands polling to another waiter when it stops,
 and servicing receives what is ready without blocking, round robin across sockets within
@@ -1092,7 +1093,7 @@ whose backend waits on no sockets, fails; once they are all deleted, the next pa
 runtime takes over. On the runtime, UDP re-polls its interfaces on a runtime timer at the
 configured interval, while any of its ports is listened, rather than on the monitor's
 thread, and reports only a change. RTPS messages go to the transport as the
-builder's gather list, which UDP passes to `sendmsg` without copying it into one buffer,
+builder's gather list, which UDP passes to `sendmsg` (`WSASendTo` on Windows) without copying it into one buffer,
 and on the runtime a UDP send never blocks: a full send buffer drops the datagram, counts
 it (`sends_would_block`) and reports `would_block`. A writer then holds that reader's
 DATA and sends it once the socket drains, best effort included, so nothing is lost to a
@@ -1160,7 +1161,7 @@ Even a minimal two-participant setup runs several background threads. An embedde
 needs a `DomainParticipant.drive(timeout)` that pumps transport polling + `checkTimers()`
 from the caller's loop with no threads spawned. In the `-Dshared-runtime` build the
 readiness adapter in [transport adapters](design/concurrency/transport-adapters.md) now
-exists for UDP on POSIX: a manual runtime over `PollBackend` runs a reliable pair over
+exists for UDP: a manual runtime over `PollBackend` runs a reliable pair over
 loopback UDP through `drive()` alone, with no thread started by zzdds, and hosted workers
 service the same sockets in place of a thread per socket, and RTPS discovery runs there
 too, its announcements, lease checks and heartbeats on runtime timers. Sends take the
@@ -1171,7 +1172,9 @@ naming it fails as closed. TCP runs there too: its listen socket and connections
 sources of the same backend, so a reliable pair over loopback TCP also runs through
 `drive()` alone, and dials and sends never block. TCP frames go through the participant's
 ingress as UDP datagrams do, and a connection whose frame does not fit stops reading until
-it does. Next is Windows. Outside that build,
+it does. Windows runs all of this too, over Winsock: the backend polls with `WSAPoll`,
+whose wake is a loopback UDP socket connected to itself, and sockets on it are made
+nonblocking, since Winsock has no `MSG_DONTWAIT`. Outside that build,
 the UDP and TCP transports still call their handlers from their own receive threads. Now specified as the
 [ManualDriver/external-loop contract](design/concurrency/runtime.md#manual-runtime-driving-and-external-loop-integration)
 (`drive(budget, max_wait)` plus prepare-to-wait integration) and the cooperative
