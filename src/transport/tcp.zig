@@ -53,6 +53,7 @@ pub const Channel = iface.Channel;
 const IoVec = iface.IoVec;
 const SendOutcome = iface.SendOutcome;
 const WritableWaiter = iface.WritableWaiter;
+const RoomWaiter = iface.RoomWaiter;
 const MAX_RECEIVE_HANDLERS = iface.MAX_RECEIVE_HANDLERS;
 
 /// Whether a participant on the shared runtime may use this transport.
@@ -369,18 +370,38 @@ pub const TcpConnection = struct {
     hdr_len: u8 = 0,
     frame: []u8 = &.{},
     frame_off: usize = 0,
+    /// The source's service's: a whole frame a handler had no room for,
+    /// owned. Input is paused until it is offered again and taken, before
+    /// anything else (docs/design/concurrency/runtime.md#ingress).
+    held: []u8 = &.{},
+    /// The handlers that took `held` before one had no room, by `ctx`,
+    /// owned: they are not offered it again.
+    held_taken: []*anyopaque = &.{},
+    /// The source's service's: the bytes read after `held`, owned, which
+    /// are parsed once it is taken.
+    backlog: []u8 = &.{},
+    /// Queued with `room_handler` while that has no room for `held`.
+    room: RoomWaiter = .{ .on_room = onRoom },
+    /// Under the transport's `room_mu`: the handler `room` was given to,
+    /// until `held` is taken, or the handler is unlistened.
+    room_handler: ?ReceiveHandler = null,
+    /// `room` ran since `held` was last refused: offer it again.
+    room_made: std.atomic.Value(bool) = .init(false),
+
+    const Fed = enum { ok, held, bad };
 
     /// Takes `bytes` read from the stream: dispatches each frame they
-    /// complete and keeps a partial prefix or frame. False on a length out
-    /// of range, or no memory for a partial frame.
-    fn feed(conn: *TcpConnection, bytes: []const u8) bool {
+    /// complete and keeps a partial prefix or frame. `.held` once a frame
+    /// is held, with what follows it in `backlog`; `.bad` on a length out
+    /// of range, or no memory to keep a frame.
+    fn feed(conn: *TcpConnection, bytes: []const u8) Fed {
         var rest = bytes;
         while (rest.len > 0) {
             if (conn.frame.len > 0) {
                 const take = @min(rest.len, conn.frame.len - conn.frame_off);
                 @memcpy(conn.frame[conn.frame_off..][0..take], rest[0..take]);
                 rest = rest[take..];
-                conn.frameRead(take);
+                if (!conn.frameRead(take)) return conn.keepBacklog(rest);
                 continue;
             }
             const take = @min(4 - conn.hdr_len, rest.len);
@@ -390,31 +411,144 @@ pub const TcpConnection = struct {
             if (conn.hdr_len < 4) break;
             conn.hdr_len = 0;
             const len = std.mem.readInt(u32, &conn.hdr, .big);
-            if (len == 0 or len > MAX_MSG_LEN) return false;
+            if (len == 0 or len > MAX_MSG_LEN) return .bad;
             if (rest.len >= len) {
                 // Whole here: dispatched in place.
-                conn.dispatch(rest[0..len]);
+                const frame = rest[0..len];
                 rest = rest[len..];
+                if (!conn.offer(frame)) {
+                    conn.held = conn.alloc.dupe(u8, frame) catch return .bad;
+                    return conn.keepBacklog(rest);
+                }
                 continue;
             }
-            conn.frame = conn.alloc.alloc(u8, len) catch return false;
+            conn.frame = conn.alloc.alloc(u8, len) catch return .bad;
             conn.frame_off = 0;
         }
+        return .ok;
+    }
+
+    fn keepBacklog(conn: *TcpConnection, rest: []const u8) Fed {
+        if (rest.len > 0) conn.backlog = conn.alloc.dupe(u8, rest) catch return .bad;
+        return .held;
+    }
+
+    /// `n` more bytes of the partly read frame have arrived. False when the
+    /// frame, complete, is held.
+    fn frameRead(conn: *TcpConnection, n: usize) bool {
+        conn.frame_off += n;
+        if (conn.frame_off < conn.frame.len) return true;
+        const frame = conn.frame;
+        conn.frame = &.{};
+        if (!conn.offer(frame)) {
+            conn.held = frame;
+            return false;
+        }
+        conn.alloc.free(frame);
         return true;
     }
 
-    /// `n` more bytes of the partly read frame have arrived.
-    fn frameRead(conn: *TcpConnection, n: usize) void {
-        conn.frame_off += n;
-        if (conn.frame_off < conn.frame.len) return;
-        const frame = conn.frame;
-        conn.frame = &.{};
-        defer conn.alloc.free(frame);
-        conn.dispatch(frame);
+    /// Offers `held` again, once its handler may have room, then parses
+    /// the backlog. `.held` while it is still held.
+    fn retryHeld(conn: *TcpConnection) Fed {
+        if (!conn.room_made.swap(false, .seq_cst)) return .held;
+        if (!conn.offer(conn.held)) return .held;
+        conn.releaseRoom();
+        conn.alloc.free(conn.held);
+        conn.held = &.{};
+        const backlog = conn.backlog;
+        conn.backlog = &.{};
+        defer conn.alloc.free(backlog);
+        return conn.feed(backlog);
     }
 
-    fn dispatch(conn: *TcpConnection, frame: []const u8) void {
-        conn.owner.dispatchToHandlers(frame, remoteKeyToLocator(&conn.remote), conn.channel);
+    /// Hands `frame` to the transport's handlers, but those in
+    /// `held_taken`. False when one has no room: the caller holds the
+    /// frame, and input pauses until that handler has room.
+    fn offer(conn: *TcpConnection, frame: []const u8) bool {
+        const self = conn.owner;
+        var snap: [MAX_RECEIVE_HANDLERS]ReceiveHandler = undefined;
+        var count: usize = 0;
+        {
+            self.handler_mu.lock();
+            defer self.handler_mu.unlock();
+            for (self.handlers.items) |h| {
+                snap[count] = h;
+                count += 1;
+            }
+        }
+        const src = remoteKeyToLocator(&conn.remote);
+        var took: [MAX_RECEIVE_HANDLERS]*anyopaque = undefined;
+        var n: usize = 0;
+        for (snap[0..count]) |h| {
+            if (std.mem.indexOfScalar(*anyopaque, conn.held_taken, h.ctx) != null) continue;
+            if (h.try_receive) |try_receive| {
+                if (!try_receive(h.ctx, frame, src, conn.channel)) {
+                    // Without memory to remember who took it, those who
+                    // have not lose it, as a full ingress loses a datagram.
+                    conn.addTaken(took[0..n]) catch {
+                        conn.clearTaken();
+                        return true;
+                    };
+                    conn.waitForRoom(h, frame, src);
+                    return false;
+                }
+            } else h.on_receive(h.ctx, frame, src, conn.channel);
+            took[n] = h.ctx;
+            n += 1;
+        }
+        conn.clearTaken();
+        return true;
+    }
+
+    fn addTaken(conn: *TcpConnection, more: []const *anyopaque) !void {
+        if (more.len == 0) return;
+        const all = try conn.alloc.alloc(*anyopaque, conn.held_taken.len + more.len);
+        @memcpy(all[0..conn.held_taken.len], conn.held_taken);
+        @memcpy(all[conn.held_taken.len..], more);
+        conn.clearTaken();
+        conn.held_taken = all;
+    }
+
+    fn clearTaken(conn: *TcpConnection) void {
+        if (conn.held_taken.len > 0) conn.alloc.free(conn.held_taken);
+        conn.held_taken = &.{};
+    }
+
+    fn waitForRoom(conn: *TcpConnection, h: ReceiveHandler, frame: []const u8, src: Locator) void {
+        const self = conn.owner;
+        self.backend.?.pauseInput(&conn.source);
+        self.room_mu.lock();
+        defer self.room_mu.unlock();
+        if (conn.room_handler) |prev| {
+            if (prev.ctx != h.ctx) prev.cancel_room.?(prev.ctx, &conn.room);
+        }
+        if (!self.hasHandler(h.ctx)) {
+            // Unlistened since the offer began: offered again without it.
+            conn.room_handler = null;
+            conn.room_made.store(true, .seq_cst);
+            self.backend.?.resumeInput(&conn.source);
+            return;
+        }
+        conn.room_handler = h;
+        h.notify_room.?(h.ctx, &conn.room, frame, src);
+    }
+
+    /// `held` was taken, or the connection closes: its waiter, if queued,
+    /// is cancelled, and its handler forgotten.
+    fn releaseRoom(conn: *TcpConnection) void {
+        const self = conn.owner;
+        self.room_mu.lock();
+        defer self.room_mu.unlock();
+        const h = conn.room_handler orelse return;
+        h.cancel_room.?(h.ctx, &conn.room);
+        conn.room_handler = null;
+    }
+
+    fn onRoom(w: *RoomWaiter) void {
+        const conn: *TcpConnection = @fieldParentPtr("room", w);
+        conn.room_made.store(true, .seq_cst);
+        conn.owner.backend.?.resumeInput(&conn.source);
     }
 };
 
@@ -525,6 +659,9 @@ pub const TcpTransport = struct {
     /// `blocked`. Waiters run under it.
     writable_mu: Mutex = .{},
     writable_waiters: ?*WritableWaiter = null,
+    /// Guards each connection's `room_handler`. Taken after `conn_mu`, and
+    /// before `handler_mu` and a handler's own lock.
+    room_mu: Mutex = .{},
     /// Connections whose `blocked` is set.
     blocked_count: usize = 0,
     /// Times a blocked connection drained or closed.
@@ -636,6 +773,7 @@ pub const TcpTransport = struct {
         self.connection_generations.deinit(self.alloc);
         self.handlers.deinit(self.alloc);
         self.writable_mu.deinit();
+        self.room_mu.deinit();
         self.alloc.destroy(self);
     }
 
@@ -775,6 +913,32 @@ pub const TcpTransport = struct {
             }
         }
         for (snap[0..count]) |h| if (h.on_channel_closed) |cb| cb(h.ctx, channel);
+    }
+
+    /// With `conn_mu` held, `handler` just unlistened: a connection holding
+    /// a frame for it stops waiting on it, and offers the frame again to
+    /// the handlers left, so that nothing calls into `handler` afterwards.
+    fn forgetRoomHandlerLocked(self: *Self, handler: ReceiveHandler) void {
+        const b = self.backend orelse return;
+        self.room_mu.lock();
+        defer self.room_mu.unlock();
+        for (self.live_connections.items) |conn| {
+            const h = conn.room_handler orelse continue;
+            if (h.ctx != handler.ctx) continue;
+            h.cancel_room.?(h.ctx, &conn.room);
+            conn.room_handler = null;
+            conn.room_made.store(true, .seq_cst);
+            b.resumeInput(&conn.source);
+        }
+    }
+
+    fn hasHandler(self: *Self, ctx: *anyopaque) bool {
+        self.handler_mu.lock();
+        defer self.handler_mu.unlock();
+        for (self.handlers.items) |h| {
+            if (h.ctx == ctx) return true;
+        }
+        return false;
     }
 
     fn removeHandlerFromListLocked(self: *Self, handler: ReceiveHandler) void {
@@ -1014,6 +1178,9 @@ pub const TcpTransport = struct {
                     break;
                 }
             }
+            // While unlisten still finds it: its handler is not called
+            // once unlisten returns.
+            conn.releaseRoom();
             self.reaping += 1;
         }
         self.finishClose(conn);
@@ -1028,6 +1195,8 @@ pub const TcpTransport = struct {
     /// owner's reference.
     fn finishClose(self: *Self, conn: *TcpConnection) void {
         self.backend.?.unregister(&conn.source);
+        // Its handler no longer wakes it.
+        conn.releaseRoom();
         self.removeConnection(conn);
         closeConnFdOnce(conn);
         conn.send_mu.lock();
@@ -1037,6 +1206,11 @@ pub const TcpTransport = struct {
         self.unblock(conn);
         if (conn.frame.len > 0) self.alloc.free(conn.frame);
         conn.frame = &.{};
+        if (conn.held.len > 0) self.alloc.free(conn.held);
+        conn.held = &.{};
+        conn.clearTaken();
+        if (conn.backlog.len > 0) self.alloc.free(conn.backlog);
+        conn.backlog = &.{};
         self.freeConn(conn);
     }
 
@@ -1478,6 +1652,7 @@ pub const TcpTransport = struct {
         self.removeHandlerFromListLocked(handler);
         const no_handlers = self.handlers.items.len == 0;
         self.handler_mu.unlock();
+        self.forgetRoomHandlerLocked(handler);
 
         if (!self.stopping.load(.acquire)) {
             if (no_handlers) listener = self.closeListenerLocked();
@@ -1575,11 +1750,20 @@ fn serviceListener(ctx: *anyopaque, budget: u32) u32 {
 
 /// Source.service for a connection on a backend: reads what is queued now
 /// and dispatches each complete frame as recvLoop does, keeping a partial
-/// one for the next read. Closes the connection at the end of its stream
-/// or on a bad frame.
+/// one for the next read. A frame a handler has no room for is held, and
+/// reading stops until it is taken. Closes the connection at the end of its
+/// stream or on a bad frame.
 fn serviceConn(ctx: *anyopaque, budget: u32) u32 {
     if (comptime !poll_backend.supported) unreachable;
     const conn: *TcpConnection = @ptrCast(@alignCast(ctx));
+    if (conn.held.len > 0) switch (conn.retryHeld()) {
+        .ok => {},
+        .held => return 0,
+        .bad => {
+            conn.owner.closeOnBackend(conn);
+            return 1;
+        },
+    };
     var buf: [RECV_CHUNK]u8 = undefined;
     var handled: u32 = 0;
     while (handled < budget) {
@@ -1596,15 +1780,19 @@ fn serviceConn(ctx: *anyopaque, budget: u32) u32 {
         };
         handled += 1;
         const read: usize = @intCast(n);
-        const ok = if (read == 0)
-            false
-        else if (conn.frame.len > 0) blk: {
-            conn.frameRead(read);
-            break :blk true;
-        } else conn.feed(buf[0..read]);
-        if (!ok) {
-            conn.owner.closeOnBackend(conn);
-            return handled;
+        const fed: TcpConnection.Fed = if (read == 0)
+            .bad
+        else if (conn.frame.len > 0)
+            (if (conn.frameRead(read)) .ok else .held)
+        else
+            conn.feed(buf[0..read]);
+        switch (fed) {
+            .ok => {},
+            .held => return handled,
+            .bad => {
+                conn.owner.closeOnBackend(conn);
+                return handled;
+            },
         }
     }
     return handled;

@@ -737,7 +737,9 @@ test "datagrams past the ingress bound are dropped, as a full receive buffer dro
     try pair.init(&m.runtime, .BEST_EFFORT_RELIABILITY_QOS, null);
     m.runtime.releaseOwner();
 
-    const limit = DomainParticipantImpl.ingress_pending_limit;
+    // One writer, so one peer: three quarters of the queue are its.
+    const reader_participant: *DomainParticipantImpl = @ptrCast(@alignCast(pair.dp_r.ptr));
+    const limit = reader_participant.ingress_budget.maxPeerRecords();
     const written = limit + 10;
     var got: std.ArrayListUnmanaged(u8) = .empty;
     defer got.deinit(alloc);
@@ -751,9 +753,8 @@ test "datagrams past the ingress bound are dropped, as a full receive buffer dro
         try takeInto(pair.dr, &got);
     }
     try testing.expectEqual(@as(usize, limit), got.items.len);
-    const reader_participant: *DomainParticipantImpl = @ptrCast(@alignCast(pair.dp_r.ptr));
     try testing.expectEqual(@as(u64, written - limit), reader_participant.ingress_drops.load(.monotonic));
-    try testing.expectEqual(@as(usize, 0), reader_participant.ingress_bytes.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), reader_participant.ingress_budget.queuedBytes());
 
     try pair.deinit();
     try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
@@ -778,17 +779,65 @@ test "datagrams past the ingress byte bound are dropped, as a full receive buffe
     const big = try alloc.alloc(u8, 64 * 1024);
     defer alloc.free(big);
     @memset(big, 0);
-    const fit = DomainParticipantImpl.ingress_byte_limit / big.len;
-    try testing.expect(fit < DomainParticipantImpl.ingress_pending_limit);
+    // From one source, so one peer: three quarters of the bytes are its.
+    const fit = dp_impl.ingress_budget.maxPeerBytes() / big.len;
+    try testing.expect(fit < dp_impl.ingress_budget.maxPeerRecords());
     const to = Locator.udp4(.{ 127, 0, 0, 1 }, dp_impl.data_listen_port);
     for (0..fit + 3) |_| try node.transport.transport().send(&to, big);
     try testing.expectEqual(@as(u64, 3), dp_impl.ingress_drops.load(.monotonic));
-    try testing.expectEqual(fit * big.len, dp_impl.ingress_bytes.load(.monotonic));
+    try testing.expectEqual(fit * big.len, dp_impl.ingress_budget.queuedBytes());
 
     // Not RTPS, so each is discarded as it is processed.
     try settle(&m);
-    try testing.expectEqual(@as(usize, 0), dp_impl.ingress_bytes.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), dp_impl.ingress_budget.queuedBytes());
 
+    try testing.expectEqual(DDS.RETCODE_OK, dp.delete_contained_entities());
+    try node.delete(dp);
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
+/// An RTPS header from the participant `prefix_byte` names, with nothing
+/// after it to process.
+fn headerFrom(prefix_byte: u8) [20]u8 {
+    var msg: [20]u8 = undefined;
+    @memcpy(msg[0..4], "RTPS");
+    msg[4..8].* = .{ 2, 5, 0x01, 0x0f };
+    @memset(msg[8..20], prefix_byte);
+    return msg;
+}
+
+test "a peer flooding a participant's ingress is held to its share, and another peer still finds room" {
+    var m: Manual = undefined;
+    m.init();
+    var delivery = try IntraProcessDelivery.init(alloc);
+    defer delivery.deinit();
+    var node = try Node.init(&delivery);
+    defer node.deinit();
+    try node.factory.selectRuntime(&m.runtime);
+    const dp = node.create();
+    try node.factory.selectRuntime(null);
+    m.runtime.releaseOwner();
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+    const budget = &dp_impl.ingress_budget;
+    const to = Locator.udp4(.{ 127, 0, 0, 1 }, dp_impl.data_listen_port);
+    const t = node.transport.transport();
+
+    // Before anything is processed, one peer sends far more than it may hold.
+    const flood = headerFrom(0xa1);
+    const cap = budget.maxPeerRecords();
+    for (0..cap + 20) |_| try t.send(&to, &flood);
+    try testing.expectEqual(cap, budget.queuedRecords());
+    try testing.expectEqual(@as(u64, 20), dp_impl.ingress_drops.load(.monotonic));
+
+    // Another peer's datagrams are all taken.
+    const other = headerFrom(0xb2);
+    for (0..10) |_| try t.send(&to, &other);
+    try testing.expectEqual(cap + 10, budget.queuedRecords());
+    try testing.expectEqual(@as(u64, 20), dp_impl.ingress_drops.load(.monotonic));
+
+    try settle(&m);
+    try testing.expectEqual(@as(u32, 0), budget.queuedRecords());
     try testing.expectEqual(DDS.RETCODE_OK, dp.delete_contained_entities());
     try node.delete(dp);
     try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());

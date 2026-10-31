@@ -12,24 +12,33 @@ const backend = @import("../runtime/backend.zig");
 const Locator = iface.Locator;
 const Channel = iface.Channel;
 const ReceiveHandler = iface.ReceiveHandler;
+const IngressBudget = @import("ingress_budget.zig").IngressBudget;
 
 pub const QueuedReceive = struct {
     alloc: std.mem.Allocator,
     context: *core.Context,
     /// Only its `on_receive` runs, in a turn of `context`.
     target: ReceiveHandler,
-    /// Bytes of the datagrams queued and not yet processed.
-    bytes: std.atomic.Value(usize) = .init(0),
-    /// Datagrams dropped: the byte bound or the context's pending limit
-    /// reached, the context closed, or no memory.
+    /// Bounds what is queued and not yet processed, in aggregate and per
+    /// peer; shared by every queue for `context`.
+    budget: *IngressBudget,
+    /// Datagrams dropped: a bound reached, the context closed, or no
+    /// memory.
     drops: std.atomic.Value(u64) = .init(0),
 
     /// Past this many queued bytes datagrams are dropped, as a full socket
     /// receive buffer drops them. A placeholder until measured.
     pub const byte_limit: usize = 4 * 1024 * 1024;
 
-    pub fn init(alloc: std.mem.Allocator, context: *core.Context, target: ReceiveHandler) QueuedReceive {
-        return .{ .alloc = alloc, .context = context, .target = target };
+    /// The budget for queues on `context`: records one under its pending
+    /// limit, as the context still counts the datagram its turn is
+    /// processing once the budget has released it.
+    pub fn budgetFor(context: *const core.Context) IngressBudget {
+        return IngressBudget.init(context.pending_limit -| 1, byte_limit);
+    }
+
+    pub fn init(alloc: std.mem.Allocator, context: *core.Context, budget: *IngressBudget, target: ReceiveHandler) QueuedReceive {
+        return .{ .alloc = alloc, .context = context, .budget = budget, .target = target };
     }
 
     /// The handler to listen and unlisten with. Must not move afterwards.
@@ -41,19 +50,22 @@ pub const QueuedReceive = struct {
     /// processed.
     pub fn discard(req: *core.Request) void {
         const item = Item.of(req);
-        _ = item.queue.bytes.fetchSub(item.data.len, .monotonic);
+        item.queue.budget.release(item.admission);
         Item.destroy(req);
     }
 
     fn onReceive(ctx: *anyopaque, raw: []const u8, src: Locator, channel: Channel) void {
         const self: *QueuedReceive = @ptrCast(@alignCast(ctx));
-        if (self.bytes.fetchAdd(raw.len, .monotonic) + raw.len > byte_limit) return self.drop(raw.len);
-        const item = self.alloc.create(Item) catch return self.drop(raw.len);
+        const adm = self.budget.admit(IngressBudget.peerKey(raw, src), raw.len) orelse {
+            _ = self.drops.fetchAdd(1, .monotonic);
+            return;
+        };
+        const item = self.alloc.create(Item) catch return self.drop(adm);
         const data = self.alloc.dupe(u8, raw) catch {
             self.alloc.destroy(item);
-            return self.drop(raw.len);
+            return self.drop(adm);
         };
-        item.* = .{ .alloc = self.alloc, .queue = self, .src = src, .channel = channel, .data = data };
+        item.* = .{ .alloc = self.alloc, .queue = self, .src = src, .channel = channel, .data = data, .admission = adm };
         item.req.on_done = Item.destroy;
         self.context.runtime.submit(null, self.context, &item.req) catch {
             discard(&item.req);
@@ -61,8 +73,8 @@ pub const QueuedReceive = struct {
         };
     }
 
-    fn drop(self: *QueuedReceive, len: usize) void {
-        _ = self.bytes.fetchSub(len, .monotonic);
+    fn drop(self: *QueuedReceive, adm: IngressBudget.Admission) void {
+        self.budget.release(adm);
         _ = self.drops.fetchAdd(1, .monotonic);
     }
 
@@ -73,6 +85,7 @@ pub const QueuedReceive = struct {
         src: Locator,
         channel: Channel,
         data: []u8,
+        admission: IngressBudget.Admission,
 
         fn of(req: *core.Request) *Item {
             return @fieldParentPtr("req", req);
@@ -82,7 +95,7 @@ pub const QueuedReceive = struct {
             const item = of(req);
             const q = item.queue;
             q.target.on_receive(q.target.ctx, item.data, item.src, item.channel);
-            _ = q.bytes.fetchSub(item.data.len, .monotonic);
+            q.budget.release(item.admission);
             return .done;
         }
 
@@ -120,7 +133,8 @@ test "a datagram's buffer is freed after its turn without the queue, which its o
     };
     Owner.received = 0;
     const q = try alloc.create(QueuedReceive);
-    q.* = QueuedReceive.init(alloc, &ctx, .{ .ctx = q, .on_receive = Owner.onReceive });
+    var budget = QueuedReceive.budgetFor(&ctx);
+    q.* = QueuedReceive.init(alloc, &ctx, &budget, .{ .ctx = q, .on_receive = Owner.onReceive });
     Owner.queue = q;
     const h = q.handler();
     h.on_receive(h.ctx, "datagram", Locator.udp4(.{ 127, 0, 0, 1 }, 7400), .none);

@@ -1110,7 +1110,9 @@ test "concurrent write_raw on one DataWriter keeps key_registry and last_sn cons
         }
     };
 
-    // Reader thread: the HashMap.get vs grow half of the race.
+    // Reader thread: the HashMap.get vs grow half of the race. It yields
+    // between reads: Valgrind runs one thread at a time, and a poller that
+    // never yields can hold the writers off the lock for many minutes.
     var stop = std.atomic.Value(bool).init(false);
     const Poller = struct {
         impl: *DataWriterImpl,
@@ -1119,6 +1121,7 @@ test "concurrent write_raw on one DataWriter keeps key_registry and last_sn cons
             while (!c.stop.load(.acquire)) {
                 const kh = std.mem.zeroes([16]u8);
                 _ = c.impl.getKeyValueRaw(DataWriterImpl.registerInstanceRaw(kh));
+                std.Thread.yield() catch {};
             }
         }
     };

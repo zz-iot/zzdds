@@ -74,6 +74,8 @@ const backend_mod = @import("../runtime/backend.zig");
 const ProgressBackend = backend_mod.ProgressBackend;
 const Source = backend_mod.Source;
 const poll_backend = @import("../runtime/poll_backend.zig");
+const runtime_mod = @import("../runtime/core.zig");
+const CloseLatch = @import("../runtime/close_latch.zig").CloseLatch;
 const schema = @import("../config/schema.zig");
 const polling = @import("monitor/polling.zig");
 
@@ -736,6 +738,12 @@ pub const UdpTransport = struct {
     /// running.
     writable_mu: mutex_mod.Mutex = .{},
     writable_waiters: ?*WritableWaiter = null,
+    /// The runtime of the participant that attached last
+    /// (vtAttachRuntime). Under `mu`.
+    runtime: ?*runtime_mod.Runtime = null,
+    /// On a runtime, while any port is listened: re-polls the interfaces in
+    /// place of the monitor's thread. Under `mu`.
+    iface_poll: ?*IfacePoll = null,
     test_hooks: if (builtin.is_test) TestHooks else void = if (builtin.is_test) .{} else {},
 
     /// Seams for deterministic tests; absent outside test builds.
@@ -743,9 +751,16 @@ pub const UdpTransport = struct {
         /// Sees each datagram before it is sent, with the flags the send
         /// passes. An outcome returned stands for the send, which is skipped.
         before_send: ?*const fn (t: *UdpTransport, iovecs: []const IoVec, flags: u32) ?SendOutcome = null,
+        /// Stands for the monitor's enumeration when the interfaces are
+        /// polled for a change.
+        enumerate: ?*const fn (t: *UdpTransport, out: *std.ArrayListUnmanaged(IfAddr)) anyerror!void = null,
     };
 
     const Self = @This();
+
+    /// Whether interfaces are re-polled after startup: off in a build
+    /// without the interface monitor, which enumerates them once.
+    pub const repolls_interfaces = build_opts.interface_monitor;
 
     // ── Init / deinit ─────────────────────────────────────────────────────────
 
@@ -833,8 +848,9 @@ pub const UdpTransport = struct {
             // enumerated once at startup only (PollingMonitor.vtStart does
             // this unconditionally), never re-polled -- interval_ms = 0 is
             // PollingMonitor's own sentinel for "no periodic re-poll thread".
-            // The shared runtime has no re-poll yet: it must start no thread
-            // (docs/design/concurrency/runtime.md#thread-mapping).
+            // On the shared runtime, which must start no thread, the
+            // transport re-polls on runtime timers instead
+            // (startIfacePollLocked).
             const poll_interval: u32 = if (build_opts.interface_monitor and !build_opts.shared_runtime) config.interface_poll_interval_ms else 0;
             const pm = try alloc.create(polling.PollingMonitor);
             pm.* = polling.PollingMonitor.init(alloc, poll_interval);
@@ -857,6 +873,11 @@ pub const UdpTransport = struct {
 
     pub fn deinit(self: *Self) void {
         self.closing.store(true, .release);
+        self.mu.lock();
+        const poll = self.iface_poll;
+        self.iface_poll = null;
+        self.mu.unlock();
+        if (poll) |p| p.stop();
         self.monitor.stop();
 
         if (self.monitor_owned) {
@@ -1217,12 +1238,34 @@ pub const UdpTransport = struct {
 
     // ── Interface change callback ─────────────────────────────────────────────
 
+    fn enumerate(self: *Self, out: *std.ArrayListUnmanaged(IfAddr)) !void {
+        if (builtin.is_test) {
+            if (self.test_hooks.enumerate) |hook| return hook(self, out);
+        }
+        return self.monitor.enumerate(out, self.alloc);
+    }
+
+    /// On a runtime's timer: handles a change of interfaces, as the
+    /// monitor's thread does, and only a change.
+    fn pollInterfaces(self: *Self) void {
+        var now: std.ArrayListUnmanaged(IfAddr) = .empty;
+        defer now.deinit(self.alloc);
+        self.enumerate(&now) catch return;
+        applyInterfaceFilter(self.alloc, &now, &self.config) catch {};
+        const changed = blk: {
+            self.mu.lock();
+            defer self.mu.unlock();
+            break :blk polling.PollingMonitor.addrListChanged(&self.active_ifaces, &now);
+        };
+        if (changed) onIfaceChange(self);
+    }
+
     fn onIfaceChange(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (self.closing.load(.acquire)) return;
 
         var new_ifaces: std.ArrayListUnmanaged(IfAddr) = .empty;
-        self.monitor.enumerate(&new_ifaces, self.alloc) catch return;
+        self.enumerate(&new_ifaces) catch return;
         applyInterfaceFilter(self.alloc, &new_ifaces, &self.config) catch {};
 
         // Collected under `mu` below, fired after it's released — see
@@ -1588,14 +1631,19 @@ pub const UdpTransport = struct {
 
     fn vtListen(ctx: *anyopaque, locator: *const Locator, handler: ReceiveHandler) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        self.mu.lock();
+        defer self.mu.unlock();
+        try self.listenLocked(locator, handler);
+        // While a port is listened, its participant keeps the runtime.
+        self.startIfacePollLocked();
+    }
+
+    fn listenLocked(self: *Self, locator: *const Locator, handler: ReceiveHandler) anyerror!void {
         const port: u32 = switch (locator.*) {
             .udp_v4 => |u| u.port,
             .udp_v6 => |u| u.port,
             else => return error.UnsupportedLocatorKind,
         };
-        self.mu.lock();
-        defer self.mu.unlock();
-
         const r = try self.port_entries.getOrPut(self.alloc, port);
         if (r.found_existing) {
             // Port already has sockets — just add the new handler to the fan-out list.
@@ -1873,8 +1921,11 @@ pub const UdpTransport = struct {
         if (fully_empty and self.backend != null) {
             self.mu.lock();
             const last = self.port_entries.count() == 0;
+            const poll = if (last) self.iface_poll else null;
+            if (last) self.iface_poll = null;
             self.mu.unlock();
             if (last) self.unregisterSendSources();
+            if (poll) |p| p.stop();
         }
 
         // Outside `mu`: wait for any on_channel_closed notification a
@@ -1934,6 +1985,38 @@ pub const UdpTransport = struct {
         self.deinit();
     }
 
+    fn vtAttachRuntime(ctx: *anyopaque, rt: *runtime_mod.Runtime) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.runtime = rt;
+    }
+
+    /// On a runtime, re-polls the interfaces on its timers, as the
+    /// monitor's thread would, unless already polling or configured not to
+    /// (docs/design/concurrency/runtime.md#thread-mapping).
+    fn startIfacePollLocked(self: *Self) void {
+        if (comptime !repolls_interfaces) return;
+        if (self.iface_poll != null or !self.monitor_owned) return;
+        const interval_ms = self.config.interface_poll_interval_ms;
+        if (interval_ms == 0) return;
+        const rt = self.runtime orelse return;
+        const p = self.alloc.create(IfacePoll) catch {
+            log.transport.warn("udp: interfaces are not re-polled: out of memory", .{});
+            return;
+        };
+        p.* = .{
+            .transport = self,
+            .context = runtime_mod.Context.init(rt, 0),
+            .timer = undefined,
+            .interval_ns = @as(i64, interval_ms) * std.time.ns_per_ms,
+        };
+        p.context.on_closed = p.latch.hook();
+        p.timer = runtime_mod.Timer.init(&p.context, IfacePoll.onTimer);
+        self.iface_poll = p;
+        _ = rt.armTimer(&p.timer, rt.clock.nowNs() + p.interval_ns);
+    }
+
     fn vtAttachBackend(ctx: *anyopaque, backend: ProgressBackend) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
@@ -1963,6 +2046,45 @@ pub const UdpTransport = struct {
         // Publishes the send sources to sendMsg along with nonblocking sends.
         self.send_nonblocking.store(true, .release);
     }
+};
+
+/// Re-polls a transport's interfaces on its participant's runtime, as a
+/// recurring timer in a context of its own.
+const IfacePoll = struct {
+    transport: *UdpTransport,
+    context: runtime_mod.Context,
+    timer: runtime_mod.Timer,
+    latch: CloseLatch = .{},
+    interval_ns: i64,
+    /// Guards `stopping`: a fire either finds it set or re-arms before
+    /// `stop` cancels the timer.
+    mu: mutex_mod.Mutex = .{},
+    stopping: bool = false,
+
+    fn onTimer(t: *runtime_mod.Timer, turn: *runtime_mod.Turn) void {
+        const self: *IfacePoll = @fieldParentPtr("timer", t);
+        self.transport.pollInterfaces();
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (!self.stopping) _ = turn.runtime.armTimer(t, turn.now_ns + self.interval_ns);
+    }
+
+    /// Stops and frees it, once a fire running elsewhere returns. Not under
+    /// the transport's `mu`, which a fire takes, and never from a fire.
+    fn stop(self: *IfacePoll) void {
+        self.mu.lock();
+        self.stopping = true;
+        self.mu.unlock();
+        self.context.runtime.cancelTimer(&self.timer);
+        const closed = self.latch.close(&self.context, discardFire);
+        std.debug.assert(closed);
+        self.context.deinit();
+        self.mu.deinit();
+        self.transport.alloc.destroy(self);
+    }
+
+    /// A queued fire is the timer's own request: nothing to free.
+    fn discardFire(_: *runtime_mod.Request) void {}
 };
 
 /// A send socket as an output-only source of the transport's backend.
@@ -1996,6 +2118,7 @@ const udp_vtable = Transport.Vtable{
     .capabilities = .{ .unicast = true, .multicast = true },
     .shared_runtime_ready = poll_backend.supported,
     .attach_backend = UdpTransport.vtAttachBackend,
+    .attach_runtime = UdpTransport.vtAttachRuntime,
     .can_reach = UdpTransport.vtCanReach,
     .send = UdpTransport.vtSend,
     .send_gather = UdpTransport.vtSendGather,

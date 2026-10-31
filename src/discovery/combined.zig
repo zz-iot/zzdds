@@ -23,6 +23,7 @@ const header_mod = @import("../rtps/message/header.zig");
 const runtime_mod = @import("../runtime/core.zig");
 const CloseLatch = @import("../runtime/close_latch.zig").CloseLatch;
 const QueuedReceive = @import("../transport/queued_receive.zig").QueuedReceive;
+const IngressBudget = @import("../transport/ingress_budget.zig").IngressBudget;
 const Mutex = @import("../util/mutex.zig").Mutex;
 
 pub const Discovery = iface.Discovery;
@@ -72,6 +73,8 @@ pub const SpdpSedpDiscovery = struct {
     runtime: ?*runtime_mod.Runtime = null,
     ingress: runtime_mod.Context = undefined,
     ingress_latch: CloseLatch = .{},
+    /// Bounds what SPDP and SEDP have queued for `ingress`, together.
+    ingress_budget: IngressBudget = undefined,
     timers: runtime_mod.Context = undefined,
     timers_latch: CloseLatch = .{},
     /// The plugin serves one participant at a time. Once that participant
@@ -179,6 +182,7 @@ pub const SpdpSedpDiscovery = struct {
         if (self.runtime != null) {
             self.ingress.deinit();
             self.timers.deinit();
+            self.ingress_budget.deinit();
         }
     }
 
@@ -204,6 +208,7 @@ pub const SpdpSedpDiscovery = struct {
         if (self.runtime != null) {
             self.ingress.deinit();
             self.timers.deinit();
+            self.ingress_budget.deinit();
         }
         self.runtime = null;
         self.ingress_latch = .{};
@@ -239,8 +244,9 @@ pub const SpdpSedpDiscovery = struct {
         // Only timer fires run here, with internal credit.
         self.timers = runtime_mod.Context.init(rt, 0);
         self.timers.on_closed = self.timers_latch.hook();
-        self.spdp.attachRuntime(rt, &self.ingress, &self.timers);
-        self.sedp.attachRuntime(rt, &self.ingress);
+        self.ingress_budget = QueuedReceive.budgetFor(&self.ingress);
+        self.spdp.attachRuntime(rt, &self.ingress, &self.ingress_budget, &self.timers);
+        self.sedp.attachRuntime(rt, &self.ingress, &self.ingress_budget);
         self.wlp.attachRuntime(rt);
     }
 

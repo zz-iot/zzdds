@@ -21,6 +21,9 @@
 //!   var asink  = try trace.AsyncRingSink.init(alloc, 4096, file_writer_ptr, .ndjson);
 //!   try asink.startFlushThread();
 //!   var tc     = trace.TraceConfig{ .sink = asink.sink() };
+//!
+//!   // Or, with no thread (a manual runtime's loop, say), drain it there:
+//!   //   asink.flush();
 
 const std = @import("std");
 const build_opts = @import("build_options");
@@ -459,6 +462,9 @@ pub const AsyncRingSink = struct {
     format: Format,
     thread: ?std.Thread,
     stopping: std.atomic.Value(bool),
+    /// Serializes drains, so that `flush` and the flush thread never write
+    /// to `writer` at once.
+    drain_mu: mutex_mod.Mutex = .{},
 
     const Self = @This();
     const FLUSH_INTERVAL_NS: u64 = 5 * std.time.ns_per_ms;
@@ -489,7 +495,7 @@ pub const AsyncRingSink = struct {
     }
 
     /// Start the background flush thread (optional). If not called, events
-    /// accumulate in the ring until `deinit` flushes them synchronously.
+    /// accumulate in the ring until `flush` or `deinit` writes them.
     pub fn startFlushThread(self: *Self) !void {
         self.thread = try std.Thread.spawn(.{}, flushLoop, .{self});
     }
@@ -500,6 +506,7 @@ pub const AsyncRingSink = struct {
             t.join();
         }
         self.drainAll(); // final flush
+        self.drain_mu.deinit();
         self.alloc.free(self.slots);
         self.alloc.destroy(self);
     }
@@ -529,7 +536,17 @@ pub const AsyncRingSink = struct {
         return n;
     }
 
+    /// Writes the events queued now to the writer, on the caller's thread,
+    /// for an application that drains the ring from its own loop instead of
+    /// a flush thread. Safe alongside the flush thread. Flushing the
+    /// writer's own buffer is the caller's.
+    pub fn flush(self: *Self) void {
+        self.drainAll();
+    }
+
     fn drainAll(self: *Self) void {
+        self.drain_mu.lock();
+        defer self.drain_mu.unlock();
         var batch: [DRAIN_BATCH]TraceEvent = undefined;
         while (true) {
             // Emit a skipped marker before the next real batch if drops occurred.
@@ -737,6 +754,31 @@ test "AsyncRingSink: dropped counter increments when ring is full" {
     const out = w.buffer[0..w.end];
     try testing.expect(std.mem.indexOf(u8, out, "\"t\":\"skipped\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"count\":2") != null);
+}
+
+test "AsyncRingSink: flush writes what is queued on the caller's thread, with no flush thread" {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const ring = try AsyncRingSink.init(testing.allocator, 2, &w, .ndjson);
+    defer ring.deinit();
+    ring.sink().submit(testDataEvent());
+    try testing.expectEqual(@as(usize, 0), w.end);
+    ring.flush();
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffer[0..w.end], "\"t\":\"send_data\""));
+
+    // Past capacity between flushes: the next flush reports the drops first.
+    for (0..3) |_| ring.sink().submit(testDataEvent());
+    ring.flush();
+    const out = w.buffer[0..w.end];
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, out, "\"t\":\"send_data\""));
+    try testing.expect(std.mem.indexOf(u8, out, "\"count\":1") != null);
+    const skipped = std.mem.indexOf(u8, out, "\"t\":\"skipped\"").?;
+    try testing.expect(skipped < std.mem.lastIndexOf(u8, out, "\"t\":\"send_data\"").?);
+
+    // Nothing queued: nothing written.
+    const end = w.end;
+    ring.flush();
+    try testing.expectEqual(end, w.end);
 }
 
 // ── Helpers for remaining event types ────────────────────────────────────────

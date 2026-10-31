@@ -37,6 +37,7 @@ const guid_mod = @import("../rtps/guid.zig");
 const unmatched_mod = @import("../rtps/unmatched_cache.zig");
 const disc = @import("../discovery/interface.zig");
 const transport_if = @import("../transport/interface.zig");
+const IngressBudget = @import("../transport/ingress_budget.zig").IngressBudget;
 const TcpTransport = @import("../transport/tcp.zig").TcpTransport;
 const security_if = @import("../security/interface.zig");
 const parser_mod = @import("../rtps/message/parser.zig");
@@ -1065,8 +1066,10 @@ pub const DomainParticipantImpl = struct {
     /// at a time (docs/design/concurrency/runtime.md#ingress).
     ingress: runtime_mod.Context = undefined,
     ingress_latch: CloseLatch = .{},
-    /// Bytes of the datagrams queued for ingress and not yet processed.
-    ingress_bytes: std.atomic.Value(usize) = .init(0),
+    /// What is queued for ingress and not yet processed, bounded in
+    /// aggregate and per peer; stream connections waiting for room wait on
+    /// it.
+    ingress_budget: IngressBudget = IngressBudget.init(ingress_record_limit, ingress_byte_limit),
     /// Datagrams dropped at ingress: a bound reached, or no memory.
     ingress_drops: std.atomic.Value(u64) = .init(0),
     /// With a runtime: `checkTimers` runs as one timer in this context,
@@ -1211,11 +1214,16 @@ pub const DomainParticipantImpl = struct {
     }
 
     /// Bounds on the datagrams queued for ingress and not yet processed, by
-    /// count and by bytes. Past either they are dropped, as a full socket
-    /// receive buffer drops them (docs/design/concurrency/runtime.md#ingress).
+    /// count and by bytes, in aggregate and, past half of either, per peer
+    /// (IngressBudget). Past them a datagram is dropped, as a full socket
+    /// receive buffer drops it, and a stream connection stops reading
+    /// until there is room (docs/design/concurrency/runtime.md#ingress).
     /// Placeholders until measured and made configurable.
     pub const ingress_pending_limit: u32 = 256;
     pub const ingress_byte_limit: usize = 4 * 1024 * 1024;
+    /// One under the context's limit: the context still counts the datagram
+    /// its turn is processing once the budget has released it.
+    pub const ingress_record_limit: u32 = ingress_pending_limit - 1;
 
     /// Puts the participant on `rt`, whose owner reference the caller has
     /// taken for it. Call once, before `start`.
@@ -1240,6 +1248,9 @@ pub const DomainParticipantImpl = struct {
         return .{
             .ctx = self,
             .on_receive = if (self.runtime != null) ingressOnReceive else userDataOnReceive,
+            .try_receive = if (self.runtime != null) ingressTryReceive else null,
+            .notify_room = if (self.runtime != null) notifyRoom else null,
+            .cancel_room = if (self.runtime != null) cancelRoom else null,
         };
     }
 
@@ -1250,6 +1261,7 @@ pub const DomainParticipantImpl = struct {
         participant: *Self,
         src: Locator,
         data: []u8,
+        admission: IngressBudget.Admission,
 
         fn of(req: *runtime_mod.Request) *Ingress {
             return @fieldParentPtr("req", req);
@@ -1261,7 +1273,7 @@ pub const DomainParticipantImpl = struct {
             userDataOnReceive(p, item.data, item.src, transport_if.Channel.none);
             // Accounted while the participant is certainly alive; the buffer
             // itself is freed by `destroy` after the turn.
-            _ = p.ingress_bytes.fetchSub(item.data.len, .monotonic);
+            p.ingress_budget.release(item.admission);
             return .done;
         }
 
@@ -1275,7 +1287,7 @@ pub const DomainParticipantImpl = struct {
         /// Drops a datagram that was queued and never processed.
         fn discard(req: *runtime_mod.Request) void {
             const item = of(req);
-            _ = item.participant.ingress_bytes.fetchSub(item.data.len, .monotonic);
+            item.participant.ingress_budget.release(item.admission);
             destroy(req);
         }
     };
@@ -1284,17 +1296,47 @@ pub const DomainParticipantImpl = struct {
     /// the sender's stack: an in-process sender may hold its writer's lock.
     fn ingressOnReceive(ctx: *anyopaque, raw: []const u8, src: Locator, _: transport_if.Channel) void {
         const self = cast(ctx);
-        if (self.ingress_bytes.fetchAdd(raw.len, .monotonic) + raw.len > ingress_byte_limit) {
-            _ = self.ingress_bytes.fetchSub(raw.len, .monotonic);
+        const adm = self.ingress_budget.admit(IngressBudget.peerKey(raw, src), raw.len) orelse {
             _ = self.ingress_drops.fetchAdd(1, .monotonic);
             return;
+        };
+        self.queueIngress(raw, src, adm);
+    }
+
+    /// As `ingressOnReceive`, for a stream connection: returns false,
+    /// keeping nothing, when ingress has no room for `raw`, rather than
+    /// dropping it, so the connection holds it and stops reading.
+    fn ingressTryReceive(ctx: *anyopaque, raw: []const u8, src: Locator, _: transport_if.Channel) bool {
+        const self = cast(ctx);
+        if (raw.len > self.ingress_budget.maxPeerBytes()) {
+            // Never fits: dropped, as an oversized datagram would be.
+            _ = self.ingress_drops.fetchAdd(1, .monotonic);
+            return true;
         }
-        const item = self.alloc.create(Ingress) catch return self.dropIngress(raw.len);
+        const adm = self.ingress_budget.admit(IngressBudget.peerKey(raw, src), raw.len) orelse return false;
+        self.queueIngress(raw, src, adm);
+        return true;
+    }
+
+    fn notifyRoom(ctx: *anyopaque, waiter: *transport_if.RoomWaiter, raw: []const u8, src: Locator) void {
+        const self = cast(ctx);
+        waiter.len = raw.len;
+        waiter.key = IngressBudget.peerKey(raw, src);
+        self.ingress_budget.notifyRoom(waiter);
+    }
+
+    fn cancelRoom(ctx: *anyopaque, waiter: *transport_if.RoomWaiter) void {
+        cast(ctx).ingress_budget.cancelRoom(waiter);
+    }
+
+    /// Queues a copy of `raw`, for which `adm` took room.
+    fn queueIngress(self: *Self, raw: []const u8, src: Locator, adm: IngressBudget.Admission) void {
+        const item = self.alloc.create(Ingress) catch return self.dropIngress(adm);
         const data = self.alloc.dupe(u8, raw) catch {
             self.alloc.destroy(item);
-            return self.dropIngress(raw.len);
+            return self.dropIngress(adm);
         };
-        item.* = .{ .alloc = self.alloc, .participant = self, .src = src, .data = data };
+        item.* = .{ .alloc = self.alloc, .participant = self, .src = src, .data = data, .admission = adm };
         item.req.on_done = Ingress.destroy;
         self.runtime.?.submit(null, &self.ingress, &item.req) catch {
             Ingress.discard(&item.req);
@@ -1302,8 +1344,8 @@ pub const DomainParticipantImpl = struct {
         };
     }
 
-    fn dropIngress(self: *Self, len: usize) void {
-        _ = self.ingress_bytes.fetchSub(len, .monotonic);
+    fn dropIngress(self: *Self, adm: IngressBudget.Admission) void {
+        self.ingress_budget.release(adm);
         _ = self.ingress_drops.fetchAdd(1, .monotonic);
     }
 
@@ -1320,6 +1362,7 @@ pub const DomainParticipantImpl = struct {
             self.listener_group.deinit();
             rt.releaseOwner();
         }
+        self.ingress_budget.deinit();
         alloc.destroy(self);
     }
 
@@ -1362,10 +1405,8 @@ pub const DomainParticipantImpl = struct {
             const ephemeral = Locator.tcp4(bind_addr, 0);
             // Bind now (rather than in the generic listen block below) so the
             // real, OS-assigned address/port is known in time to announce it.
-            try self.transport.listen(&ephemeral, transport_if.ReceiveHandler{
-                .ctx = self,
-                .on_receive = userDataOnReceive,
-            });
+            // On a runtime, frames go through ingress as datagrams do.
+            try self.transport.listen(&ephemeral, self.userDataHandler());
             self.data_listening = true;
             var tcp_locs: std.ArrayListUnmanaged(Locator) = .empty;
             defer tcp_locs.deinit(self.alloc);

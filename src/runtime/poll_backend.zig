@@ -137,6 +137,8 @@ pub const PollBackend = struct {
         .register = vtRegister,
         .unregister = vtUnregister,
         .arm_output = vtArmOutput,
+        .pause_input = vtPauseInput,
+        .resume_input = vtResumeInput,
     };
 
     const clock_vtable: Clock.Vtable = .{ .now_ns = vtNow, .sleep_ns = vtSleep };
@@ -242,7 +244,7 @@ pub const PollBackend = struct {
     /// left out, since poll would still report its errors.
     fn waitEvents(s: *const Source) i16 {
         var events: i16 = 0;
-        if (s.input) events |= posix.POLL.IN;
+        if (s.input and !s.input_paused) events |= posix.POLL.IN;
         if (s.output_armed) events |= posix.POLL.OUT;
         return events;
     }
@@ -283,6 +285,32 @@ pub const PollBackend = struct {
         }
         // A poller already waiting starts waiting for the output.
         if (self.polling.load(.seq_cst)) self.signal();
+    }
+
+    fn vtPauseInput(ctx: *anyopaque, source: *Source) void {
+        const self = of(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (source.input_paused) return;
+        source.input_paused = true;
+        self.version += 1;
+        // A poller still waiting on it finds it ready at most once more,
+        // and its service holds the input.
+    }
+
+    fn vtResumeInput(ctx: *anyopaque, source: *Source) void {
+        const self = of(ctx);
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            source.kicked.store(true, .seq_cst);
+            if (source.input_paused) {
+                source.input_paused = false;
+                self.version += 1;
+            }
+        }
+        // Whoever waits services next, whether or not the socket has input.
+        self.wakeN(1);
     }
 
     /// Under `service_mu`: whether `s` was armed, disarming it.
@@ -342,7 +370,14 @@ pub const PollBackend = struct {
         if (!self.rebuildServiceList()) return .{};
         const fds = self.service_fds.items;
         if (fds.len == 0) return .{};
-        const ready = posix.poll(fds, 0) catch return .{};
+        var ready = posix.poll(fds, 0) catch return .{};
+        // A resumed source runs as if it had input, until it is serviced.
+        // Others are only read.
+        for (self.service_sources.items, fds) |s, *fd| {
+            if (!s.kicked.load(.seq_cst)) continue;
+            if (fd.revents == 0) ready += 1;
+            fd.revents |= posix.POLL.IN;
+        }
         if (ready == 0) return .{};
 
         // Round robin: one input from each ready source per round, starting
@@ -371,6 +406,7 @@ pub const PollBackend = struct {
                     progressed = true;
                     continue;
                 }
+                if (s.kicked.load(.seq_cst)) s.kicked.store(false, .seq_cst);
                 if (fds[i].revents & posix.POLL.NVAL != 0 or s.service(s.ctx, 1) == 0) {
                     fds[i].revents = 0;
                     continue;
