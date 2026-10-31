@@ -351,6 +351,20 @@ const Announcements = struct {
         self.writer = w;
     }
 
+    /// Lets go of the writer, which stops: nothing more is written to it,
+    /// and the next one attached reserves the slots again. An endpoint it
+    /// announced is announced afresh there.
+    fn detachWriter(self: *Announcements) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.writer = null;
+        var it = self.endpoints.valueIterator();
+        while (it.next()) |p| {
+            p.slot = false;
+            p.announced = false;
+        }
+    }
+
     /// Takes `payload` and `disposal` on success; frees nothing on failure.
     fn prepare(self: *Announcements, alloc: std.mem.Allocator, kh: [16]u8, payload: []u8, disposal: []u8) !void {
         self.mu.lock();
@@ -409,6 +423,56 @@ const Announcements = struct {
     }
 };
 
+/// What the publications and subscriptions writers announce. It can outlive
+/// the writers (`SedpEndpoints.useAnnouncements`): endpoints are prepared
+/// before discovery starts, and a plugin that restarts makes new writers.
+pub const LocalAnnouncements = struct {
+    publications: Announcements = .{},
+    subscriptions: Announcements = .{},
+
+    pub fn deinit(self: *LocalAnnouncements, alloc: std.mem.Allocator) void {
+        self.publications.deinit(alloc);
+        self.subscriptions.deinit(alloc);
+    }
+
+    fn detachWriters(self: *LocalAnnouncements) void {
+        self.publications.detachWriter();
+        self.subscriptions.detachWriter();
+    }
+
+    pub fn prepareWriter(self: *LocalAnnouncements, alloc: std.mem.Allocator, ann: *const WriterAnnouncement) !void {
+        const payload = try encodeWriterData(alloc, ann);
+        errdefer alloc.free(payload);
+        const disposal = try encodeEndpointDisposalPayload(alloc, ann.guid);
+        errdefer alloc.free(disposal);
+        try self.publications.prepare(alloc, guidToKeyHash(ann.guid), payload, disposal);
+    }
+
+    pub fn announceWriter(self: *LocalAnnouncements, alloc: std.mem.Allocator, guid: Guid) void {
+        self.publications.announce(alloc, guidToKeyHash(guid));
+    }
+
+    pub fn retractWriter(self: *LocalAnnouncements, alloc: std.mem.Allocator, guid: Guid) void {
+        self.publications.retract(alloc, guidToKeyHash(guid));
+    }
+
+    pub fn prepareReader(self: *LocalAnnouncements, alloc: std.mem.Allocator, ann: *const ReaderAnnouncement) !void {
+        const payload = try encodeReaderData(alloc, ann);
+        errdefer alloc.free(payload);
+        const disposal = try encodeEndpointDisposalPayload(alloc, ann.guid);
+        errdefer alloc.free(disposal);
+        try self.subscriptions.prepare(alloc, guidToKeyHash(ann.guid), payload, disposal);
+    }
+
+    pub fn announceReader(self: *LocalAnnouncements, alloc: std.mem.Allocator, guid: Guid) void {
+        self.subscriptions.announce(alloc, guidToKeyHash(guid));
+    }
+
+    pub fn retractReader(self: *LocalAnnouncements, alloc: std.mem.Allocator, guid: Guid) void {
+        self.subscriptions.retract(alloc, guidToKeyHash(guid));
+    }
+};
+
 /// SEDP built-in endpoints + endpoint announcement/detection.
 pub const SedpEndpoints = struct {
     alloc: std.mem.Allocator,
@@ -423,9 +487,10 @@ pub const SedpEndpoints = struct {
     pub_reader: ?*StatefulReader,
     sub_writer: ?*StatefulWriter,
     sub_reader: ?*StatefulReader,
-    /// What `pub_writer` and `sub_writer` announce.
-    pub_announcements: Announcements = .{},
-    sub_announcements: Announcements = .{},
+    /// What `pub_writer` and `sub_writer` announce: `own_announcements`,
+    /// unless `useAnnouncements` gave others.
+    announcements: *LocalAnnouncements,
+    own_announcements: LocalAnnouncements = .{},
 
     mu: Mutex,
     participant_locs_mu: Mutex,
@@ -511,17 +576,25 @@ pub const SedpEndpoints = struct {
             .wlp_ctx = null,
             .wlp_try_handle_fn = null,
             .data_reachable = null,
+            .announcements = undefined,
         };
+        self.announcements = &self.own_announcements;
         return self;
     }
 
+    /// Announces from `a`, which outlives this, instead of its own. Call
+    /// before `start` and before anything is prepared here.
+    pub fn useAnnouncements(self: *Self, a: *LocalAnnouncements) void {
+        self.announcements = a;
+    }
+
     pub fn deinit(self: *Self) void {
+        self.announcements.detachWriters();
         if (self.pub_writer) |w| w.deinit();
         if (self.pub_reader) |r| r.deinit();
         if (self.sub_writer) |w| w.deinit();
         if (self.sub_reader) |r| r.deinit();
-        self.pub_announcements.deinit(self.alloc);
-        self.sub_announcements.deinit(self.alloc);
+        self.own_announcements.deinit(self.alloc);
         self.deferred.deinit(self.alloc, self);
         self.participant_locs_mu.lock();
         var it = self.participant_locs.iterator();
@@ -684,8 +757,8 @@ pub const SedpEndpoints = struct {
         );
         self.sub_reader.?.setTracer(self.tracer);
         self.sub_reader.?.setCallback(.{ .ctx = self, .on_data = onSubData, .on_flush = onFlush });
-        try self.pub_announcements.attachWriter(self.pub_writer.?);
-        try self.sub_announcements.attachWriter(self.sub_writer.?);
+        try self.announcements.publications.attachWriter(self.pub_writer.?);
+        try self.announcements.subscriptions.attachWriter(self.sub_writer.?);
 
         // Listen on the metatraffic unicast port for SEDP traffic.
         if (self.meta_unicast_port != 0) {
@@ -704,6 +777,9 @@ pub const SedpEndpoints = struct {
         // thread can fire onProbeResult -> onParticipantLost on freed memory.
         if (self.pub_writer) |w| w.stopHeartbeat();
         if (self.sub_writer) |w| w.stopHeartbeat();
+        // An endpoint deleted after this sends no disposal: the writers go
+        // with the participant, whose peers drop what it announced.
+        self.announcements.detachWriters();
         if (self.meta_unicast_port != 0) {
             const loc = Locator.udp4(.{ 0, 0, 0, 0 }, self.meta_unicast_port);
             self.transport.unlisten(&loc, self.receiveHandler());
@@ -820,35 +896,27 @@ pub const SedpEndpoints = struct {
     // retains all endpoints rather than overwriting with the most recent.
 
     pub fn prepareWriter(self: *Self, ann: *const WriterAnnouncement) !void {
-        const payload = try encodeWriterData(self.alloc, ann);
-        errdefer self.alloc.free(payload);
-        const disposal = try encodeEndpointDisposalPayload(self.alloc, ann.guid);
-        errdefer self.alloc.free(disposal);
-        try self.pub_announcements.prepare(self.alloc, guidToKeyHash(ann.guid), payload, disposal);
+        return self.announcements.prepareWriter(self.alloc, ann);
     }
 
     pub fn announceWriter(self: *Self, guid: Guid) void {
-        self.pub_announcements.announce(self.alloc, guidToKeyHash(guid));
+        self.announcements.announceWriter(self.alloc, guid);
     }
 
     pub fn retractWriter(self: *Self, guid: Guid) void {
-        self.pub_announcements.retract(self.alloc, guidToKeyHash(guid));
+        self.announcements.retractWriter(self.alloc, guid);
     }
 
     pub fn prepareReader(self: *Self, ann: *const ReaderAnnouncement) !void {
-        const payload = try encodeReaderData(self.alloc, ann);
-        errdefer self.alloc.free(payload);
-        const disposal = try encodeEndpointDisposalPayload(self.alloc, ann.guid);
-        errdefer self.alloc.free(disposal);
-        try self.sub_announcements.prepare(self.alloc, guidToKeyHash(ann.guid), payload, disposal);
+        return self.announcements.prepareReader(self.alloc, ann);
     }
 
     pub fn announceReader(self: *Self, guid: Guid) void {
-        self.sub_announcements.announce(self.alloc, guidToKeyHash(guid));
+        self.announcements.announceReader(self.alloc, guid);
     }
 
     pub fn retractReader(self: *Self, guid: Guid) void {
-        self.sub_announcements.retract(self.alloc, guidToKeyHash(guid));
+        self.announcements.retractReader(self.alloc, guid);
     }
 
     // ── Transport receive callback ────────────────────────────────────────────

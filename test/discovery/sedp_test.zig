@@ -1073,3 +1073,46 @@ test "SEDP: a writer retracted unannounced gives back its reservation" {
     var buf: [4]history_kind = undefined;
     try testing.expectEqual(@as(usize, 0), r.history(&buf).len);
 }
+
+test "SEDP: a writer prepared while the plugin is stopped is announced once the next participant starts it" {
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+    const meta_locs = [_]Locator{Locator.udp4(.{ 127, 0, 0, 0x31 }, metaPort(0x31))};
+    const transport = try MockTransport.init(testing.allocator, net, &meta_locs);
+    defer transport.deinit();
+    const plugin = try zzdds.combined_discovery.SpdpSedpDiscovery.init(testing.allocator, transport.transport(), 0, 1_000);
+    defer plugin.deinit();
+    const d = plugin.toDiscovery();
+    var rec: Recorder = .{ .alloc = testing.allocator };
+    defer rec.deinit();
+    const cbs = rec.callbacks();
+    var ann: ParticipantAnnouncement = .{
+        .guid = makeGuid(0x31, 0x01),
+        .domain_id = 0,
+        .name = "",
+        .metatraffic_unicast_locators = &meta_locs,
+        .metatraffic_multicast_locators = &.{},
+        .default_unicast_locators = &.{},
+        .default_multicast_locators = &.{},
+        .lease_duration_ms = 10_000,
+        .builtin_endpoint_set = ALL_SEDP_ENDPOINTS,
+    };
+    try d.start(&ann, &cbs);
+    d.stop();
+
+    // The next participant prepares its writer before it starts the plugin,
+    // which then gives it new SEDP.
+    ann.guid = makeGuid(0x32, 0x01);
+    const guid = makeGuid(0x32, 0x10);
+    var w = Reserving.writerAnnouncement(guid);
+    w.participant_guid = ann.guid;
+    try d.prepareWriter(&w);
+    try d.start(&ann, &cbs);
+    defer d.stop();
+    d.announceWriter(guid);
+    const changes = plugin.sedp.pub_writer.?.cache.changes.items;
+    try testing.expectEqual(@as(usize, 1), changes.len);
+    try testing.expectEqual(history_kind.alive, changes[0].kind);
+    d.retractWriter(guid);
+    try testing.expectEqual(history_kind.not_alive_disposed, plugin.sedp.pub_writer.?.cache.changes.items[0].kind);
+}

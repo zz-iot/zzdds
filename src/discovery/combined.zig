@@ -66,6 +66,10 @@ pub const SpdpSedpDiscovery = struct {
     sedp: *sedp.SedpEndpoints,
     wlp: *wlp_mod.WlpEndpoints,
     disc_fanout: DiscoveredFanout,
+    /// What the participant's endpoints prepared, announced by `sedp`. Kept
+    /// across `reset`: a participant prepares its endpoints before it
+    /// starts, and its start makes the parts new after a stopped one.
+    announcements: sedp.LocalAnnouncements = .{},
 
     /// With a runtime (`attachRuntime`): the contexts that process received
     /// datagrams, one at a time, and run the SPDP timers. Writers'
@@ -136,6 +140,7 @@ pub const SpdpSedpDiscovery = struct {
 
         const se = try sedp.SedpEndpoints.init(alloc, self.transport);
         errdefer se.deinit();
+        se.useAnnouncements(&self.announcements);
 
         const wl = try wlp_mod.WlpEndpoints.init(alloc, self.transport);
         errdefer wl.deinit();
@@ -188,14 +193,16 @@ pub const SpdpSedpDiscovery = struct {
 
     pub fn deinit(self: *Self) void {
         self.deinitParts();
+        self.announcements.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
     /// Gives a participant after a stopped one, or one on another runtime
     /// than a participant that never started, the state of a new plugin on
     /// `rt`: nothing of the earlier participant's peers or announcements
-    /// remains. Unstarted or stopped, the old parts have nothing armed or
-    /// queued. With `mu` held.
+    /// remains. What endpoints prepared (`announcements`) is kept: the new
+    /// parts announce it. Unstarted or stopped, the old parts have nothing
+    /// armed or queued. With `mu` held.
     fn reset(self: *Self, rt: ?*runtime_mod.Runtime) !void {
         std.debug.assert(self.phase == .fresh or self.phase == .stopped);
         const sp = self.spdp;
@@ -412,32 +419,32 @@ pub const SpdpSedpDiscovery = struct {
 
     fn vtPrepareWriter(ctx: *anyopaque, info: *const iface.WriterAnnouncement) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.sedp.prepareWriter(info);
+        return self.announcements.prepareWriter(self.alloc, info);
     }
 
     fn vtAnnounceWriter(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.sedp.announceWriter(guid);
+        self.announcements.announceWriter(self.alloc, guid);
     }
 
     fn vtRetractWriter(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.sedp.retractWriter(guid);
+        self.announcements.retractWriter(self.alloc, guid);
     }
 
     fn vtPrepareReader(ctx: *anyopaque, info: *const iface.ReaderAnnouncement) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.sedp.prepareReader(info);
+        return self.announcements.prepareReader(self.alloc, info);
     }
 
     fn vtAnnounceReader(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.sedp.announceReader(guid);
+        self.announcements.announceReader(self.alloc, guid);
     }
 
     fn vtRetractReader(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.sedp.retractReader(guid);
+        self.announcements.retractReader(self.alloc, guid);
     }
 
     fn vtDeinit(ctx: *anyopaque) void {

@@ -233,6 +233,16 @@ Forward-looking only: known gaps, planned features, and open design questions.
   commits an announcement into the bus without allocating, but telling the other
   participants copies it for each of them, and a copy that fails is skipped; nothing
   repairs it, as reliable SEDP repairs a lost announcement.
+- **A remote endpoint's discovery is handled best-effort when out of memory.** The
+  participant allocates as it handles a remote endpoint's announcement, refresh or loss
+  (`onWriterDiscovered`/`onReaderDiscovered`/`onWriterLost`/`onReaderLost`): the
+  announcement's discovery generation, the matches to make, and the removals whose
+  callbacks fire once `mu` is released. When one fails, those matches are not made or not
+  removed, and nothing retries, as SEDP has accepted the announcement and does not deliver
+  it again: a refresh that no longer matches then stays matched, and a lost endpoint stays
+  matched and discovered. Holding this needs room made ahead, as for a local endpoint's
+  announcement: removals collected in fixed storage, a batch at a time, and the
+  generations sized as remote endpoints are discovered.
 
 ### Entity cleanup lock order
 
