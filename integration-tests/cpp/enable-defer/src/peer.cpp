@@ -13,6 +13,7 @@
 #include "zzdds_cpp.hpp"
 #include "dcps_impl.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -103,9 +104,12 @@ int main(int argc, char **argv) {
     // Core assertion: for a window comfortably inside the configurer's own
     // pre-enable delay, matched-current-count must stay exactly 0 -- direct
     // proof the deferred SEDP announcement genuinely never went out while
-    // the configurer's writer was disabled.
+    // the configurer's writer was disabled. Timed by the clock, not by
+    // counting polls: a sleep can run long (Windows rounds it up to the
+    // timer tick), and counted polls then outlast the configurer's delay.
     ::DDS::SubscriptionMatchedStatus status;
-    for (int waited_ms = 0; waited_ms < PREMATURE_CHECK_WINDOW_SEC * 1000; waited_ms += POLL_PERIOD_MS) {
+    const auto window_end = std::chrono::steady_clock::now() + std::chrono::seconds(PREMATURE_CHECK_WINDOW_SEC);
+    while (std::chrono::steady_clock::now() < window_end) {
         if (dr->get_subscription_matched_status(status) != ::DDS::RETCODE_OK) {
             std::fprintf(stderr, "FAIL: get_subscription_matched_status() failed\n");
             return 1;
