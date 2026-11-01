@@ -276,7 +276,9 @@ pub const DiscoveryBus = struct {
             // A copy to tell from: the stored one is the entry's.
             info = owned.clone(arena.allocator()) catch null;
             writer_data_locs = arena.allocator().dupe(Locator, e.data_locators) catch &.{};
-            own_callbacks = e.callbacks;
+            // A refresh tells it nothing new: the participant matches its
+            // endpoint again against what it has discovered.
+            if (first) own_callbacks = e.callbacks;
             // Same-domain peers.
             for (self.entries.items) |*peer| {
                 if (peer == e or peer.domain_id != e.domain_id) continue;
@@ -369,7 +371,9 @@ pub const DiscoveryBus = struct {
             storeEndpoint(ReaderAnnouncement, self.alloc, &e.readers, &e.reserved_readers, owned, first);
             info = owned.clone(arena.allocator()) catch null;
             reader_data_locs = arena.allocator().dupe(Locator, e.data_locators) catch &.{};
-            own_callbacks = e.callbacks;
+            // A refresh tells it nothing new: the participant matches its
+            // endpoint again against what it has discovered.
+            if (first) own_callbacks = e.callbacks;
             for (self.entries.items) |*peer| {
                 if (peer == e or peer.domain_id != e.domain_id) continue;
                 if (snap_count < snapshots.len) {
@@ -572,6 +576,8 @@ pub const DirectDiscovery = struct {
         return struct {
             /// To store on the next announce, until stored.
             pending: ?T,
+            /// Prepared to replace `pending`, until adopted or abandoned.
+            staged: ?T = null,
             /// Room is reserved for it in the bus entry.
             slot: bool,
             announced: bool = false,
@@ -592,7 +598,10 @@ pub const DirectDiscovery = struct {
     pub fn deinit(self: *DirectDiscovery) void {
         inline for (.{ &self.writers, &self.readers }) |map| {
             var it = map.valueIterator();
-            while (it.next()) |p| if (p.pending) |*a| a.deinit(self.alloc);
+            while (it.next()) |p| {
+                if (p.pending) |*a| a.deinit(self.alloc);
+                if (p.staged) |*a| a.deinit(self.alloc);
+            }
             map.deinit(self.alloc);
         }
         self.mu.deinit();
@@ -669,8 +678,8 @@ pub const DirectDiscovery = struct {
         const map = &@field(self, @tagName(kind));
         const gop = try map.getOrPut(self.alloc, info.guid);
         if (gop.found_existing) {
-            if (gop.value_ptr.pending) |*old| old.deinit(self.alloc);
-            gop.value_ptr.pending = owned;
+            if (gop.value_ptr.staged) |*old| old.deinit(self.alloc);
+            gop.value_ptr.staged = owned;
             return;
         }
         if (self.joined) self.bus.busReserve(self.participant_guid, kind, 1) catch |err| {
@@ -678,6 +687,24 @@ pub const DirectDiscovery = struct {
             return err;
         };
         gop.value_ptr.* = .{ .pending = owned, .slot = self.joined };
+    }
+
+    fn adopt(self: *DirectDiscovery, comptime kind: DiscoveryBus.Kind, guid: Guid) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const p = @field(self, @tagName(kind)).getPtr(guid) orelse return;
+        const staged = p.staged orelse return;
+        if (p.pending) |*old| old.deinit(self.alloc);
+        p.pending = staged;
+        p.staged = null;
+    }
+
+    fn abandon(self: *DirectDiscovery, comptime kind: DiscoveryBus.Kind, guid: Guid) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const p = @field(self, @tagName(kind)).getPtr(guid) orelse return;
+        if (p.staged) |*a| a.deinit(self.alloc);
+        p.staged = null;
     }
 
     fn announce(self: *DirectDiscovery, comptime kind: DiscoveryBus.Kind, guid: Guid) void {
@@ -715,6 +742,7 @@ pub const DirectDiscovery = struct {
         } orelse return;
         var p = kv.value;
         if (p.pending) |*a| a.deinit(self.alloc);
+        if (p.staged) |*a| a.deinit(self.alloc);
         if (p.announced) switch (kind) {
             .writers => self.bus.busRetractWriter(participant_guid, guid),
             .readers => self.bus.busRetractReader(participant_guid, guid),
@@ -724,6 +752,16 @@ pub const DirectDiscovery = struct {
     fn vtPrepareWriter(ctx: *anyopaque, info: *const WriterAnnouncement) anyerror!void {
         const self: *DirectDiscovery = @ptrCast(@alignCast(ctx));
         try self.prepare(.writers, info);
+    }
+
+    fn vtAdoptWriter(ctx: *anyopaque, guid: Guid) void {
+        const self: *DirectDiscovery = @ptrCast(@alignCast(ctx));
+        self.adopt(.writers, guid);
+    }
+
+    fn vtAbandonWriter(ctx: *anyopaque, guid: Guid) void {
+        const self: *DirectDiscovery = @ptrCast(@alignCast(ctx));
+        self.abandon(.writers, guid);
     }
 
     fn vtAnnounceWriter(ctx: *anyopaque, guid: Guid) void {
@@ -739,6 +777,16 @@ pub const DirectDiscovery = struct {
     fn vtPrepareReader(ctx: *anyopaque, info: *const ReaderAnnouncement) anyerror!void {
         const self: *DirectDiscovery = @ptrCast(@alignCast(ctx));
         try self.prepare(.readers, info);
+    }
+
+    fn vtAdoptReader(ctx: *anyopaque, guid: Guid) void {
+        const self: *DirectDiscovery = @ptrCast(@alignCast(ctx));
+        self.adopt(.readers, guid);
+    }
+
+    fn vtAbandonReader(ctx: *anyopaque, guid: Guid) void {
+        const self: *DirectDiscovery = @ptrCast(@alignCast(ctx));
+        self.abandon(.readers, guid);
     }
 
     fn vtAnnounceReader(ctx: *anyopaque, guid: Guid) void {
@@ -762,9 +810,13 @@ const direct_vtable = Discovery.Vtable{
     .start = DirectDiscovery.vtStart,
     .stop = DirectDiscovery.vtStop,
     .prepare_writer = DirectDiscovery.vtPrepareWriter,
+    .adopt_writer = DirectDiscovery.vtAdoptWriter,
+    .abandon_writer = DirectDiscovery.vtAbandonWriter,
     .announce_writer = DirectDiscovery.vtAnnounceWriter,
     .retract_writer = DirectDiscovery.vtRetractWriter,
     .prepare_reader = DirectDiscovery.vtPrepareReader,
+    .adopt_reader = DirectDiscovery.vtAdoptReader,
+    .abandon_reader = DirectDiscovery.vtAbandonReader,
     .announce_reader = DirectDiscovery.vtAnnounceReader,
     .retract_reader = DirectDiscovery.vtRetractReader,
     .deinit = DirectDiscovery.vtDeinit,

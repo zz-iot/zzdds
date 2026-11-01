@@ -297,11 +297,15 @@ test "DataReader: set_qos / get_qos round-trip" {
     defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr);
 
     var qos = DDS.DataReaderQos{};
-    qos.history.depth = 17;
+    qos.deadline.period = .{ .sec = 17, .nanosec = 0 };
     try testing.expectEqual(DDS.RETCODE_OK, dr.set_qos(qos));
     var got: DDS.DataReaderQos = undefined;
     try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.get_qos(dr.ptr, &got));
-    try testing.expectEqual(@as(i32, 17), got.history.depth);
+    try testing.expectEqual(@as(i32, 17), got.deadline.period.sec);
+
+    // HISTORY is immutable: the protocol reader was made with it.
+    qos.history.depth = 17;
+    try testing.expectEqual(DDS.RETCODE_IMMUTABLE_POLICY, dr.set_qos(qos));
 }
 
 test "DataReader: set_listener / get_listener round-trip" {

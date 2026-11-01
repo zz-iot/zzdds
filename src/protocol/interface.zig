@@ -72,12 +72,18 @@ pub const ReliabilityKind = enum(u8) { best_effort = 0, reliable = 1 };
 pub const MatchCurrency = struct {
     ctx: *anyopaque,
     generation: u64,
+    /// The local endpoint's generation, when it has one: the decision is
+    /// committed only while that is current too, so a match a newer local
+    /// QoS or partition change removed is not restored.
+    local: ?struct { guid: Guid, generation: u64 } = null,
     /// Whether `generation` is still `guid`'s current one. Called under the
     /// protocol endpoint's lock, so takes only leaf locks.
     is_current: *const fn (ctx: *anyopaque, guid: Guid, generation: u64) bool,
 
     pub fn check(self: MatchCurrency, guid: Guid) bool {
-        return self.is_current(self.ctx, guid, self.generation);
+        if (!self.is_current(self.ctx, guid, self.generation)) return false;
+        const l = self.local orelse return true;
+        return self.is_current(self.ctx, l.guid, l.generation);
     }
 };
 
