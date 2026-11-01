@@ -277,9 +277,13 @@ pub const SpdpSedpDiscovery = struct {
         .start = vtStart,
         .stop = vtStop,
         .prepare_writer = vtPrepareWriter,
+        .adopt_writer = vtAdoptWriter,
+        .abandon_writer = vtAbandonWriter,
         .announce_writer = vtAnnounceWriter,
         .retract_writer = vtRetractWriter,
         .prepare_reader = vtPrepareReader,
+        .adopt_reader = vtAdoptReader,
+        .abandon_reader = vtAbandonReader,
         .announce_reader = vtAnnounceReader,
         .retract_reader = vtRetractReader,
         .deinit = vtDeinit,
@@ -422,6 +426,16 @@ pub const SpdpSedpDiscovery = struct {
         return self.announcements.prepareWriter(self.alloc, info);
     }
 
+    fn vtAdoptWriter(ctx: *anyopaque, guid: Guid) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.announcements.adoptWriter(self.alloc, guid);
+    }
+
+    fn vtAbandonWriter(ctx: *anyopaque, guid: Guid) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.announcements.abandonWriter(self.alloc, guid);
+    }
+
     fn vtAnnounceWriter(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.announcements.announceWriter(self.alloc, guid);
@@ -435,6 +449,16 @@ pub const SpdpSedpDiscovery = struct {
     fn vtPrepareReader(ctx: *anyopaque, info: *const iface.ReaderAnnouncement) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         return self.announcements.prepareReader(self.alloc, info);
+    }
+
+    fn vtAdoptReader(ctx: *anyopaque, guid: Guid) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.announcements.adoptReader(self.alloc, guid);
+    }
+
+    fn vtAbandonReader(ctx: *anyopaque, guid: Guid) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.announcements.abandonReader(self.alloc, guid);
     }
 
     fn vtAnnounceReader(ctx: *anyopaque, guid: Guid) void {

@@ -10,11 +10,22 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-10-31
 
+- `set_qos` on a DataWriter or DataReader announces the change to peers, and a partition
+  change on a Publisher or Subscriber announces each of its enabled endpoints again. The
+  change is prepared first: when it cannot be, `set_qos` returns
+  RETCODE_OUT_OF_RESOURCES and nothing changes. A refreshed endpoint is unmatched from
+  the remote endpoints it no longer matches, as a remote refresh is. Peers used to see
+  only the QoS and partitions an endpoint had when it was enabled.
+- `set_qos` returns RETCODE_IMMUTABLE_POLICY for a change to a DataWriter's or
+  DataReader's immutable policies (RELIABILITY, HISTORY, DURABILITY and the others DDS
+  marks unchangeable), before `enable()` too, and to an enabled Publisher's or
+  Subscriber's PRESENTATION. Such changes used to be accepted and reported by `get_qos`,
+  while the endpoint kept the QoS it was created with.
+- The discovery plugin interface gains `adopt_*`/`abandon_*`: `prepare_*` for an endpoint
+  prepared already holds the replacement until one of them.
 - A local DataWriter's or DataReader's SEDP announcement and disposal can no longer fail
-  once it exists. Discovery reserves what both need when the endpoint is created (and
-  again at `enable()`, should its Publisher's or Subscriber's partitions or presentation
-  have changed): creation returns nil, and `enable()` RETCODE_OUT_OF_RESOURCES, when it
-  cannot. A failed announcement used to be only logged, and the endpoint never announced;
+  once it exists. Discovery reserves what both need when the endpoint is created:
+  creation returns nil when it cannot. A failed announcement used to be only logged, and the endpoint never announced;
   a disposal that could not be encoded was dropped.
 - An endpoint deleted while its announcement is being written is disposed of once, after
   the announcement. Peers used to be able to see it announced again after its disposal,

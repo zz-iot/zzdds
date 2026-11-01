@@ -29,12 +29,14 @@ const Op = enum { announce_writer, retract_writer, announce_reader, retract_read
 
 /// Forwards to `inner`, recording each local endpoint operation, and runs
 /// `before_announce` once, just before forwarding the next announcement.
-/// With `fail_prepare`, preparing fails as for lack of memory.
+/// With `fail_prepare`, preparing fails as for lack of memory, and with
+/// `fail_after`, it does once that many more have succeeded.
 const Recorder = struct {
     inner: disc.Discovery,
     ops: [16]Op = undefined,
     n: usize = 0,
     fail_prepare: bool = false,
+    fail_after: ?usize = null,
     before_announce: ?*const fn (ctx: *anyopaque) void = null,
     before_ctx: *anyopaque = undefined,
 
@@ -42,9 +44,13 @@ const Recorder = struct {
         .start = start,
         .stop = stop,
         .prepare_writer = prepareWriter,
+        .adopt_writer = adoptWriter,
+        .abandon_writer = abandonWriter,
         .announce_writer = announceWriter,
         .retract_writer = retractWriter,
         .prepare_reader = prepareReader,
+        .adopt_reader = adoptReader,
+        .abandon_reader = abandonReader,
         .announce_reader = announceReader,
         .retract_reader = retractReader,
         .deinit = deinit,
@@ -80,9 +86,22 @@ const Recorder = struct {
     fn stop(ctx: *anyopaque) void {
         of(ctx).inner.stop();
     }
+    fn failing(self: *Recorder) bool {
+        if (self.fail_prepare) return true;
+        const n = self.fail_after orelse return false;
+        if (n == 0) return true;
+        self.fail_after = n - 1;
+        return false;
+    }
     fn prepareWriter(ctx: *anyopaque, info: *const disc.WriterAnnouncement) anyerror!void {
-        if (of(ctx).fail_prepare) return error.OutOfMemory;
+        if (of(ctx).failing()) return error.OutOfMemory;
         return of(ctx).inner.prepareWriter(info);
+    }
+    fn adoptWriter(ctx: *anyopaque, guid: Guid) void {
+        of(ctx).inner.adoptWriter(guid);
+    }
+    fn abandonWriter(ctx: *anyopaque, guid: Guid) void {
+        of(ctx).inner.abandonWriter(guid);
     }
     fn announceWriter(ctx: *anyopaque, guid: Guid) void {
         const self = of(ctx);
@@ -95,8 +114,14 @@ const Recorder = struct {
         of(ctx).inner.retractWriter(guid);
     }
     fn prepareReader(ctx: *anyopaque, info: *const disc.ReaderAnnouncement) anyerror!void {
-        if (of(ctx).fail_prepare) return error.OutOfMemory;
+        if (of(ctx).failing()) return error.OutOfMemory;
         return of(ctx).inner.prepareReader(info);
+    }
+    fn adoptReader(ctx: *anyopaque, guid: Guid) void {
+        of(ctx).inner.adoptReader(guid);
+    }
+    fn abandonReader(ctx: *anyopaque, guid: Guid) void {
+        of(ctx).inner.abandonReader(guid);
     }
     fn announceReader(ctx: *anyopaque, guid: Guid) void {
         const self = of(ctx);
@@ -366,52 +391,227 @@ test "a reader whose announcement cannot be reserved is not created" {
     try testing.expectEqualSlices(Op, &.{.retract_reader}, rec.recorded());
 }
 
-test "a writer whose announcement cannot be reserved again for new partitions stays disabled" {
+fn partitionNames(names: []const [*:0]const u8) DDS.PartitionQosPolicy {
+    const len: u32 = @intCast(names.len);
+    return .{ .name = .{ ._buffer = @constCast(names.ptr), ._length = len, ._maximum = len, ._release = false } };
+}
+
+fn partitionCount(p: DDS.PartitionQosPolicy) u32 {
+    return if (p.name._buffer != null) p.name._length else 0;
+}
+
+fn offeredIncompatibleCount(dw: DDS.DataWriter) !i32 {
+    var st: DDS.OfferedIncompatibleQosStatus = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.get_offered_incompatible_qos_status(dw.ptr, &st));
+    return st.total_count;
+}
+
+fn requestedIncompatibleCount(dr: DDS.DataReader) !i32 {
+    var st: DDS.RequestedIncompatibleQosStatus = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.get_requested_incompatible_qos_status(dr.ptr, &st));
+    return st.total_count;
+}
+
+const other_partition = [_][*:0]const u8{"other"};
+
+test "a Publisher's partitions do not change when its writers' announcements cannot all be prepared, and do with them announced when they can" {
+    var rec: Recorder = undefined;
+    var fx = try Fixture.init(testing.allocator, &rec);
+    defer fx.deinit();
+
+    const dr_b = fx.sub_b.create_datareader(topicDesc(fx.topic_b), .{}, null, 0);
+    const topic2_b = fx.dp_b.create_topic("AnnounceTopic2", "AnnounceType", .{}, null, 0);
+    const dr_b2 = fx.sub_b.create_datareader(topicDesc(topic2_b), .{}, null, 0);
+    // A writer left disabled, prepared first; then one enabled.
+    const topic2 = fx.dp_a.create_topic("AnnounceTopic2", "AnnounceType", .{}, null, 0);
+    const dw_a2 = fx.pub_a.create_datawriter(topic2, .{}, null, 0);
+    const dw_a = fx.pub_a.create_datawriter(fx.topic_a, .{}, null, 0);
+    try testing.expectEqual(DDS.RETCODE_OK, dw_a.vtable.enable(dw_a.ptr));
+    try testing.expectEqual(@as(i32, 1), try subscriptionMatchedCount(dr_b));
+
+    var q = DDS.PublisherQos{};
+    q.entity_factory.autoenable_created_entities = false;
+    q.partition = partitionNames(&other_partition);
+    // The enabled writer's preparation fails after the disabled one's
+    // succeeded.
+    rec.fail_after = 1;
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, fx.pub_a.vtable.set_qos(fx.pub_a.ptr, &q));
+    var got: DDS.PublisherQos = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_a.vtable.get_qos(fx.pub_a.ptr, &got));
+    defer got.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 0), partitionCount(got.partition));
+    // Nothing was announced again, and the match stands.
+    try testing.expectEqualSlices(Op, &.{.announce_writer}, rec.recorded());
+    try testing.expectEqual(@as(i32, 1), try subscriptionMatchedCount(dr_b));
+    // The disabled writer kept its announcement too: enabled, it is
+    // announced in the default partition.
+    rec.fail_after = null;
+    try testing.expectEqual(DDS.RETCODE_OK, dw_a2.vtable.enable(dw_a2.ptr));
+    try testing.expectEqual(@as(i32, 1), try subscriptionMatchedCount(dr_b2));
+
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_a.vtable.set_qos(fx.pub_a.ptr, &q));
+    try testing.expectEqualSlices(Op, &.{ .announce_writer, .announce_writer, .announce_writer, .announce_writer }, rec.recorded());
+    try testing.expectEqual(@as(i32, 0), try subscriptionMatchedCount(dr_b2));
+    // The reader is outside the new partition: unmatched on both sides.
+    try testing.expectEqual(@as(i32, 0), try subscriptionMatchedCount(dr_b));
+    try testing.expectEqual(@as(i32, 0), try publicationMatchedCount(dw_a));
+}
+
+test "a Subscriber's partitions do not change when its readers' announcements cannot all be prepared, and do with them announced when they can" {
+    var rec: Recorder = undefined;
+    var fx = try Fixture.init(testing.allocator, &rec);
+    defer fx.deinit();
+
+    const dw_b = fx.pub_b.create_datawriter(fx.topic_b, .{}, null, 0);
+    const topic2_b = fx.dp_b.create_topic("AnnounceTopic2", "AnnounceType", .{}, null, 0);
+    const dw_b2 = fx.pub_b.create_datawriter(topic2_b, .{}, null, 0);
+    const topic2 = fx.dp_a.create_topic("AnnounceTopic2", "AnnounceType", .{}, null, 0);
+    const dr_a2 = fx.sub_a.create_datareader(topicDesc(topic2), .{}, null, 0);
+    const dr_a = fx.sub_a.create_datareader(topicDesc(fx.topic_a), .{}, null, 0);
+    try testing.expectEqual(DDS.RETCODE_OK, dr_a.vtable.enable(dr_a.ptr));
+    try testing.expectEqual(@as(i32, 1), try publicationMatchedCount(dw_b));
+
+    var q = DDS.SubscriberQos{};
+    q.entity_factory.autoenable_created_entities = false;
+    q.partition = partitionNames(&other_partition);
+    rec.fail_after = 1;
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, fx.sub_a.vtable.set_qos(fx.sub_a.ptr, &q));
+    var got: DDS.SubscriberQos = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, fx.sub_a.vtable.get_qos(fx.sub_a.ptr, &got));
+    defer got.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 0), partitionCount(got.partition));
+    try testing.expectEqualSlices(Op, &.{.announce_reader}, rec.recorded());
+    try testing.expectEqual(@as(i32, 1), try publicationMatchedCount(dw_b));
+    rec.fail_after = null;
+    try testing.expectEqual(DDS.RETCODE_OK, dr_a2.vtable.enable(dr_a2.ptr));
+    try testing.expectEqual(@as(i32, 1), try publicationMatchedCount(dw_b2));
+
+    try testing.expectEqual(DDS.RETCODE_OK, fx.sub_a.vtable.set_qos(fx.sub_a.ptr, &q));
+    try testing.expectEqualSlices(Op, &.{ .announce_reader, .announce_reader, .announce_reader, .announce_reader }, rec.recorded());
+    try testing.expectEqual(@as(i32, 0), try publicationMatchedCount(dw_b2));
+    try testing.expectEqual(@as(i32, 0), try publicationMatchedCount(dw_b));
+    try testing.expectEqual(@as(i32, 0), try subscriptionMatchedCount(dr_a));
+}
+
+test "a writer created disabled in a Publisher whose partitions changed is announced in the new ones" {
     var rec: Recorder = undefined;
     var fx = try Fixture.init(testing.allocator, &rec);
     defer fx.deinit();
 
     const dr_b = fx.sub_b.create_datareader(topicDesc(fx.topic_b), .{}, null, 0);
     const dw_a = fx.pub_a.create_datawriter(fx.topic_a, .{}, null, 0);
-    // Prepared at creation with the default partition; the Publisher's
-    // partitions change before it is enabled.
-    var names = [1][*:0]const u8{""};
     var q = DDS.PublisherQos{};
     q.entity_factory.autoenable_created_entities = false;
-    q.partition.name = .{ ._buffer = &names, ._length = 1, ._maximum = 1, ._release = false };
+    q.partition = partitionNames(&other_partition);
     try testing.expectEqual(DDS.RETCODE_OK, fx.pub_a.vtable.set_qos(fx.pub_a.ptr, &q));
-
+    // Prepared by the change, so enabling it cannot fail.
     rec.fail_prepare = true;
-    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, dw_a.vtable.enable(dw_a.ptr));
-    try testing.expectEqual(@as(usize, 0), rec.recorded().len);
-    try testing.expectEqual(@as(i32, 0), try subscriptionMatchedCount(dr_b));
-
-    rec.fail_prepare = false;
     try testing.expectEqual(DDS.RETCODE_OK, dw_a.vtable.enable(dw_a.ptr));
     try testing.expectEqualSlices(Op, &.{.announce_writer}, rec.recorded());
-    try testing.expectEqual(@as(i32, 1), try subscriptionMatchedCount(dr_b));
+    try testing.expectEqual(@as(i32, 0), try subscriptionMatchedCount(dr_b));
 }
 
-test "a reader whose announcement cannot be reserved again for new partitions stays disabled" {
+test "a writer's QoS does not change when its announcement cannot be prepared, and does with it announced when it can" {
     var rec: Recorder = undefined;
     var fx = try Fixture.init(testing.allocator, &rec);
     defer fx.deinit();
 
-    const dw_b = fx.pub_b.create_datawriter(fx.topic_b, .{}, null, 0);
-    const dr_a = fx.sub_a.create_datareader(topicDesc(fx.topic_a), .{}, null, 0);
-    var names = [1][*:0]const u8{""};
-    var q = DDS.SubscriberQos{};
-    q.entity_factory.autoenable_created_entities = false;
-    q.partition.name = .{ ._buffer = &names, ._length = 1, ._maximum = 1, ._release = false };
-    try testing.expectEqual(DDS.RETCODE_OK, fx.sub_a.vtable.set_qos(fx.sub_a.ptr, &q));
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.deadline.period = .{ .sec = 2, .nanosec = 0 };
+    const dr_b = fx.sub_b.create_datareader(topicDesc(fx.topic_b), dr_qos, null, 0);
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
+    const dw_a = fx.pub_a.create_datawriter(fx.topic_a, dw_qos, null, 0);
+    try testing.expectEqual(DDS.RETCODE_OK, dw_a.vtable.enable(dw_a.ptr));
+    try testing.expectEqual(@as(i32, 1), try subscriptionMatchedCount(dr_b));
 
+    // Offering a longer deadline than the reader requests.
+    var longer = dw_qos;
+    longer.deadline.period = .{ .sec = 5, .nanosec = 0 };
     rec.fail_prepare = true;
-    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, dr_a.vtable.enable(dr_a.ptr));
-    try testing.expectEqual(@as(usize, 0), rec.recorded().len);
-    try testing.expectEqual(@as(i32, 0), try publicationMatchedCount(dw_b));
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, dw_a.vtable.set_qos(dw_a.ptr, &longer));
+    var got: DDS.DataWriterQos = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw_a.vtable.get_qos(dw_a.ptr, &got));
+    try testing.expectEqual(@as(i32, 1), got.deadline.period.sec);
+    got.deinit(testing.allocator);
+    try testing.expectEqualSlices(Op, &.{.announce_writer}, rec.recorded());
+    try testing.expectEqual(@as(i32, 1), try subscriptionMatchedCount(dr_b));
 
     rec.fail_prepare = false;
+    try testing.expectEqual(DDS.RETCODE_OK, dw_a.vtable.set_qos(dw_a.ptr, &longer));
+    try testing.expectEqualSlices(Op, &.{ .announce_writer, .announce_writer }, rec.recorded());
+    try testing.expectEqual(@as(i32, 0), try subscriptionMatchedCount(dr_b));
+    try testing.expectEqual(@as(i32, 0), try publicationMatchedCount(dw_a));
+    // Each side counts the mismatch once.
+    try testing.expectEqual(@as(i32, 1), try requestedIncompatibleCount(dr_b));
+    try testing.expectEqual(@as(i32, 1), try offeredIncompatibleCount(dw_a));
+
+    // Back within what the reader requests: matched again.
+    try testing.expectEqual(DDS.RETCODE_OK, dw_a.vtable.set_qos(dw_a.ptr, &dw_qos));
+    try testing.expectEqual(@as(i32, 1), try subscriptionMatchedCount(dr_b));
+    try testing.expectEqual(@as(i32, 1), try publicationMatchedCount(dw_a));
+}
+
+test "a reader's QoS does not change when its announcement cannot be prepared, and does with it announced when it can" {
+    var rec: Recorder = undefined;
+    var fx = try Fixture.init(testing.allocator, &rec);
+    defer fx.deinit();
+
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.deadline.period = .{ .sec = 2, .nanosec = 0 };
+    const dw_b = fx.pub_b.create_datawriter(fx.topic_b, dw_qos, null, 0);
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.deadline.period = .{ .sec = 5, .nanosec = 0 };
+    const dr_a = fx.sub_a.create_datareader(topicDesc(fx.topic_a), dr_qos, null, 0);
     try testing.expectEqual(DDS.RETCODE_OK, dr_a.vtable.enable(dr_a.ptr));
+    try testing.expectEqual(@as(i32, 1), try publicationMatchedCount(dw_b));
+
+    // Requesting a shorter deadline than the writer offers.
+    var shorter = dr_qos;
+    shorter.deadline.period = .{ .sec = 1, .nanosec = 0 };
+    rec.fail_prepare = true;
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, dr_a.vtable.set_qos(dr_a.ptr, &shorter));
+    var got: DDS.DataReaderQos = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr_a.vtable.get_qos(dr_a.ptr, &got));
+    try testing.expectEqual(@as(i32, 5), got.deadline.period.sec);
+    got.deinit(testing.allocator);
     try testing.expectEqualSlices(Op, &.{.announce_reader}, rec.recorded());
     try testing.expectEqual(@as(i32, 1), try publicationMatchedCount(dw_b));
+
+    rec.fail_prepare = false;
+    try testing.expectEqual(DDS.RETCODE_OK, dr_a.vtable.set_qos(dr_a.ptr, &shorter));
+    try testing.expectEqualSlices(Op, &.{ .announce_reader, .announce_reader }, rec.recorded());
+    try testing.expectEqual(@as(i32, 0), try publicationMatchedCount(dw_b));
+    try testing.expectEqual(@as(i32, 0), try subscriptionMatchedCount(dr_a));
+    try testing.expectEqual(@as(i32, 1), try offeredIncompatibleCount(dw_b));
+    try testing.expectEqual(@as(i32, 1), try requestedIncompatibleCount(dr_a));
+
+    try testing.expectEqual(DDS.RETCODE_OK, dr_a.vtable.set_qos(dr_a.ptr, &dr_qos));
+    try testing.expectEqual(@as(i32, 1), try publicationMatchedCount(dw_b));
+    try testing.expectEqual(@as(i32, 1), try subscriptionMatchedCount(dr_a));
+}
+
+test "an immutable policy does not change, enabled or not, and nothing is announced" {
+    var rec: Recorder = undefined;
+    var fx = try Fixture.init(testing.allocator, &rec);
+    defer fx.deinit();
+
+    const dw_a = fx.pub_a.create_datawriter(fx.topic_a, .{}, null, 0);
+    const dr_a = fx.sub_a.create_datareader(topicDesc(fx.topic_a), .{}, null, 0);
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.history.depth = 9;
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    try testing.expectEqual(DDS.RETCODE_IMMUTABLE_POLICY, dw_a.vtable.set_qos(dw_a.ptr, &dw_qos));
+    try testing.expectEqual(DDS.RETCODE_IMMUTABLE_POLICY, dr_a.vtable.set_qos(dr_a.ptr, &dr_qos));
+    try testing.expectEqual(DDS.RETCODE_OK, dw_a.vtable.enable(dw_a.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, dr_a.vtable.enable(dr_a.ptr));
+    try testing.expectEqual(DDS.RETCODE_IMMUTABLE_POLICY, dw_a.vtable.set_qos(dw_a.ptr, &dw_qos));
+    try testing.expectEqual(DDS.RETCODE_IMMUTABLE_POLICY, dr_a.vtable.set_qos(dr_a.ptr, &dr_qos));
+    // An enabled Publisher's presentation is immutable too.
+    var pq = DDS.PublisherQos{};
+    pq.entity_factory.autoenable_created_entities = false;
+    pq.presentation.coherent_access = true;
+    try testing.expectEqual(DDS.RETCODE_IMMUTABLE_POLICY, fx.pub_a.vtable.set_qos(fx.pub_a.ptr, &pq));
+    try testing.expectEqualSlices(Op, &.{ .announce_writer, .announce_reader }, rec.recorded());
 }

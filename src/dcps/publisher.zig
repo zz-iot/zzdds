@@ -14,6 +14,7 @@ const DDS = @import("zzdds_generated").DDS;
 const nil = @import("nil.zig");
 const proto = @import("../protocol/interface.zig");
 const writer_mod = @import("writer.zig");
+const qos_change = @import("qos_change.zig");
 const ZZDDS = @import("zzdds_ext_generated").zzdds;
 const extensions_mod = @import("../c_abi/extensions.zig");
 const waitset = @import("waitset.zig");
@@ -77,15 +78,22 @@ pub const ParticipantCbs = struct {
         notify_fn: *const fn (notify_ctx: *anyopaque, remote_handle: DDS.InstanceHandle_t, added: bool) void,
     ) void,
 
-    /// Have discovery prepare the announcement of the writer identified by
-    /// handle, with this Publisher's partitions and presentation: reserve
-    /// what announcing it and later disposing of it needs. Does nothing when
-    /// one with them is prepared already. Called at creation, before the
-    /// writer joins this Publisher, and again before it is enabled.
-    prepare_writer: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void,
+    /// Have discovery prepare the announcements of the writers identified
+    /// by handles, with this Publisher's partitions and presentation:
+    /// reserve what announcing each and later disposing of it needs. Skips
+    /// a writer that has one with them prepared already. All or none:
+    /// fails changing nothing. Called for a writer at creation, before it
+    /// joins this Publisher, and for all of them when the partitions or
+    /// presentation change.
+    prepare_writers: *const fn (ctx: *anyopaque, handles: []const DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void,
+
+    /// `prepare_writers`, for the writer identified by handle and its new
+    /// QoS, before the change takes effect.
+    prepare_writer_qos: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, qos: *const DDS.DataWriterQos) anyerror!void,
 
     /// Announce the writer identified by handle, prepared already, to the
-    /// discovery layer. Called after register_incompat_qos so that
+    /// discovery layer, or announce it again once its announcement changed.
+    /// Called after register_incompat_qos so that
     /// synchronous discovery callbacks (e.g. DirectDiscovery) fire with the
     /// incompat callback already set.
     announce_writer: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t) void,
@@ -142,7 +150,11 @@ pub const PublisherImpl = struct {
     alloc: std.mem.Allocator,
     participant: DDS.DomainParticipant,
     cbs: ParticipantCbs,
+    /// Replaced under `qos_mu`; the partitions are read under it.
     qos: DDS.PublisherQos,
+    /// Orders a QoS change against the writers' preparations, so none is
+    /// prepared with partitions replaced meanwhile.
+    qos_mu: Mutex = .{},
     /// Entity::enable() state. Seeded by vtCreatePublisher (participant.zig)
     /// from the owning participant's `qos.entity_factory.autoenable_created_entities`
     /// -- NOT from this Publisher's own `qos.entity_factory`, which instead
@@ -573,15 +585,30 @@ pub const PublisherImpl = struct {
 
     /// Prepares the writer's announcement with this Publisher's current
     /// partitions and presentation (see ParticipantCbs.prepare_writer).
-    pub fn prepareDataWriter(self: *Self, publication_handle: DDS.InstanceHandle_t) !void {
-        const pname_seq = &self.qos.partition.name;
+    fn prepareDataWriter(self: *Self, publication_handle: DDS.InstanceHandle_t) !void {
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
+        try self.prepareDataWritersLocked(&.{publication_handle}, &self.qos);
+    }
+
+    /// `prepareDataWriter` for `handles`, with the partitions and
+    /// presentation of `qos`. With `qos_mu` held.
+    fn prepareDataWritersLocked(self: *Self, handles: []const DDS.InstanceHandle_t, qos: *const DDS.PublisherQos) !void {
+        const pname_seq = &qos.partition.name;
         const pname_count: u32 = if (pname_seq._buffer != null) pname_seq._length else 0;
         var pname_buf: [64][]const u8 = undefined;
         const pname_slice = pname_buf[0..@min(pname_count, pname_buf.len)];
         if (pname_seq._buffer) |b| for (pname_slice, 0..) |*s, i| {
             s.* = std.mem.span(b[i]);
         };
-        try self.cbs.prepare_writer(self.cbs.ctx, publication_handle, self.instance_handle, pname_slice, self.qos.presentation);
+        try self.cbs.prepare_writers(self.cbs.ctx, handles, self.instance_handle, pname_slice, qos.presentation);
+    }
+
+    /// Has the writer `publication_handle`'s announcement prepared with its
+    /// new `qos`, before the change takes effect: see
+    /// ParticipantCbs.prepare_writer_qos.
+    pub fn prepareDataWriterQos(self: *Self, publication_handle: DDS.InstanceHandle_t, qos: *const DDS.DataWriterQos) !void {
+        try self.cbs.prepare_writer_qos(self.cbs.ctx, publication_handle, self.instance_handle, qos);
     }
 
     /// The outbound SEDP publication announcement -- the one part of
@@ -678,16 +705,62 @@ pub const PublisherImpl = struct {
         return DDS.RETCODE_OK;
     }
 
+    /// A change of partitions has every writer's announcement prepared
+    /// again first: should that fail, nothing changes and the call returns
+    /// OUT_OF_RESOURCES. The enabled writers are then announced again
+    /// (docs/design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal).
     fn vtSetQos(ctx: *anyopaque, qos: *const DDS.PublisherQos) DDS.ReturnCode_t {
         const self = cast(ctx);
-        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        self.qos.deinit(self.alloc);
-        self.qos = new_qos;
+        var handles: std.ArrayListUnmanaged(DDS.InstanceHandle_t) = .empty;
+        defer handles.deinit(self.alloc);
+        {
+            self.qos_mu.lock();
+            defer self.qos_mu.unlock();
+            if (self.enabled.load(.acquire) and
+                !qos_change.eql(DDS.PresentationQosPolicy, &self.qos.presentation, &qos.presentation))
+                return DDS.RETCODE_IMMUTABLE_POLICY;
+            var new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+            if (!qos_change.eql(DDS.PartitionQosPolicy, &self.qos.partition, &qos.partition) or
+                !qos_change.eql(DDS.PresentationQosPolicy, &self.qos.presentation, &qos.presentation))
+            {
+                self.writerHandles(&handles, .all) catch {
+                    new_qos.deinit(self.alloc);
+                    return DDS.RETCODE_OUT_OF_RESOURCES;
+                };
+                self.prepareDataWritersLocked(handles.items, &new_qos) catch {
+                    new_qos.deinit(self.alloc);
+                    return DDS.RETCODE_OUT_OF_RESOURCES;
+                };
+            }
+            self.qos.deinit(self.alloc);
+            self.qos = new_qos;
+        }
+        if (handles.items.len == 0) return DDS.RETCODE_OK;
+        // A writer enabled meanwhile is announced by its enable as well.
+        self.writerHandles(&handles, .enabled) catch unreachable;
+        for (handles.items) |h| self.announceDataWriter(h);
         return DDS.RETCODE_OK;
+    }
+
+    /// Replaces `out` with the handles of this Publisher's writers, or of
+    /// those enabled. Room for all of them is made first: with as much
+    /// already, it cannot fail.
+    fn writerHandles(self: *Self, out: *std.ArrayListUnmanaged(DDS.InstanceHandle_t), which: enum { all, enabled }) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        out.clearRetainingCapacity();
+        if (which == .all) try out.ensureTotalCapacityPrecise(self.alloc, self.writers.items.len);
+        for (self.writers.items) |w| {
+            if (which == .enabled and !w.enabled.load(.acquire)) continue;
+            if (out.items.len == out.capacity) break;
+            out.appendAssumeCapacity(w.instance_handle);
+        }
     }
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.PublisherQos) DDS.ReturnCode_t {
         const self = cast(ctx);
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
         qos.* = self.qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }

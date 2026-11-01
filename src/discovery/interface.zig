@@ -409,9 +409,21 @@ pub const Discovery = struct {
         /// needs, and what disposing it once announced needs, so neither
         /// `announce_writer` nor `retract_writer` can fail for lack of local
         /// resources (docs/design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal).
-        /// Called again for the same GUID, replaces what will be announced.
-        /// May be called before `start`. Fails changing nothing.
+        /// Called again for the same GUID, holds `info` as its replacement,
+        /// undecided: `adopt_writer` makes it what is announced, and
+        /// `abandon_writer` drops it, keeping what was. May be called before
+        /// `start`. Fails changing nothing.
         prepare_writer: *const fn (ctx: *anyopaque, info: *const WriterAnnouncement) anyerror!void,
+
+        /// Makes the replacement `prepare_writer` holds for the local
+        /// DataWriter `guid` what its next `announce_writer` commits. Does
+        /// nothing when there is none. Null for a plugin that holds none.
+        adopt_writer: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
+
+        /// Drops the replacement `prepare_writer` holds for the local
+        /// DataWriter `guid`, keeping what it replaced. Does nothing when
+        /// there is none. Null for a plugin that holds none.
+        abandon_writer: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
 
         /// Commits the prepared announcement of the local DataWriter `guid`
         /// to the discovery record, from which it reaches remote peers. Does
@@ -426,6 +438,12 @@ pub const Discovery = struct {
 
         /// `prepare_writer`, for a local DataReader.
         prepare_reader: *const fn (ctx: *anyopaque, info: *const ReaderAnnouncement) anyerror!void,
+
+        /// `adopt_writer`, for a local DataReader.
+        adopt_reader: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
+
+        /// `abandon_writer`, for a local DataReader.
+        abandon_reader: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
 
         /// `announce_writer`, for a local DataReader.
         announce_reader: *const fn (ctx: *anyopaque, guid: Guid) void,
@@ -468,6 +486,14 @@ pub const Discovery = struct {
         return self.vtable.prepare_writer(self.ctx, info);
     }
 
+    pub fn adoptWriter(self: Discovery, guid: Guid) void {
+        if (self.vtable.adopt_writer) |f| f(self.ctx, guid);
+    }
+
+    pub fn abandonWriter(self: Discovery, guid: Guid) void {
+        if (self.vtable.abandon_writer) |f| f(self.ctx, guid);
+    }
+
     pub fn announceWriter(self: Discovery, guid: Guid) void {
         self.vtable.announce_writer(self.ctx, guid);
     }
@@ -478,6 +504,14 @@ pub const Discovery = struct {
 
     pub fn prepareReader(self: Discovery, info: *const ReaderAnnouncement) anyerror!void {
         return self.vtable.prepare_reader(self.ctx, info);
+    }
+
+    pub fn adoptReader(self: Discovery, guid: Guid) void {
+        if (self.vtable.adopt_reader) |f| f(self.ctx, guid);
+    }
+
+    pub fn abandonReader(self: Discovery, guid: Guid) void {
+        if (self.vtable.abandon_reader) |f| f(self.ctx, guid);
     }
 
     pub fn announceReader(self: Discovery, guid: Guid) void {
