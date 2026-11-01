@@ -71,6 +71,11 @@ public:
     explicit SubListener(SubState *state) : state_(state) {}
 
     void on_data_available(std::shared_ptr<::DDS::DataReader> /*the_reader*/) override {
+        take_available();
+    }
+
+    // Takes everything the reader holds, recording each seq_num.
+    void take_available() {
         bool became_done = false;
 
         for (;;) {
@@ -179,11 +184,6 @@ int main(int argc, char **argv) {
     HistoryEventDataReader reader(dr_handle);
     state.reader = &reader;
 
-    if (dr->set_listener(listener, DDS_DATA_AVAILABLE_STATUS) != ::DDS::RETCODE_OK) {
-        std::fprintf(stderr, "FAIL: set_listener() failed\n");
-        return 1;
-    }
-
     // Negative case -- see this file's header comment. No writer exists
     // anywhere on this domain yet (the harness enforces that), so a short,
     // non-zero max_wait here is guaranteed to time out.
@@ -216,7 +216,8 @@ int main(int argc, char **argv) {
     std::printf("Subscriber: wait_for_historical_data() returned\n");
 
     // Confirm the real guarantee, not just the return code: every
-    // historical sample must already have been delivered by now.
+    // historical sample must already be in the reader.
+    listener->take_available();
     int historical_count = 0;
     for (auto &v : state.historical_received) {
         if (v.load()) historical_count++;
@@ -229,6 +230,11 @@ int main(int argc, char **argv) {
     state.historical_confirmed.store(true);
     if (state.ready_to_finish()) {
         state.all_done.store(true);
+    } else if (dr->set_listener(listener, DDS_DATA_AVAILABLE_STATUS) != ::DDS::RETCODE_OK) {
+        // The rest of the live batch; set_listener() fires at once for
+        // anything that arrived meanwhile.
+        std::fprintf(stderr, "FAIL: set_listener() failed\n");
+        return 1;
     }
 
     for (int waited_ms = 0; !state.all_done.load(); waited_ms += POLL_PERIOD_MS) {
