@@ -3263,6 +3263,18 @@ pub const DomainParticipantImpl = struct {
         self.unmatched.dropWriter(writer);
     }
 
+    /// Whether a change was committed to the local endpoint of one of
+    /// `jobs`' match decisions since it was decided (see
+    /// `renewLocalGenLocked`): its match may then not have been made.
+    /// Caller holds self.mu.
+    fn localChangedSinceLocked(self: *Self, jobs: []const MatchedWriterJob) bool {
+        for (jobs) |job| {
+            const l = (job.info.currency orelse continue).local orelse continue;
+            if (self.currentDiscoveryGenLocked(l.guid) != l.generation) return true;
+        }
+        return false;
+    }
+
     /// Where `ar` takes what a writer it matches sent before the match.
     fn prematchFor(self: *Self, ar: *const ActiveReader) unmatched_mod.Prematch {
         return .{
@@ -3411,7 +3423,10 @@ pub const DomainParticipantImpl = struct {
             job.proto.quiesceRelease();
         }
         self.mu.lock();
-        self.settleWriterLocked(data.guid, gen);
+        // A match a change to its reader superseded took nothing: what is
+        // held stays for the match the reader's own announcement makes in
+        // its place, until it expires or the writer is announced again.
+        if (!self.localChangedSinceLocked(jobs.items)) self.settleWriterLocked(data.guid, gen);
         self.mu.unlock();
         if (push_dr) |dr| pushBuiltinPublicationCdr(self.alloc, dr, data);
         if (push_topic_dr) |dr| if (new_topic) |dt| pushBuiltinTopicCdr(self.alloc, dr, .{
