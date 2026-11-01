@@ -238,13 +238,20 @@ jobs:
   # skip would mean something regressed, not that the environment is just
   # missing an optional piece (see run_all.py's own default, unstrict
   # behavior for the latter case). Windows explicitly excludes only OpenCV.
+  #
+  # Each platform runs twice: on the default build, and on a -Dshared-runtime
+  # build, where every participant runs on the shared runtime (the contributor
+  # migration switch; see docs/roadmap.md), so that build's examples cannot
+  # regress unnoticed before it becomes the default.
 
   examples:
-    name: examples / ${{ matrix.name }}
+    name: examples / ${{ matrix.name }}${{ matrix.runtime == 'shared' && ' (shared runtime)' || '' }}
     needs: test-linux
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
+        runtime: [threaded, shared]
         include:
           - name: Linux x86_64
             os: ubuntu-latest
@@ -299,7 +306,7 @@ jobs:
         run: python -m unittest discover -s examples -p test_common.py
 
       - name: Build zzdds
-        run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
+        run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true -Dshared-runtime=${{ matrix.runtime == 'shared' }} install
 
       - name: Prepare failure diagnostics (Linux)
         if: runner.os == 'Linux'
@@ -343,7 +350,7 @@ jobs:
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
-          name: diagnostics-examples-${{ matrix.os }}
+          name: diagnostics-examples-${{ matrix.os }}-${{ matrix.runtime }}
           path: |
             ${{ runner.temp }}/net-diagnostics
             examples/interop/.smoke-logs
@@ -379,8 +386,10 @@ jobs:
   # still caught immediately and loudly by anyone running run_all.py locally
   # before pushing, or by CMake itself the moment two scenarios' subdirectories
   # are ever built together again.
+  #
+  # As with `examples`, every scenario also runs on a -Dshared-runtime build.
   integration-tests:
-    name: integration-tests / ${{ matrix.scenario }} (${{ matrix.os }})
+    name: integration-tests / ${{ matrix.scenario }} (${{ matrix.os }}${{ matrix.runtime == 'shared' && ', shared runtime' || '' }})
     needs: test-linux
     runs-on: ${{ matrix.os }}
     strategy:
@@ -388,6 +397,7 @@ jobs:
       matrix:
         # Windows builds the C/C++ ports with MSVC (CMake's default generator).
         os: [ubuntu-latest, windows-latest]
+        runtime: [threaded, shared]
         scenario:
           - coherent-sets
           - delete-contained-entities
@@ -432,7 +442,7 @@ jobs:
           python-version: "3.12"
 
       - name: Build zzdds (all bindings)
-        run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
+        run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true -Dshared-runtime=${{ matrix.runtime == 'shared' }} install
 
       - name: Prepare failure diagnostics (Linux)
         if: runner.os == 'Linux'
@@ -473,7 +483,7 @@ jobs:
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
-          name: diagnostics-integration-${{ matrix.scenario }}-${{ matrix.os }}
+          name: diagnostics-integration-${{ matrix.scenario }}-${{ matrix.os }}-${{ matrix.runtime }}
           path: |
             ${{ runner.temp }}/net-diagnostics
             integration-tests/interop/.smoke-logs
