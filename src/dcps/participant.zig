@@ -1001,6 +1001,9 @@ pub const DomainParticipantImpl = struct {
     /// Each known remote endpoint's current discovery generation: a match
     /// decision for it is made only while the generation it carries is
     /// current (docs/design/concurrency/architecture.md#remote-endpoint-match-and-loss).
+    /// Each local endpoint prepared has one too, renewed by each change
+    /// committed to it (`renewLocalGenLocked`), so a match decided before
+    /// the change is not made after it.
     /// Written under mu and discovery_gens_mu; read under either.
     /// discovery_gens_mu is a leaf lock, taken by a local endpoint under its
     /// protocol lock to check a match it is installing (isDiscoveryGenCurrent).
@@ -2121,6 +2124,7 @@ pub const DomainParticipantImpl = struct {
         var handed_off = false;
         if (found_guid) |g| {
             _ = self.active_writers.remove(entityIdKey(g.entity_id));
+            self.withdrawDiscoveryGenLocked(g);
             handed_off = self.handOffDisposalLocked(g);
         }
         self.mu.unlock();
@@ -2243,6 +2247,7 @@ pub const DomainParticipantImpl = struct {
         var handed_off = false;
         if (found_guid) |g| {
             _ = self.active_readers.remove(entityIdKey(g.entity_id));
+            self.withdrawDiscoveryGenLocked(g);
             handed_off = self.handOffDisposalLocked(g);
         }
         self.mu.unlock();
@@ -3174,8 +3179,9 @@ pub const DomainParticipantImpl = struct {
         return gen;
     }
 
-    /// Withdraws the discovery generation of remote endpoint `guid`, lost:
-    /// a match of it decided before is not installed.  Caller holds self.mu.
+    /// Withdraws the discovery generation of endpoint `guid`, a remote one
+    /// lost or a local one deleted: a match of it decided before is not
+    /// installed.  Caller holds self.mu.
     fn withdrawDiscoveryGenLocked(self: *Self, guid: Guid) void {
         self.discovery_gens_mu.lock();
         defer self.discovery_gens_mu.unlock();
@@ -3195,7 +3201,28 @@ pub const DomainParticipantImpl = struct {
         }
     }
 
-    /// Remote endpoint `guid`'s current discovery generation, if any.
+    /// Gives the local endpoint `guid` a generation, unless it has one.
+    /// Caller holds self.mu.
+    fn ensureLocalGenLocked(self: *Self, guid: Guid) !void {
+        self.discovery_gens_mu.lock();
+        defer self.discovery_gens_mu.unlock();
+        const gop = try self.discovery_gens.getOrPut(self.alloc, guid);
+        if (gop.found_existing) return;
+        self.last_discovery_gen += 1;
+        gop.value_ptr.* = self.last_discovery_gen;
+    }
+
+    /// Gives the local endpoint `guid` a new generation, in place of the
+    /// one `ensureLocalGenLocked` gave it, for a change committed to it: a
+    /// match decided before is not made. Caller holds self.mu.
+    fn renewLocalGenLocked(self: *Self, guid: Guid) void {
+        self.last_discovery_gen += 1;
+        self.discovery_gens_mu.lock();
+        defer self.discovery_gens_mu.unlock();
+        if (self.discovery_gens.getPtr(guid)) |g| g.* = self.last_discovery_gen;
+    }
+
+    /// Endpoint `guid`'s current discovery generation, if any.
     /// Caller holds self.mu.
     fn currentDiscoveryGenLocked(self: *Self, guid: Guid) ?u64 {
         self.discovery_gens_mu.lock();
@@ -3210,9 +3237,16 @@ pub const DomainParticipantImpl = struct {
         return self.discovery_gens.get(guid) == gen;
     }
 
-    /// A match decision's currency: made only while `gen` is current.
-    fn matchCurrency(self: *Self, gen: u64) proto.MatchCurrency {
-        return .{ .ctx = self, .generation = gen, .is_current = isDiscoveryGenCurrent };
+    /// A match decision's currency: made only while `gen`, the remote
+    /// endpoint's, and the local endpoint `local`'s generation now are
+    /// current. Caller holds self.mu.
+    fn matchCurrency(self: *Self, gen: u64, local: Guid) proto.MatchCurrency {
+        return .{
+            .ctx = self,
+            .generation = gen,
+            .local = if (self.currentDiscoveryGenLocked(local)) |lg| .{ .guid = local, .generation = lg } else null,
+            .is_current = isDiscoveryGenCurrent,
+        };
     }
 
     /// `writer` is settled, if `gen` (its announcement's discovery
@@ -3321,7 +3355,7 @@ pub const DomainParticipantImpl = struct {
             if (!ar.proto.quiesceAcquire()) continue;
             var info = buildMatchedWriterInfo(data.guid, data.qos, data.unicast_locators, data.multicast_locators);
             info.prematch = self.prematchFor(ar);
-            info.currency = self.matchCurrency(g);
+            info.currency = self.matchCurrency(g, ar.guid);
             const nq = if (ar.matched_notify) |cb| cb.quiesceAcquire() else false;
             jobs.append(self.alloc, .{ .proto = ar.proto, .info = info, .notify = ar.matched_notify, .notify_quiesced = nq }) catch {
                 ar.proto.quiesceRelease();
@@ -3618,7 +3652,7 @@ pub const DomainParticipantImpl = struct {
             // until after self.mu is released below.
             if (!aw.proto.quiesceAcquire()) continue;
             var info = self.buildMatchedReaderInfo(data.guid, data.qos, data.unicast_locators, data.multicast_locators);
-            info.currency = self.matchCurrency(g);
+            info.currency = self.matchCurrency(g, aw.guid);
             const nq = if (aw.matched_notify) |cb| cb.quiesceAcquire() else false;
             jobs.append(self.alloc, .{ .proto = aw.proto, .info = info, .notify = aw.matched_notify, .notify_quiesced = nq }) catch {
                 aw.proto.quiesceRelease();
@@ -3985,6 +4019,10 @@ pub const DomainParticipantImpl = struct {
         /// It was deleted meanwhile: the last commit disposes of it, after
         /// itself, so no announcement follows its disposal.
         dispose: bool = false,
+        /// A commit is writing its announcement (`commitAnnouncement`).
+        writing: bool = false,
+        /// Another commit began meanwhile: the one writing writes again.
+        again: bool = false,
     };
 
     /// Makes room in `announcing` for every local endpoint. With `mu` held.
@@ -4015,6 +4053,59 @@ pub const DomainParticipantImpl = struct {
             return dispose;
         };
         return false;
+    }
+
+    /// Has discovery write `guid`'s announcement, then ends the commit
+    /// (`finishAnnouncing`). One commit of an endpoint writes at a time, so
+    /// discovery writes what was adopted last, last: one begun while
+    /// another writes leaves it to write again, once done, rather than wait,
+    /// which a listener the write re-enters could not.
+    fn commitAnnouncement(self: *Self, comptime kind: enum { writer, reader }, guid: Guid) void {
+        if (self.claimWrite(guid)) while (true) {
+            switch (kind) {
+                .writer => self.discovery.announceWriter(guid),
+                .reader => self.discovery.announceReader(guid),
+            }
+            if (!self.writeAgain(guid)) break;
+        };
+        if (self.finishAnnouncing(guid)) self.retractDeleted(switch (kind) {
+            .writer => .writer,
+            .reader => .reader,
+        }, guid);
+    }
+
+    /// Whether this commit of `guid` writes its announcement; otherwise the
+    /// one writing writes again.
+    fn claimWrite(self: *Self, guid: Guid) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const a = self.announcingLocked(guid);
+        if (a.writing) {
+            a.again = true;
+            return false;
+        }
+        a.writing = true;
+        return true;
+    }
+
+    /// Whether a commit of `guid` began while this one wrote, which it then
+    /// writes for; otherwise it is done writing.
+    fn writeAgain(self: *Self, guid: Guid) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const a = self.announcingLocked(guid);
+        if (a.again) {
+            a.again = false;
+            return true;
+        }
+        a.writing = false;
+        return false;
+    }
+
+    /// The commit under way of `guid`'s announcement. With `mu` held.
+    fn announcingLocked(self: *Self, guid: Guid) *Announcing {
+        for (self.announcing.items) |*a| if (a.guid.eql(guid)) return a;
+        unreachable;
     }
 
     /// For the deletion of `guid`: leaves its disposal to a commit of its
@@ -4148,6 +4239,7 @@ pub const DomainParticipantImpl = struct {
                 if (ep.prepared and change.qos == null and std.meta.eql(ep.presentation, presentation) and
                     (change.partition_names == null or partitionNamesEql(ep.partition_names, change.partition_names.?))) continue;
                 if (staged.items.len == 0) try self.reserveAnnouncingLocked();
+                try self.ensureLocalGenLocked(ep.guid);
                 const names: ?[]const []const u8 = if (change.partition_names) |n| try dupePartitionNamesOrFail(self.alloc, n) else null;
                 errdefer if (names) |n| freePartitionNames(self.alloc, n);
                 var qos: ?QosOf(kind) = if (change.qos) |q| try ownQos(self.alloc, q.*) else null;
@@ -4223,6 +4315,8 @@ pub const DomainParticipantImpl = struct {
             }
             ep.presentation = st.presentation;
             ep.prepared = true;
+            // A match decided with what this replaced is not made.
+            self.renewLocalGenLocked(st.guid);
         }
     }
 
@@ -4329,7 +4423,7 @@ pub const DomainParticipantImpl = struct {
                     const uloc = dupeLocators(self.alloc, dr.unicast_locators);
                     const mloc = dupeLocators(self.alloc, dr.multicast_locators);
                     var info = self.buildMatchedReaderInfo(dr.guid, &dr.qos, uloc, mloc);
-                    info.currency = self.matchCurrency(g);
+                    info.currency = self.matchCurrency(g, aw.guid);
                     const nq = if (aw.matched_notify) |cb| cb.quiesceAcquire() else false;
                     jobs.append(self.alloc, .{
                         .proto = aw.proto,
@@ -4364,8 +4458,7 @@ pub const DomainParticipantImpl = struct {
             self.alloc.free(job.multicast_locs);
         }
         const guid = guid_opt orelse return;
-        self.discovery.announceWriter(guid);
-        if (self.finishAnnouncing(guid)) self.retractDeleted(.writer, guid);
+        self.commitAnnouncement(.writer, guid);
     }
 
     const AnnounceMatchedWriterJob = struct {
@@ -4467,7 +4560,7 @@ pub const DomainParticipantImpl = struct {
                     const mloc = dupeLocators(self.alloc, dw.multicast_locators);
                     var info = buildMatchedWriterInfo(dw.guid, &dw.qos, uloc, mloc);
                     info.prematch = self.prematchFor(ar);
-                    info.currency = self.matchCurrency(g);
+                    info.currency = self.matchCurrency(g, ar.guid);
                     const nq = if (ar.matched_notify) |cb| cb.quiesceAcquire() else false;
                     jobs.append(self.alloc, .{
                         .proto = ar.proto,
@@ -4502,8 +4595,7 @@ pub const DomainParticipantImpl = struct {
             self.alloc.free(job.multicast_locs);
         }
         const guid = guid_opt orelse return;
-        self.discovery.announceReader(guid);
-        if (self.finishAnnouncing(guid)) self.retractDeleted(.reader, guid);
+        self.commitAnnouncement(.reader, guid);
     }
 
     fn pubRegisterWriterIncompatQos(

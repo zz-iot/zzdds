@@ -428,7 +428,9 @@ pub const Discovery = struct {
         /// Commits the prepared announcement of the local DataWriter `guid`
         /// to the discovery record, from which it reaches remote peers. Does
         /// nothing for a writer not prepared. The participant never calls it
-        /// for a writer it has retracted, nor `retract_writer` while it runs.
+        /// for a writer it has retracted, nor `retract_writer` while it runs,
+        /// nor again for the same writer before it returns: what it commits
+        /// last is what was adopted last.
         announce_writer: *const fn (ctx: *anyopaque, guid: Guid) void,
 
         /// Disposes of the local DataWriter `guid` (e.g. on

@@ -30,11 +30,14 @@ const Op = enum { announce_writer, retract_writer, announce_reader, retract_read
 /// Forwards to `inner`, recording each local endpoint operation, and runs
 /// `before_announce` once, just before forwarding the next announcement.
 /// With `fail_prepare`, preparing fails as for lack of memory, and with
-/// `fail_after`, it does once that many more have succeeded.
+/// `fail_after`, it does once that many more have succeeded. `nested` is
+/// set when an announcement is asked for while one is being written.
 const Recorder = struct {
     inner: disc.Discovery,
     ops: [16]Op = undefined,
     n: usize = 0,
+    writing: bool = false,
+    nested: bool = false,
     fail_prepare: bool = false,
     fail_after: ?usize = null,
     before_announce: ?*const fn (ctx: *anyopaque) void = null,
@@ -105,6 +108,9 @@ const Recorder = struct {
     }
     fn announceWriter(ctx: *anyopaque, guid: Guid) void {
         const self = of(ctx);
+        if (self.writing) self.nested = true;
+        self.writing = true;
+        defer self.writing = false;
         self.runBeforeAnnounce();
         self.record(.announce_writer);
         self.inner.announceWriter(guid);
@@ -125,6 +131,9 @@ const Recorder = struct {
     }
     fn announceReader(ctx: *anyopaque, guid: Guid) void {
         const self = of(ctx);
+        if (self.writing) self.nested = true;
+        self.writing = true;
+        defer self.writing = false;
         self.runBeforeAnnounce();
         self.record(.announce_reader);
         self.inner.announceReader(guid);
@@ -509,6 +518,104 @@ test "a writer created disabled in a Publisher whose partitions changed is annou
     try testing.expectEqual(DDS.RETCODE_OK, dw_a.vtable.enable(dw_a.ptr));
     try testing.expectEqualSlices(Op, &.{.announce_writer}, rec.recorded());
     try testing.expectEqual(@as(i32, 0), try subscriptionMatchedCount(dr_b));
+}
+
+test "a writer whose Publisher's partitions change while it is created is announced in the new ones" {
+    var rec: Recorder = undefined;
+    var fx = try Fixture.init(testing.allocator, &rec);
+    defer fx.deinit();
+
+    const dr_b = fx.sub_b.create_datareader(topicDesc(fx.topic_b), .{}, null, 0);
+    const pub_impl: *zzdds.dcps.PublisherImpl = @ptrCast(@alignCast(fx.pub_a.ptr));
+    const qos = DDS.DataWriterQos{};
+    const parts = try pub_impl.createProtoWriter(fx.topic_a, &qos);
+    // Between creation's two steps, the change cannot find the writer.
+    var q = DDS.PublisherQos{};
+    q.entity_factory.autoenable_created_entities = false;
+    q.partition = partitionNames(&other_partition);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_a.vtable.set_qos(fx.pub_a.ptr, &q));
+    const dw_a = pub_impl.finishDataWriter(fx.topic_a, &qos, .{}, 0, parts);
+    try testing.expect(dw_a.ptr != zzdds.dcps.NIL_PTR);
+    // Prepared by its creation, so enabling it cannot fail.
+    rec.fail_prepare = true;
+    try testing.expectEqual(DDS.RETCODE_OK, dw_a.vtable.enable(dw_a.ptr));
+    try testing.expectEqualSlices(Op, &.{.announce_writer}, rec.recorded());
+    try testing.expectEqual(@as(i32, 0), try subscriptionMatchedCount(dr_b));
+    try testing.expectEqual(@as(i32, 0), try publicationMatchedCount(dw_a));
+}
+
+test "a match decided before a Publisher's partition change is not made after it" {
+    var rec: Recorder = undefined;
+    var fx = try Fixture.init(testing.allocator, &rec);
+    defer fx.deinit();
+
+    const Probe = struct {
+        var publisher: DDS.Publisher = undefined;
+        var changed: bool = false;
+        var rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR;
+        fn onMatched(_: *anyopaque, _: *const DDS.PublicationMatchedStatus, _: ?*anyopaque) callconv(.c) void {
+            if (changed) return;
+            changed = true;
+            var q = DDS.PublisherQos{};
+            q.entity_factory.autoenable_created_entities = false;
+            q.partition = partitionNames(&other_partition);
+            rc = publisher.vtable.set_qos(publisher.ptr, &q);
+        }
+    };
+    Probe.publisher = fx.pub_a;
+    Probe.changed = false;
+    Probe.rc = DDS.RETCODE_ERROR;
+    const listener: DDS.DataWriterListener = .{ .on_publication_matched = Probe.onMatched };
+    const dw_1 = fx.pub_a.create_datawriter(fx.topic_a, .{}, listener, DDS.PUBLICATION_MATCHED_STATUS);
+    const dw_2 = fx.pub_a.create_datawriter(fx.topic_a, .{}, listener, DDS.PUBLICATION_MATCHED_STATUS);
+    try testing.expectEqual(DDS.RETCODE_OK, dw_1.vtable.enable(dw_1.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, dw_2.vtable.enable(dw_2.ptr));
+    // Its discovery decides a match with each writer; the first one made
+    // moves both writers out of its partition before the second is made.
+    const dr_b = fx.sub_b.create_datareader(topicDesc(fx.topic_b), .{}, null, 0);
+    try testing.expect(Probe.changed);
+    try testing.expectEqual(DDS.RETCODE_OK, Probe.rc);
+    try testing.expectEqual(@as(i32, 0), try publicationMatchedCount(dw_1));
+    try testing.expectEqual(@as(i32, 0), try publicationMatchedCount(dw_2));
+    try testing.expectEqual(@as(i32, 0), try subscriptionMatchedCount(dr_b));
+}
+
+test "a writer's QoS changed while its announcement is written is announced after it, not within it" {
+    var rec: Recorder = undefined;
+    var fx = try Fixture.init(testing.allocator, &rec);
+    defer fx.deinit();
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.deadline.period = .{ .sec = 2, .nanosec = 0 };
+    const dr_b = fx.sub_b.create_datareader(topicDesc(fx.topic_b), dr_qos, null, 0);
+    const Change = struct {
+        var dw: DDS.DataWriter = undefined;
+        var rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR;
+        fn f(_: *anyopaque) void {
+            var within = DDS.DataWriterQos{};
+            within.deadline.period = .{ .sec = 1, .nanosec = 0 };
+            rc = dw.vtable.set_qos(dw.ptr, &within);
+        }
+    };
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
+    const dw_a = fx.pub_a.create_datawriter(fx.topic_a, dw_qos, null, 0);
+    try testing.expectEqual(DDS.RETCODE_OK, dw_a.vtable.enable(dw_a.ptr));
+    try testing.expectEqual(@as(i32, 1), try subscriptionMatchedCount(dr_b));
+
+    // While the longer deadline's announcement is written, the writer goes
+    // back within what the reader requests.
+    Change.dw = dw_a;
+    Change.rc = DDS.RETCODE_ERROR;
+    rec.before_announce = Change.f;
+    var longer = dw_qos;
+    longer.deadline.period = .{ .sec = 5, .nanosec = 0 };
+    try testing.expectEqual(DDS.RETCODE_OK, dw_a.vtable.set_qos(dw_a.ptr, &longer));
+    try testing.expectEqual(DDS.RETCODE_OK, Change.rc);
+    try testing.expect(!rec.nested);
+    try testing.expectEqualSlices(Op, &.{ .announce_writer, .announce_writer, .announce_writer }, rec.recorded());
+    try testing.expectEqual(@as(i32, 1), try subscriptionMatchedCount(dr_b));
+    try testing.expectEqual(@as(i32, 1), try publicationMatchedCount(dw_a));
 }
 
 test "a writer's QoS does not change when its announcement cannot be prepared, and does with it announced when it can" {

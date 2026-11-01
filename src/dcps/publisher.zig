@@ -561,6 +561,7 @@ pub const PublisherImpl = struct {
         // Publisher with the (spec-default) true QoS must not produce an
         // already-enabled DataWriter that could announce/match before its
         // own parent is operational.
+        self.qos_mu.lock();
         dw.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
         // Held until creation returns: once the writer is in the Publisher,
         // a callback the announcement's matches raise may delete it, and
@@ -569,15 +570,23 @@ pub const PublisherImpl = struct {
         defer dw.releaseQuiesce();
         // Joins this Publisher before it is announced, so a failed append
         // announces nothing, and a callback the announcement's matches raise
-        // gets a writer delete_datawriter can find.
-        self.mu.lock();
-        self.writers.append(self.alloc, dw) catch {
-            self.mu.unlock();
+        // gets a writer delete_datawriter can find. Prepared again first,
+        // under `qos_mu`: a partition change since `createProtoWriter`
+        // prepared it did not find it, so this prepares it with what that
+        // change set (nothing, without one), and a later change finds it.
+        const joined = joined: {
+            defer self.qos_mu.unlock();
+            self.prepareDataWritersLocked(&.{publication_handle}, &self.qos) catch break :joined false;
+            self.mu.lock();
+            defer self.mu.unlock();
+            self.writers.append(self.alloc, dw) catch break :joined false;
+            break :joined true;
+        };
+        if (!joined) {
             self.cbs.destroy_proto_writer(self.cbs.ctx, publication_handle);
             dw.deinit();
             return nil.nil_datawriter;
-        };
-        self.mu.unlock();
+        }
         if (dw.enabled.load(.acquire)) self.announceDataWriter(publication_handle);
         if (dw.quiesce.tearingDown()) return nil.nil_datawriter;
         return dw.toDDSDataWriter();

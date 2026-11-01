@@ -22,7 +22,8 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   Subscriber's PRESENTATION. Such changes used to be accepted and reported by `get_qos`,
   while the endpoint kept the QoS it was created with.
 - The discovery plugin interface gains `adopt_*`/`abandon_*`: `prepare_*` for an endpoint
-  prepared already holds the replacement until one of them.
+  prepared already holds the replacement until one of them. The participant calls
+  `announce_*` for an endpoint again only once the call before has returned.
 - A local DataWriter's or DataReader's SEDP announcement and disposal can no longer fail
   once it exists. Discovery reserves what both need when the endpoint is created:
   creation returns nil when it cannot. A failed announcement used to be only logged, and the endpoint never announced;

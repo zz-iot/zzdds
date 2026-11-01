@@ -530,19 +530,26 @@ pub const SubscriberImpl = struct {
         // registrations are safe to leave unconditional. Also gated on this
         // Subscriber's own current enabled state -- see publisher.zig's
         // identical DataWriter gate (PR #91 Greptile finding).
+        self.qos_mu.lock();
         dr.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
-        // Joins this Subscriber before it is announced, held until creation
-        // returns; see PublisherImpl.finishDataWriter.
+        // Joins this Subscriber before it is announced, prepared again
+        // first, held until creation returns; see
+        // PublisherImpl.finishDataWriter.
         _ = dr.acquireQuiesce();
         defer dr.releaseQuiesce();
-        self.mu.lock();
-        self.readers.append(self.alloc, dr) catch {
-            self.mu.unlock();
+        const joined = joined: {
+            defer self.qos_mu.unlock();
+            self.prepareDataReadersLocked(&.{subscription_handle}, &self.qos) catch break :joined false;
+            self.mu.lock();
+            defer self.mu.unlock();
+            self.readers.append(self.alloc, dr) catch break :joined false;
+            break :joined true;
+        };
+        if (!joined) {
             self.cbs.destroy_proto_reader(self.cbs.ctx, subscription_handle);
             dr.deinit();
             return nil.nil_datareader;
-        };
-        self.mu.unlock();
+        }
         if (dr.enabled.load(.acquire)) self.announceDataReader(subscription_handle);
         if (dr.quiesce.tearingDown()) return nil.nil_datareader;
         return dr.toDDSDataReader();
