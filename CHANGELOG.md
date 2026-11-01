@@ -24,6 +24,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   _INCOMPATIBLE_QOS for a QoS mismatch). It used to stay matched.
 - The discovery plugin interface's `announce_writer`/`announce_reader` are split into a
   fallible `prepare_*` and an infallible `announce_*(guid)`.
+- The shared runtime's readiness backend, and UDP and TCP on it, now run on Windows
+  (`-Dshared-runtime`): the backend polls with `WSAPoll` and wakes through a loopback
+  socket, sockets on it are nonblocking, and sends take the builder's gather list
+  (`WSASendTo`, `WSASend`) instead of UDP flattening it into one buffer.
+- The C and C++ enable-defer peers time their premature-match window by a monotonic
+  clock rather than by counting sleeps, which on Windows overran it into the enable.
 
 ## 2026-10-30
 

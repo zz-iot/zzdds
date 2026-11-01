@@ -125,6 +125,7 @@ pub const util = struct {
     pub const time = @import("util/time.zig");
     pub const clock_registry = @import("util/clock_registry.zig");
     pub const guid_gen = @import("util/guid_gen.zig");
+    pub const sock = @import("util/sock.zig");
     pub const mutex = @import("util/mutex.zig");
     pub const condvar = @import("util/condvar.zig");
     pub const listener_box = @import("util/listener_box.zig");
@@ -170,6 +171,7 @@ test {
     _ = @import("util/time.zig");
     _ = @import("util/clock_registry.zig");
     _ = @import("util/guid_gen.zig");
+    _ = @import("util/sock.zig");
     _ = @import("util/mutex.zig");
     _ = @import("util/listener_box.zig");
     _ = @import("util/listener_identity.zig");

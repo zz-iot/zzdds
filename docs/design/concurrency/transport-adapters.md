@@ -151,7 +151,7 @@ through its futex or condition, a manual driver through `wake()`. The runtime co
 assumes the wait is a futex.
 
 **Conforming approach.** The readiness adapter's wake is an `eventfd` on Linux, a pipe
-on other POSIX systems, and a loopback socket or an event handle on Windows; it is
+on other POSIX systems, and a loopback UDP socket connected to itself on Windows; it is
 registered with the sockets in the same `poll` set. An external loop receives the
 handles to wait on through the external-loop adapter, whose ABI is the open design item.
 Under Threaded, an `Io.Batch` of receives and a read on the wake descriptor implements
@@ -179,7 +179,7 @@ asking for read readiness on a paused source, and the kernel queues or drops fur
 input. The completion adapter stops posting receives. The MCU adapter stops taking buffers
 from the driver, which drops at its own limit.
 
-TCP on POSIX does this on a backend. A frame its receive handler has no room for
+TCP does this on a backend. A frame its receive handler has no room for
 (`ReceiveHandler.try_receive`) is held whole, with the bytes read after it, and the
 connection's source stops waiting for input (`pause_input`). The participant runs the
 connection's waiter once it has processed a queued datagram and the frame fits, and
@@ -222,8 +222,9 @@ Sending becomes a submission with one of the four outcomes in
   never blocks the executor that requested it.
 
 **Implemented so far.** `Transport.send_gather` takes the gather list and returns
-`completed` or `would_block`, or fails (rejected); UDP on POSIX sends it with `sendmsg`,
-nonblocking once its sockets are a backend's. The caller's bytes are lent for the call
+`completed` or `would_block`, or fails (rejected); UDP sends it with `sendmsg` (`WSASendTo`
+on Windows), nonblocking once its sockets are a backend's (on Windows, which has no
+`MSG_DONTWAIT`, by making the sockets nonblocking). The caller's bytes are lent for the call
 only, so accepted-pending is not offered yet. The owner registers for output readiness
 with `Transport.notifyWritable`: its waiter runs once a send socket that blocked can take
 output, or at once if none is blocked, so a drain between the send and the registration
@@ -240,8 +241,9 @@ began with: a reader removed and matched again meanwhile is a new match, which t
 neither holds nor resumes. Protocol messages that would block are lost, as their content
 is sent again from current state.
 
-TCP on POSIX does the same on a backend, framing the gather list with its length prefix
-in one `sendmsg`. A frame the socket takes only part of is copied: the transport keeps
+TCP does the same on a backend, framing the gather list with its length prefix
+in one `sendmsg` (`WSASend` on Windows). A frame the socket takes only part of is copied
+(Winsock takes a frame whole or not at all, so on Windows there is none): the transport keeps
 the unwritten rest as the connection's tail and returns `completed`, so the caller's
 bytes are still lent for the call only. While a connection has a tail, a send on it is
 `would_block`, so frames never interleave; the tail is written when the socket reports

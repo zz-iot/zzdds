@@ -43,6 +43,7 @@ const backend_mod = @import("../runtime/backend.zig");
 const ProgressBackend = backend_mod.ProgressBackend;
 const Source = backend_mod.Source;
 const poll_backend = @import("../runtime/poll_backend.zig");
+const sock = @import("../util/sock.zig");
 
 pub const Locator = iface.Locator;
 pub const LocatorKind = iface.LocatorKind;
@@ -102,48 +103,16 @@ const WinPoll = if (builtin.os.tag == .windows) struct {
     ) callconv(.winapi) c_int;
 } else struct {};
 
-// ── Windows Winsock initialisation ───────────────────────────────────────────
-// Winsock requires WSAStartup before any socket call. Call once lazily.
-
-const wsa = if (builtin.os.tag == .windows) struct {
-    extern "ws2_32" fn closesocket(s: posix.socket_t) callconv(.winapi) c_int;
-    const WSADATA = [408]u8;
-    extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *WSADATA) c_int;
-    var initiated: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-    var data: WSADATA = undefined;
-    fn ensure() void {
-        if (initiated.load(.acquire)) return;
-        _ = WSAStartup(0x0202, &data);
-        initiated.store(true, .release);
-    }
-} else struct {};
-
-/// INVALID_SOCKET sentinel: -1 on POSIX (c_int), ~0 pointer on Windows.
-const INVALID_SOCKET: posix.socket_t = if (builtin.os.tag == .windows)
-    @ptrFromInt(std.math.maxInt(usize))
-else
-    @as(posix.socket_t, -1);
+const INVALID_SOCKET: posix.socket_t = sock.invalid;
 
 // ── Socket helpers (cross-platform) ──────────────────────────────────────────
 
-/// Create a TCP socket, handling the posix.socket_t←c_int conversion on Windows.
 fn socketCreate(family: u32, sock_type: u32) !posix.socket_t {
-    if (comptime builtin.os.tag == .windows) wsa.ensure();
-    const fd = c.socket(@intCast(family), @intCast(sock_type), 0);
-    if (fd < 0) return error.SocketCreateFailed;
-    if (comptime builtin.os.tag == .windows) {
-        return @ptrFromInt(@as(usize, @intCast(fd)));
-    }
-    return @intCast(fd);
+    return sock.open(family, sock_type);
 }
 
 fn socketClose(fd: posix.socket_t) void {
-    if (builtin.os.tag == .windows) {
-        // Winsock handles must not be passed to the CRT's close().
-        _ = wsa.closesocket(fd);
-    } else {
-        _ = c.close(fd);
-    }
+    sock.close(fd);
 }
 
 test "socketClose releases a bound TCP port" {
@@ -175,10 +144,7 @@ fn socketShutdown(fd: posix.socket_t, how: c_int) void {
 fn socketAccept(fd: posix.socket_t, addr: *posix.sockaddr.storage, len: *posix.socklen_t) ?posix.socket_t {
     const conn = c.accept(fd, @ptrCast(addr), len);
     if (conn < 0) return null;
-    if (comptime builtin.os.tag == .windows) {
-        return @ptrFromInt(@as(usize, @intCast(conn)));
-    }
-    return @intCast(conn);
+    return sock.handle(conn);
 }
 
 /// Set SO_NOSIGPIPE on newly created sockets on macOS/BSD so that writes to a
@@ -193,9 +159,42 @@ fn setSockNoSigPipe(fd: posix.socket_t) void {
 /// Sockets on a backend never block.
 fn setNonblocking(fd: posix.socket_t) error{SocketSetupFailed}!void {
     if (comptime !poll_backend.supported) unreachable;
-    const fl = c.fcntl(fd, c.F.GETFL);
-    const nonblock: c_int = @bitCast(@as(u32, @bitCast(c.O{ .NONBLOCK = true })));
-    if (fl < 0 or c.fcntl(fd, c.F.SETFL, fl | nonblock) < 0) return error.SocketSetupFailed;
+    return sock.setNonblocking(fd);
+}
+
+/// Writes what a nonblocking socket takes of `parts` (at most 1 +
+/// MAX_GATHER) in one call; null if it takes nothing now.
+fn sendParts(fd: posix.socket_t, parts: []const IoVec) error{SendFailed}!?usize {
+    if (comptime builtin.os.tag == .windows) {
+        // WSASend is Winsock's sendmsg; a WSABUF puts the length first.
+        var bufs: [1 + MAX_GATHER]sock.ws.WSABUF = undefined;
+        for (parts, bufs[0..parts.len]) |iov, *b| b.* = .{ .len = @intCast(iov.len), .buf = iov.base };
+        var sent: u32 = 0;
+        while (sock.ws.WSASend(fd, &bufs, @intCast(parts.len), &sent, 0, null, null) != 0) switch (sock.lastError()) {
+            .interrupted => continue,
+            .would_block => return null,
+            else => return error.SendFailed,
+        };
+        return sent;
+    }
+    const msg: c.msghdr_const = .{
+        .name = null,
+        .namelen = 0,
+        .iov = parts.ptr,
+        .iovlen = @intCast(parts.len),
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    while (true) {
+        const n = c.sendmsg(fd, &msg, @intCast(MSG_NOSIGNAL));
+        if (n >= 0) return @intCast(n);
+        switch (sock.lastError()) {
+            .interrupted => continue,
+            .would_block => return null,
+            else => return error.SendFailed,
+        }
+    }
 }
 
 /// The socket's pending error (SO_ERROR), clearing it: how a nonblocking
@@ -1251,9 +1250,9 @@ pub const TcpTransport = struct {
         while (conn.tail_off < conn.tail.len) {
             const rest = conn.tail[conn.tail_off..];
             const n = c.send(conn.fd, rest.ptr, rest.len, @intCast(MSG_NOSIGNAL));
-            if (n < 0) switch (posix.errno(n)) {
-                .INTR => continue,
-                .AGAIN => {
+            if (n < 0) switch (sock.lastError()) {
+                .interrupted => continue,
+                .would_block => {
                     self.backend.?.armOutput(&conn.source);
                     return .again;
                 },
@@ -1280,26 +1279,9 @@ pub const TcpTransport = struct {
         @memcpy(parts[1..][0..iovecs.len], iovecs);
         var total: usize = 0;
         for (parts[0 .. 1 + iovecs.len]) |iov| total += iov.len;
-        const msg: c.msghdr_const = .{
-            .name = null,
-            .namelen = 0,
-            .iov = &parts,
-            .iovlen = @intCast(1 + iovecs.len),
-            .control = null,
-            .controllen = 0,
-            .flags = 0,
-        };
-        const sent: usize = while (true) {
-            const n = c.sendmsg(conn.fd, &msg, @intCast(MSG_NOSIGNAL));
-            if (n >= 0) break @intCast(n);
-            switch (posix.errno(n)) {
-                .INTR => continue,
-                .AGAIN => {
-                    self.backend.?.armOutput(&conn.source);
-                    return self.wouldBlockLocked(conn);
-                },
-                else => return error.SendFailed,
-            }
+        const sent = try sendParts(conn.fd, parts[0 .. 1 + iovecs.len]) orelse {
+            self.backend.?.armOutput(&conn.source);
+            return self.wouldBlockLocked(conn);
         };
         if (sent == total) return .completed;
         self.keepTailLocked(conn, hdr, iovecs, sent) catch {
@@ -1729,21 +1711,21 @@ fn serviceListener(ctx: *anyopaque, budget: u32) u32 {
         var addr: posix.sockaddr.storage = undefined;
         var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
         const rc = c.accept(l.fd, @ptrCast(&addr), &len);
-        if (rc < 0) switch (posix.errno(rc)) {
-            .AGAIN => break,
-            .INTR => continue,
-            .CONNABORTED => {
+        if (rc < 0) switch (sock.lastError()) {
+            .would_block => break,
+            .interrupted => continue,
+            .connection_aborted => {
                 handled += 1;
                 continue;
             },
             else => |err| {
                 // Tried again when next ready.
-                log.transport.warn("tcp: transient accept error: {}", .{err});
+                log.transport.warn("tcp: transient accept error: {t}", .{err});
                 break;
             },
         };
         handled += 1;
-        l.transport.adoptAccepted(@intCast(rc), &addr);
+        l.transport.adoptAccepted(sock.handle(rc), &addr);
     }
     return handled;
 }
@@ -1770,9 +1752,9 @@ fn serviceConn(ctx: *anyopaque, budget: u32) u32 {
         // A partly read frame takes the bytes in place.
         const into: []u8 = if (conn.frame.len > 0) conn.frame[conn.frame_off..] else &buf;
         const n = c.recv(conn.fd, into.ptr, into.len, 0);
-        if (n < 0) switch (posix.errno(n)) {
-            .AGAIN => break,
-            .INTR => continue,
+        if (n < 0) switch (sock.lastError()) {
+            .would_block => break,
+            .interrupted => continue,
             else => {
                 conn.owner.closeOnBackend(conn);
                 return handled + 1;
@@ -2130,7 +2112,7 @@ fn dialConnection(alloc: std.mem.Allocator, key: RemoteKey, nonblocking: bool) !
     var connecting = false;
     if (rc != 0) {
         if (comptime !poll_backend.supported) return error.ConnectFailed;
-        if (!nonblocking or posix.errno(rc) != .INPROGRESS) return error.ConnectFailed;
+        if (!nonblocking or !sock.connectPending(sock.lastError())) return error.ConnectFailed;
         connecting = true;
     }
 

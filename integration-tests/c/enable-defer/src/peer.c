@@ -18,6 +18,7 @@
 #include "zzdds_c.h"
 #include "zzdds.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,8 +33,15 @@
 #include <windows.h>
 static inline void usleep(unsigned long us) { Sleep((DWORD)(us / 1000)); }
 static inline void sleep(unsigned s) { Sleep((DWORD)s * 1000); }
+static uint64_t now_ms(void) { return GetTickCount64(); }
 #else
+#include <time.h>
 #include <unistd.h>
+static uint64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
 #endif
 
 #define SAMPLE_TARGET 5
@@ -104,9 +112,12 @@ int main(int argc, char **argv) {
     /* Core assertion: for a window comfortably inside the configurer's own
      * pre-enable delay, matched-current-count must stay exactly 0 -- direct
      * proof the deferred SEDP announcement genuinely never went out while
-     * the configurer's writer was disabled. */
+     * the configurer's writer was disabled. Timed by the clock, not by
+     * counting polls: a sleep can run long (Windows rounds it up to the
+     * timer tick), and counted polls then outlast the configurer's delay. */
     DDS_SubscriptionMatchedStatus status;
-    for (int waited_ms = 0; waited_ms < PREMATURE_CHECK_WINDOW_SEC * 1000; waited_ms += POLL_PERIOD_MS) {
+    const uint64_t window_end_ms = now_ms() + PREMATURE_CHECK_WINDOW_SEC * 1000;
+    while (now_ms() < window_end_ms) {
         if (DDS_DataReader_get_subscription_matched_status(dr, &status) != DDS_RETCODE_OK) {
             fprintf(stderr, "FAIL: get_subscription_matched_status() failed\n");
             return 1;
