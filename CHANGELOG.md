@@ -8,6 +8,17 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-01
+
+- CI runs the examples and every integration-test scenario on a `-Dshared-runtime` build
+  too, on Linux and Windows. The example and integration-test Zig apps take a
+  `-Dshared-runtime` option for their own zzdds build, which the runner scripts pass when
+  `ZZDDS_SHARED_RUNTIME=1`.
+- The wait-for-historical-data subscribers confirm the historical batch by taking it from
+  the reader once `wait_for_historical_data()` returns, attaching their listener only
+  afterwards. The call promises the samples are in the reader, not that
+  `on_data_available` has run, which on the shared runtime happens later.
+
 ## 2026-10-31
 
 - A local DataWriter's or DataReader's SEDP announcement and disposal can no longer fail

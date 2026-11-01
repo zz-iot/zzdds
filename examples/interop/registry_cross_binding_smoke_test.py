@@ -41,6 +41,7 @@ from _common import (
     require_tool,
     run_build,
     run_env,
+    zig_build_cmd,
     zzdds_zig_out,
 )
 
@@ -80,7 +81,7 @@ def build_all(zig_out: Path) -> bool:
     print("== Building zig/registry ==")
     zig_out_dir = ZIG_DIR / "zig-out"
     zig_out_dir.mkdir(parents=True, exist_ok=True)
-    if not run_build(["zig", "build", "-Doptimize=ReleaseSafe"], cwd=ZIG_DIR, log_path=zig_out_dir / "build.log"):
+    if not run_build(zig_build_cmd(), cwd=ZIG_DIR, log_path=zig_out_dir / "build.log"):
         print(f"FAIL: zig/registry build -- see {zig_out_dir}/build.log", file=sys.stderr)
         return False
 

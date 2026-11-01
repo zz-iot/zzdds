@@ -15,10 +15,11 @@ pub fn build(b: *std.Build) void {
 
     const config_authoring = b.option(bool, "config-authoring", "Use the shared config reader") orelse true;
     const zidl_source = b.option([]const u8, "zidl-source", "Coordinated zidl checkout (absolute path)");
+    const shared_runtime = b.option(bool, "shared-runtime", "Build zzdds with -Dshared-runtime (contributors only; default: false)") orelse false;
     const zzdds_dep = if (zidl_source) |source|
-        b.dependency("zzdds", .{ .target = target, .optimize = optimize, .@"config-authoring" = config_authoring, .@"zidl-source" = source })
+        b.dependency("zzdds", .{ .target = target, .optimize = optimize, .@"config-authoring" = config_authoring, .@"zidl-source" = source, .@"shared-runtime" = shared_runtime })
     else
-        b.dependency("zzdds", .{ .target = target, .optimize = optimize, .@"config-authoring" = config_authoring });
+        b.dependency("zzdds", .{ .target = target, .optimize = optimize, .@"config-authoring" = config_authoring, .@"shared-runtime" = shared_runtime });
     const zzdds_mod = zzdds_dep.module("zzdds");
     const zzdds_gen = zzdds_dep.module("zzdds_generated");
     const zzdds_ext_gen = zzdds_dep.module("zzdds_ext_generated");

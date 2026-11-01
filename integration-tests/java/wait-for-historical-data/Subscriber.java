@@ -42,6 +42,33 @@ public class Subscriber {
         return 0;
     }
 
+    // Takes everything the reader holds, recording each seq_num.
+    static void takeAvailable(HistoryEventDataReader reader, AtomicBoolean[] historicalReceived,
+                              AtomicBoolean[] liveReceived, AtomicBoolean historicalConfirmed,
+                              AtomicBoolean allDone) {
+        boolean becameDone = false;
+        HistoryEventDataReader.Sample sample;
+        while ((sample = reader.take()) != null) {
+            if (!sample.validData) continue;
+            int seqNum = sample.data.get_seq_num();
+            if (seqNum >= 0 && seqNum < HISTORICAL_COUNT) {
+                historicalReceived[seqNum].set(true);
+            } else if (seqNum >= HISTORICAL_COUNT && seqNum < HISTORICAL_COUNT + LIVE_COUNT) {
+                System.out.println("LIVE SAMPLE seq_num=" + seqNum);
+                liveReceived[seqNum - HISTORICAL_COUNT].set(true);
+                if (!allDone.get() && !becameDone && readyToFinish(historicalConfirmed, liveReceived)) {
+                    becameDone = true;
+                }
+            } else {
+                System.err.println("FAIL: unexpected seq_num=" + seqNum);
+                System.exit(1);
+            }
+        }
+        if (becameDone) {
+            allDone.set(true);
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         int domainId = parseDomain(args);
 
@@ -99,28 +126,8 @@ public class Subscriber {
             public void on_sample_lost(Dcps.DDS.DataReader r, Dcps.DDS.SampleLostStatus s) {}
 
             public void on_data_available(Dcps.DDS.DataReader r) {
-                HistoryEventDataReader reader = (HistoryEventDataReader) readerBox[0];
-                boolean becameDone = false;
-                HistoryEventDataReader.Sample sample;
-                while ((sample = reader.take()) != null) {
-                    if (!sample.validData) continue;
-                    int seqNum = sample.data.get_seq_num();
-                    if (seqNum >= 0 && seqNum < HISTORICAL_COUNT) {
-                        historicalReceived[seqNum].set(true);
-                    } else if (seqNum >= HISTORICAL_COUNT && seqNum < HISTORICAL_COUNT + LIVE_COUNT) {
-                        System.out.println("LIVE SAMPLE seq_num=" + seqNum);
-                        liveReceived[seqNum - HISTORICAL_COUNT].set(true);
-                        if (!allDone.get() && !becameDone && readyToFinish(historicalConfirmed, liveReceived)) {
-                            becameDone = true;
-                        }
-                    } else {
-                        System.err.println("FAIL: unexpected seq_num=" + seqNum);
-                        System.exit(1);
-                    }
-                }
-                if (becameDone) {
-                    allDone.set(true);
-                }
+                takeAvailable((HistoryEventDataReader) readerBox[0], historicalReceived, liveReceived,
+                              historicalConfirmed, allDone);
             }
         };
 
@@ -135,10 +142,6 @@ public class Subscriber {
         System.out.println("Create reader for topic: HistoryEvent");
 
         readerBox[0] = new HistoryEventDataReader(rawReader);
-        if (rawReader.set_listener(listener, Dcps.DDS.DATA_AVAILABLE_STATUS.value) != 0) {
-            System.err.println("FAIL: set_listener() failed");
-            System.exit(1);
-        }
 
         // Negative case -- see this file's header comment. No writer exists
         // anywhere on this domain yet (the harness enforces that), so a
@@ -172,7 +175,9 @@ public class Subscriber {
         System.out.println("Subscriber: wait_for_historical_data() returned");
 
         // Confirm the real guarantee, not just the return code: every
-        // historical sample must already have been delivered by now.
+        // historical sample must already be in the reader.
+        takeAvailable((HistoryEventDataReader) readerBox[0], historicalReceived, liveReceived,
+                      historicalConfirmed, allDone);
         int historicalCount = 0;
         for (AtomicBoolean v : historicalReceived) {
             if (v.get()) historicalCount++;
@@ -185,6 +190,11 @@ public class Subscriber {
         historicalConfirmed.set(true);
         if (readyToFinish(historicalConfirmed, liveReceived)) {
             allDone.set(true);
+        } else if (rawReader.set_listener(listener, Dcps.DDS.DATA_AVAILABLE_STATUS.value) != 0) {
+            // The rest of the live batch; set_listener() fires at once for
+            // anything that arrived meanwhile.
+            System.err.println("FAIL: set_listener() failed");
+            System.exit(1);
         }
 
         long deadline = System.currentTimeMillis() + RECEIVE_TIMEOUT_MS;
