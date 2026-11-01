@@ -271,6 +271,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Windows now also builds nine native Zig examples and runs the full mesh.
     timeout-minutes: ${{ matrix.timeout }}
+    env:
+      # The native Zig apps build their own zzdds, so the runner scripts pass
+      # them -Dshared-runtime too (examples/_common.py's zig_build_cmd).
+      ZZDDS_SHARED_RUNTIME: ${{ matrix.runtime == 'shared' && '1' || '0' }}
 
     steps:
       - name: Check out zzdds
@@ -416,6 +420,8 @@ jobs:
     # the old monolithic job's 40min, since that budget no longer has to
     # cover all 9 scenarios cumulatively.
     timeout-minutes: 20
+    env:
+      ZZDDS_SHARED_RUNTIME: ${{ matrix.runtime == 'shared' && '1' || '0' }}
 
     steps:
       - name: Check out zzdds
