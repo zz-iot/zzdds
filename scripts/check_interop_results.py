@@ -23,6 +23,9 @@ When run under GitHub Actions (GITHUB_ACTIONS=true):
     and listed tests that passed as ::warning:: annotations.
   - Any TSAN log files found in --tsan-log-dir are printed the same way.
   - A results table is appended to the job summary ($GITHUB_STEP_SUMMARY).
+  - The step output failed_tests ($GITHUB_OUTPUT) counts the failing tests,
+    known failures included, so a later step can keep a failed run's files
+    even when the check passes.
 """
 
 import sys
@@ -61,6 +64,13 @@ def gha_summary(lines):
     if IN_GHA and path:
         with open(path, "a") as f:
             f.write("\n".join(lines) + "\n")
+
+
+def gha_output(name, value):
+    path = os.environ.get("GITHUB_OUTPUT")
+    if IN_GHA and path:
+        with open(path, "a") as f:
+            f.write(f"{name}={value}\n")
 
 
 def strip_html(text):
@@ -214,6 +224,7 @@ def main():
     total, real_failures, known_failures, known_passed, vendor_skipped = \
         check_junit(args.report, known)
     passed = total - len(real_failures) - len(known_failures) - len(vendor_skipped)
+    gha_output("failed_tests", len(real_failures) + len(known_failures))
     print(f"Interop results: {passed}/{total} passed"
           + (f", {len(known_failures)} known failures" if known_failures else "")
           + (f", {len(vendor_skipped)} vendor-skipped" if vendor_skipped else ""))

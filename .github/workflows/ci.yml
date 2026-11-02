@@ -1391,13 +1391,18 @@ jobs:
         run: chmod +x bins/zzdds_shape_main_linux bins/${{ matrix.vendor.binary }}
 
       # A failure that only the runner reproduces needs its packets: capture
-      # every UDP datagram of the run, and keep it if a test fails. The job
-      # log's per-test result lines give each test's window in it.
+      # every UDP datagram of the run, and keep it if a test fails, known
+      # failures included. The job log's per-test result lines give each
+      # test's window in it.
       - name: Start packet capture
         run: |
           command -v tcpdump >/dev/null || sudo apt-get install -y tcpdump
           sudo timeout -s INT 3600 tcpdump -i any -U -w /tmp/interop-tsan.pcap udp > /tmp/tcpdump.log 2>&1 &
           for _ in $(seq 50); do [ -s /tmp/interop-tsan.pcap ] && break; sleep 0.1; done
+          if ! pgrep -x tcpdump >/dev/null || [ ! -s /tmp/interop-tsan.pcap ]; then
+            echo "::warning::Packet capture did not start; a failure will have no packets"
+            cat /tmp/tcpdump.log || true
+          fi
 
       - name: Run interop TSan (${{ matrix.direction }})
         working-directory: dds-rtps
@@ -1422,6 +1427,7 @@ jobs:
           cat /tmp/tcpdump.log || true
 
       - name: Check results
+        id: check
         run: |
           python3 zzdds/scripts/check_interop_results.py \
             /tmp/interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml \
@@ -1437,7 +1443,7 @@ jobs:
           path: /tmp/interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
 
       - name: Upload packet capture
-        if: failure()
+        if: failure() || (success() && steps.check.outputs.failed_tests != '0')
         uses: actions/upload-artifact@v4
         with:
           name: interop-tsan-capture-${{ matrix.vendor.name }}-${{ matrix.direction }}
