@@ -30,6 +30,10 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 - `integration-tests/run_all.py --strict` finds `bin/zidl.exe` on Windows.
 - The ignore and wait-for-historical-data unit tests keep their mock discovery on the heap;
   the factory kept a pointer to a copy that `Harness.init` returned by value.
+- When a matched-status listener fires after teardown has begun, the
+  delete-contained-entities integration test's session now says whether it fired during
+  or after `delete_contained_entities()`, and names the callback, the endpoint's topic
+  and the status counts.
 
 ## 2026-11-01
 

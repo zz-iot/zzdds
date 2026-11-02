@@ -14,9 +14,11 @@
  * immediately-following delete_participant() ALSO returns RETCODE_OK (per
  * spec this only succeeds if the cascade genuinely left nothing dangling --
  * a real leaked child fails this with PRECONDITION_NOT_MET), and no
- * matched-status listener ever fires after the torn_down flag is set (a
- * callback firing after logical teardown began is a UAF-class bug this
- * project has hit before in teardown paths).
+ * matched-status listener ever fires once teardown begins (a callback
+ * firing after logical teardown began is a UAF-class bug this project has
+ * hit before in teardown paths). The failure line says whether the callback
+ * came during or after delete_contained_entities(), and names the endpoint
+ * and its status.
  *
  * Required stdout markers: "Create topic:" x3, "Create writer for topic:"
  * x2, "Create reader for topic:" x2, "Session: torn down via
@@ -53,20 +55,35 @@ static inline void sleep(unsigned s) { Sleep((DWORD)s * 1000); }
 #define WAIT_STEP_SEC 1
 #define POLL_PERIOD_MS 20
 
-static atomic_bool torn_down = false;
+enum { PHASE_RUNNING, PHASE_DELETING, PHASE_DELETED };
+static atomic_int phase = PHASE_RUNNING;
+
+static void fail_if_torn_down(const char *callback, const char *topic, int32_t total_count,
+                              int32_t total_count_change, int32_t current_count, int32_t current_count_change) {
+    int p = atomic_load(&phase);
+    if (p == PHASE_RUNNING) return;
+    fprintf(stderr,
+            "FAIL: listener fired %s delete_contained_entities: %s on %s "
+            "(total_count=%d total_count_change=%d current_count=%d current_count_change=%d)\n",
+            p == PHASE_DELETING ? "during" : "after", callback, topic, total_count, total_count_change,
+            current_count, current_count_change);
+    exit(1);
+}
 
 typedef struct {
+    const char *topic;
     atomic_bool reader_ready;
 } WriterSyncState;
 
+typedef struct {
+    const char *topic;
+} ReaderTag;
+
 static void on_publication_matched_ex(DDS_DataWriter writer, const DDS_PublicationMatchedStatus *status, void *listener_data) {
     (void)writer;
-    (void)status;
-    (void)listener_data;
-    if (atomic_load(&torn_down)) {
-        fprintf(stderr, "FAIL: listener fired after delete_contained_entities\n");
-        exit(1);
-    }
+    const WriterSyncState *state = (const WriterSyncState *)listener_data;
+    fail_if_torn_down("on_publication_matched", state->topic, status->total_count, status->total_count_change,
+                      status->current_count, status->current_count_change);
 }
 
 static void on_reliable_reader_ready(DDS_InstanceHandle_t reader_handle, bool is_ready, void *listener_data) {
@@ -91,12 +108,9 @@ static DDS_DataWriter create_writer_ex(DDS_Publisher pub, DDS_Topic topic, const
 
 static void on_subscription_matched(DDS_DataReader reader, const DDS_SubscriptionMatchedStatus *status, void *listener_data) {
     (void)reader;
-    (void)status;
-    (void)listener_data;
-    if (atomic_load(&torn_down)) {
-        fprintf(stderr, "FAIL: listener fired after delete_contained_entities\n");
-        exit(1);
-    }
+    const ReaderTag *tag = (const ReaderTag *)listener_data;
+    fail_if_torn_down("on_subscription_matched", tag->topic, status->total_count, status->total_count_change,
+                      status->current_count, status->current_count_change);
 }
 
 static uint32_t parse_domain(int argc, char **argv) {
@@ -164,6 +178,8 @@ int main(int argc, char **argv) {
     WriterSyncState out1_state, out2_state;
     memset(&out1_state, 0, sizeof(out1_state));
     memset(&out2_state, 0, sizeof(out2_state));
+    out1_state.topic = "SessionOut1";
+    out2_state.topic = "SessionOut2";
     DDS_DataWriter out1_dw = create_writer_ex(pub, out1_topic, &dw_qos, &out1_state);
     DDS_DataWriter out2_dw = create_writer_ex(pub, out2_topic, &dw_qos, &out2_state);
     if (!out1_dw || !out2_dw) {
@@ -186,8 +202,11 @@ int main(int argc, char **argv) {
 
     /* Reader listeners are attached at creation, so their "never after
      * teardown" check covers the readers' whole lifetime. */
+    static ReaderTag in_tag = {"SessionIn"};
+    static ReaderTag cft_tag = {"SessionIn_cft"};
     DDS_DataReaderListener dr_listener;
     memset(&dr_listener, 0, sizeof(dr_listener));
+    dr_listener.listener_data = &in_tag;
     dr_listener.on_subscription_matched = on_subscription_matched;
 
     DDS_TopicDescription in_desc = zzdds_topic_as_description(in_topic);
@@ -207,7 +226,9 @@ int main(int argc, char **argv) {
         return 1;
     }
     DDS_TopicDescription cft_desc = DDS_ContentFilteredTopic_as_DDS_TopicDescription(cft);
-    DDS_DataReader cft_dr = DDS_Subscriber_create_datareader(sub, cft_desc, &dr_qos, &dr_listener, DDS_SUBSCRIPTION_MATCHED_STATUS);
+    DDS_DataReaderListener cft_listener = dr_listener;
+    cft_listener.listener_data = &cft_tag;
+    DDS_DataReader cft_dr = DDS_Subscriber_create_datareader(sub, cft_desc, &dr_qos, &cft_listener, DDS_SUBSCRIPTION_MATCHED_STATUS);
     if (!cft_dr) {
         fprintf(stderr, "FAIL: create_datareader(SessionIn_cft) failed\n");
         return 1;
@@ -297,13 +318,14 @@ int main(int argc, char **argv) {
 
     /* The core test: tear the whole tree down in one shot instead of
      * deleting out1_dw/out2_dw/in_dr/cft_dr/cft one at a time. */
-    atomic_store(&torn_down, true);
+    atomic_store(&phase, PHASE_DELETING);
 
     DDS_ReturnCode_t rc1 = DDS_DomainParticipant_delete_contained_entities(dp);
     if (rc1 != DDS_RETCODE_OK) {
         fprintf(stderr, "FAIL: delete_contained_entities() returned %d, expected RETCODE_OK\n", rc1);
         return 1;
     }
+    atomic_store(&phase, PHASE_DELETED);
 
     DDS_ReturnCode_t rc2 = DDS_DomainParticipantFactory_delete_participant(dds_factory, dp);
     if (rc2 != DDS_RETCODE_OK) {
