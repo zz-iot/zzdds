@@ -172,7 +172,11 @@ Two assertions, in order, on the same reader:
    `interop/wait_for_historical_data_cross_binding_test.py`'s `wait_for_marker()` -- before
    starting the publisher process at all) does it make a second, generous-timeout call and
    confirm every one of the 8 historical samples actually arrived by the time that call
-   returns `RETCODE_OK`, not just that the return code itself was `RETCODE_OK`.
+   returns `RETCODE_OK`, not just that the return code itself was `RETCODE_OK`. It takes
+   them from the reader itself, with no listener attached yet: the call promises the
+   samples are in the reader, not that `on_data_available` has run (on the shared
+   runtime, listeners run later, as runtime turns). The listener is attached afterwards,
+   for the live batch.
 
 Cross-binding matrix: the same 8-pair subset as `coherent-sets`, with subscriber and
 publisher roles assigned per pair the same way `coherent-sets` assigns them.

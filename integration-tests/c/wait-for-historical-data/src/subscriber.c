@@ -22,7 +22,10 @@
  *    real, generous-timeout wait_for_historical_data() call and confirm the
  *    full historical batch actually landed by the time it returns -- the
  *    positive counterpart, unblocking only once durable replay has actually
- *    happened rather than on its own timer.
+ *    happened rather than on its own timer. It confirms that by taking from
+ *    the reader itself, before any listener is attached: the call promises
+ *    the samples are in the reader, not that a listener has run (on the
+ *    shared runtime, on_data_available runs later, as a runtime turn).
  *
  * Required stdout markers: "Create topic:", "Create reader for topic:",
  * "Subscriber: negative check (no writer yet) correctly returned TIMEOUT.",
@@ -81,9 +84,8 @@ static bool ready_to_finish(SubState *state) {
     return true;
 }
 
-static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
-    (void)the_reader;
-    SubState *state = (SubState *)listener_data;
+/* Takes everything the reader holds, recording each seq_num. */
+static void take_available(SubState *state) {
     bool became_done = false;
 
     for (;;) {
@@ -120,6 +122,11 @@ static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
     if (became_done) {
         atomic_store(&state->all_done, true);
     }
+}
+
+static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
+    (void)the_reader;
+    take_available((SubState *)listener_data);
 }
 
 static uint32_t parse_domain(int argc, char **argv) {
@@ -183,11 +190,9 @@ int main(int argc, char **argv) {
     listener.listener_data = &state;
     listener.on_data_available = on_data_available;
 
-    /* Create with no listener attached yet: on_data_available fires on a
-     * zzdds-internal dispatch thread as soon as the reader matches, which
-     * can race state.reader's own initialization below. Attach the listener
-     * only once state.reader is set, via set_listener() below, closing the
-     * window entirely. */
+    /* Create with no listener attached yet: it is attached only once the
+     * historical batch has been taken and checked below, so until then
+     * nothing else takes from the reader. */
     DDS_TopicDescription topic_desc = zzdds_topic_as_description(topic);
     DDS_DataReader dr = DDS_Subscriber_create_datareader(sub, topic_desc, &dr_qos, NULL, 0);
     if (!dr) {
@@ -199,11 +204,6 @@ int main(int argc, char **argv) {
     HistoryEventDataReader reader;
     HistoryEventDataReader_init(&reader, dr);
     state.reader = &reader;
-
-    if (DDS_DataReader_set_listener(dr, &listener, DDS_DATA_AVAILABLE_STATUS) != DDS_RETCODE_OK) {
-        fprintf(stderr, "FAIL: set_listener() failed\n");
-        return 1;
-    }
 
     /* Negative case -- see this file's header comment. No writer exists
      * anywhere on this domain yet (the harness enforces that), so a short,
@@ -236,7 +236,8 @@ int main(int argc, char **argv) {
     printf("Subscriber: wait_for_historical_data() returned\n");
 
     /* Confirm the real guarantee, not just the return code: every
-     * historical sample must already have been delivered by now. */
+     * historical sample must already be in the reader. */
+    take_available(&state);
     int historical_count = 0;
     for (int i = 0; i < HISTORICAL_COUNT; i++) {
         if (atomic_load(&state.historical_received[i])) historical_count++;
@@ -249,6 +250,11 @@ int main(int argc, char **argv) {
     atomic_store(&state.historical_confirmed, true);
     if (ready_to_finish(&state)) {
         atomic_store(&state.all_done, true);
+    } else if (DDS_DataReader_set_listener(dr, &listener, DDS_DATA_AVAILABLE_STATUS) != DDS_RETCODE_OK) {
+        /* The rest of the live batch; set_listener() fires at once for
+         * anything that arrived meanwhile. */
+        fprintf(stderr, "FAIL: set_listener() failed\n");
+        return 1;
     }
 
     for (int waited_ms = 0; !atomic_load(&state.all_done); waited_ms += POLL_PERIOD_MS) {

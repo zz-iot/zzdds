@@ -23,7 +23,9 @@
 //!    real, generous-timeout wait_for_historical_data() call and confirm the
 //!    full historical batch actually landed by the time it returns -- the
 //!    positive counterpart, unblocking only once durable replay has
-//!    actually happened rather than on its own timer.
+//!    actually happened rather than on its own timer. It takes from the
+//!    reader itself to confirm that, before any listener is attached: see
+//!    c/wait-for-historical-data/src/subscriber.c.
 //!
 //! Required stdout markers: "Create topic:", "Create reader for topic:",
 //! "Subscriber: negative check (no writer yet) correctly returned TIMEOUT.",
@@ -74,6 +76,11 @@ fn readyToFinish(state: *State) bool {
 
 fn onDataAvailable(state: *State, dr: DDS.DataReader) void {
     _ = dr;
+    takeAvailable(state);
+}
+
+/// Takes everything the reader holds, recording each seq_num.
+fn takeAvailable(state: *State) void {
     var became_done = false;
     while (true) {
         var value: history_event_gen.HistoryEvent = .{};
@@ -183,11 +190,6 @@ pub fn main(init: std.process.Init) !void {
     }
     std.debug.print("Create reader for topic: HistoryEvent\n", .{});
     state.reader = history_event_gen.HistoryEventDataReader.init(dr, alloc);
-    const set_rc = dr.set_listener(dr_listener, DDS.DATA_AVAILABLE_STATUS);
-    if (set_rc != DDS.RETCODE_OK) {
-        std.debug.print("FAIL: set_listener() returned {d}\n", .{set_rc});
-        std.process.exit(1);
-    }
 
     // Negative case -- see this file's header comment. No writer exists
     // anywhere on this domain yet (the harness enforces that), so a short,
@@ -215,7 +217,8 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Subscriber: wait_for_historical_data() returned\n", .{});
 
     // Confirm the real guarantee, not just the return code: every
-    // historical sample must already have been delivered by now.
+    // historical sample must already be in the reader.
+    takeAvailable(&state);
     var historical_count: i32 = 0;
     for (&state.historical_received) |*v| {
         if (v.load(.acquire)) historical_count += 1;
@@ -228,6 +231,14 @@ pub fn main(init: std.process.Init) !void {
     state.historical_confirmed.store(true, .release);
     if (readyToFinish(&state)) {
         state.all_done.store(true, .release);
+    } else {
+        // The rest of the live batch; set_listener() fires at once for
+        // anything that arrived meanwhile.
+        const set_rc = dr.set_listener(dr_listener, DDS.DATA_AVAILABLE_STATUS);
+        if (set_rc != DDS.RETCODE_OK) {
+            std.debug.print("FAIL: set_listener() returned {d}\n", .{set_rc});
+            std.process.exit(1);
+        }
     }
 
     const deadline = monoNs(io) + RECEIVE_TIMEOUT_NS;

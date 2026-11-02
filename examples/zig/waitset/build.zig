@@ -17,11 +17,13 @@ pub fn build(b: *std.Build) void {
     // WaitSet/conditions), so both sides need the same instrumentation for
     // TSAN to see the full picture.
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer") orelse false;
+    const shared_runtime = b.option(bool, "shared-runtime", "Build zzdds with -Dshared-runtime (contributors only; default: false)") orelse false;
 
     const zzdds_dep = b.dependency("zzdds", .{
         .target = target,
         .optimize = optimize,
         .@"sanitize-thread" = sanitize_thread,
+        .@"shared-runtime" = shared_runtime,
     });
     const zzdds_mod = zzdds_dep.module("zzdds");
     const zzdds_gen = zzdds_dep.module("zzdds_generated");
