@@ -1029,6 +1029,30 @@ pub fn build(b: *std.Build) void {
             // taken by any socket on the machine first.
             cpp_ext_smoke_run.setEnvironmentVariable("ZZDDS_TEST_DOMAIN_BASE", "100");
             binding_smoke_step.dependOn(&cpp_ext_smoke_run.step);
+
+            // A C++ listener replaced mid-callback outlives that callback.
+            const cpp_lifetime_mod = b.createModule(.{
+                .root_source_file = null,
+                .target = target,
+                .optimize = .Debug,
+                .link_libc = true,
+                .link_libcpp = true,
+            });
+            cpp_lifetime_mod.addCSourceFiles(.{
+                .files = &.{"test/bindings/smoke/cpp_listener_lifetime.cpp"},
+                .flags = &.{ "-std=c++17", "-Wall", "-Wextra" },
+            });
+            cpp_lifetime_mod.addCSourceFile(.{ .file = alloc_smoke_dcps_impl_cpp, .flags = &.{ "-std=c++17", "-Wall" } });
+            cpp_lifetime_mod.addCSourceFile(.{ .file = alloc_smoke_zzdds_impl_cpp, .flags = &.{ "-std=c++17", "-Wall" } });
+            cpp_lifetime_mod.addIncludePath(alloc_smoke_merged.getDirectory());
+            cpp_lifetime_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+            cpp_lifetime_mod.addIncludePath(b.path("include"));
+            cpp_lifetime_mod.linkLibrary(zzdds_lib);
+            const cpp_lifetime = b.addExecutable(.{ .name = "zzdds_cpp_listener_lifetime", .root_module = cpp_lifetime_mod });
+            const cpp_lifetime_run = b.addRunArtifact(cpp_lifetime);
+            // Own domain, as above: 7400 + 250*101 = 32650, still below 32768.
+            cpp_lifetime_run.setEnvironmentVariable("ZZDDS_TEST_DOMAIN_BASE", "101");
+            binding_smoke_step.dependOn(&cpp_lifetime_run.step);
         }
 
         // Generate and install lib/pkgconfig/zzdds.pc.
