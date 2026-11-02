@@ -1405,8 +1405,9 @@ jobs:
         env:
           TSAN_OPTIONS: abort_on_error=1
           # DIAGNOSTIC (Lifespan_6/7 vs hdds): revert before merge. hdds's
-          # reader logs each sample it takes in and each it drops.
-          RUST_LOG: ${{ startsWith(matrix.vendor.name, 'hdds') && 'hdds::dds::reader=debug' || '' }}
+          # discovery and reader debug log, written to a file per process by
+          # the wrapper below so the harness's output is unchanged.
+          RUST_LOG: ${{ startsWith(matrix.vendor.name, 'hdds') && 'info,hdds::core::discovery=debug,hdds::core::discovery::multicast::classifier=info,hdds::core::discovery::multicast::listener=info,hdds::dds::participant::builder::discovery_setup::sedp_handler=debug,hdds::engine::demux=debug,hdds::dds::reader=debug' || '' }}
         run: |
           ZZDDS="$GITHUB_WORKSPACE/bins/zzdds_shape_main_linux"
           VENDOR="$GITHUB_WORKSPACE/bins/${{ matrix.vendor.binary }}"
@@ -1415,29 +1416,15 @@ jobs:
           else
             PUB="$VENDOR"; SUB="$ZZDDS"
           fi
+          # DIAGNOSTIC (Lifespan_6/7 vs hdds): revert before merge.
+          if [ -n "$RUST_LOG" ] && [ "${{ matrix.direction }}" = "pub" ]; then
+            mkdir -p /tmp/hdds-logs /tmp/hdds-wrap
+            W="/tmp/hdds-wrap/${{ matrix.vendor.binary }}"
+            printf '#!/bin/sh\nexec "%s" "$@" 2>>"/tmp/hdds-logs/$(date -u +%%H%%M%%S)-$$.log"\n' "$VENDOR" > "$W"
+            chmod +x "$W"; cat "$W"; SUB="$W"
+          fi
           python3 interoperability_report.py -P "$PUB" -S "$SUB" \
             -o /tmp/interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
-
-      # DIAGNOSTIC (Lifespan_6/7 vs hdds): revert before merge. Rerun the
-      # lifespan tests with hdds's full debug log, which names what makes it
-      # drop the zzdds writer after its first samples.
-      - name: Rerun lifespan tests with hdds debug log
-        if: always() && startsWith(matrix.vendor.name, 'hdds') && matrix.direction == 'pub'
-        continue-on-error: true
-        timeout-minutes: 10
-        working-directory: dds-rtps
-        env:
-          TSAN_OPTIONS: abort_on_error=1
-          RUST_LOG: hdds=debug
-        run: |
-          for i in 1 2 3; do
-            python3 interoperability_report.py \
-              -P "$GITHUB_WORKSPACE/bins/zzdds_shape_main_linux" \
-              -S "$GITHUB_WORKSPACE/bins/${{ matrix.vendor.binary }}" \
-              -t Test_Lifespan_5 Test_Lifespan_6 Test_Lifespan_7 \
-              -o /tmp/lifespan-debug-$i.xml || true
-            python3 ../zzdds/scripts/check_interop_results.py /tmp/lifespan-debug-$i.xml || true
-          done
 
       - name: Stop packet capture
         if: always()
@@ -1468,6 +1455,16 @@ jobs:
         with:
           name: interop-tsan-capture-${{ matrix.vendor.name }}-${{ matrix.direction }}
           path: /tmp/interop-tsan.pcap
+          retention-days: 7
+
+      # DIAGNOSTIC (Lifespan_6/7 vs hdds): revert before merge.
+      - name: Upload hdds logs
+        if: failure() && startsWith(matrix.vendor.name, 'hdds')
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-tsan-hdds-logs-${{ matrix.vendor.name }}-${{ matrix.direction }}
+          path: /tmp/hdds-logs
+          if-no-files-found: ignore
           retention-days: 7
 
   # ── Interop: Zenzen DDS (DebugAllocator) vs vendor ────────────────────────
