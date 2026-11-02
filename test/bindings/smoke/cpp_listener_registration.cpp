@@ -15,6 +15,11 @@
 //
 // All synchronization state is global: with the bug, the listener is freed
 // while its callback runs, so the callback must not touch `this` after waking.
+//
+// Also: a listener implementing DDS::DataReaderListener directly (not through
+// the generated DataReaderListenerBase) is installed, and an entity this
+// binding did not create is rejected with an error, not a crash. The test is
+// also built with -fno-rtti -fno-exceptions.
 #include "zzdds_cpp.hpp"
 
 #include <atomic>
@@ -58,6 +63,45 @@ public:
     }
 };
 
+// Implements the listener interface itself, not DataReaderListenerBase.
+std::atomic<int> g_direct_matches{0};
+class DirectListener : public ::DDS::DataReaderListener {
+public:
+    void on_requested_deadline_missed(std::shared_ptr<::DDS::DataReader>, ::DDS::RequestedDeadlineMissedStatus) override {}
+    void on_requested_incompatible_qos(std::shared_ptr<::DDS::DataReader>, ::DDS::RequestedIncompatibleQosStatus) override {}
+    void on_sample_rejected(std::shared_ptr<::DDS::DataReader>, ::DDS::SampleRejectedStatus) override {}
+    void on_liveliness_changed(std::shared_ptr<::DDS::DataReader>, ::DDS::LivelinessChangedStatus) override {}
+    void on_data_available(std::shared_ptr<::DDS::DataReader>) override {}
+    void on_subscription_matched(std::shared_ptr<::DDS::DataReader>, ::DDS::SubscriptionMatchedStatus status) override {
+        if (status.current_count > 0) g_direct_matches++;
+    }
+    void on_sample_lost(std::shared_ptr<::DDS::DataReader>, ::DDS::SampleLostStatus) override {}
+};
+
+// A condition this binding did not create: it has no C handle.
+class ForeignCondition : public ::DDS::Condition {
+public:
+    bool get_trigger_value() override { return false; }
+};
+
+void check_conditions() {
+    auto ws = zzdds::create_waitset();
+    CHECK(ws);
+    auto foreign = std::make_shared<ForeignCondition>();
+    CHECK(ws->attach_condition(foreign) == ::DDS::RETCODE_BAD_PARAMETER);
+    CHECK(ws->detach_condition(foreign) != ::DDS::RETCODE_OK);
+
+    // A guard condition registered by zzdds_cpp.hpp comes back as itself.
+    auto gc = zzdds::create_guardcondition();
+    CHECK(gc);
+    CHECK(ws->attach_condition(gc) == ::DDS::RETCODE_OK);
+    ::DDS::ConditionSeq attached;
+    CHECK(ws->get_conditions(attached) == ::DDS::RETCODE_OK);
+    CHECK(attached.size() == 1);
+    CHECK(attached[0] == std::static_pointer_cast<::DDS::Condition>(gc));
+    CHECK(ws->detach_condition(gc) == ::DDS::RETCODE_OK);
+}
+
 // One object, two listener interfaces.
 class ReaderWriterListener : public ::DDS::DataReaderListenerBase, public ::DDS::DataWriterListenerBase {};
 
@@ -98,6 +142,7 @@ bool wait_until(Pred pred) {
 
 int main() {
     check_identity();
+    check_conditions();
 
     const char *base = std::getenv("ZZDDS_TEST_DOMAIN_BASE");
     const ::DDS::DomainId_t domain = base ? std::atoi(base) : 101;
@@ -122,6 +167,10 @@ int main() {
         ::DDS::DataReaderQos::default_value(), nullptr, 0);
     CHECK(dr);
     CHECK(dr->set_listener(std::make_shared<BlockingListener>(), ::DDS::SUBSCRIPTION_MATCHED_STATUS) == ::DDS::RETCODE_OK);
+    auto dr_direct = sub->create_datareader(
+        std::static_pointer_cast<::zzdds::TopicImpl>(topic_r)->as_topic_description(),
+        ::DDS::DataReaderQos::default_value(), std::make_shared<DirectListener>(), ::DDS::SUBSCRIPTION_MATCHED_STATUS);
+    CHECK(dr_direct);
 
     auto dw = pub->create_datawriter(topic_w, ::DDS::DataWriterQos::default_value(), nullptr, 0);
     CHECK(dw);
@@ -142,9 +191,11 @@ int main() {
     CHECK(g_alive_after_replace.load() == 1);
     // Released once the callback returned, not leaked.
     CHECK(wait_until([] { return g_destroyed.load(); }));
+    CHECK(wait_until([] { return g_direct_matches.load() > 0; }));
 
     CHECK(pub->delete_datawriter(dw) == ::DDS::RETCODE_OK);
     CHECK(sub->delete_datareader(dr) == ::DDS::RETCODE_OK);
+    CHECK(sub->delete_datareader(dr_direct) == ::DDS::RETCODE_OK);
     CHECK(dp_w->delete_contained_entities() == ::DDS::RETCODE_OK);
     CHECK(dp_r->delete_contained_entities() == ::DDS::RETCODE_OK);
     CHECK(factory->delete_participant(dp_w) == ::DDS::RETCODE_OK);

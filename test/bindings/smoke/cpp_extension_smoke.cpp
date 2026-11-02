@@ -35,6 +35,17 @@
 
 namespace {
 
+// zzdds creates every entity as its zzdds extension class, so without RTTI
+// (this test is also built with -fno-rtti) a static cast reaches that API.
+template <typename To, typename From>
+std::shared_ptr<To> as_zzdds(const std::shared_ptr<From>& p) {
+#if defined(__cpp_rtti) || defined(__GXX_RTTI) || defined(_CPPRTTI)
+    return std::dynamic_pointer_cast<To>(p);
+#else
+    return std::static_pointer_cast<To>(p);
+#endif
+}
+
 class WriterListener : public ::zzdds::DataWriterListenerExBase {
 public:
     void on_publication_matched(std::shared_ptr<::DDS::DataWriter> writer, ::DDS::PublicationMatchedStatus status) override {
@@ -94,8 +105,8 @@ int main() {
     auto pub = dp_w->create_publisher(::DDS::PublisherQos::default_value(), nullptr, 0);
     auto sub = dp_r->create_subscriber(::DDS::SubscriberQos::default_value(), nullptr, 0);
     CHECK(pub && sub);
-    auto zpub = std::dynamic_pointer_cast<::zzdds::PublisherImpl>(pub);
-    auto zsub = std::dynamic_pointer_cast<::zzdds::SubscriberImpl>(sub);
+    auto zpub = as_zzdds<::zzdds::PublisherImpl>(pub);
+    auto zsub = as_zzdds<::zzdds::SubscriberImpl>(sub);
     CHECK(zpub && zsub);
 
     // RELIABLE on both sides, so the readiness callbacks wait for the
@@ -110,12 +121,12 @@ int main() {
         std::static_pointer_cast<::zzdds::TopicImpl>(topic_r)->as_topic_description(),
         dr_qos, rlistener, ::DDS::SUBSCRIPTION_MATCHED_STATUS);
     CHECK(dr);
-    CHECK(std::dynamic_pointer_cast<::zzdds::DataReaderImpl>(dr));
+    CHECK(as_zzdds<::zzdds::DataReaderImpl>(dr));
 
     auto wlistener = std::make_shared<WriterListener>();
     auto dw = zpub->create_datawriter_ex(topic_w, dw_qos, wlistener, ::DDS::PUBLICATION_MATCHED_STATUS);
     CHECK(dw);
-    CHECK(std::dynamic_pointer_cast<::zzdds::DataWriterImpl>(dw));
+    CHECK(as_zzdds<::zzdds::DataWriterImpl>(dw));
     CHECK(dw->get_publisher() == pub);
 
     CHECK(wait_until([&] { std::lock_guard<std::mutex> l(wlistener->mu); return wlistener->matched_writer != nullptr; }));
@@ -135,7 +146,7 @@ int main() {
     // filtered topic keeps its match across an expression change.
     auto cft = dp_r->create_contentfilteredtopic("CppExtensionSmokeFiltered", topic_r, "id > 10", {});
     CHECK(cft);
-    auto zcft = std::dynamic_pointer_cast<::zzdds::ContentFilteredTopicImpl>(cft);
+    auto zcft = as_zzdds<::zzdds::ContentFilteredTopicImpl>(cft);
     CHECK(zcft);
     auto cft_reader = sub->create_datareader(cft, dr_qos, nullptr, 0);
     CHECK(cft_reader);

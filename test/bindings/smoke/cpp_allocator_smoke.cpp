@@ -7,7 +7,7 @@
 // exhausted, std::allocate_shared throws *before*
 // DomainParticipantFactorySupport is constructed, so its destructor (which
 // owns the only zzdds_destroy_factory(handle) call) never runs -- without
-// the try/catch fix in wrapFactoryHandle, this leaks the already-created
+// the cleanup in wrapFactoryHandle, this leaks the already-created
 // C-ABI factory and everything its own allocator allocated during bootstrap.
 #include "zzdds_cpp.hpp"
 
@@ -39,8 +39,9 @@ static void test_happy_path() {
 
 // The pmr allocator is rigged to always fail, forcing
 // std::allocate_shared<DomainParticipantFactorySupport> to throw bad_alloc
-// -- proving wrapFactoryHandle's try/catch still tears down the already-
+// -- proving wrapFactoryHandle's guard still tears down the already-
 // created C-ABI factory instead of leaking it.
+#if ZIDL_HAS_EXCEPTIONS
 static void* failing_alloc(void*, size_t, size_t) { return nullptr; }
 static bool failing_resize(void*, void*, size_t, size_t, size_t) { return false; }
 static void failing_free(void*, void*, size_t, size_t) {}
@@ -64,10 +65,14 @@ static void test_pmr_exhaustion_does_not_leak_factory() {
     assert(c_alloc_calls > 0); // factory bootstrap did allocate something
     assert(c_alloc_calls == c_free_calls); // ...and it was all freed, not leaked
 }
+#endif
 
 int main() {
     test_happy_path();
+    // Without exceptions an exhausted allocator aborts instead.
+#if ZIDL_HAS_EXCEPTIONS
     test_pmr_exhaustion_does_not_leak_factory();
+#endif
     std::printf("cpp_allocator_smoke: OK\n");
     return 0;
 }

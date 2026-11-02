@@ -19,6 +19,14 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   through `release_listener_data`. A listener replaced or cleared while one of its
   callbacks runs, or passed only to a `create_*` call, no longer has to be kept alive by
   the application.
+- The C++ binding compiles and works without RTTI or exceptions (`-fno-rtti
+  -fno-exceptions`), and uses RTTI where the compiler provides it. Entity parameters
+  convert through a virtual handle accessor instead of `dynamic_cast`. A condition or
+  entity the binding did not create now gets an error code (`attach_condition` returns
+  `RETCODE_BAD_PARAMETER`) instead of a thrown `std::invalid_argument`. A listener that
+  implements a listener interface directly, rather than through the generated
+  `FooListenerBase`, is now installed. `test-bindings` also builds the C++ tests with
+  `-fno-rtti -fno-exceptions`.
 - `integration-tests/run_all.py --strict` finds `bin/zidl.exe` on Windows.
 - The ignore and wait-for-historical-data unit tests keep their mock discovery on the heap;
   the factory kept a pointer to a copy that `Harness.init` returned by value.

@@ -231,8 +231,9 @@ below, not a single shared mutable slot). Both identified surfaces now go throug
 Per the C++ `Allocator` named requirement, OOM is signaled via `std::bad_alloc` (not a
 graceful null return) — a deliberate, documented departure from every other phase's
 graceful-failure contract, accepted per explicit user direction in favor of idiomatic C++;
-under `-fno-exceptions` this degrades to `std::terminate()`, matching libstdc++'s own
-`operator new` behavior. The registration surface (`ZidlAllocator*`, not a raw
+under `-fno-exceptions` this degrades to `std::abort()`, matching libstdc++'s own
+`operator new` behavior. `zzdds_cpp.hpp` frees a C handle whose wrapper allocation fails
+with a scope guard rather than `try`/`catch`, so it compiles either way. The registration surface (`ZidlAllocator*`, not a raw
 `std::pmr::memory_resource*`) was deliberately chosen so a future graceful/no-exception
 option (deferred, not built) stays cheap to retrofit later without an API break.
 

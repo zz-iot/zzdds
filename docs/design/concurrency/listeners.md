@@ -203,10 +203,11 @@ record is not ownership of a borrowed application object.
 zidl's C++ backend maps to virtual inheritance, so an object holds one `Listener`
 subobject however many listener interfaces it implements, at one address from
 construction on. `FooListenerBase::c_listener` passes it as the registration's
-`listener_identity` (an interface with no `@shared_base` ancestor passes
-`dynamic_cast<void*>`, the complete object). Dispatch keeps the adjusted base pointer,
-reached through `listener_data`, which is a per-registration `shared_ptr` owning the
-listener until the core calls `release_listener_data`. Separate forwarding objects remain
+`listener_identity`, a static upcast that needs no RTTI. An interface with no
+`@shared_base` ancestor passes the complete object (`dynamic_cast<void*>`) where RTTI is
+available, else its own subobject. Dispatch goes through the listener interface's virtual
+functions, reached through `listener_data`, which is a per-registration `shared_ptr` owning
+the listener until the core calls `release_listener_data`. Separate forwarding objects remain
 distinct unless an adapter explicitly supplies common identity or the application groups
 them. This is not an entity-wrapper identity mechanism.
 
