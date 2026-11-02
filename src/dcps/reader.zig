@@ -44,6 +44,7 @@ pub fn listenerExFromBase(l: DDS.DataReaderListener) ZZDDS.DataReaderListenerEx 
     return .{
         .listener_data = l.listener_data,
         .release_listener_data = l.release_listener_data,
+        .listener_identity = l.listener_identity,
         .on_requested_deadline_missed = l.on_requested_deadline_missed,
         .on_requested_incompatible_qos = l.on_requested_incompatible_qos,
         .on_sample_rejected = l.on_sample_rejected,
@@ -61,6 +62,7 @@ fn baseFromListenerEx(l: ZZDDS.DataReaderListenerEx) DDS.DataReaderListener {
     return .{
         .listener_data = l.listener_data,
         .release_listener_data = l.release_listener_data,
+        .listener_identity = l.listener_identity,
         .on_requested_deadline_missed = l.on_requested_deadline_missed,
         .on_requested_incompatible_qos = l.on_requested_incompatible_qos,
         .on_sample_rejected = l.on_sample_rejected,

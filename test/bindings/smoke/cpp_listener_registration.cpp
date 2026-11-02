@@ -1,8 +1,12 @@
-// Binding test: a C++ listener replaced while one of its callbacks is running
-// stays alive until that callback returns. Compiled and run by
+// Binding test for C++ listener registrations. Compiled and run by
 // `zig build test-bindings -Dcpp-binding=true`.
 //
-// The application hands the reader its only reference to the listener. Its
+// Identity: one application object registers under one listener_identity
+// whichever listener interfaces it implements (DDS::Listener is a virtual
+// base), while each registration has its own listener_data.
+//
+// Lifetime: a listener replaced while one of its callbacks is running stays
+// alive until that callback returns. The application hands the reader its only reference to the listener. Its
 // on_subscription_matched blocks until the main thread has replaced the
 // listener, then checks the listener's destructor has not run. The core keeps
 // the old registration until an in-flight dispatch finishes and then calls its
@@ -54,6 +58,32 @@ public:
     }
 };
 
+// One object, two listener interfaces.
+class ReaderWriterListener : public ::DDS::DataReaderListenerBase, public ::DDS::DataWriterListenerBase {};
+
+// DomainParticipantListener reaches DDS::Listener through three interfaces.
+class ParticipantListener : public ::DDS::DomainParticipantListenerBase {};
+
+void check_identity() {
+    auto rw = std::make_shared<ReaderWriterListener>();
+    auto r = ::DDS::DataReaderListenerBase::c_listener(std::shared_ptr<::DDS::DataReaderListenerBase>(rw));
+    auto w = ::DDS::DataWriterListenerBase::c_listener(std::shared_ptr<::DDS::DataWriterListenerBase>(rw));
+    CHECK(r.listener_identity != nullptr);
+    CHECK(r.listener_identity == w.listener_identity);
+    CHECK(r.listener_identity == static_cast<::DDS::Listener*>(rw.get()));
+    CHECK(r.listener_data != w.listener_data);
+    // Each registration holds a reference until the core releases it.
+    CHECK(rw.use_count() == 3);
+    r.release_listener_data(r.listener_data);
+    w.release_listener_data(w.listener_data);
+    CHECK(rw.use_count() == 1);
+
+    auto p = std::make_shared<ParticipantListener>();
+    auto pl = ::DDS::DomainParticipantListenerBase::c_listener(p);
+    CHECK(pl.listener_identity == static_cast<::DDS::Listener*>(p.get()));
+    pl.release_listener_data(pl.listener_data);
+}
+
 template <typename Pred>
 bool wait_until(Pred pred) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
@@ -67,6 +97,8 @@ bool wait_until(Pred pred) {
 } // namespace
 
 int main() {
+    check_identity();
+
     const char *base = std::getenv("ZZDDS_TEST_DOMAIN_BASE");
     const ::DDS::DomainId_t domain = base ? std::atoi(base) : 101;
 
@@ -117,6 +149,6 @@ int main() {
     CHECK(dp_r->delete_contained_entities() == ::DDS::RETCODE_OK);
     CHECK(factory->delete_participant(dp_w) == ::DDS::RETCODE_OK);
     CHECK(factory->delete_participant(dp_r) == ::DDS::RETCODE_OK);
-    std::printf("cpp_listener_lifetime: OK\n");
+    std::printf("cpp_listener_registration: OK\n");
     return 0;
 }

@@ -1030,7 +1030,8 @@ pub fn build(b: *std.Build) void {
             cpp_ext_smoke_run.setEnvironmentVariable("ZZDDS_TEST_DOMAIN_BASE", "100");
             binding_smoke_step.dependOn(&cpp_ext_smoke_run.step);
 
-            // A C++ listener replaced mid-callback outlives that callback.
+            // C++ listener registrations: one identity per object, and a listener
+            // replaced mid-callback outlives that callback.
             const cpp_lifetime_mod = b.createModule(.{
                 .root_source_file = null,
                 .target = target,
@@ -1039,7 +1040,7 @@ pub fn build(b: *std.Build) void {
                 .link_libcpp = true,
             });
             cpp_lifetime_mod.addCSourceFiles(.{
-                .files = &.{"test/bindings/smoke/cpp_listener_lifetime.cpp"},
+                .files = &.{"test/bindings/smoke/cpp_listener_registration.cpp"},
                 .flags = &.{ "-std=c++17", "-Wall", "-Wextra" },
             });
             cpp_lifetime_mod.addCSourceFile(.{ .file = alloc_smoke_dcps_impl_cpp, .flags = &.{ "-std=c++17", "-Wall" } });
@@ -1048,7 +1049,7 @@ pub fn build(b: *std.Build) void {
             cpp_lifetime_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
             cpp_lifetime_mod.addIncludePath(b.path("include"));
             cpp_lifetime_mod.linkLibrary(zzdds_lib);
-            const cpp_lifetime = b.addExecutable(.{ .name = "zzdds_cpp_listener_lifetime", .root_module = cpp_lifetime_mod });
+            const cpp_lifetime = b.addExecutable(.{ .name = "zzdds_cpp_listener_registration", .root_module = cpp_lifetime_mod });
             const cpp_lifetime_run = b.addRunArtifact(cpp_lifetime);
             // Own domain, as above: 7400 + 250*101 = 32650, still below 32768.
             cpp_lifetime_run.setEnvironmentVariable("ZZDDS_TEST_DOMAIN_BASE", "101");

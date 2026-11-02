@@ -15,6 +15,7 @@ import io.zzdds.ext.Zzdds;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class JavaSmoke {
     static void check(boolean cond, String msg) {
@@ -63,6 +64,7 @@ public class JavaSmoke {
         final CountDownLatch readerReady = new CountDownLatch(1);
         final CountDownLatch writerReady = new CountDownLatch(1);
         final CountDownLatch dataAvailable = new CountDownLatch(1);
+        final AtomicInteger dataCount = new AtomicInteger();
 
         // Protocol-ready RELIABLE readiness signal — deliberately not
         // on_publication_matched (fires on bare SEDP discovery, before the
@@ -91,7 +93,7 @@ public class JavaSmoke {
             public void on_requested_incompatible_qos(Dcps.DDS.DataReader r, Dcps.DDS.RequestedIncompatibleQosStatus s) {}
             public void on_sample_rejected(Dcps.DDS.DataReader r, Dcps.DDS.SampleRejectedStatus s) {}
             public void on_liveliness_changed(Dcps.DDS.DataReader r, Dcps.DDS.LivelinessChangedStatus s) {}
-            public void on_data_available(Dcps.DDS.DataReader r) { dataAvailable.countDown(); }
+            public void on_data_available(Dcps.DDS.DataReader r) { dataCount.incrementAndGet(); dataAvailable.countDown(); }
             public void on_subscription_matched(Dcps.DDS.DataReader r, Dcps.DDS.SubscriptionMatchedStatus s) {}
             public void on_sample_lost(Dcps.DDS.DataReader r, Dcps.DDS.SampleLostStatus s) {}
             public void on_reliable_writer_ready(int writerHandle, boolean isReady) {
@@ -132,6 +134,17 @@ public class JavaSmoke {
         check("java-smoke".equals(got.data.get_label()), "label round-tripped");
         System.out.println("  round-tripped sample: id=" + got.data.get_id()
             + " count=" + got.data.get_count() + " label=" + got.data.get_label());
+
+        // One native context per Java listener object, shared by all of its
+        // registrations and released once per registration: registering
+        // `listener` on a second reader and deleting that reader drops one
+        // reference, leaving the first reader's registration working (the
+        // dispose below still reaches on_data_available).
+        Dcps.DDS.DataReader second = subscriber.create_datareader(topicReader, readerQos, null, 0);
+        check(second != null, "second create_datareader() returned non-null");
+        check(second.set_listener(listener, Dcps.DDS.DATA_AVAILABLE_STATUS.value) == 0, "set_listener() of an already-registered listener rc == 0");
+        check(subscriber.delete_datareader(second) == 0, "delete_datareader(second) rc == 0");
+        final int dataBeforeDispose = dataCount.get();
 
         // Sanity/link-level regression guard for zidl PR #39's Greptile
         // MUST-FIX (StatusCondition.get_entity() returning a bare DDS.Entity
@@ -186,6 +199,9 @@ public class JavaSmoke {
         check(disposed.instanceState == Dcps.DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE.value,
             "dispose sample instance_state == NOT_ALIVE_DISPOSED_INSTANCE_STATE");
         System.out.println("  writer.dispose() via loan path: OK");
+        for (int i = 0; i < 50 && dataCount.get() == dataBeforeDispose; i++) Thread.sleep(100);
+        check(dataCount.get() > dataBeforeDispose, "the listener still fires after its other registration was released");
+        System.out.println("  listener shared by two readers, one deleted: OK");
 
         int deleteRc = publisher.delete_datawriter(rawWriter);
         check(deleteRc == 0, "delete_datawriter() rc == 0 (would be PRECONDITION_NOT_MET if any loan_raw call above leaked its outstanding-loan count)");

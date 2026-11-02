@@ -8,6 +8,21 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-02
+
+- Listener identity in the C++ and Java bindings: one application listener object is one
+  listener to the core wherever it is installed, so on the shared runtime it runs one call
+  at a time. Callback structs gain a trailing `listener_identity`, which the core prefers
+  over `listener_data`; `DDS::Listener` is `@shared_base` (a C++ virtual base). Needs a
+  zidl release with the matching generators.
+- C++ listener lifetime: each registration owns a reference to its listener, released
+  through `release_listener_data`. A listener replaced or cleared while one of its
+  callbacks runs, or passed only to a `create_*` call, no longer has to be kept alive by
+  the application.
+- `integration-tests/run_all.py --strict` finds `bin/zidl.exe` on Windows.
+- The ignore and wait-for-historical-data unit tests keep their mock discovery on the heap;
+  the factory kept a pointer to a copy that `Harness.init` returned by value.
+
 ## 2026-11-01
 
 - CI runs the examples and every integration-test scenario on a `-Dshared-runtime` build

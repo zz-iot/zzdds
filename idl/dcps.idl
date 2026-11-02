@@ -195,7 +195,10 @@ module DDS {
     // -----------------------------------------------------------------------
     // Listener interfaces
 
-    @callback interface Listener {};
+    // @shared_base (zidl): one copy per application object however many
+    // listener interfaces it implements, so a binding can name the object
+    // behind every registration (C++: virtual inheritance).
+    @shared_base @callback interface Listener {};
 
     @callback interface TopicListener : Listener {
         void on_inconsistent_topic(
