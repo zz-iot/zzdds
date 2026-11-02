@@ -180,12 +180,12 @@ public:
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
         auto& _cache = ::DDS::EntityImpl::_familyCache();
         auto _it = _cache.find(_fh);
-        if (_it != _cache.end() && _it->second.second == _familyTag()) {
-            if (auto _base = _it->second.first.lock()) return std::static_pointer_cast<TopicSupport>(_base);
+        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
+            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<TopicSupport>(_base, static_cast<TopicSupport*>(_it->second.obj));
         }
         auto _sp = std::allocate_shared<TopicSupport>(
             std::pmr::polymorphic_allocator<TopicSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = {_sp, _familyTag()};
+        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
         return _sp;
     }
 
@@ -270,12 +270,12 @@ public:
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
         auto& _cache = ::DDS::EntityImpl::_familyCache();
         auto _it = _cache.find(_fh);
-        if (_it != _cache.end() && _it->second.second == _familyTag()) {
-            if (auto _base = _it->second.first.lock()) return std::static_pointer_cast<DataWriterSupport>(_base);
+        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
+            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<DataWriterSupport>(_base, static_cast<DataWriterSupport*>(_it->second.obj));
         }
         auto _sp = std::allocate_shared<DataWriterSupport>(
             std::pmr::polymorphic_allocator<DataWriterSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = {_sp, _familyTag()};
+        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
         return _sp;
     }
 
@@ -395,12 +395,12 @@ public:
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
         auto& _cache = ::DDS::EntityImpl::_familyCache();
         auto _it = _cache.find(_fh);
-        if (_it != _cache.end() && _it->second.second == _familyTag()) {
-            if (auto _base = _it->second.first.lock()) return std::static_pointer_cast<DataReaderSupport>(_base);
+        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
+            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<DataReaderSupport>(_base, static_cast<DataReaderSupport*>(_it->second.obj));
         }
         auto _sp = std::allocate_shared<DataReaderSupport>(
             std::pmr::polymorphic_allocator<DataReaderSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = {_sp, _familyTag()};
+        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
         return _sp;
     }
 
@@ -468,12 +468,12 @@ public:
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
         auto& _cache = ::DDS::EntityImpl::_familyCache();
         auto _it = _cache.find(_fh);
-        if (_it != _cache.end() && _it->second.second == _familyTag()) {
-            if (auto _base = _it->second.first.lock()) return std::static_pointer_cast<PublisherSupport>(_base);
+        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
+            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<PublisherSupport>(_base, static_cast<PublisherSupport*>(_it->second.obj));
         }
         auto _sp = std::allocate_shared<PublisherSupport>(
             std::pmr::polymorphic_allocator<PublisherSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = {_sp, _familyTag()};
+        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
         return _sp;
     }
 
@@ -545,12 +545,12 @@ public:
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
         auto& _cache = ::DDS::EntityImpl::_familyCache();
         auto _it = _cache.find(_fh);
-        if (_it != _cache.end() && _it->second.second == _familyTag()) {
-            if (auto _base = _it->second.first.lock()) return std::static_pointer_cast<SubscriberSupport>(_base);
+        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
+            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<SubscriberSupport>(_base, static_cast<SubscriberSupport*>(_it->second.obj));
         }
         auto _sp = std::allocate_shared<SubscriberSupport>(
             std::pmr::polymorphic_allocator<SubscriberSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = {_sp, _familyTag()};
+        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
         return _sp;
     }
 
@@ -595,12 +595,12 @@ public:
         std::lock_guard<std::mutex> _lock(::DDS::TopicDescriptionImpl::_familyMutex());
         auto& _cache = ::DDS::TopicDescriptionImpl::_familyCache();
         auto _it = _cache.find(_fh);
-        if (_it != _cache.end() && _it->second.second == _familyTag()) {
-            if (auto _base = _it->second.first.lock()) return std::static_pointer_cast<ContentFilteredTopicSupport>(_base);
+        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
+            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<ContentFilteredTopicSupport>(_base, static_cast<ContentFilteredTopicSupport*>(_it->second.obj));
         }
         auto _sp = std::allocate_shared<ContentFilteredTopicSupport>(
             std::pmr::polymorphic_allocator<ContentFilteredTopicSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = {_sp, _familyTag()};
+        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
         return _sp;
     }
 
@@ -714,12 +714,12 @@ public:
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
         auto& _cache = ::DDS::EntityImpl::_familyCache();
         auto _it = _cache.find(_fh);
-        if (_it != _cache.end() && _it->second.second == _familyTag()) {
-            if (auto _base = _it->second.first.lock()) return std::static_pointer_cast<DomainParticipantSupport>(_base);
+        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
+            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<DomainParticipantSupport>(_base, static_cast<DomainParticipantSupport*>(_it->second.obj));
         }
         auto _sp = std::allocate_shared<DomainParticipantSupport>(
             std::pmr::polymorphic_allocator<DomainParticipantSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = {_sp, _familyTag()};
+        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
         return _sp;
     }
 
@@ -1024,7 +1024,7 @@ inline std::shared_ptr<::DDS::GuardCondition> wrapGuardConditionHandle(DDS_Guard
     {
         std::lock_guard<std::mutex> _lock(::DDS::ConditionImpl::_familyMutex());
         ::DDS::ConditionImpl::_familyCache()[DDS_GuardCondition_as_DDS_Condition(handle)] =
-            {sp, ::DDS::GuardConditionImpl::_familyTag()};
+            {sp, ::DDS::GuardConditionImpl::_familyTag(), static_cast<::DDS::GuardConditionImpl*>(sp.get())};
     }
     return sp;
 }
