@@ -1418,6 +1418,27 @@ jobs:
           python3 interoperability_report.py -P "$PUB" -S "$SUB" \
             -o /tmp/interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
 
+      # DIAGNOSTIC (Lifespan_6/7 vs hdds): revert before merge. Rerun the
+      # lifespan tests with hdds's full debug log, which names what makes it
+      # drop the zzdds writer after its first samples.
+      - name: Rerun lifespan tests with hdds debug log
+        if: always() && startsWith(matrix.vendor.name, 'hdds') && matrix.direction == 'pub'
+        continue-on-error: true
+        timeout-minutes: 10
+        working-directory: dds-rtps
+        env:
+          TSAN_OPTIONS: abort_on_error=1
+          RUST_LOG: hdds=debug
+        run: |
+          for i in 1 2 3; do
+            python3 interoperability_report.py \
+              -P "$GITHUB_WORKSPACE/bins/zzdds_shape_main_linux" \
+              -S "$GITHUB_WORKSPACE/bins/${{ matrix.vendor.binary }}" \
+              -t Test_Lifespan_5 Test_Lifespan_6 Test_Lifespan_7 \
+              -o /tmp/lifespan-debug-$i.xml || true
+            python3 ../zzdds/scripts/check_interop_results.py /tmp/lifespan-debug-$i.xml || true
+          done
+
       - name: Stop packet capture
         if: always()
         run: |
