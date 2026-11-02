@@ -46,7 +46,7 @@ std::condition_variable g_cv;
 bool g_entered = false;
 bool g_replaced = false;
 std::atomic<bool> g_destroyed{false};
-std::atomic<int> g_alive_after_replace{-1}; // -1 not checked, 0 freed, 1 alive
+std::atomic<int> g_alive_after_replace{-1}; // -1 not checked, 0 freed, 1 alive, 2 never replaced
 
 class BlockingListener : public ::DDS::DataReaderListenerBase {
 public:
@@ -58,7 +58,12 @@ public:
         if (g_entered) return;
         g_entered = true;
         g_cv.notify_all();
-        g_cv.wait_for(lock, std::chrono::seconds(10), [] { return g_replaced; });
+        // A wait that times out never saw the replacement, so it proves
+        // nothing about the listener's lifetime: record that as a failure.
+        if (!g_cv.wait_for(lock, std::chrono::seconds(10), [] { return g_replaced; })) {
+            g_alive_after_replace = 2;
+            return;
+        }
         g_alive_after_replace = g_destroyed.load() ? 0 : 1;
     }
 };

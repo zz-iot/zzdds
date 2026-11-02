@@ -189,6 +189,11 @@ public class JavaSmoke {
         // if any prior loan_raw call's outstanding-loan count was never
         // cleared.
         check(writer.dispose(sample, 0L) == 0, "writer.dispose() rc == 0");
+        // Wait for the listener before taking: a take() that consumes the
+        // sample first clears DATA_AVAILABLE, and the core then skips the
+        // callback.
+        for (int i = 0; i < 50 && dataCount.get() == dataBeforeDispose; i++) Thread.sleep(100);
+        check(dataCount.get() > dataBeforeDispose, "the listener still fires after its other registration was released");
         BindingSmokeStatusDataReader.Sample disposed = null;
         for (int i = 0; i < 50 && disposed == null; i++) {
             disposed = reader.take();
@@ -199,8 +204,6 @@ public class JavaSmoke {
         check(disposed.instanceState == Dcps.DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE.value,
             "dispose sample instance_state == NOT_ALIVE_DISPOSED_INSTANCE_STATE");
         System.out.println("  writer.dispose() via loan path: OK");
-        for (int i = 0; i < 50 && dataCount.get() == dataBeforeDispose; i++) Thread.sleep(100);
-        check(dataCount.get() > dataBeforeDispose, "the listener still fires after its other registration was released");
         System.out.println("  listener shared by two readers, one deleted: OK");
 
         int deleteRc = publisher.delete_datawriter(rawWriter);
