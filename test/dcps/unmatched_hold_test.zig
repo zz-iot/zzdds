@@ -250,6 +250,64 @@ test "data from an unannounced writer is held once, taken by each reader that ma
     try testing.expectEqual(@as(usize, 0), h.held());
 }
 
+test "data held for a reader whose match a change to it superseded is taken by the match made in its place" {
+    var clock = ManualClock.init(0);
+    var h: Harness = undefined;
+    try h.init(&clock);
+    defer h.deinit();
+    const Probe = struct {
+        var readers: [2]DDS.DataReader = undefined;
+        var changed: ?DDS.DataReader = null;
+        var rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR;
+        fn matchedCount(dr: DDS.DataReader) i32 {
+            var st: DDS.SubscriptionMatchedStatus = undefined;
+            _ = dr.vtable.get_subscription_matched_status(dr.ptr, &st);
+            return st.current_count;
+        }
+        /// On the first match, makes the reader not matched yet request a
+        /// deadline the writer does not offer, before its match is made.
+        fn onMatched(_: *anyopaque, _: *const DDS.SubscriptionMatchedStatus, _: ?*anyopaque) callconv(.c) void {
+            if (changed != null) return;
+            const other = for (readers) |dr| {
+                if (matchedCount(dr) == 0) break dr;
+            } else return;
+            changed = other;
+            var q = DDS.DataReaderQos{};
+            if (other.vtable.get_qos(other.ptr, &q) != DDS.RETCODE_OK) return;
+            defer q.deinit(testing.allocator);
+            q.deadline.period = .{ .sec = 1, .nanosec = 0 };
+            rc = other.vtable.set_qos(other.ptr, &q);
+        }
+    };
+    const topic = h.dp.create_topic("Held", "T", .{}, null, 0);
+    const desc = @as(*TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
+    var qos = DDS.DataReaderQos{};
+    qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    for (&Probe.readers) |*dr| {
+        dr.* = h.sub.create_datareader(desc, qos, .{ .on_subscription_matched = Probe.onMatched }, DDS.SUBSCRIPTION_MATCHED_STATUS);
+    }
+    Probe.changed = null;
+    Probe.rc = DDS.RETCODE_ERROR;
+
+    const w = writerGuid(0x53, 1);
+    try h.inject(w, ANY_READER, &.{ 1, 2 });
+    h.announceWriter(w, "Held");
+    const other = Probe.changed orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(DDS.RETCODE_OK, Probe.rc);
+    try testing.expectEqual(@as(i32, 0), Probe.matchedCount(other));
+    const other_impl: *DataReaderImpl = @ptrCast(@alignCast(other.ptr));
+    try testing.expectEqual(@as(usize, 0), delivered(other_impl));
+
+    // Back within what the writer offers: matched, with what was held.
+    var q = DDS.DataReaderQos{};
+    try testing.expectEqual(DDS.RETCODE_OK, other.vtable.get_qos(other.ptr, &q));
+    defer q.deinit(testing.allocator);
+    q.deadline = qos.deadline;
+    try testing.expectEqual(DDS.RETCODE_OK, other.vtable.set_qos(other.ptr, &q));
+    try testing.expectEqual(@as(i32, 1), Probe.matchedCount(other));
+    try testing.expectEqual(@as(usize, 2), delivered(other_impl));
+}
+
 test "a historical-data wait satisfied by history held before the match finds it in the reader" {
     var clock = ManualClock.init(0);
     var h: Harness = undefined;

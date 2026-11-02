@@ -11,6 +11,7 @@ const DDS = @import("zzdds_generated").DDS;
 const nil = @import("nil.zig");
 const proto = @import("../protocol/interface.zig");
 const reader_mod = @import("reader.zig");
+const qos_change = @import("qos_change.zig");
 const topic_mod = @import("topic.zig");
 const filter_mod = @import("filter.zig");
 const waitset = @import("waitset.zig");
@@ -73,15 +74,22 @@ pub const ParticipantCbs = struct {
         notify_fn: *const fn (notify_ctx: *anyopaque, remote_handle: DDS.InstanceHandle_t, added: bool) void,
     ) void,
 
-    /// Have discovery prepare the announcement of the reader identified by
-    /// handle, with this Subscriber's partitions and presentation: reserve
-    /// what announcing it and later disposing of it needs. Does nothing when
-    /// one with them is prepared already. Called at creation, before the
-    /// reader joins this Subscriber, and again before it is enabled.
-    prepare_reader: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void,
+    /// Have discovery prepare the announcements of the readers identified
+    /// by handles, with this Subscriber's partitions and presentation:
+    /// reserve what announcing each and later disposing of it needs. Skips
+    /// a reader that has one with them prepared already. All or none:
+    /// fails changing nothing. Called for a reader at creation, before it
+    /// joins this Subscriber, and for all of them when the partitions or
+    /// presentation change.
+    prepare_readers: *const fn (ctx: *anyopaque, handles: []const DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void,
+
+    /// `prepare_readers`, for the reader identified by handle and its new
+    /// QoS, before the change takes effect.
+    prepare_reader_qos: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t, qos: *const DDS.DataReaderQos) anyerror!void,
 
     /// Announce the reader identified by handle, prepared already, to the
-    /// discovery layer. Called after register_incompat_qos so that
+    /// discovery layer, or announce it again once its announcement changed.
+    /// Called after register_incompat_qos so that
     /// synchronous discovery callbacks (e.g. DirectDiscovery) fire with the
     /// incompat callback already set.
     announce_reader: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t) void,
@@ -156,7 +164,11 @@ pub const SubscriberImpl = struct {
     alloc: std.mem.Allocator,
     participant: DDS.DomainParticipant,
     cbs: ParticipantCbs,
+    /// Replaced under `qos_mu`; the partitions are read under it.
     qos: DDS.SubscriberQos,
+    /// Orders a QoS change against the readers' preparations, so none is
+    /// prepared with partitions replaced meanwhile.
+    qos_mu: Mutex = .{},
     /// Entity::enable() state. Seeded by vtCreateSubscriber (participant.zig)
     /// from the owning participant's `qos.entity_factory.autoenable_created_entities`
     /// -- NOT from this Subscriber's own `qos.entity_factory`, which instead
@@ -518,19 +530,26 @@ pub const SubscriberImpl = struct {
         // registrations are safe to leave unconditional. Also gated on this
         // Subscriber's own current enabled state -- see publisher.zig's
         // identical DataWriter gate (PR #91 Greptile finding).
+        self.qos_mu.lock();
         dr.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
-        // Joins this Subscriber before it is announced, held until creation
-        // returns; see PublisherImpl.finishDataWriter.
+        // Joins this Subscriber before it is announced, prepared again
+        // first, held until creation returns; see
+        // PublisherImpl.finishDataWriter.
         _ = dr.acquireQuiesce();
         defer dr.releaseQuiesce();
-        self.mu.lock();
-        self.readers.append(self.alloc, dr) catch {
-            self.mu.unlock();
+        const joined = joined: {
+            defer self.qos_mu.unlock();
+            self.prepareDataReadersLocked(&.{subscription_handle}, &self.qos) catch break :joined false;
+            self.mu.lock();
+            defer self.mu.unlock();
+            self.readers.append(self.alloc, dr) catch break :joined false;
+            break :joined true;
+        };
+        if (!joined) {
             self.cbs.destroy_proto_reader(self.cbs.ctx, subscription_handle);
             dr.deinit();
             return nil.nil_datareader;
-        };
-        self.mu.unlock();
+        }
         if (dr.enabled.load(.acquire)) self.announceDataReader(subscription_handle);
         if (dr.quiesce.tearingDown()) return nil.nil_datareader;
         return dr.toDDSDataReader();
@@ -538,15 +557,30 @@ pub const SubscriberImpl = struct {
 
     /// Prepares the reader's announcement with this Subscriber's current
     /// partitions and presentation (see ParticipantCbs.prepare_reader).
-    pub fn prepareDataReader(self: *Self, subscription_handle: DDS.InstanceHandle_t) !void {
-        const pname_seq = &self.qos.partition.name;
+    fn prepareDataReader(self: *Self, subscription_handle: DDS.InstanceHandle_t) !void {
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
+        try self.prepareDataReadersLocked(&.{subscription_handle}, &self.qos);
+    }
+
+    /// `prepareDataReader` for `handles`, with the partitions and
+    /// presentation of `qos`. With `qos_mu` held.
+    fn prepareDataReadersLocked(self: *Self, handles: []const DDS.InstanceHandle_t, qos: *const DDS.SubscriberQos) !void {
+        const pname_seq = &qos.partition.name;
         const pname_count: u32 = if (pname_seq._buffer != null) pname_seq._length else 0;
         var pname_buf: [64][]const u8 = undefined;
         const pname_slice = pname_buf[0..@min(pname_count, pname_buf.len)];
         if (pname_seq._buffer) |b| for (pname_slice, 0..) |*s, i| {
             s.* = std.mem.span(b[i]);
         };
-        try self.cbs.prepare_reader(self.cbs.ctx, subscription_handle, pname_slice, self.qos.presentation);
+        try self.cbs.prepare_readers(self.cbs.ctx, handles, pname_slice, qos.presentation);
+    }
+
+    /// Has the reader `subscription_handle`'s announcement prepared with its
+    /// new `qos`, before the change takes effect: see
+    /// ParticipantCbs.prepare_reader_qos.
+    pub fn prepareDataReaderQos(self: *Self, subscription_handle: DDS.InstanceHandle_t, qos: *const DDS.DataReaderQos) !void {
+        try self.cbs.prepare_reader_qos(self.cbs.ctx, subscription_handle, qos);
     }
 
     /// The outbound SEDP subscription announcement -- the one part of
@@ -727,16 +761,57 @@ pub const SubscriberImpl = struct {
         return DDS.RETCODE_OK;
     }
 
+    /// Publisher's `vtSetQos`, for readers.
     fn vtSetQos(ctx: *anyopaque, qos: *const DDS.SubscriberQos) DDS.ReturnCode_t {
         const self = cast(ctx);
-        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        self.qos.deinit(self.alloc);
-        self.qos = new_qos;
+        var handles: std.ArrayListUnmanaged(DDS.InstanceHandle_t) = .empty;
+        defer handles.deinit(self.alloc);
+        {
+            self.qos_mu.lock();
+            defer self.qos_mu.unlock();
+            if (self.enabled.load(.acquire) and
+                !qos_change.eql(DDS.PresentationQosPolicy, &self.qos.presentation, &qos.presentation))
+                return DDS.RETCODE_IMMUTABLE_POLICY;
+            var new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+            if (!qos_change.eql(DDS.PartitionQosPolicy, &self.qos.partition, &qos.partition) or
+                !qos_change.eql(DDS.PresentationQosPolicy, &self.qos.presentation, &qos.presentation))
+            {
+                self.readerHandles(&handles, .all) catch {
+                    new_qos.deinit(self.alloc);
+                    return DDS.RETCODE_OUT_OF_RESOURCES;
+                };
+                self.prepareDataReadersLocked(handles.items, &new_qos) catch {
+                    new_qos.deinit(self.alloc);
+                    return DDS.RETCODE_OUT_OF_RESOURCES;
+                };
+            }
+            self.qos.deinit(self.alloc);
+            self.qos = new_qos;
+        }
+        if (handles.items.len == 0) return DDS.RETCODE_OK;
+        // A reader enabled meanwhile is announced by its enable as well.
+        self.readerHandles(&handles, .enabled) catch unreachable;
+        for (handles.items) |h| self.announceDataReader(h);
         return DDS.RETCODE_OK;
+    }
+
+    /// Publisher's `writerHandles`, for readers.
+    fn readerHandles(self: *Self, out: *std.ArrayListUnmanaged(DDS.InstanceHandle_t), which: enum { all, enabled }) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        out.clearRetainingCapacity();
+        if (which == .all) try out.ensureTotalCapacityPrecise(self.alloc, self.readers.items.len);
+        for (self.readers.items) |r| {
+            if (which == .enabled and !r.enabled.load(.acquire)) continue;
+            if (out.items.len == out.capacity) break;
+            out.appendAssumeCapacity(r.instance_handle);
+        }
     }
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.SubscriberQos) DDS.ReturnCode_t {
         const self = cast(ctx);
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
         qos.* = self.qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }

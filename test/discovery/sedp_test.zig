@@ -1116,3 +1116,37 @@ test "SEDP: a writer prepared while the plugin is stopped is announced once the 
     d.retractWriter(guid);
     try testing.expectEqual(history_kind.not_alive_disposed, plugin.sedp.pub_writer.?.cache.changes.items[0].kind);
 }
+
+test "SEDP: a writer prepared again is announced with the replacement only once adopted, with no memory left" {
+    var r: Reserving = undefined;
+    try r.init();
+    defer r.deinit();
+    try r.start();
+
+    const guid = makeGuid(0x30, 0x15);
+    var ann = Reserving.writerAnnouncement(guid);
+    try r.sedp.prepareWriter(&ann);
+    r.sedp.announceWriter(guid);
+    const first = r.sedp.pub_writer.?.cache.changes.items[0].sequence_number;
+
+    // Held beside the announcement: neither an announce nor an abandon
+    // writes it.
+    ann.partition_names = &.{"p3"};
+    try r.sedp.prepareWriter(&ann);
+    r.sedp.announceWriter(guid);
+    r.sedp.abandonWriter(guid);
+    r.sedp.announceWriter(guid);
+    var buf: [4]history_kind = undefined;
+    try testing.expectEqualSlices(history_kind, &.{.alive}, r.history(&buf));
+    try testing.expect(std.meta.eql(first, r.sedp.pub_writer.?.cache.changes.items[0].sequence_number));
+
+    try r.sedp.prepareWriter(&ann);
+    r.exhaust();
+    r.sedp.adoptWriter(guid);
+    r.sedp.announceWriter(guid);
+    // The replacement takes the announcement's slot.
+    try testing.expectEqualSlices(history_kind, &.{.alive}, r.history(&buf));
+    try testing.expect(!std.meta.eql(first, r.sedp.pub_writer.?.cache.changes.items[0].sequence_number));
+    r.sedp.retractWriter(guid);
+    try testing.expectEqualSlices(history_kind, &.{.not_alive_disposed}, r.history(&buf));
+}

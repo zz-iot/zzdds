@@ -105,9 +105,11 @@ Discovers participants and endpoints; delivers events to DCPS via callbacks.
 
 ```zig
 start(local_participant_info, callbacks) !void
-prepare_writer(info) !void    // reserves what announcing and disposing need
+prepare_writer(info) !void    // reserves what announcing and disposing need;
+                              // for a prepared writer, holds its replacement
+adopt_writer(guid) void       abandon_writer(guid) void  // keep or drop it
 announce_writer(guid) void    retract_writer(guid) void
-prepare_reader(info) !void
+prepare_reader(info) !void    adopt_reader / abandon_reader
 announce_reader(guid) void    retract_reader(guid) void
 stop() void
 

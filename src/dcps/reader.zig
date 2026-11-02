@@ -16,6 +16,7 @@ const std = @import("std");
 const DDS = @import("zzdds_generated").DDS;
 const ZZDDS = @import("zzdds_ext_generated").zzdds;
 const nil = @import("nil.zig");
+const qos_change = @import("qos_change.zig");
 const proto = @import("../protocol/interface.zig");
 const history_mod = @import("../rtps/history.zig");
 const filter_mod = @import("filter.zig");
@@ -3030,9 +3031,8 @@ pub const DataReaderImpl = struct {
         if (nil.isNil(self.subscriber)) return DDS.RETCODE_PRECONDITION_NOT_MET;
         const sub_: *subscriber_mod.SubscriberImpl = @ptrCast(@alignCast(self.subscriber.ptr));
         if (!sub_.enabled.load(.acquire)) return DDS.RETCODE_PRECONDITION_NOT_MET;
-        // Again, should the Subscriber's partitions or presentation have
-        // changed since creation: once enabled, its announcement cannot fail.
-        sub_.prepareDataReader(self.instance_handle) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        // Prepared at creation, and again by each change since, so its
+        // announcement cannot fail.
         // Only the call that enables it announces it.
         if (self.enabled.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return DDS.RETCODE_OK;
         sub_.announceDataReader(self.instance_handle);
@@ -3205,13 +3205,27 @@ pub const DataReaderImpl = struct {
         return DDS.RETCODE_OK;
     }
 
+    /// The immutable policies cannot change, even before `enable`: the
+    /// protocol endpoint was made with them. A change to the others has the
+    /// announcement prepared again first: should that fail, nothing changes
+    /// and the call returns OUT_OF_RESOURCES. Enabled, the DataReader is then
+    /// announced again
+    /// (docs/design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal).
     fn vtSetQos(ctx: *anyopaque, qos: *const DDS.DataReaderQos) DDS.ReturnCode_t {
         const self = cast(ctx);
-        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        if (qos_change.readerImmutableChanged(&self.qos, qos)) return DDS.RETCODE_IMMUTABLE_POLICY;
+        if (qos_change.eql(DDS.DataReaderQos, &self.qos, qos)) return DDS.RETCODE_OK;
+        var new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        const parent: ?*subscriber_mod.SubscriberImpl = if (nil.isNil(self.subscriber)) null else @ptrCast(@alignCast(self.subscriber.ptr));
+        if (parent) |p| p.prepareDataReaderQos(self.instance_handle, &new_qos) catch {
+            new_qos.deinit(self.alloc);
+            return DDS.RETCODE_OUT_OF_RESOURCES;
+        };
         self.qos.deinit(self.alloc);
         self.qos = new_qos;
         // A shorter deadline may fall due sooner.
         self.timersChanged();
+        if (parent) |p| if (self.enabled.load(.acquire)) p.announceDataReader(self.instance_handle);
         return DDS.RETCODE_OK;
     }
 

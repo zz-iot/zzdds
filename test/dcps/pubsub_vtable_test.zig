@@ -217,14 +217,16 @@ test "Publisher: set_qos / get_qos round-trip" {
 
     const pub_ = dp.create_publisher(.{}, null, 0);
     var qos = DDS.PublisherQos{};
-    // Default Partition has no names — set a marker via the presentation field.
-    qos.presentation.coherent_access = true;
-
-    _ = pub_.set_qos(qos);
+    qos.entity_factory.autoenable_created_entities = false;
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.set_qos(qos));
 
     var got: DDS.PublisherQos = .{};
     _ = pub_.vtable.get_qos(pub_.ptr, &got);
-    try testing.expectEqual(true, got.presentation.coherent_access);
+    try testing.expectEqual(false, got.entity_factory.autoenable_created_entities);
+
+    // PRESENTATION is immutable once the Publisher is enabled.
+    qos.presentation.coherent_access = true;
+    try testing.expectEqual(DDS.RETCODE_IMMUTABLE_POLICY, pub_.set_qos(qos));
 
     _ = dp.vtable.delete_contained_entities(dp.ptr);
 }
@@ -490,11 +492,15 @@ test "Subscriber: set_qos / get_qos round-trip" {
 
     const sub = dp.create_subscriber(.{}, null, 0);
     var qos = DDS.SubscriberQos{};
-    qos.presentation.ordered_access = true;
-    _ = sub.set_qos(qos);
+    qos.entity_factory.autoenable_created_entities = false;
+    try testing.expectEqual(DDS.RETCODE_OK, sub.set_qos(qos));
     var got: DDS.SubscriberQos = .{};
     _ = sub.vtable.get_qos(sub.ptr, &got);
-    try testing.expectEqual(true, got.presentation.ordered_access);
+    try testing.expectEqual(false, got.entity_factory.autoenable_created_entities);
+
+    // PRESENTATION is immutable once the Subscriber is enabled.
+    qos.presentation.ordered_access = true;
+    try testing.expectEqual(DDS.RETCODE_IMMUTABLE_POLICY, sub.set_qos(qos));
 
     _ = dp.vtable.delete_contained_entities(dp.ptr);
 }

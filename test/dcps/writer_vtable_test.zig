@@ -289,13 +289,17 @@ test "set_qos / get_qos: round-trips" {
     const dw = fx.makeWriter(qos, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
-    var qos2 = DDS.DataWriterQos{};
-    qos2.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
-    _ = dw.set_qos(qos2);
+    var qos2 = qos;
+    qos2.deadline.period = .{ .sec = 3, .nanosec = 0 };
+    try testing.expectEqual(DDS.RETCODE_OK, dw.set_qos(qos2));
 
     var out: DDS.DataWriterQos = .{};
     _ = dw.vtable.get_qos(dw.ptr, &out);
-    try testing.expectEqual(DDS.ReliabilityQosPolicyKind.BEST_EFFORT_RELIABILITY_QOS, out.reliability.kind);
+    try testing.expectEqual(@as(i32, 3), out.deadline.period.sec);
+
+    // RELIABILITY is immutable: the protocol writer was made with it.
+    qos2.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    try testing.expectEqual(DDS.RETCODE_IMMUTABLE_POLICY, dw.set_qos(qos2));
 }
 
 test "set_listener / get_listener: round-trips" {

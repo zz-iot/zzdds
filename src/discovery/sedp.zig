@@ -322,6 +322,8 @@ const Announcements = struct {
     const Prepared = struct {
         /// To write on the next announce, until written.
         payload: ?[]u8,
+        /// Prepared to replace `payload`, until adopted or abandoned.
+        staged: ?[]u8 = null,
         disposal: []u8,
         /// A slot is reserved in `writer`'s history.
         slot: bool,
@@ -332,6 +334,7 @@ const Announcements = struct {
         var it = self.endpoints.valueIterator();
         while (it.next()) |p| {
             if (p.payload) |pl| alloc.free(pl);
+            if (p.staged) |st| alloc.free(st);
             alloc.free(p.disposal);
         }
         self.endpoints.deinit(alloc);
@@ -366,13 +369,15 @@ const Announcements = struct {
     }
 
     /// Takes `payload` and `disposal` on success; frees nothing on failure.
+    /// For an endpoint prepared already, `payload` is staged to replace what
+    /// it has, until `adopt` or `abandon`.
     fn prepare(self: *Announcements, alloc: std.mem.Allocator, kh: [16]u8, payload: []u8, disposal: []u8) !void {
         self.mu.lock();
         defer self.mu.unlock();
         const gop = try self.endpoints.getOrPut(alloc, kh);
         if (gop.found_existing) {
-            if (gop.value_ptr.payload) |old| alloc.free(old);
-            gop.value_ptr.payload = payload;
+            if (gop.value_ptr.staged) |old| alloc.free(old);
+            gop.value_ptr.staged = payload;
             alloc.free(disposal);
             return;
         }
@@ -381,6 +386,25 @@ const Announcements = struct {
             return err;
         };
         gop.value_ptr.* = .{ .payload = payload, .disposal = disposal, .slot = self.writer != null };
+    }
+
+    /// The staged replacement becomes what the next announce writes.
+    fn adopt(self: *Announcements, alloc: std.mem.Allocator, kh: [16]u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const p = self.endpoints.getPtr(kh) orelse return;
+        const staged = p.staged orelse return;
+        if (p.payload) |old| alloc.free(old);
+        p.payload = staged;
+        p.staged = null;
+    }
+
+    fn abandon(self: *Announcements, alloc: std.mem.Allocator, kh: [16]u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const p = self.endpoints.getPtr(kh) orelse return;
+        if (p.staged) |st| alloc.free(st);
+        p.staged = null;
     }
 
     fn announce(self: *Announcements, alloc: std.mem.Allocator, kh: [16]u8) void {
@@ -412,6 +436,7 @@ const Announcements = struct {
         } orelse return;
         const p = kv.value;
         if (p.payload) |pl| alloc.free(pl);
+        if (p.staged) |st| alloc.free(st);
         const w = writer orelse return alloc.free(p.disposal);
         if (p.announced) {
             // Replaces the announcement in its slot.
@@ -448,6 +473,14 @@ pub const LocalAnnouncements = struct {
         try self.publications.prepare(alloc, guidToKeyHash(ann.guid), payload, disposal);
     }
 
+    pub fn adoptWriter(self: *LocalAnnouncements, alloc: std.mem.Allocator, guid: Guid) void {
+        self.publications.adopt(alloc, guidToKeyHash(guid));
+    }
+
+    pub fn abandonWriter(self: *LocalAnnouncements, alloc: std.mem.Allocator, guid: Guid) void {
+        self.publications.abandon(alloc, guidToKeyHash(guid));
+    }
+
     pub fn announceWriter(self: *LocalAnnouncements, alloc: std.mem.Allocator, guid: Guid) void {
         self.publications.announce(alloc, guidToKeyHash(guid));
     }
@@ -462,6 +495,14 @@ pub const LocalAnnouncements = struct {
         const disposal = try encodeEndpointDisposalPayload(alloc, ann.guid);
         errdefer alloc.free(disposal);
         try self.subscriptions.prepare(alloc, guidToKeyHash(ann.guid), payload, disposal);
+    }
+
+    pub fn adoptReader(self: *LocalAnnouncements, alloc: std.mem.Allocator, guid: Guid) void {
+        self.subscriptions.adopt(alloc, guidToKeyHash(guid));
+    }
+
+    pub fn abandonReader(self: *LocalAnnouncements, alloc: std.mem.Allocator, guid: Guid) void {
+        self.subscriptions.abandon(alloc, guidToKeyHash(guid));
     }
 
     pub fn announceReader(self: *LocalAnnouncements, alloc: std.mem.Allocator, guid: Guid) void {
@@ -899,6 +940,14 @@ pub const SedpEndpoints = struct {
         return self.announcements.prepareWriter(self.alloc, ann);
     }
 
+    pub fn adoptWriter(self: *Self, guid: Guid) void {
+        self.announcements.adoptWriter(self.alloc, guid);
+    }
+
+    pub fn abandonWriter(self: *Self, guid: Guid) void {
+        self.announcements.abandonWriter(self.alloc, guid);
+    }
+
     pub fn announceWriter(self: *Self, guid: Guid) void {
         self.announcements.announceWriter(self.alloc, guid);
     }
@@ -909,6 +958,14 @@ pub const SedpEndpoints = struct {
 
     pub fn prepareReader(self: *Self, ann: *const ReaderAnnouncement) !void {
         return self.announcements.prepareReader(self.alloc, ann);
+    }
+
+    pub fn adoptReader(self: *Self, guid: Guid) void {
+        self.announcements.adoptReader(self.alloc, guid);
+    }
+
+    pub fn abandonReader(self: *Self, guid: Guid) void {
+        self.announcements.abandonReader(self.alloc, guid);
     }
 
     pub fn announceReader(self: *Self, guid: Guid) void {
