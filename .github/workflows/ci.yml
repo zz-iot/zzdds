@@ -1317,7 +1317,8 @@ jobs:
           python3 zzdds/scripts/check_interop_results.py \
             /tmp/interop-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml \
             --known-failures zzdds/.github/interop-known-failures.toml \
-            --vendor "${{ matrix.vendor.name }}" --direction ${{ matrix.direction }}
+            --vendor "${{ matrix.vendor.name }}" --direction ${{ matrix.direction }} \
+            --lane normal
 
       - name: Upload report
         if: always()
@@ -1397,17 +1398,11 @@ jobs:
           command -v tcpdump >/dev/null || sudo apt-get install -y tcpdump
           sudo timeout -s INT 3600 tcpdump -i any -U -w /tmp/interop-tsan.pcap udp > /tmp/tcpdump.log 2>&1 &
           for _ in $(seq 50); do [ -s /tmp/interop-tsan.pcap ] && break; sleep 0.1; done
-          # DIAGNOSTIC (Lifespan_6/7 vs hdds): revert before merge.
-          ls -la /dev/shm
 
       - name: Run interop TSan (${{ matrix.direction }})
         working-directory: dds-rtps
         env:
           TSAN_OPTIONS: abort_on_error=1
-          # DIAGNOSTIC (Lifespan_6/7 vs hdds): revert before merge. hdds's
-          # discovery and reader debug log, written to a file per process by
-          # the wrapper below so the harness's output is unchanged.
-          RUST_LOG: ${{ startsWith(matrix.vendor.name, 'hdds') && 'info,hdds::core::discovery=debug,hdds::core::discovery::multicast::classifier=info,hdds::core::discovery::multicast::listener=info,hdds::dds::participant::builder::discovery_setup::sedp_handler=debug,hdds::engine::demux=debug,hdds::dds::reader=debug' || '' }}
         run: |
           ZZDDS="$GITHUB_WORKSPACE/bins/zzdds_shape_main_linux"
           VENDOR="$GITHUB_WORKSPACE/bins/${{ matrix.vendor.binary }}"
@@ -1415,13 +1410,6 @@ jobs:
             PUB="$ZZDDS"; SUB="$VENDOR"
           else
             PUB="$VENDOR"; SUB="$ZZDDS"
-          fi
-          # DIAGNOSTIC (Lifespan_6/7 vs hdds): revert before merge.
-          if [ -n "$RUST_LOG" ] && [ "${{ matrix.direction }}" = "pub" ]; then
-            mkdir -p /tmp/hdds-logs /tmp/hdds-wrap
-            W="/tmp/hdds-wrap/${{ matrix.vendor.binary }}"
-            printf '#!/bin/sh\nexec "%s" "$@" 2>>"/tmp/hdds-logs/$(date -u +%%H%%M%%S)-$$.log"\n' "$VENDOR" > "$W"
-            chmod +x "$W"; cat "$W"; SUB="$W"
           fi
           python3 interoperability_report.py -P "$PUB" -S "$SUB" \
             -o /tmp/interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
@@ -1432,15 +1420,14 @@ jobs:
           sudo pkill -INT -x tcpdump || true
           for _ in $(seq 50); do pgrep -x tcpdump >/dev/null || break; sleep 0.1; done
           cat /tmp/tcpdump.log || true
-          # DIAGNOSTIC (Lifespan_6/7 vs hdds): revert before merge.
-          ls -la /dev/shm
 
       - name: Check results
         run: |
           python3 zzdds/scripts/check_interop_results.py \
             /tmp/interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml \
             --known-failures zzdds/.github/interop-known-failures.toml \
-            --vendor "${{ matrix.vendor.name }}" --direction ${{ matrix.direction }}
+            --vendor "${{ matrix.vendor.name }}" --direction ${{ matrix.direction }} \
+            --lane tsan
 
       - name: Upload TSan report
         if: always()
@@ -1455,16 +1442,6 @@ jobs:
         with:
           name: interop-tsan-capture-${{ matrix.vendor.name }}-${{ matrix.direction }}
           path: /tmp/interop-tsan.pcap
-          retention-days: 7
-
-      # DIAGNOSTIC (Lifespan_6/7 vs hdds): revert before merge.
-      - name: Upload hdds logs
-        if: failure() && startsWith(matrix.vendor.name, 'hdds')
-        uses: actions/upload-artifact@v4
-        with:
-          name: interop-tsan-hdds-logs-${{ matrix.vendor.name }}-${{ matrix.direction }}
-          path: /tmp/hdds-logs
-          if-no-files-found: ignore
           retention-days: 7
 
   # ── Interop: Zenzen DDS (DebugAllocator) vs vendor ────────────────────────
@@ -1553,7 +1530,8 @@ jobs:
           python3 zzdds/scripts/check_interop_results.py \
             /tmp/interop-debug-allocator-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml \
             --known-failures zzdds/.github/interop-known-failures.toml \
-            --vendor "${{ matrix.vendor.name }}" --direction ${{ matrix.direction }}
+            --vendor "${{ matrix.vendor.name }}" --direction ${{ matrix.direction }} \
+            --lane debug-allocator
 
       - name: Upload DebugAllocator report
         if: always()
