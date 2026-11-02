@@ -1397,11 +1397,16 @@ jobs:
           command -v tcpdump >/dev/null || sudo apt-get install -y tcpdump
           sudo timeout -s INT 3600 tcpdump -i any -U -w /tmp/interop-tsan.pcap udp > /tmp/tcpdump.log 2>&1 &
           for _ in $(seq 50); do [ -s /tmp/interop-tsan.pcap ] && break; sleep 0.1; done
+          # DIAGNOSTIC (Lifespan_6/7 vs hdds): revert before merge.
+          ls -la /dev/shm
 
       - name: Run interop TSan (${{ matrix.direction }})
         working-directory: dds-rtps
         env:
           TSAN_OPTIONS: abort_on_error=1
+          # DIAGNOSTIC (Lifespan_6/7 vs hdds): revert before merge. hdds's
+          # reader logs each sample it takes in and each it drops.
+          RUST_LOG: ${{ startsWith(matrix.vendor.name, 'hdds') && 'hdds::dds::reader=debug' || '' }}
         run: |
           ZZDDS="$GITHUB_WORKSPACE/bins/zzdds_shape_main_linux"
           VENDOR="$GITHUB_WORKSPACE/bins/${{ matrix.vendor.binary }}"
@@ -1419,6 +1424,8 @@ jobs:
           sudo pkill -INT -x tcpdump || true
           for _ in $(seq 50); do pgrep -x tcpdump >/dev/null || break; sleep 0.1; done
           cat /tmp/tcpdump.log || true
+          # DIAGNOSTIC (Lifespan_6/7 vs hdds): revert before merge.
+          ls -la /dev/shm
 
       - name: Check results
         run: |
