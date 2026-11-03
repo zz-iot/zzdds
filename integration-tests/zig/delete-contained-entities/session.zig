@@ -11,8 +11,9 @@
 //! Core assertions: delete_contained_entities() returns RETCODE_OK, the
 //! immediately-following delete_participant() ALSO returns RETCODE_OK (per
 //! spec this only succeeds if the cascade genuinely left nothing dangling),
-//! and no matched-status listener ever fires after the torn_down flag is
-//! set.
+//! and no matched-status listener ever fires once teardown begins. The
+//! failure line says whether the callback came during or after
+//! delete_contained_entities(), and names the endpoint and its status.
 //!
 //! Required stdout markers: "Create topic:" x3, "Create writer for topic:"
 //! x2, "Create reader for topic:" x2, "Session: torn down via
@@ -31,9 +32,20 @@ const READER_READY_TIMEOUT_NS: i64 = 10 * std.time.ns_per_s;
 const RECEIVE_TIMEOUT_NS: i64 = 20 * std.time.ns_per_s;
 const POLL_PERIOD_NS: u64 = 20 * std.time.ns_per_ms;
 
-var torn_down = std.atomic.Value(bool).init(false);
+const Phase = enum(u8) { running, deleting, deleted };
+var phase = std.atomic.Value(Phase).init(.running);
+
+fn failIfTornDown(callback: []const u8, topic: []const u8, total_count: i32, total_count_change: i32, current_count: i32, current_count_change: i32) void {
+    const p = phase.load(.acquire);
+    if (p == .running) return;
+    std.debug.print("FAIL: listener fired {s} delete_contained_entities: {s} on {s} (total_count={d} total_count_change={d} current_count={d} current_count_change={d})\n", .{
+        if (p == .deleting) "during" else "after", callback, topic, total_count, total_count_change, current_count, current_count_change,
+    });
+    std.process.exit(1);
+}
 
 const WriterSyncState = struct {
+    topic: []const u8,
     reader_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
@@ -46,13 +58,8 @@ fn sleepNs(io: std.Io, ns: u64) void {
 }
 
 fn onPublicationMatchedEx(state: *WriterSyncState, dw: DDS.DataWriter, status: DDS.PublicationMatchedStatus) void {
-    _ = state;
     _ = dw;
-    _ = status;
-    if (torn_down.load(.acquire)) {
-        std.debug.print("FAIL: listener fired after delete_contained_entities\n", .{});
-        std.process.exit(1);
-    }
+    failIfTornDown("on_publication_matched", state.topic, status.total_count, status.total_count_change, status.current_count, status.current_count_change);
 }
 
 fn onReliableReaderReady(state: *WriterSyncState, reader_handle: DDS.InstanceHandle_t, is_ready: bool) void {
@@ -60,17 +67,17 @@ fn onReliableReaderReady(state: *WriterSyncState, reader_handle: DDS.InstanceHan
     if (is_ready) state.reader_ready.store(true, .release);
 }
 
-const ReaderSyncNoop = struct {};
-var reader_sync_noop = ReaderSyncNoop{};
+const ReaderTag = struct {
+    topic: []const u8,
+    matched: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+var in_reader_tag = ReaderTag{ .topic = "SessionIn" };
+var cft_reader_tag = ReaderTag{ .topic = "SessionIn_cft" };
 
-fn onSubscriptionMatched(ctx: *ReaderSyncNoop, dr: DDS.DataReader, status: DDS.SubscriptionMatchedStatus) void {
-    _ = ctx;
+fn onSubscriptionMatched(tag: *ReaderTag, dr: DDS.DataReader, status: DDS.SubscriptionMatchedStatus) void {
     _ = dr;
-    _ = status;
-    if (torn_down.load(.acquire)) {
-        std.debug.print("FAIL: listener fired after delete_contained_entities\n", .{});
-        std.process.exit(1);
-    }
+    failIfTornDown("on_subscription_matched", tag.topic, status.total_count, status.total_count_change, status.current_count, status.current_count_change);
+    if (status.current_count > 0) tag.matched.store(true, .release);
 }
 
 /// Creates a writer with its extended listener installed from the start: a
@@ -150,8 +157,8 @@ pub fn main(init: std.process.Init) !void {
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
 
-    var out1_state = WriterSyncState{};
-    var out2_state = WriterSyncState{};
+    var out1_state = WriterSyncState{ .topic = "SessionOut1" };
+    var out2_state = WriterSyncState{ .topic = "SessionOut2" };
     const out1_dw = createWriterEx(publisher, out1_topic, dw_qos, &out1_state);
     const out2_dw = createWriterEx(publisher, out2_topic, dw_qos, &out2_state);
     if (out1_dw.ptr == zzdds.dcps.NIL_PTR or out2_dw.ptr == zzdds.dcps.NIL_PTR) {
@@ -173,7 +180,10 @@ pub fn main(init: std.process.Init) !void {
 
     // Reader listeners are attached at creation, so their "never after
     // teardown" check covers the readers' whole lifetime.
-    const in_dr_listener = DDS.dataReaderListener(&reader_sync_noop, .{
+    const in_dr_listener = DDS.dataReaderListener(&in_reader_tag, .{
+        .on_subscription_matched = onSubscriptionMatched,
+    });
+    const cft_dr_listener = DDS.dataReaderListener(&cft_reader_tag, .{
         .on_subscription_matched = onSubscriptionMatched,
     });
     const in_topic_desc = dp.lookup_topicdescription("SessionIn");
@@ -193,7 +203,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
     const cft_desc = cft.vtable.as_TopicDescription(cft.ptr);
-    const cft_dr = subscriber.create_datareader(cft_desc, dr_qos, in_dr_listener, DDS.SUBSCRIPTION_MATCHED_STATUS);
+    const cft_dr = subscriber.create_datareader(cft_desc, dr_qos, cft_dr_listener, DDS.SUBSCRIPTION_MATCHED_STATUS);
     if (cft_dr.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_datareader(SessionIn_cft) failed\n", .{});
         std.process.exit(1);
@@ -227,6 +237,20 @@ pub fn main(init: std.process.Init) !void {
     while (!(out1_state.reader_ready.load(.acquire) and out2_state.reader_ready.load(.acquire))) {
         if (monoNs(io) > ready_deadline) {
             std.debug.print("FAIL: no reliable reader became ready within 10s\n", .{});
+            std.process.exit(1);
+        }
+        sleepNs(io, POLL_PERIOD_NS);
+    }
+
+    // Both readers must match the peer's writer before teardown too: samples
+    // on the plain reader do not mean the CFT reader has matched, and a first
+    // match arriving late would fire its listener during the teardown.
+    const matched_deadline = monoNs(io) + READER_READY_TIMEOUT_NS;
+    while (!(in_reader_tag.matched.load(.acquire) and cft_reader_tag.matched.load(.acquire))) {
+        if (monoNs(io) > matched_deadline) {
+            std.debug.print("FAIL: readers not matched with the peer's writer within 10s (SessionIn={any} SessionIn_cft={any})\n", .{
+                in_reader_tag.matched.load(.acquire), cft_reader_tag.matched.load(.acquire),
+            });
             std.process.exit(1);
         }
         sleepNs(io, POLL_PERIOD_NS);
@@ -272,13 +296,14 @@ pub fn main(init: std.process.Init) !void {
 
     // The core test: tear the whole tree down in one shot instead of
     // deleting out1_dw/out2_dw/in_dr/cft_dr/cft one at a time.
-    torn_down.store(true, .release);
+    phase.store(.deleting, .release);
 
     const rc1 = dp.delete_contained_entities();
     if (rc1 != DDS.RETCODE_OK) {
         std.debug.print("FAIL: delete_contained_entities() returned {d}, expected RETCODE_OK\n", .{rc1});
         std.process.exit(1);
     }
+    phase.store(.deleted, .release);
 
     const rc2 = dpf.delete_participant(dp);
     if (rc2 != DDS.RETCODE_OK) {

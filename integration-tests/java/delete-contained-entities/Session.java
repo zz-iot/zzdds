@@ -13,6 +13,7 @@ import io.zzdds.ext.Zzdds;
 
 import java.util.Collections;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class Session {
     static final int SAMPLE_COUNT = 5;
@@ -22,7 +23,21 @@ public class Session {
     static final int WAIT_STEP_SEC = 1;
     static final int POLL_PERIOD_MS = 20;
 
-    static final AtomicBoolean tornDown = new AtomicBoolean(false);
+    static final int PHASE_RUNNING = 0;
+    static final int PHASE_DELETING = 1;
+    static final int PHASE_DELETED = 2;
+    static final AtomicInteger phase = new AtomicInteger(PHASE_RUNNING);
+
+    static void failIfTornDown(String callback, String topic, int totalCount, int totalCountChange,
+                               int currentCount, int currentCountChange) {
+        int p = phase.get();
+        if (p == PHASE_RUNNING) return;
+        System.err.println("FAIL: listener fired " + (p == PHASE_DELETING ? "during" : "after")
+            + " delete_contained_entities: " + callback + " on " + topic
+            + " (total_count=" + totalCount + " total_count_change=" + totalCountChange
+            + " current_count=" + currentCount + " current_count_change=" + currentCountChange + ")");
+        System.exit(1);
+    }
 
     static class WriterSyncState {
         final AtomicBoolean readerReady = new AtomicBoolean(false);
@@ -37,17 +52,15 @@ public class Session {
         return 0;
     }
 
-    static Zzdds.zzdds.DataWriterListenerEx makeWriterListener(WriterSyncState state) {
+    static Zzdds.zzdds.DataWriterListenerEx makeWriterListener(WriterSyncState state, String topic) {
         return new Zzdds.zzdds.DataWriterListenerEx() {
             public void on_offered_deadline_missed(Dcps.DDS.DataWriter w, Dcps.DDS.OfferedDeadlineMissedStatus s) {}
             public void on_offered_incompatible_qos(Dcps.DDS.DataWriter w, Dcps.DDS.OfferedIncompatibleQosStatus s) {}
             public void on_liveliness_lost(Dcps.DDS.DataWriter w, Dcps.DDS.LivelinessLostStatus s) {}
 
             public void on_publication_matched(Dcps.DDS.DataWriter w, Dcps.DDS.PublicationMatchedStatus s) {
-                if (tornDown.get()) {
-                    System.err.println("FAIL: listener fired after delete_contained_entities");
-                    System.exit(1);
-                }
+                failIfTornDown("on_publication_matched", topic, s.get_total_count(), s.get_total_count_change(),
+                    s.get_current_count(), s.get_current_count_change());
             }
 
             public void on_reliable_reader_ready(int readerHandle, boolean isReady) {
@@ -56,7 +69,7 @@ public class Session {
         };
     }
 
-    static Dcps.DDS.DataReaderListener makeReaderListener() {
+    static Dcps.DDS.DataReaderListener makeReaderListener(String topic, AtomicBoolean matched) {
         return new Dcps.DDS.DataReaderListener() {
             public void on_requested_deadline_missed(Dcps.DDS.DataReader r, Dcps.DDS.RequestedDeadlineMissedStatus s) {}
             public void on_requested_incompatible_qos(Dcps.DDS.DataReader r, Dcps.DDS.RequestedIncompatibleQosStatus s) {}
@@ -66,10 +79,9 @@ public class Session {
             public void on_sample_lost(Dcps.DDS.DataReader r, Dcps.DDS.SampleLostStatus s) {}
 
             public void on_subscription_matched(Dcps.DDS.DataReader r, Dcps.DDS.SubscriptionMatchedStatus s) {
-                if (tornDown.get()) {
-                    System.err.println("FAIL: listener fired after delete_contained_entities");
-                    System.exit(1);
-                }
+                failIfTornDown("on_subscription_matched", topic, s.get_total_count(), s.get_total_count_change(),
+                    s.get_current_count(), s.get_current_count_change());
+                if (s.get_current_count() > 0) matched.set(true);
             }
         };
     }
@@ -128,8 +140,8 @@ public class Session {
             System.err.println("FAIL: asZzddsPublisher() failed");
             System.exit(1);
         }
-        Dcps.DDS.DataWriter out1Dw = zPub.create_datawriter_ex(out1Topic, dwQos, makeWriterListener(out1State), Dcps.DDS.PUBLICATION_MATCHED_STATUS.value);
-        Dcps.DDS.DataWriter out2Dw = zPub.create_datawriter_ex(out2Topic, dwQos, makeWriterListener(out2State), Dcps.DDS.PUBLICATION_MATCHED_STATUS.value);
+        Dcps.DDS.DataWriter out1Dw = zPub.create_datawriter_ex(out1Topic, dwQos, makeWriterListener(out1State, "SessionOut1"), Dcps.DDS.PUBLICATION_MATCHED_STATUS.value);
+        Dcps.DDS.DataWriter out2Dw = zPub.create_datawriter_ex(out2Topic, dwQos, makeWriterListener(out2State, "SessionOut2"), Dcps.DDS.PUBLICATION_MATCHED_STATUS.value);
         if (out1Dw == null || out2Dw == null) {
             System.err.println("FAIL: create_datawriter() failed");
             System.exit(1);
@@ -150,8 +162,9 @@ public class Session {
 
         // Reader listeners are attached at creation, so their "never after
         // teardown" check covers the readers' whole lifetime.
-        Dcps.DDS.DataReaderListener readerListener = makeReaderListener();
-        Dcps.DDS.DataReader inDr = sub.create_datareader(inTopic, drQos, readerListener, Dcps.DDS.SUBSCRIPTION_MATCHED_STATUS.value);
+        AtomicBoolean inMatched = new AtomicBoolean(false);
+        AtomicBoolean cftMatched = new AtomicBoolean(false);
+        Dcps.DDS.DataReader inDr = sub.create_datareader(inTopic, drQos, makeReaderListener("SessionIn", inMatched), Dcps.DDS.SUBSCRIPTION_MATCHED_STATUS.value);
         if (inDr == null) {
             System.err.println("FAIL: create_datareader(SessionIn) failed");
             System.exit(1);
@@ -167,7 +180,7 @@ public class Session {
             System.err.println("FAIL: create_contentfilteredtopic() failed");
             System.exit(1);
         }
-        Dcps.DDS.DataReader cftDr = sub.create_datareader(cft, drQos, readerListener, Dcps.DDS.SUBSCRIPTION_MATCHED_STATUS.value);
+        Dcps.DDS.DataReader cftDr = sub.create_datareader(cft, drQos, makeReaderListener("SessionIn_cft", cftMatched), Dcps.DDS.SUBSCRIPTION_MATCHED_STATUS.value);
         if (cftDr == null) {
             System.err.println("FAIL: create_datareader(SessionIn_cft) failed");
             System.exit(1);
@@ -204,6 +217,20 @@ public class Session {
         while (!(out1State.readerReady.get() && out2State.readerReady.get())) {
             if (System.currentTimeMillis() > deadline) {
                 System.err.println("FAIL: no reliable reader became ready within " + (READER_READY_TIMEOUT_MS / 1000) + "s");
+                System.exit(1);
+            }
+            Thread.sleep(POLL_PERIOD_MS);
+        }
+
+        // Both readers must match the peer's writer before teardown too:
+        // samples on the plain reader do not mean the CFT reader has
+        // matched, and a first match arriving late would fire its listener
+        // during the teardown.
+        long matchedDeadline = System.currentTimeMillis() + READER_READY_TIMEOUT_MS;
+        while (!(inMatched.get() && cftMatched.get())) {
+            if (System.currentTimeMillis() > matchedDeadline) {
+                System.err.println("FAIL: readers not matched with the peer's writer within " + (READER_READY_TIMEOUT_MS / 1000)
+                    + "s (SessionIn=" + inMatched.get() + " SessionIn_cft=" + cftMatched.get() + ")");
                 System.exit(1);
             }
             Thread.sleep(POLL_PERIOD_MS);
@@ -249,13 +276,14 @@ public class Session {
 
         // The core test: tear the whole tree down in one shot instead of
         // deleting out1Dw/out2Dw/inDr/cftDr/cft one at a time.
-        tornDown.set(true);
+        phase.set(PHASE_DELETING);
 
         int rc1 = dp.delete_contained_entities();
         if (rc1 != Dcps.DDS.RETCODE_OK.value) {
             System.err.println("FAIL: delete_contained_entities() returned " + rc1 + ", expected RETCODE_OK");
             System.exit(1);
         }
+        phase.set(PHASE_DELETED);
 
         int rc2 = factory.delete_participant(dp);
         if (rc2 != Dcps.DDS.RETCODE_OK.value) {

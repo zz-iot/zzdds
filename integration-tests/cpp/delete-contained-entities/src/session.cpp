@@ -42,7 +42,20 @@ constexpr int RECEIVE_TIMEOUT_MS = 20000;
 constexpr ::DDS::Duration_t WAIT_STEP{1, 0};
 constexpr int POLL_PERIOD_MS = 20;
 
-std::atomic<bool> torn_down{false};
+enum Phase : int { PHASE_RUNNING, PHASE_DELETING, PHASE_DELETED };
+std::atomic<int> phase{PHASE_RUNNING};
+
+void fail_if_torn_down(const char *callback, const char *topic, int32_t total_count, int32_t total_count_change,
+                       int32_t current_count, int32_t current_count_change) {
+    int p = phase.load();
+    if (p == PHASE_RUNNING) return;
+    std::fprintf(stderr,
+                 "FAIL: listener fired %s delete_contained_entities: %s on %s "
+                 "(total_count=%d total_count_change=%d current_count=%d current_count_change=%d)\n",
+                 p == PHASE_DELETING ? "during" : "after", callback, topic, total_count, total_count_change,
+                 current_count, current_count_change);
+    std::exit(1);
+}
 
 struct WriterSyncState {
     std::atomic<bool> reader_ready{false};
@@ -50,14 +63,12 @@ struct WriterSyncState {
 
 class WriterListener : public ::zzdds::DataWriterListenerExBase {
 public:
-    explicit WriterListener(WriterSyncState *state) : state_(state) {}
+    WriterListener(WriterSyncState *state, const char *topic) : state_(state), topic_(topic) {}
 
     void on_publication_matched(std::shared_ptr<::DDS::DataWriter> /*writer*/,
-                                 ::DDS::PublicationMatchedStatus /*status*/) override {
-        if (torn_down.load()) {
-            std::fprintf(stderr, "FAIL: listener fired after delete_contained_entities\n");
-            std::exit(1);
-        }
+                                 ::DDS::PublicationMatchedStatus status) override {
+        fail_if_torn_down("on_publication_matched", topic_, status.total_count, status.total_count_change,
+                          status.current_count, status.current_count_change);
     }
 
     void on_reliable_reader_ready(::DDS::InstanceHandle_t /*reader_handle*/, bool is_ready) override {
@@ -66,17 +77,25 @@ public:
 
 private:
     WriterSyncState *state_;
+    const char *topic_;
 };
 
 class ReaderListener : public ::DDS::DataReaderListenerBase {
 public:
+    explicit ReaderListener(const char *topic) : topic_(topic) {}
+
     void on_subscription_matched(std::shared_ptr<::DDS::DataReader> /*reader*/,
-                                  ::DDS::SubscriptionMatchedStatus /*status*/) override {
-        if (torn_down.load()) {
-            std::fprintf(stderr, "FAIL: listener fired after delete_contained_entities\n");
-            std::exit(1);
-        }
+                                  ::DDS::SubscriptionMatchedStatus status) override {
+        fail_if_torn_down("on_subscription_matched", topic_, status.total_count, status.total_count_change,
+                          status.current_count, status.current_count_change);
+        if (status.current_count > 0) matched_.store(true);
     }
+
+    bool matched() const { return matched_.load(); }
+
+private:
+    const char *topic_;
+    std::atomic<bool> matched_{false};
 };
 
 uint32_t parse_domain(int argc, char **argv) {
@@ -142,8 +161,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     WriterSyncState out1_state, out2_state;
-    auto out1_listener = std::make_shared<WriterListener>(&out1_state);
-    auto out2_listener = std::make_shared<WriterListener>(&out2_state);
+    auto out1_listener = std::make_shared<WriterListener>(&out1_state, "SessionOut1");
+    auto out2_listener = std::make_shared<WriterListener>(&out2_state, "SessionOut2");
     auto out1_dw = zpub->create_datawriter_ex(out1_topic, dw_qos, out1_listener, DDS_PUBLICATION_MATCHED_STATUS);
     auto out2_dw = zpub->create_datawriter_ex(out2_topic, dw_qos, out2_listener, DDS_PUBLICATION_MATCHED_STATUS);
     if (!out1_dw || !out2_dw) {
@@ -165,7 +184,8 @@ int main(int argc, char **argv) {
 
     // Reader listeners are attached at creation, so their "never after
     // teardown" check covers the readers' whole lifetime.
-    auto reader_listener = std::make_shared<ReaderListener>();
+    auto reader_listener = std::make_shared<ReaderListener>("SessionIn");
+    auto cft_reader_listener = std::make_shared<ReaderListener>("SessionIn_cft");
     auto zin_topic = std::static_pointer_cast<::zzdds::TopicImpl>(in_topic);
     auto in_desc = zin_topic->as_topic_description();
     auto in_dr = sub->create_datareader(in_desc, dr_qos, reader_listener, DDS_SUBSCRIPTION_MATCHED_STATUS);
@@ -183,7 +203,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "FAIL: create_contentfilteredtopic() failed\n");
         return 1;
     }
-    auto cft_dr = sub->create_datareader(cft, dr_qos, reader_listener, DDS_SUBSCRIPTION_MATCHED_STATUS);
+    auto cft_dr = sub->create_datareader(cft, dr_qos, cft_reader_listener, DDS_SUBSCRIPTION_MATCHED_STATUS);
     if (!cft_dr) {
         std::fprintf(stderr, "FAIL: create_datareader(SessionIn_cft) failed\n");
         return 1;
@@ -217,6 +237,19 @@ int main(int argc, char **argv) {
     for (int waited_ms = 0; !(out1_state.reader_ready.load() && out2_state.reader_ready.load()); waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= READER_READY_TIMEOUT_MS) {
             std::fprintf(stderr, "FAIL: no reliable reader became ready within %ds\n", READER_READY_TIMEOUT_MS / 1000);
+            return 1;
+        }
+        usleep(POLL_PERIOD_MS * 1000);
+    }
+
+    // Both readers must match the peer's writer before teardown too: samples
+    // on the plain reader do not mean the CFT reader has matched, and a first
+    // match arriving late would fire its listener during the teardown.
+    for (int waited_ms = 0; !(reader_listener->matched() && cft_reader_listener->matched()); waited_ms += POLL_PERIOD_MS) {
+        if (waited_ms >= READER_READY_TIMEOUT_MS) {
+            std::fprintf(stderr, "FAIL: readers not matched with the peer's writer within %ds (SessionIn=%s SessionIn_cft=%s)\n",
+                         READER_READY_TIMEOUT_MS / 1000, reader_listener->matched() ? "true" : "false",
+                         cft_reader_listener->matched() ? "true" : "false");
             return 1;
         }
         usleep(POLL_PERIOD_MS * 1000);
@@ -261,13 +294,14 @@ int main(int argc, char **argv) {
 
     // The core test: tear the whole tree down in one shot instead of
     // deleting out1_dw/out2_dw/in_dr/cft_dr/cft one at a time.
-    torn_down.store(true);
+    phase.store(PHASE_DELETING);
 
     auto rc1 = dp->delete_contained_entities();
     if (rc1 != ::DDS::RETCODE_OK) {
         std::fprintf(stderr, "FAIL: delete_contained_entities() returned %d, expected RETCODE_OK\n", static_cast<int>(rc1));
         return 1;
     }
+    phase.store(PHASE_DELETED);
 
     auto rc2 = factory->delete_participant(dp);
     if (rc2 != ::DDS::RETCODE_OK) {
