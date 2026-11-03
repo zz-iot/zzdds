@@ -262,12 +262,12 @@ jobs:
           - name: Linux x86_64
             os: ubuntu-latest
             install_opencv: true
-            timeout: 40
+            timeout: 42
             # Below `timeout` with room for setup/build before it and the
             # diagnostics upload after it. A typical run takes ~18 min on the
             # threaded runtime and ~23 min on the shared one, longer when the
             # Zig cache misses (e.g. after a zidl bump).
-            test_timeout: 32
+            test_timeout: 35
           # All bindings and mesh scenarios run on Windows. Only OpenCV is
           # excluded, since its Windows toolchain is not installed here.
           - name: Windows x86_64
