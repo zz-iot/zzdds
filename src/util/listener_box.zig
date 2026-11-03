@@ -49,11 +49,13 @@ pub fn ListenerBox(comptime T: type) type {
         }
 
         /// The listener's exclusion identity (listener_identity.zig): its
-        /// `listener_data`, or this registration when that is null. Null
-        /// without memory to record it. Call while holding a reference.
+        /// `listener_identity`, else its `listener_data`, else this
+        /// registration. Null without memory to record it. Call while
+        /// holding a reference.
         pub fn identity(self: *Self) ?*listener_identity.Identity {
             if (self.ident.load(.acquire)) |id| return id;
-            const data: ?*anyopaque = self.listener.listener_data;
+            const explicit: ?*anyopaque = if (@hasField(T, "listener_identity")) self.listener.listener_identity else null;
+            const data: ?*anyopaque = explicit orelse self.listener.listener_data;
             const key: listener_identity.Key = if (data) |d|
                 .{ .ptr = @intFromPtr(d), .kind = .context }
             else
@@ -137,4 +139,27 @@ test "ListenerBox: a null release_listener_data is a no-op, not a crash" {
     };
     const box = try ListenerBox(Listener).create(testing.allocator, .{});
     box.releaseRef(testing.allocator);
+}
+
+test "ListenerBox: listener_identity, when set, names the identity rather than listener_data" {
+    const Listener = struct {
+        listener_data: ?*anyopaque = null,
+        release_listener_data: ?*const fn (?*anyopaque) callconv(.c) void = null,
+        listener_identity: ?*anyopaque = null,
+    };
+    var object: u8 = 0;
+    var reg_a: u8 = 0;
+    var reg_b: u8 = 0;
+    // Two registrations of one object, each with its own listener_data (as
+    // the C++ binding's owning references are): one identity.
+    const a = try ListenerBox(Listener).create(testing.allocator, .{ .listener_data = &reg_a, .listener_identity = &object });
+    defer a.releaseRef(testing.allocator);
+    const b = try ListenerBox(Listener).create(testing.allocator, .{ .listener_data = &reg_b, .listener_identity = &object });
+    defer b.releaseRef(testing.allocator);
+    try testing.expect(a.identity().? == b.identity().?);
+    // Without listener_identity, listener_data still names it.
+    const c = try ListenerBox(Listener).create(testing.allocator, .{ .listener_data = &reg_a });
+    defer c.releaseRef(testing.allocator);
+    try testing.expect(c.identity().? != a.identity().?);
+    try testing.expect(c.identity().?.key.ptr == @intFromPtr(&reg_a));
 }

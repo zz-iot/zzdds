@@ -51,6 +51,7 @@ pub fn listenerExFromBase(l: DDS.DataWriterListener) ZZDDS.DataWriterListenerEx 
     return .{
         .listener_data = l.listener_data,
         .release_listener_data = l.release_listener_data,
+        .listener_identity = l.listener_identity,
         .on_offered_deadline_missed = l.on_offered_deadline_missed,
         .on_offered_incompatible_qos = l.on_offered_incompatible_qos,
         .on_liveliness_lost = l.on_liveliness_lost,
@@ -65,6 +66,7 @@ fn baseFromListenerEx(l: ZZDDS.DataWriterListenerEx) DDS.DataWriterListener {
     return .{
         .listener_data = l.listener_data,
         .release_listener_data = l.release_listener_data,
+        .listener_identity = l.listener_identity,
         .on_offered_deadline_missed = l.on_offered_deadline_missed,
         .on_offered_incompatible_qos = l.on_offered_incompatible_qos,
         .on_liveliness_lost = l.on_liveliness_lost,

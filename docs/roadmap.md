@@ -473,35 +473,12 @@ or an optimisation on an already-improved path):
   tests migrated to it. Keep public `TypeSupport`, `filter` (`FilterValue`/`CdrFieldGetter`,
   used by generated `getFieldFromCdr`) and the `nil_*`/`NIL_PTR` sentinels. Verify with
   `zig build test`, the strict examples suite and a `dds-rtps` rebuild.
-- **Listener identity in the C++ and Java bindings.** On a shared runtime, one listener
-  runs one call at a time wherever it is installed, and the core recognizes one listener
-  by its registration's `listener_data` (`src/util/listener_identity.zig`). C and Zig
-  callers pass one pointer per listener; the bindings do not yet
-  ([design](design/concurrency/listeners.md#binding-identity-and-ownership), and the
-  index's "Listener bridge ABI" open item):
-  - **C++** passes `this` as the specific `FooListenerBase*`, so an object deriving from
-    two listener bases registers under two addresses. Plan: a zidl annotation
-    `@shared_base` on a base interface, meaning its direct inheritors share one copy of
-    it. The C++ backend maps it to `public virtual` inheritance and rejects it on an
-    interface that declares operations (the generated `Base` classes' default overrides
-    would have no unique final overrider); other backends decide for themselves and
-    ignore it for now. `dcps.idl` marks `Listener` with it, and `c_listener()` passes
-    `static_cast<::DDS::Listener*>(this)` as a new identity field in the C listener
-    struct, which the core prefers over `listener_data`; dispatch keeps the base pointer.
-    The virtual base also gives a partly constructed object its final identity.
-  - **Java** allocates a native context with a new global reference per registration, so
-    one Java object set on two entities is two listeners. Plan: a binding-owned registry,
-    consulted only at `set_listener`/`create_*`, never per callback, mapping a Java object
-    (bucketed by `System.identityHashCode`, matched with `IsSameObject`) to one
-    reference-counted native context released through `release_listener_data`. An
-    optional generated base class holding the native handle could later skip the lookup
-    for applications that register often.
-  - **C++ listener lifetime (suspected, not reproduced).** `c_listener()` does not set
-    `release_listener_data`: the listener stays alive only through the entity wrapper's
-    stored `shared_ptr`, which `set_listener` overwrites at once, so replacing a listener
-    the application holds no other reference to may free it while a call is running or
-    queued. Fix: each registration owns a heap copy of the `shared_ptr`, deleted in
-    `release_listener_data`. Write the failing test first.
+- **A failed `create_*` does not release its listener registration.** The core frees the
+  boxed listener without calling `release_listener_data`, so the C++ and Java bindings read
+  the new entity's listener back and release theirs when it is not installed. If a callback
+  of the new entity replaces that listener before the read-back, the registration is
+  released twice. Fix: the core releases the registration on every failed `create_*`, and
+  the bindings drop the read-back.
 - **Java: a few DCPS ops taking a bare `sequence<T>` parameter** (not inside a struct) throw
   `UnsupportedOperationException` (`get_datareaders`, some batch ops). `zzdds.idl`
   vendor-extension / cross-file type refs in zidl's Java backend may be partly stale versus
@@ -1116,12 +1093,15 @@ deleting it from any callback chain does not wait. Builtin-topic readers' listen
 the same way. One endpoint's listeners run one at a time, and different endpoints' may
 run at once on hosted workers, except that one listener runs one call at a time wherever
 it is installed, including as a parent's listener: the core identifies it by its
-`listener_data` (or the registration, when that is null), and a turn whose listener is
+`listener_identity`, else its `listener_data` (or the registration, when both are null), and a turn whose listener is
 running elsewhere leaves the runtime until it returns. `notify_datareaders` runs a reader's
 listener inline only when neither the reader's turn nor that listener is running elsewhere
 (its own callback chain excepted), and otherwise leaves it to the reader's turn, which
-waits for an inline call to return. The C++ and Java bindings do not yet
-pass one `listener_data` per application object (see [Bindings](#bindings)). Deleting a
+waits for an inline call to return. A registration's `listener_identity`, when set, names
+the listener instead of its `listener_data`: the C++ binding passes the object's
+`DDS::Listener` subobject (a virtual base, so one per object), and the Java binding keeps
+one native context per listener object, so each identifies one application object across
+all of its registrations. Deleting a
 participant from one of its listeners, including one called by `notify_datareaders`,
 finishes once its other listeners in progress, and that traversal, return. On a manual runtime, blocking calls help: a WaitSet
 created with that runtime, `wait_for_acknowledgments` on a writer or publisher, and

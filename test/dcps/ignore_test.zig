@@ -72,12 +72,16 @@ const Harness = struct {
     net: *MockNetwork,
     transport: *MockTransport,
     factory: *DomainParticipantFactoryImpl,
-    disc: CapturingDisc,
+    /// On the heap: the factory keeps a pointer to it, and `init` returns
+    /// the Harness by value.
+    disc: *CapturingDisc,
 
     fn init() !Harness {
         var h: Harness = undefined;
-        h.disc = .{};
         const alloc = testing.allocator;
+        h.disc = try alloc.create(CapturingDisc);
+        errdefer alloc.destroy(h.disc);
+        h.disc.* = .{};
         h.net = try MockNetwork.init(alloc);
         errdefer h.net.deinit();
         h.transport = try MockTransport.init(alloc, h.net, &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7410)});
@@ -97,6 +101,7 @@ const Harness = struct {
         self.factory.deinit();
         self.transport.deinit();
         self.net.deinit();
+        testing.allocator.destroy(self.disc);
     }
 
     /// Fire on_participant_discovered for a fake remote participant with the

@@ -26,7 +26,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR.parent / "examples"))
-from _common import run_build, zzdds_zig_out  # noqa: E402
+from _common import executable_path, run_build, zzdds_zig_out  # noqa: E402
 
 PASSED: list[str] = []
 SKIPPED: list[str] = []
@@ -94,7 +94,7 @@ def main() -> int:
 
     c_binding = (zig_out / "include" / "zzdds_c.h").is_file()
     cpp_binding = (zig_out / "src" / "dcps_impl.cpp").is_file()
-    java_binding = (zig_out / "java").is_dir() and (zig_out / "bin" / "zidl").is_file()
+    java_binding = (zig_out / "java").is_dir() and executable_path(zig_out / "bin" / "zidl").is_file()
 
     print(f"ZZDDS_ZIG_OUT={zig_out}")
     print(f"Detected: c-binding={int(c_binding)} cpp-binding={int(cpp_binding)} java-binding={int(java_binding)}")

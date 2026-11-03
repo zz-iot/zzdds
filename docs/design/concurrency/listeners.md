@@ -199,22 +199,29 @@ Supply canonical identity independently at registration, retain the resolved exc
 record for callbacks, and track binding-resource ownership separately. An identity
 record is not ownership of a borrowed application object.
 
-**Conforming approach — C++ identity.** Registration-time `dynamic_cast<void*>(this)` is a candidate
-for obtaining complete-object identity while retaining the adjusted ListenerBase
-pointer for dispatch. It needs no new application override or common virtual base.
-Constructor/destructor registration and multiple-inheritance/interface-view tests
-must be addressed before selecting the implementation. Separate forwarding objects
-remain distinct unless an adapter explicitly supplies common identity or the
-application groups them. This is not an entity-wrapper identity mechanism.
+**C++ identity (implemented).** `dcps.idl` marks `DDS::Listener` `@shared_base`, which
+zidl's C++ backend maps to virtual inheritance, so an object holds one `Listener`
+subobject however many listener interfaces it implements, at one address from
+construction on. `FooListenerBase::c_listener` passes it as the registration's
+`listener_identity`, a static upcast that needs no RTTI. An interface with no
+`@shared_base` ancestor passes the complete object (`dynamic_cast<void*>`) where RTTI is
+available, else its own subobject. Dispatch goes through the listener interface's virtual
+functions, reached through `listener_data`, which is a per-registration `shared_ptr` owning
+the listener until the core calls `release_listener_data`. Separate forwarding objects remain
+distinct unless an adapter explicitly supplies common identity or the application groups
+them. This is not an entity-wrapper identity mechanism.
 
-**Conforming approach — Java identity.** Prefer binding-owned canonicalization of actual object identity over a
+**Java identity (implemented as below).** The generated JNI bridge keeps one
+reference-counted native context per listener object, found through a registry bucketed by
+`System.identityHashCode` and matched with `IsSameObject`, so the shared `listener_data` is
+the identity. Prefer binding-owned canonicalization of actual object identity over a
 mandatory application superclass containing a native handle. Registration-time lookup
 and reference bookkeeping keep this work off the callback path. Raw C/Zig retain
 application-context identity defaults. Canonical tokens must have an explicit namespace
 and lifetime; they cannot alias unrelated native or VM objects accidentally.
 
-A separate identity field, versioned registration descriptor or identity-query hook
-remain ABI alternatives. Appending a field to existing generated callback structs
+The identity travels in a `listener_identity` field appended to each generated callback
+struct; a versioned registration descriptor or identity-query hook remain alternatives. Appending a field to existing generated callback structs
 is not automatically binary-compatible. Resolve layout/version negotiation and
 failure ownership in an implementation plan rather than changing OMG interfaces.
 New application controls remain in `zzdds.idl`; generated internal metadata does not

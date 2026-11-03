@@ -6,13 +6,30 @@
 #include <memory>
 #include <memory_resource>
 #include <mutex>
-#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 
 namespace zzdds {
 
 namespace detail {
+
+// Runs `f` on scope exit unless dismissed. The wrap*Handle functions below
+// use it to destroy a C handle when constructing its wrapper fails: with
+// exceptions, std::allocate_shared throws std::bad_alloc and unwinding runs
+// the guard; without them, allocation failure aborts.
+template <typename F>
+class ScopeGuard {
+public:
+    explicit ScopeGuard(F f) : f_(std::move(f)) {}
+    ScopeGuard(const ScopeGuard&) = delete;
+    ScopeGuard& operator=(const ScopeGuard&) = delete;
+    ~ScopeGuard() { if (active_) f_(); }
+    void dismiss() noexcept { active_ = false; }
+
+private:
+    F f_;
+    bool active_ = true;
+};
 
 class DomainParticipantFactorySupport final : public DomainParticipantFactoryImpl {
 public:
@@ -154,31 +171,32 @@ public:
     // StatusCondition::get_entity() can return a generic ::DDS::Entity for
     // the exact same handle this object wraps — without sharing the cache,
     // that generic Entity would never compare identity-equal to this object.
+    // Identifies this class's entries in the family's shared cache.
+    static const void* _familyTag() noexcept { static const char t = 0; return &t; }
+
     static std::shared_ptr<TopicSupport> _getOrCreate(DDS_Topic h) {
         if (!h) return nullptr;
         DDS_Entity _fh = DDS_Topic_as_DDS_Entity(h);
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
         auto& _cache = ::DDS::EntityImpl::_familyCache();
         auto _it = _cache.find(_fh);
-        if (_it != _cache.end()) {
-            if (auto _base = _it->second.lock()) {
-                if (auto _sp = std::dynamic_pointer_cast<TopicSupport>(_base)) return _sp;
-            }
+        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
+            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<TopicSupport>(_base, static_cast<TopicSupport*>(_it->second.obj));
         }
         auto _sp = std::allocate_shared<TopicSupport>(
             std::pmr::polymorphic_allocator<TopicSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = _sp;
+        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
         return _sp;
     }
 
+    // The DDS views' C handles come from dds_, the DDS::*Impl this class
+    // composes, as entity parameters of DDS types expect. They override
+    // the inherited zzdds::*Impl ones, which convert from the extension handle.
+    DDS_Topic _zidl_handle_DDS_Topic() const noexcept override { return dds_._zidl_handle_DDS_Topic(); }
+    DDS_TopicDescription _zidl_handle_DDS_TopicDescription() const noexcept override { return dds_._zidl_handle_DDS_TopicDescription(); }
+    DDS_Entity _zidl_handle_DDS_Entity() const noexcept override { return dds_._zidl_handle_DDS_Entity(); }
+
 private:
-    // Shadows the inherited TopicImpl (base) friend of the same name, which
-    // returns the zzdds *extension* handle (zzdds_Topic) -- wrong type for
-    // call sites expecting the base DDS_Topic (confirmed directly: without
-    // this, dcps_impl.cpp fails to compile with "cannot convert zzdds_Topic
-    // to DDS_Topic"). Exact-match overload resolution prefers this one over
-    // the inherited const TopicImpl& version.
-    friend DDS_Topic zidl_concrete_handle(const TopicSupport& self) noexcept { return self.dds_.native_handle(); }
     ::DDS::TopicImpl dds_;
 };
 
@@ -243,26 +261,29 @@ public:
     }
 
     // See TopicSupport's matching comment.
+    // Identifies this class's entries in the family's shared cache.
+    static const void* _familyTag() noexcept { static const char t = 0; return &t; }
+
     static std::shared_ptr<DataWriterSupport> _getOrCreate(DDS_DataWriter h) {
         if (!h) return nullptr;
         DDS_Entity _fh = DDS_DataWriter_as_DDS_Entity(h);
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
         auto& _cache = ::DDS::EntityImpl::_familyCache();
         auto _it = _cache.find(_fh);
-        if (_it != _cache.end()) {
-            if (auto _base = _it->second.lock()) {
-                if (auto _sp = std::dynamic_pointer_cast<DataWriterSupport>(_base)) return _sp;
-            }
+        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
+            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<DataWriterSupport>(_base, static_cast<DataWriterSupport*>(_it->second.obj));
         }
         auto _sp = std::allocate_shared<DataWriterSupport>(
             std::pmr::polymorphic_allocator<DataWriterSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = _sp;
+        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
         return _sp;
     }
 
+    // DDS-view handles from dds_; see TopicSupport.
+    DDS_DataWriter _zidl_handle_DDS_DataWriter() const noexcept override { return dds_._zidl_handle_DDS_DataWriter(); }
+    DDS_Entity _zidl_handle_DDS_Entity() const noexcept override { return dds_._zidl_handle_DDS_Entity(); }
+
 private:
-    // See TopicSupport's matching comment.
-    friend DDS_DataWriter zidl_concrete_handle(const DataWriterSupport& self) noexcept { return self.dds_.native_handle(); }
     ::DDS::DataWriterImpl dds_;
 };
 
@@ -365,26 +386,29 @@ public:
     }
 
     // See TopicSupport's matching comment.
+    // Identifies this class's entries in the family's shared cache.
+    static const void* _familyTag() noexcept { static const char t = 0; return &t; }
+
     static std::shared_ptr<DataReaderSupport> _getOrCreate(DDS_DataReader h) {
         if (!h) return nullptr;
         DDS_Entity _fh = DDS_DataReader_as_DDS_Entity(h);
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
         auto& _cache = ::DDS::EntityImpl::_familyCache();
         auto _it = _cache.find(_fh);
-        if (_it != _cache.end()) {
-            if (auto _base = _it->second.lock()) {
-                if (auto _sp = std::dynamic_pointer_cast<DataReaderSupport>(_base)) return _sp;
-            }
+        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
+            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<DataReaderSupport>(_base, static_cast<DataReaderSupport*>(_it->second.obj));
         }
         auto _sp = std::allocate_shared<DataReaderSupport>(
             std::pmr::polymorphic_allocator<DataReaderSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = _sp;
+        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
         return _sp;
     }
 
+    // DDS-view handles from dds_; see TopicSupport.
+    DDS_DataReader _zidl_handle_DDS_DataReader() const noexcept override { return dds_._zidl_handle_DDS_DataReader(); }
+    DDS_Entity _zidl_handle_DDS_Entity() const noexcept override { return dds_._zidl_handle_DDS_Entity(); }
+
 private:
-    // See TopicSupport's matching comment.
-    friend DDS_DataReader zidl_concrete_handle(const DataReaderSupport& self) noexcept { return self.dds_.native_handle(); }
     ::DDS::DataReaderImpl dds_;
 };
 
@@ -435,26 +459,29 @@ public:
     }
 
     // See TopicSupport's matching comment.
+    // Identifies this class's entries in the family's shared cache.
+    static const void* _familyTag() noexcept { static const char t = 0; return &t; }
+
     static std::shared_ptr<PublisherSupport> _getOrCreate(DDS_Publisher h) {
         if (!h) return nullptr;
         DDS_Entity _fh = DDS_Publisher_as_DDS_Entity(h);
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
         auto& _cache = ::DDS::EntityImpl::_familyCache();
         auto _it = _cache.find(_fh);
-        if (_it != _cache.end()) {
-            if (auto _base = _it->second.lock()) {
-                if (auto _sp = std::dynamic_pointer_cast<PublisherSupport>(_base)) return _sp;
-            }
+        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
+            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<PublisherSupport>(_base, static_cast<PublisherSupport*>(_it->second.obj));
         }
         auto _sp = std::allocate_shared<PublisherSupport>(
             std::pmr::polymorphic_allocator<PublisherSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = _sp;
+        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
         return _sp;
     }
 
+    // DDS-view handles from dds_; see TopicSupport.
+    DDS_Publisher _zidl_handle_DDS_Publisher() const noexcept override { return dds_._zidl_handle_DDS_Publisher(); }
+    DDS_Entity _zidl_handle_DDS_Entity() const noexcept override { return dds_._zidl_handle_DDS_Entity(); }
+
 private:
-    // See TopicSupport's matching comment.
-    friend DDS_Publisher zidl_concrete_handle(const PublisherSupport& self) noexcept { return self.dds_.native_handle(); }
     ::DDS::PublisherImpl dds_;
 };
 
@@ -509,26 +536,29 @@ public:
     }
 
     // See TopicSupport's matching comment.
+    // Identifies this class's entries in the family's shared cache.
+    static const void* _familyTag() noexcept { static const char t = 0; return &t; }
+
     static std::shared_ptr<SubscriberSupport> _getOrCreate(DDS_Subscriber h) {
         if (!h) return nullptr;
         DDS_Entity _fh = DDS_Subscriber_as_DDS_Entity(h);
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
         auto& _cache = ::DDS::EntityImpl::_familyCache();
         auto _it = _cache.find(_fh);
-        if (_it != _cache.end()) {
-            if (auto _base = _it->second.lock()) {
-                if (auto _sp = std::dynamic_pointer_cast<SubscriberSupport>(_base)) return _sp;
-            }
+        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
+            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<SubscriberSupport>(_base, static_cast<SubscriberSupport*>(_it->second.obj));
         }
         auto _sp = std::allocate_shared<SubscriberSupport>(
             std::pmr::polymorphic_allocator<SubscriberSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = _sp;
+        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
         return _sp;
     }
 
+    // DDS-view handles from dds_; see TopicSupport.
+    DDS_Subscriber _zidl_handle_DDS_Subscriber() const noexcept override { return dds_._zidl_handle_DDS_Subscriber(); }
+    DDS_Entity _zidl_handle_DDS_Entity() const noexcept override { return dds_._zidl_handle_DDS_Entity(); }
+
 private:
-    // See TopicSupport's matching comment.
-    friend DDS_Subscriber zidl_concrete_handle(const SubscriberSupport& self) noexcept { return self.dds_.native_handle(); }
     ::DDS::SubscriberImpl dds_;
 };
 
@@ -556,28 +586,29 @@ public:
     // See TopicSupport's matching comment. A ContentFilteredTopic is not an
     // Entity, so the wrapper lives in the TopicDescription family cache, as
     // the generated ::DDS::ContentFilteredTopicImpl does.
+    // Identifies this class's entries in the family's shared cache.
+    static const void* _familyTag() noexcept { static const char t = 0; return &t; }
+
     static std::shared_ptr<ContentFilteredTopicSupport> _getOrCreate(DDS_ContentFilteredTopic h) {
         if (!h) return nullptr;
         DDS_TopicDescription _fh = DDS_ContentFilteredTopic_as_DDS_TopicDescription(h);
         std::lock_guard<std::mutex> _lock(::DDS::TopicDescriptionImpl::_familyMutex());
         auto& _cache = ::DDS::TopicDescriptionImpl::_familyCache();
         auto _it = _cache.find(_fh);
-        if (_it != _cache.end()) {
-            if (auto _base = _it->second.lock()) {
-                if (auto _sp = std::dynamic_pointer_cast<ContentFilteredTopicSupport>(_base)) return _sp;
-            }
+        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
+            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<ContentFilteredTopicSupport>(_base, static_cast<ContentFilteredTopicSupport*>(_it->second.obj));
         }
         auto _sp = std::allocate_shared<ContentFilteredTopicSupport>(
             std::pmr::polymorphic_allocator<ContentFilteredTopicSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = _sp;
+        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
         return _sp;
     }
 
+    // DDS-view handles from dds_; see TopicSupport.
+    DDS_ContentFilteredTopic _zidl_handle_DDS_ContentFilteredTopic() const noexcept override { return dds_._zidl_handle_DDS_ContentFilteredTopic(); }
+    DDS_TopicDescription _zidl_handle_DDS_TopicDescription() const noexcept override { return dds_._zidl_handle_DDS_TopicDescription(); }
+
 private:
-    // See TopicSupport's matching comment.
-    friend DDS_ContentFilteredTopic zidl_concrete_handle(const ContentFilteredTopicSupport& self) noexcept {
-        return self.dds_.native_handle();
-    }
     ::DDS::ContentFilteredTopicImpl dds_;
 };
 
@@ -674,26 +705,29 @@ public:
     ::DDS::ReturnCode_t get_current_time(::DDS::Time_t& current_time) override { return dds_.get_current_time(current_time); }
 
     // See TopicSupport's matching comment.
+    // Identifies this class's entries in the family's shared cache.
+    static const void* _familyTag() noexcept { static const char t = 0; return &t; }
+
     static std::shared_ptr<DomainParticipantSupport> _getOrCreate(DDS_DomainParticipant h) {
         if (!h) return nullptr;
         DDS_Entity _fh = DDS_DomainParticipant_as_DDS_Entity(h);
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
         auto& _cache = ::DDS::EntityImpl::_familyCache();
         auto _it = _cache.find(_fh);
-        if (_it != _cache.end()) {
-            if (auto _base = _it->second.lock()) {
-                if (auto _sp = std::dynamic_pointer_cast<DomainParticipantSupport>(_base)) return _sp;
-            }
+        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
+            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<DomainParticipantSupport>(_base, static_cast<DomainParticipantSupport*>(_it->second.obj));
         }
         auto _sp = std::allocate_shared<DomainParticipantSupport>(
             std::pmr::polymorphic_allocator<DomainParticipantSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = _sp;
+        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
         return _sp;
     }
 
+    // DDS-view handles from dds_; see TopicSupport.
+    DDS_DomainParticipant _zidl_handle_DDS_DomainParticipant() const noexcept override { return dds_._zidl_handle_DDS_DomainParticipant(); }
+    DDS_Entity _zidl_handle_DDS_Entity() const noexcept override { return dds_._zidl_handle_DDS_Entity(); }
+
 private:
-    // See TopicSupport's matching comment.
-    friend DDS_DomainParticipant zidl_concrete_handle(const DomainParticipantSupport& self) noexcept { return self.dds_.native_handle(); }
     ::DDS::DomainParticipantImpl dds_;
 };
 
@@ -728,22 +762,20 @@ namespace detail {
 // std::bad_alloc *before* the constructor ever runs, e.g. under a bounded
 // pool allocator registered via zidl::setCppAllocator that's exhausted. In
 // that case DomainParticipantFactorySupport never exists, so its destructor
-// never runs, so nothing frees `handle` -- the try/catch below is what
-// closes that gap, not the constructor's own noexcept-ness.
+// never runs, so nothing frees `handle` -- the guard below is what closes
+// that gap, not the constructor's own noexcept-ness.
 inline std::shared_ptr<DomainParticipantFactory> wrapFactoryHandle(zzdds_DomainParticipantFactory handle)
 {
     if (zzdds_factory_is_nil(handle)) return {};
 
-    try {
-        return std::allocate_shared<detail::DomainParticipantFactorySupport>(
-            std::pmr::polymorphic_allocator<detail::DomainParticipantFactorySupport>(
-                std::pmr::get_default_resource()),
-            handle
-        );
-    } catch (...) {
-        zzdds_destroy_factory(handle);
-        throw;
-    }
+    ScopeGuard guard([handle] { zzdds_destroy_factory(handle); });
+    auto sp = std::allocate_shared<detail::DomainParticipantFactorySupport>(
+        std::pmr::polymorphic_allocator<detail::DomainParticipantFactorySupport>(
+            std::pmr::get_default_resource()),
+        handle
+    );
+    guard.dismiss();
+    return sp;
 }
 
 } // namespace detail
@@ -846,7 +878,9 @@ public:
     ::DDS::ReturnCode_t attach_condition(std::shared_ptr<::DDS::Condition> cond) override
     {
         if (!cond) return ::DDS::WaitSetImpl::attach_condition(cond);
-        DDS_Condition h = resolve_handle(cond);
+        // A condition this binding did not create has no C handle.
+        DDS_Condition h = cond->_zidl_handle_DDS_Condition();
+        if (!h) return ::DDS::RETCODE_BAD_PARAMETER;
         auto* ctx = allocReleaseCtx(std::move(cond));
         bool accepted = false;
         auto rc = zzdds_waitset_attach_condition_with_release(handle_, h, ctx, &release_trampoline, &accepted);
@@ -933,24 +967,6 @@ private:
         freeReleaseCtx(static_cast<ReleaseCtx*>(ctx_raw));
     }
 
-    // Mirrors WaitSetImpl::attach_condition's own generated dynamic_cast
-    // cascade (dcps_impl.cpp) -- duplicated rather than shared because that
-    // one lives inline in a lambda with no separately-callable entry point.
-    static DDS_Condition resolve_handle(const std::shared_ptr<::DDS::Condition>& cond)
-    {
-        if (auto* impl = dynamic_cast<::DDS::ConditionImpl*>(cond.get()))
-            return zidl_concrete_handle(*impl);
-        if (auto* impl = dynamic_cast<::DDS::GuardConditionImpl*>(cond.get()))
-            return DDS_GuardCondition_as_DDS_Condition(zidl_concrete_handle(*impl));
-        if (auto* impl = dynamic_cast<::DDS::StatusConditionImpl*>(cond.get()))
-            return DDS_StatusCondition_as_DDS_Condition(zidl_concrete_handle(*impl));
-        if (auto* impl = dynamic_cast<::DDS::ReadConditionImpl*>(cond.get()))
-            return DDS_ReadCondition_as_DDS_Condition(zidl_concrete_handle(*impl));
-        if (auto* impl = dynamic_cast<::DDS::QueryConditionImpl*>(cond.get()))
-            return DDS_ReadCondition_as_DDS_Condition(DDS_QueryCondition_as_DDS_ReadCondition(zidl_concrete_handle(*impl)));
-        throw std::invalid_argument("zidl: incompatible entity implementation for DDS::Condition");
-    }
-
     DDS_WaitSet handle_;
 };
 
@@ -976,44 +992,41 @@ inline std::shared_ptr<::DDS::WaitSet> wrapWaitSetHandle(DDS_WaitSet handle)
 {
     if (zzdds_waitset_is_nil(handle)) return {};
 
-    try {
-        return std::allocate_shared<WaitSetSupport>(
-            std::pmr::polymorphic_allocator<WaitSetSupport>(
-                std::pmr::get_default_resource()),
-            handle
-        );
-    } catch (...) {
-        zzdds_destroy_waitset(handle);
-        throw;
-    }
+    ScopeGuard guard([handle] { zzdds_destroy_waitset(handle); });
+    auto sp = std::allocate_shared<WaitSetSupport>(
+        std::pmr::polymorphic_allocator<WaitSetSupport>(
+            std::pmr::get_default_resource()),
+        handle
+    );
+    guard.dismiss();
+    return sp;
 }
 
 inline std::shared_ptr<::DDS::GuardCondition> wrapGuardConditionHandle(DDS_GuardCondition handle)
 {
     if (zzdds_guardcondition_is_nil(handle)) return {};
 
-    try {
-        auto sp = std::allocate_shared<GuardConditionSupport>(
-            std::pmr::polymorphic_allocator<GuardConditionSupport>(
-                std::pmr::get_default_resource()),
-            handle
-        );
-        // Register into Condition's shared family cache (see the comment
-        // above this function) so a later WaitSet::wait()/get_conditions()
-        // resolving the same handle via ::DDS::ConditionImpl::_getOrCreate
-        // finds THIS object instead of constructing an unrelated one.
-        // create_guardcondition() always mints a fresh handle, so this is
-        // always a first registration, never a "someone else already cached
-        // it" race to reconcile against.
-        {
-            std::lock_guard<std::mutex> _lock(::DDS::ConditionImpl::_familyMutex());
-            ::DDS::ConditionImpl::_familyCache()[DDS_GuardCondition_as_DDS_Condition(handle)] = sp;
-        }
-        return sp;
-    } catch (...) {
-        zzdds_destroy_guardcondition(handle);
-        throw;
+    ScopeGuard guard([handle] { zzdds_destroy_guardcondition(handle); });
+    auto sp = std::allocate_shared<GuardConditionSupport>(
+        std::pmr::polymorphic_allocator<GuardConditionSupport>(
+            std::pmr::get_default_resource()),
+        handle
+    );
+    // From here on sp's destructor owns the handle.
+    guard.dismiss();
+    // Register into Condition's shared family cache (see the comment
+    // above this function) so a later WaitSet::wait()/get_conditions()
+    // resolving the same handle via ::DDS::ConditionImpl::_getOrCreate
+    // finds THIS object instead of constructing an unrelated one.
+    // create_guardcondition() always mints a fresh handle, so this is
+    // always a first registration, never a "someone else already cached
+    // it" race to reconcile against.
+    {
+        std::lock_guard<std::mutex> _lock(::DDS::ConditionImpl::_familyMutex());
+        ::DDS::ConditionImpl::_familyCache()[DDS_GuardCondition_as_DDS_Condition(handle)] =
+            {sp, ::DDS::GuardConditionImpl::_familyTag(), static_cast<::DDS::GuardConditionImpl*>(sp.get())};
     }
+    return sp;
 }
 
 } // namespace detail

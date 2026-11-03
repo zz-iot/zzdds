@@ -3,10 +3,12 @@
 //! automatic invocations of one application listener never overlap, across
 //! the entities it is installed on and the runtimes they use.
 //!
-//! An identity is a registration's non-null `listener_data`, shared by every
-//! registration passing the same pointer, or the registration itself when it
-//! passes null. A binding makes the pointer consistent for one application
-//! object; the core never looks past it.
+//! An identity is a registration's non-null `listener_identity`, else its
+//! non-null `listener_data`, shared by every registration passing the same
+//! pointer, or the registration itself when both are null. A binding whose
+//! `listener_data` differs per registration (C++: an owning reference) sets
+//! `listener_identity` to the application object; the core never looks past
+//! the pointer.
 //!
 //! Each identity has one execution right. A turn that finds it taken queues
 //! a `Waiter` and returns rather than blocking; the holder's release hands
@@ -23,7 +25,7 @@ pub var global: Registry = .{};
 pub const Key = struct {
     ptr: usize,
     kind: enum(u8) {
-        /// An application's `listener_data`.
+        /// An application's `listener_identity` or `listener_data`.
         context,
         /// A registration whose `listener_data` is null: never shared, so
         /// never in the table.

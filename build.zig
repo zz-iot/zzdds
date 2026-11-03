@@ -846,7 +846,8 @@ pub fn build(b: *std.Build) void {
         });
         c_alloc_smoke_mod.addCSourceFiles(.{
             .files = &.{"test/bindings/smoke/c_allocator_smoke.c"},
-            .flags = &.{ "-std=c99", "-Wall" },
+            // C11 for <stdatomic.h>: the allocation counters are atomic.
+            .flags = &.{ "-std=c11", "-Wall" },
         });
         c_alloc_smoke_mod.addIncludePath(gen_c_dir);
         c_alloc_smoke_mod.addIncludePath(gen_zzdds_c_dir);
@@ -974,61 +975,100 @@ pub fn build(b: *std.Build) void {
             const cpp_smoke = b.addExecutable(.{ .name = "zzdds_cpp_binding_smoke", .root_module = cpp_smoke_mod });
             binding_smoke_step.dependOn(&b.addRunArtifact(cpp_smoke).step);
 
-            const cpp_alloc_smoke_mod = b.createModule(.{
-                .root_source_file = null,
-                .target = target,
-                .optimize = .Debug,
-                .link_libc = true,
-                .link_libcpp = true,
-            });
-            cpp_alloc_smoke_mod.addCSourceFiles(.{
-                .files = &.{"test/bindings/smoke/cpp_allocator_smoke.cpp"},
-                .flags = &.{ "-std=c++17", "-Wall", "-Wextra" },
-            });
-            cpp_alloc_smoke_mod.addCSourceFile(.{
-                .file = alloc_smoke_dcps_impl_cpp,
-                .flags = &.{ "-std=c++17", "-Wall" },
-            });
-            cpp_alloc_smoke_mod.addCSourceFile(.{
-                .file = alloc_smoke_zzdds_impl_cpp,
-                .flags = &.{ "-std=c++17", "-Wall" },
-            });
-            cpp_alloc_smoke_mod.addIncludePath(alloc_smoke_merged.getDirectory());
-            cpp_alloc_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
-            cpp_alloc_smoke_mod.addIncludePath(b.path("include"));
-            cpp_alloc_smoke_mod.linkLibrary(zzdds_lib);
-            const cpp_alloc_smoke = b.addExecutable(.{ .name = "zzdds_cpp_allocator_smoke", .root_module = cpp_alloc_smoke_mod });
-            binding_smoke_step.dependOn(&b.addRunArtifact(cpp_alloc_smoke).step);
+            // The tests below build the generated bindings and zzdds_cpp.hpp
+            // twice: as usual, and with -fno-rtti -fno-exceptions, which they
+            // must also compile and work under. A variant's runs follow the
+            // previous variant's, since each test uses its own domain.
+            const CppVariant = struct { suffix: []const u8, extra: []const []const u8 };
+            const cpp_variants = [_]CppVariant{
+                .{ .suffix = "", .extra = &.{} },
+                .{ .suffix = "_no_rtti_no_exceptions", .extra = &.{ "-fno-rtti", "-fno-exceptions" } },
+            };
+            var prev_ext_run: ?*std.Build.Step = null;
+            var prev_lifetime_run: ?*std.Build.Step = null;
+            for (cpp_variants) |variant| {
+                const test_flags = std.mem.concat(b.allocator, []const u8, &.{ &.{ "-std=c++17", "-Wall", "-Wextra" }, variant.extra }) catch @panic("OOM");
+                const impl_flags = std.mem.concat(b.allocator, []const u8, &.{ &.{ "-std=c++17", "-Wall" }, variant.extra }) catch @panic("OOM");
 
-            // zzdds::Publisher::create_datawriter_ex / Subscriber::create_datareader_ex
-            // through the zzdds_cpp.hpp wrappers, over real loopback discovery.
-            const cpp_ext_smoke_mod = b.createModule(.{
-                .root_source_file = null,
-                .target = target,
-                .optimize = .Debug,
-                .link_libc = true,
-                .link_libcpp = true,
-            });
-            cpp_ext_smoke_mod.addCSourceFiles(.{
-                .files = &.{"test/bindings/smoke/cpp_extension_smoke.cpp"},
-                .flags = &.{ "-std=c++17", "-Wall", "-Wextra" },
-            });
-            cpp_ext_smoke_mod.addCSourceFile(.{ .file = alloc_smoke_dcps_impl_cpp, .flags = &.{ "-std=c++17", "-Wall" } });
-            cpp_ext_smoke_mod.addCSourceFile(.{ .file = alloc_smoke_zzdds_impl_cpp, .flags = &.{ "-std=c++17", "-Wall" } });
-            cpp_ext_smoke_mod.addIncludePath(alloc_smoke_merged.getDirectory());
-            cpp_ext_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
-            cpp_ext_smoke_mod.addIncludePath(b.path("include"));
-            cpp_ext_smoke_mod.linkLibrary(zzdds_lib);
-            const cpp_ext_smoke = b.addExecutable(.{ .name = "zzdds_cpp_extension_smoke", .root_module = cpp_ext_smoke_mod });
-            const cpp_ext_smoke_run = b.addRunArtifact(cpp_ext_smoke);
-            // Own domain: binding smoke binaries run in parallel with each other
-            // (the Java smoke uses domain 0) and with `zig build test` lanes,
-            // whose addTestRun domains count up from 1. Its ports (7400 +
-            // 250*100 = 32400 up) stay below the OS ephemeral ranges (Linux
-            // from 32768, Windows from 49152): a port in that range can be
-            // taken by any socket on the machine first.
-            cpp_ext_smoke_run.setEnvironmentVariable("ZZDDS_TEST_DOMAIN_BASE", "100");
-            binding_smoke_step.dependOn(&cpp_ext_smoke_run.step);
+                const cpp_alloc_smoke_mod = b.createModule(.{
+                    .root_source_file = null,
+                    .target = target,
+                    .optimize = .Debug,
+                    .link_libc = true,
+                    .link_libcpp = true,
+                });
+                cpp_alloc_smoke_mod.addCSourceFiles(.{
+                    .files = &.{"test/bindings/smoke/cpp_allocator_smoke.cpp"},
+                    .flags = test_flags,
+                });
+                cpp_alloc_smoke_mod.addCSourceFile(.{ .file = alloc_smoke_dcps_impl_cpp, .flags = impl_flags });
+                cpp_alloc_smoke_mod.addCSourceFile(.{ .file = alloc_smoke_zzdds_impl_cpp, .flags = impl_flags });
+                cpp_alloc_smoke_mod.addIncludePath(alloc_smoke_merged.getDirectory());
+                cpp_alloc_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+                cpp_alloc_smoke_mod.addIncludePath(b.path("include"));
+                cpp_alloc_smoke_mod.linkLibrary(zzdds_lib);
+                const cpp_alloc_smoke = b.addExecutable(.{ .name = b.fmt("zzdds_cpp_allocator_smoke{s}", .{variant.suffix}), .root_module = cpp_alloc_smoke_mod });
+                binding_smoke_step.dependOn(&b.addRunArtifact(cpp_alloc_smoke).step);
+
+                // zzdds::Publisher::create_datawriter_ex / Subscriber::create_datareader_ex
+                // through the zzdds_cpp.hpp wrappers, over real loopback discovery.
+                const cpp_ext_smoke_mod = b.createModule(.{
+                    .root_source_file = null,
+                    .target = target,
+                    .optimize = .Debug,
+                    .link_libc = true,
+                    .link_libcpp = true,
+                });
+                cpp_ext_smoke_mod.addCSourceFiles(.{
+                    .files = &.{"test/bindings/smoke/cpp_extension_smoke.cpp"},
+                    .flags = test_flags,
+                });
+                cpp_ext_smoke_mod.addCSourceFile(.{ .file = alloc_smoke_dcps_impl_cpp, .flags = impl_flags });
+                cpp_ext_smoke_mod.addCSourceFile(.{ .file = alloc_smoke_zzdds_impl_cpp, .flags = impl_flags });
+                cpp_ext_smoke_mod.addIncludePath(alloc_smoke_merged.getDirectory());
+                cpp_ext_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+                cpp_ext_smoke_mod.addIncludePath(b.path("include"));
+                cpp_ext_smoke_mod.linkLibrary(zzdds_lib);
+                const cpp_ext_smoke = b.addExecutable(.{ .name = b.fmt("zzdds_cpp_extension_smoke{s}", .{variant.suffix}), .root_module = cpp_ext_smoke_mod });
+                const cpp_ext_smoke_run = b.addRunArtifact(cpp_ext_smoke);
+                // Own domain: binding smoke binaries run in parallel with each other
+                // (the Java smoke uses domain 0) and with `zig build test` lanes,
+                // whose addTestRun domains count up from 1. Its ports (7400 +
+                // 250*100 = 32400 up) stay below the OS ephemeral ranges (Linux
+                // from 32768, Windows from 49152): a port in that range can be
+                // taken by any socket on the machine first.
+                cpp_ext_smoke_run.setEnvironmentVariable("ZZDDS_TEST_DOMAIN_BASE", "100");
+                if (prev_ext_run) |prev| cpp_ext_smoke_run.step.dependOn(prev);
+                prev_ext_run = &cpp_ext_smoke_run.step;
+                binding_smoke_step.dependOn(&cpp_ext_smoke_run.step);
+
+                // C++ listener registrations: one identity per object, and a listener
+                // replaced mid-callback outlives that callback.
+                const cpp_lifetime_mod = b.createModule(.{
+                    .root_source_file = null,
+                    .target = target,
+                    .optimize = .Debug,
+                    .link_libc = true,
+                    .link_libcpp = true,
+                });
+                cpp_lifetime_mod.addCSourceFiles(.{
+                    .files = &.{"test/bindings/smoke/cpp_listener_registration.cpp"},
+                    .flags = test_flags,
+                });
+                cpp_lifetime_mod.addCSourceFile(.{ .file = alloc_smoke_dcps_impl_cpp, .flags = impl_flags });
+                cpp_lifetime_mod.addCSourceFile(.{ .file = alloc_smoke_zzdds_impl_cpp, .flags = impl_flags });
+                cpp_lifetime_mod.addIncludePath(alloc_smoke_merged.getDirectory());
+                cpp_lifetime_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+                cpp_lifetime_mod.addIncludePath(b.path("include"));
+                cpp_lifetime_mod.linkLibrary(zzdds_lib);
+                const cpp_lifetime = b.addExecutable(.{ .name = b.fmt("zzdds_cpp_listener_registration{s}", .{variant.suffix}), .root_module = cpp_lifetime_mod });
+                const cpp_lifetime_run = b.addRunArtifact(cpp_lifetime);
+                // Own domain, as above: 7400 + 250*101 = 32650, still below 32768.
+                cpp_lifetime_run.setEnvironmentVariable("ZZDDS_TEST_DOMAIN_BASE", "101");
+                if (prev_lifetime_run) |prev| cpp_lifetime_run.step.dependOn(prev);
+                prev_lifetime_run = &cpp_lifetime_run.step;
+                binding_smoke_step.dependOn(&cpp_lifetime_run.step);
+            }
         }
 
         // Generate and install lib/pkgconfig/zzdds.pc.
@@ -1464,6 +1504,9 @@ pub fn build(b: *std.Build) void {
                 const run_java_smoke = b.addRunArtifact(launcher);
                 run_java_smoke.addDirectoryArg2(library_dir, .{ .make_absolute = true });
                 run_java_smoke.addArgs(&.{ maybe_java_for_jni.?, "--enable-native-access=ALL-UNNAMED", "-Xss8m", "-cp", "build-tmp/java-binding-smoke" });
+                // JavaSmoke checks the shared runtime's one-listener-at-a-time
+                // rule only on that runtime.
+                run_java_smoke.addArg(b.fmt("-Dzzdds.sharedRuntime={}", .{shared_runtime}));
                 run_java_smoke.addDirectoryArg2(library_dir, .{ .prefix = "-Djava.library.path=", .make_absolute = true });
                 run_java_smoke.addArg("JavaSmoke");
                 run_java_smoke.step.dependOn(&compile_java_smoke.step);

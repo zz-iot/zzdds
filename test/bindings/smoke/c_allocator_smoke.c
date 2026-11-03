@@ -14,10 +14,13 @@
 #include "zzdds_c.h"
 
 #include <assert.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 
-static size_t g_alloc_calls = 0, g_free_calls = 0;
+// Atomic: on the shared runtime the factory's worker threads allocate and
+// free through this allocator too.
+static atomic_size_t g_alloc_calls = 0, g_free_calls = 0;
 
 static void *track_alloc(void *ctx, size_t len, size_t alignment) {
     (void)ctx;

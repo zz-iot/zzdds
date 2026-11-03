@@ -15,10 +15,73 @@ import io.zzdds.ext.Zzdds;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class JavaSmoke {
     static void check(boolean cond, String msg) {
         if (!cond) throw new AssertionError("FAIL: " + msg);
+    }
+
+    // On the shared runtime one listener identity runs one invocation at a
+    // time wherever it is installed. A Java listener object set on two
+    // readers must be one identity: while its callback for one reader is
+    // blocked, its callback for the other must wait, not run alongside. With
+    // a native context per registration (one identity each), it would.
+    static void checkOneIdentity(Zzdds.zzdds.Subscriber zdSubscriber, Dcps.DDS.Topic topic,
+                                 Dcps.DDS.DataReaderQos qos, BindingSmokeStatusDataWriter writer,
+                                 Binding_smoke.BindingSmokeStatus sample) throws Exception {
+        final CountDownLatch ready = new CountDownLatch(2);
+        final CountDownLatch firstEntered = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        final CountDownLatch secondEntered = new CountDownLatch(1);
+        final AtomicBoolean first = new AtomicBoolean(true);
+        final AtomicInteger active = new AtomicInteger();
+        final AtomicBoolean overlapped = new AtomicBoolean(false);
+
+        Zzdds.zzdds.DataReaderListenerEx shared = new Zzdds.zzdds.DataReaderListenerEx() {
+            public void on_requested_deadline_missed(Dcps.DDS.DataReader r, Dcps.DDS.RequestedDeadlineMissedStatus s) {}
+            public void on_requested_incompatible_qos(Dcps.DDS.DataReader r, Dcps.DDS.RequestedIncompatibleQosStatus s) {}
+            public void on_sample_rejected(Dcps.DDS.DataReader r, Dcps.DDS.SampleRejectedStatus s) {}
+            public void on_liveliness_changed(Dcps.DDS.DataReader r, Dcps.DDS.LivelinessChangedStatus s) {}
+            public void on_data_available(Dcps.DDS.DataReader r) {
+                if (active.incrementAndGet() > 1) overlapped.set(true);
+                try {
+                    if (first.getAndSet(false)) {
+                        firstEntered.countDown();
+                        release.await(10, TimeUnit.SECONDS);
+                    } else {
+                        secondEntered.countDown();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    active.decrementAndGet();
+                }
+            }
+            public void on_subscription_matched(Dcps.DDS.DataReader r, Dcps.DDS.SubscriptionMatchedStatus s) {}
+            public void on_sample_lost(Dcps.DDS.DataReader r, Dcps.DDS.SampleLostStatus s) {}
+            public void on_reliable_writer_ready(int writerHandle, boolean isReady) {
+                if (isReady) ready.countDown();
+            }
+        };
+        Dcps.DDS.DataReader a = zdSubscriber.create_datareader_ex(topic, qos, shared, 0xFFFFFFFF);
+        Dcps.DDS.DataReader b = zdSubscriber.create_datareader_ex(topic, qos, shared, 0xFFFFFFFF);
+        check(a != null && b != null, "create_datareader_ex() of two readers sharing a listener returned non-null");
+        check(ready.await(20, TimeUnit.SECONDS), "both readers sharing a listener became reliable-ready within 20s");
+
+        check(writer.write(sample, 0L) == 0, "writer.write() to the readers sharing a listener rc == 0");
+        check(firstEntered.await(10, TimeUnit.SECONDS), "the shared listener's first on_data_available fired within 10s");
+        // The other reader's callback is due now; it must not start while
+        // the first is blocked.
+        check(!secondEntered.await(1, TimeUnit.SECONDS), "the shared listener ran for the second reader while blocked for the first");
+        release.countDown();
+        check(secondEntered.await(10, TimeUnit.SECONDS), "the shared listener ran for the second reader once the first returned");
+        check(!overlapped.get(), "the shared listener's callbacks never overlapped");
+
+        Dcps.DDS.Subscriber subscriber = a.get_subscriber();
+        check(subscriber.delete_datareader(a) == 0, "delete_datareader(a) rc == 0");
+        check(subscriber.delete_datareader(b) == 0, "delete_datareader(b) rc == 0");
     }
 
     public static void main(String[] args) throws Exception {
@@ -63,6 +126,7 @@ public class JavaSmoke {
         final CountDownLatch readerReady = new CountDownLatch(1);
         final CountDownLatch writerReady = new CountDownLatch(1);
         final CountDownLatch dataAvailable = new CountDownLatch(1);
+        final AtomicInteger dataCount = new AtomicInteger();
 
         // Protocol-ready RELIABLE readiness signal — deliberately not
         // on_publication_matched (fires on bare SEDP discovery, before the
@@ -91,7 +155,7 @@ public class JavaSmoke {
             public void on_requested_incompatible_qos(Dcps.DDS.DataReader r, Dcps.DDS.RequestedIncompatibleQosStatus s) {}
             public void on_sample_rejected(Dcps.DDS.DataReader r, Dcps.DDS.SampleRejectedStatus s) {}
             public void on_liveliness_changed(Dcps.DDS.DataReader r, Dcps.DDS.LivelinessChangedStatus s) {}
-            public void on_data_available(Dcps.DDS.DataReader r) { dataAvailable.countDown(); }
+            public void on_data_available(Dcps.DDS.DataReader r) { dataCount.incrementAndGet(); dataAvailable.countDown(); }
             public void on_subscription_matched(Dcps.DDS.DataReader r, Dcps.DDS.SubscriptionMatchedStatus s) {}
             public void on_sample_lost(Dcps.DDS.DataReader r, Dcps.DDS.SampleLostStatus s) {}
             public void on_reliable_writer_ready(int writerHandle, boolean isReady) {
@@ -132,6 +196,17 @@ public class JavaSmoke {
         check("java-smoke".equals(got.data.get_label()), "label round-tripped");
         System.out.println("  round-tripped sample: id=" + got.data.get_id()
             + " count=" + got.data.get_count() + " label=" + got.data.get_label());
+
+        // One native context per Java listener object, shared by all of its
+        // registrations and released once per registration: registering
+        // `listener` on a second reader and deleting that reader drops one
+        // reference, leaving the first reader's registration working (the
+        // dispose below still reaches on_data_available).
+        Dcps.DDS.DataReader second = subscriber.create_datareader(topicReader, readerQos, null, 0);
+        check(second != null, "second create_datareader() returned non-null");
+        check(second.set_listener(listener, Dcps.DDS.DATA_AVAILABLE_STATUS.value) == 0, "set_listener() of an already-registered listener rc == 0");
+        check(subscriber.delete_datareader(second) == 0, "delete_datareader(second) rc == 0");
+        final int dataBeforeDispose = dataCount.get();
 
         // Sanity/link-level regression guard for zidl PR #39's Greptile
         // MUST-FIX (StatusCondition.get_entity() returning a bare DDS.Entity
@@ -176,6 +251,11 @@ public class JavaSmoke {
         // if any prior loan_raw call's outstanding-loan count was never
         // cleared.
         check(writer.dispose(sample, 0L) == 0, "writer.dispose() rc == 0");
+        // Wait for the listener before taking: a take() that consumes the
+        // sample first clears DATA_AVAILABLE, and the core then skips the
+        // callback.
+        for (int i = 0; i < 50 && dataCount.get() == dataBeforeDispose; i++) Thread.sleep(100);
+        check(dataCount.get() > dataBeforeDispose, "the listener still fires after its other registration was released");
         BindingSmokeStatusDataReader.Sample disposed = null;
         for (int i = 0; i < 50 && disposed == null; i++) {
             disposed = reader.take();
@@ -186,6 +266,12 @@ public class JavaSmoke {
         check(disposed.instanceState == Dcps.DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE.value,
             "dispose sample instance_state == NOT_ALIVE_DISPOSED_INSTANCE_STATE");
         System.out.println("  writer.dispose() via loan path: OK");
+        System.out.println("  listener shared by two readers, one deleted: OK");
+
+        if (Boolean.getBoolean("zzdds.sharedRuntime")) {
+            checkOneIdentity(zdSubscriber, topicReader, readerQos, writer, sample);
+            System.out.println("  one listener object runs one callback at a time across readers: OK");
+        }
 
         int deleteRc = publisher.delete_datawriter(rawWriter);
         check(deleteRc == 0, "delete_datawriter() rc == 0 (would be PRECONDITION_NOT_MET if any loan_raw call above leaked its outstanding-loan count)");
