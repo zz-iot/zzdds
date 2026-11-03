@@ -20,7 +20,7 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 - C++ `get_listener()` returns the listener installed on the entity, including one passed
   to `create_*`. `get_listener` retains a registration it hands out to a binding
   (`retain_listener_data`), so a concurrent `set_listener` cannot free it.
-- Builds against zidl 0.3.25.
+- Builds against zidl 0.3.26.
 
 ## 2026-11-02
 
