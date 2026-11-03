@@ -61,14 +61,14 @@ fn findJniIncludeDir(b: *std.Build, java_path: []const u8) ?JniIncludeDirs {
 // entity (a base DDS::*Impl there would replace the cached wrapper and hand
 // callbacks a different object than the application holds).
 const cpp_impl_override_args = [_][]const u8{
-    "--cpp-impl-override", "DDS::Topic=::zzdds::detail::TopicSupport",
-    "--cpp-impl-override", "DDS::DataWriter=::zzdds::detail::DataWriterSupport",
-    "--cpp-impl-override", "DDS::DataReader=::zzdds::detail::DataReaderSupport",
-    "--cpp-impl-override", "DDS::Publisher=::zzdds::detail::PublisherSupport",
-    "--cpp-impl-override", "DDS::Subscriber=::zzdds::detail::SubscriberSupport",
-    "--cpp-impl-override", "DDS::ContentFilteredTopic=::zzdds::detail::ContentFilteredTopicSupport",
-    "--cpp-impl-override", "DDS::DomainParticipant=::zzdds::detail::DomainParticipantSupport",
-    "--cpp-impl-include",  "zzdds_cpp.hpp",
+    "--cpp-impl-override",  "DDS::Topic=::zzdds::detail::TopicSupport",
+    "--cpp-impl-override",  "DDS::DataWriter=::zzdds::detail::DataWriterSupport",
+    "--cpp-impl-override",  "DDS::DataReader=::zzdds::detail::DataReaderSupport",
+    "--cpp-impl-override",  "DDS::Publisher=::zzdds::detail::PublisherSupport",
+    "--cpp-impl-override",  "DDS::Subscriber=::zzdds::detail::SubscriberSupport",
+    "--cpp-impl-override",  "DDS::ContentFilteredTopic=::zzdds::detail::ContentFilteredTopicSupport",
+    "--cpp-impl-override",  "DDS::DomainParticipant=::zzdds::detail::DomainParticipantSupport",
+    "--cpp-impl-include",   "zzdds_cpp.hpp",
     // Wrappers of deleted entities are dropped and retired (src/c_abi/extensions.zig).
     "--handle-retire-hook", "zzdds_handle_retire",
 };
