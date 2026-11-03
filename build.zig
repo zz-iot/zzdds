@@ -1503,6 +1503,9 @@ pub fn build(b: *std.Build) void {
                 const run_java_smoke = b.addRunArtifact(launcher);
                 run_java_smoke.addDirectoryArg2(library_dir, .{ .make_absolute = true });
                 run_java_smoke.addArgs(&.{ maybe_java_for_jni.?, "--enable-native-access=ALL-UNNAMED", "-Xss8m", "-cp", "build-tmp/java-binding-smoke" });
+                // JavaSmoke checks the shared runtime's one-listener-at-a-time
+                // rule only on that runtime.
+                run_java_smoke.addArg(b.fmt("-Dzzdds.sharedRuntime={}", .{shared_runtime}));
                 run_java_smoke.addDirectoryArg2(library_dir, .{ .prefix = "-Djava.library.path=", .make_absolute = true });
                 run_java_smoke.addArg("JavaSmoke");
                 run_java_smoke.step.dependOn(&compile_java_smoke.step);
