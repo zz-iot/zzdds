@@ -11,21 +11,24 @@
 // C-ABI factory and everything its own allocator allocated during bootstrap.
 #include "zzdds_cpp.hpp"
 
+#include <atomic>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 
 // C-level allocator for the factory itself
 // (zzdds_create_factory_with_allocator) -- tracks alloc/free counts to prove
-// whether zzdds_destroy_factory actually ran.
-static size_t c_alloc_calls = 0, c_free_calls = 0;
+// whether zzdds_destroy_factory actually ran. Atomic: on the shared runtime
+// the factory's worker threads allocate and free through it too.
+static std::atomic<size_t> c_alloc_calls{0}, c_free_calls{0};
 static void* c_alloc(void*, size_t len, size_t) { c_alloc_calls++; return std::malloc(len); }
 static bool c_resize(void*, void*, size_t, size_t, size_t) { return false; }
 static void c_free(void*, void* p, size_t, size_t) { c_free_calls++; std::free(p); }
 
 static void test_happy_path() {
     ZidlAllocator c_tracking{nullptr, c_alloc, c_resize, c_free};
-    c_alloc_calls = c_free_calls = 0;
+    c_alloc_calls = 0;
+    c_free_calls = 0;
     {
         auto factory = zzdds::create_factory(&c_tracking);
         assert(factory);
@@ -49,7 +52,8 @@ static void failing_free(void*, void*, size_t, size_t) {}
 static void test_pmr_exhaustion_does_not_leak_factory() {
     ZidlAllocator c_tracking{nullptr, c_alloc, c_resize, c_free};
     ZidlAllocator failing{nullptr, failing_alloc, failing_resize, failing_free};
-    c_alloc_calls = c_free_calls = 0;
+    c_alloc_calls = 0;
+    c_free_calls = 0;
 
     zidl::setCppAllocator(&failing);
     bool threw = false;

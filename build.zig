@@ -846,7 +846,8 @@ pub fn build(b: *std.Build) void {
         });
         c_alloc_smoke_mod.addCSourceFiles(.{
             .files = &.{"test/bindings/smoke/c_allocator_smoke.c"},
-            .flags = &.{ "-std=c99", "-Wall" },
+            // C11 for <stdatomic.h>: the allocation counters are atomic.
+            .flags = &.{ "-std=c11", "-Wall" },
         });
         c_alloc_smoke_mod.addIncludePath(gen_c_dir);
         c_alloc_smoke_mod.addIncludePath(gen_zzdds_c_dir);
