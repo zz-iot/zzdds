@@ -77,6 +77,7 @@ typedef struct {
 
 typedef struct {
     const char *topic;
+    atomic_bool matched;
 } ReaderTag;
 
 static void on_publication_matched_ex(DDS_DataWriter writer, const DDS_PublicationMatchedStatus *status, void *listener_data) {
@@ -108,9 +109,10 @@ static DDS_DataWriter create_writer_ex(DDS_Publisher pub, DDS_Topic topic, const
 
 static void on_subscription_matched(DDS_DataReader reader, const DDS_SubscriptionMatchedStatus *status, void *listener_data) {
     (void)reader;
-    const ReaderTag *tag = (const ReaderTag *)listener_data;
+    ReaderTag *tag = (ReaderTag *)listener_data;
     fail_if_torn_down("on_subscription_matched", tag->topic, status->total_count, status->total_count_change,
                       status->current_count, status->current_count_change);
+    if (status->current_count > 0) atomic_store(&tag->matched, true);
 }
 
 static uint32_t parse_domain(int argc, char **argv) {
@@ -202,8 +204,8 @@ int main(int argc, char **argv) {
 
     /* Reader listeners are attached at creation, so their "never after
      * teardown" check covers the readers' whole lifetime. */
-    static ReaderTag in_tag = {"SessionIn"};
-    static ReaderTag cft_tag = {"SessionIn_cft"};
+    static ReaderTag in_tag = {.topic = "SessionIn"};
+    static ReaderTag cft_tag = {.topic = "SessionIn_cft"};
     DDS_DataReaderListener dr_listener;
     memset(&dr_listener, 0, sizeof(dr_listener));
     dr_listener.listener_data = &in_tag;
@@ -267,6 +269,19 @@ int main(int argc, char **argv) {
     for (int waited_ms = 0; !(atomic_load(&out1_state.reader_ready) && atomic_load(&out2_state.reader_ready)); waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= READER_READY_TIMEOUT_MS) {
             fprintf(stderr, "FAIL: no reliable reader became ready within %ds\n", READER_READY_TIMEOUT_MS / 1000);
+            return 1;
+        }
+        usleep(POLL_PERIOD_MS * 1000);
+    }
+
+    /* Both readers must match the peer's writer before teardown too: samples
+     * on the plain reader do not mean the CFT reader has matched, and a first
+     * match arriving late would fire its listener during the teardown. */
+    for (int waited_ms = 0; !(atomic_load(&in_tag.matched) && atomic_load(&cft_tag.matched)); waited_ms += POLL_PERIOD_MS) {
+        if (waited_ms >= READER_READY_TIMEOUT_MS) {
+            fprintf(stderr, "FAIL: readers not matched with the peer's writer within %ds (SessionIn=%s SessionIn_cft=%s)\n",
+                    READER_READY_TIMEOUT_MS / 1000, atomic_load(&in_tag.matched) ? "true" : "false",
+                    atomic_load(&cft_tag.matched) ? "true" : "false");
             return 1;
         }
         usleep(POLL_PERIOD_MS * 1000);

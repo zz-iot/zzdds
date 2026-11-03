@@ -69,7 +69,7 @@ public class Session {
         };
     }
 
-    static Dcps.DDS.DataReaderListener makeReaderListener(String topic) {
+    static Dcps.DDS.DataReaderListener makeReaderListener(String topic, AtomicBoolean matched) {
         return new Dcps.DDS.DataReaderListener() {
             public void on_requested_deadline_missed(Dcps.DDS.DataReader r, Dcps.DDS.RequestedDeadlineMissedStatus s) {}
             public void on_requested_incompatible_qos(Dcps.DDS.DataReader r, Dcps.DDS.RequestedIncompatibleQosStatus s) {}
@@ -81,6 +81,7 @@ public class Session {
             public void on_subscription_matched(Dcps.DDS.DataReader r, Dcps.DDS.SubscriptionMatchedStatus s) {
                 failIfTornDown("on_subscription_matched", topic, s.get_total_count(), s.get_total_count_change(),
                     s.get_current_count(), s.get_current_count_change());
+                if (s.get_current_count() > 0) matched.set(true);
             }
         };
     }
@@ -161,7 +162,9 @@ public class Session {
 
         // Reader listeners are attached at creation, so their "never after
         // teardown" check covers the readers' whole lifetime.
-        Dcps.DDS.DataReader inDr = sub.create_datareader(inTopic, drQos, makeReaderListener("SessionIn"), Dcps.DDS.SUBSCRIPTION_MATCHED_STATUS.value);
+        AtomicBoolean inMatched = new AtomicBoolean(false);
+        AtomicBoolean cftMatched = new AtomicBoolean(false);
+        Dcps.DDS.DataReader inDr = sub.create_datareader(inTopic, drQos, makeReaderListener("SessionIn", inMatched), Dcps.DDS.SUBSCRIPTION_MATCHED_STATUS.value);
         if (inDr == null) {
             System.err.println("FAIL: create_datareader(SessionIn) failed");
             System.exit(1);
@@ -177,7 +180,7 @@ public class Session {
             System.err.println("FAIL: create_contentfilteredtopic() failed");
             System.exit(1);
         }
-        Dcps.DDS.DataReader cftDr = sub.create_datareader(cft, drQos, makeReaderListener("SessionIn_cft"), Dcps.DDS.SUBSCRIPTION_MATCHED_STATUS.value);
+        Dcps.DDS.DataReader cftDr = sub.create_datareader(cft, drQos, makeReaderListener("SessionIn_cft", cftMatched), Dcps.DDS.SUBSCRIPTION_MATCHED_STATUS.value);
         if (cftDr == null) {
             System.err.println("FAIL: create_datareader(SessionIn_cft) failed");
             System.exit(1);
@@ -214,6 +217,20 @@ public class Session {
         while (!(out1State.readerReady.get() && out2State.readerReady.get())) {
             if (System.currentTimeMillis() > deadline) {
                 System.err.println("FAIL: no reliable reader became ready within " + (READER_READY_TIMEOUT_MS / 1000) + "s");
+                System.exit(1);
+            }
+            Thread.sleep(POLL_PERIOD_MS);
+        }
+
+        // Both readers must match the peer's writer before teardown too:
+        // samples on the plain reader do not mean the CFT reader has
+        // matched, and a first match arriving late would fire its listener
+        // during the teardown.
+        long matchedDeadline = System.currentTimeMillis() + READER_READY_TIMEOUT_MS;
+        while (!(inMatched.get() && cftMatched.get())) {
+            if (System.currentTimeMillis() > matchedDeadline) {
+                System.err.println("FAIL: readers not matched with the peer's writer within " + (READER_READY_TIMEOUT_MS / 1000)
+                    + "s (SessionIn=" + inMatched.get() + " SessionIn_cft=" + cftMatched.get() + ")");
                 System.exit(1);
             }
             Thread.sleep(POLL_PERIOD_MS);

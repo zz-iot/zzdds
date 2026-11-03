@@ -69,6 +69,7 @@ fn onReliableReaderReady(state: *WriterSyncState, reader_handle: DDS.InstanceHan
 
 const ReaderTag = struct {
     topic: []const u8,
+    matched: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 var in_reader_tag = ReaderTag{ .topic = "SessionIn" };
 var cft_reader_tag = ReaderTag{ .topic = "SessionIn_cft" };
@@ -76,6 +77,7 @@ var cft_reader_tag = ReaderTag{ .topic = "SessionIn_cft" };
 fn onSubscriptionMatched(tag: *ReaderTag, dr: DDS.DataReader, status: DDS.SubscriptionMatchedStatus) void {
     _ = dr;
     failIfTornDown("on_subscription_matched", tag.topic, status.total_count, status.total_count_change, status.current_count, status.current_count_change);
+    if (status.current_count > 0) tag.matched.store(true, .release);
 }
 
 /// Creates a writer with its extended listener installed from the start: a
@@ -235,6 +237,20 @@ pub fn main(init: std.process.Init) !void {
     while (!(out1_state.reader_ready.load(.acquire) and out2_state.reader_ready.load(.acquire))) {
         if (monoNs(io) > ready_deadline) {
             std.debug.print("FAIL: no reliable reader became ready within 10s\n", .{});
+            std.process.exit(1);
+        }
+        sleepNs(io, POLL_PERIOD_NS);
+    }
+
+    // Both readers must match the peer's writer before teardown too: samples
+    // on the plain reader do not mean the CFT reader has matched, and a first
+    // match arriving late would fire its listener during the teardown.
+    const matched_deadline = monoNs(io) + READER_READY_TIMEOUT_NS;
+    while (!(in_reader_tag.matched.load(.acquire) and cft_reader_tag.matched.load(.acquire))) {
+        if (monoNs(io) > matched_deadline) {
+            std.debug.print("FAIL: readers not matched with the peer's writer within 10s (SessionIn={any} SessionIn_cft={any})\n", .{
+                in_reader_tag.matched.load(.acquire), cft_reader_tag.matched.load(.acquire),
+            });
             std.process.exit(1);
         }
         sleepNs(io, POLL_PERIOD_NS);

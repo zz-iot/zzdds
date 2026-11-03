@@ -88,10 +88,14 @@ public:
                                   ::DDS::SubscriptionMatchedStatus status) override {
         fail_if_torn_down("on_subscription_matched", topic_, status.total_count, status.total_count_change,
                           status.current_count, status.current_count_change);
+        if (status.current_count > 0) matched_.store(true);
     }
+
+    bool matched() const { return matched_.load(); }
 
 private:
     const char *topic_;
+    std::atomic<bool> matched_{false};
 };
 
 uint32_t parse_domain(int argc, char **argv) {
@@ -233,6 +237,19 @@ int main(int argc, char **argv) {
     for (int waited_ms = 0; !(out1_state.reader_ready.load() && out2_state.reader_ready.load()); waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= READER_READY_TIMEOUT_MS) {
             std::fprintf(stderr, "FAIL: no reliable reader became ready within %ds\n", READER_READY_TIMEOUT_MS / 1000);
+            return 1;
+        }
+        usleep(POLL_PERIOD_MS * 1000);
+    }
+
+    // Both readers must match the peer's writer before teardown too: samples
+    // on the plain reader do not mean the CFT reader has matched, and a first
+    // match arriving late would fire its listener during the teardown.
+    for (int waited_ms = 0; !(reader_listener->matched() && cft_reader_listener->matched()); waited_ms += POLL_PERIOD_MS) {
+        if (waited_ms >= READER_READY_TIMEOUT_MS) {
+            std::fprintf(stderr, "FAIL: readers not matched with the peer's writer within %ds (SessionIn=%s SessionIn_cft=%s)\n",
+                         READER_READY_TIMEOUT_MS / 1000, reader_listener->matched() ? "true" : "false",
+                         cft_reader_listener->matched() ? "true" : "false");
             return 1;
         }
         usleep(POLL_PERIOD_MS * 1000);

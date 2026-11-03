@@ -34,6 +34,10 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   delete-contained-entities integration test's session now says whether it fired during
   or after `delete_contained_entities()`, and names the callback, the endpoint's topic
   and the status counts.
+- The delete-contained-entities integration test's session waits for both of its readers
+  to match the peer's writer before the samples are exchanged. Its ContentFilteredTopic
+  reader could match after the plain reader had its samples, and the first match then
+  fired its listener during `delete_contained_entities()`, failing the test.
 
 ## 2026-11-01
 
