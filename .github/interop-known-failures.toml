@@ -11,6 +11,8 @@
 #               DEFAULT_PREFIXES in .github/workflows/ci.yml
 #   direction - "pub" (zzdds publishes, the vendor subscribes) or "sub"
 #   tests     - dds-rtps test names
+#   lanes     - optional: the CI lanes it applies to ("normal", "tsan",
+#               "debug-allocator"); without it, every lane
 #   reason    - why, with a pointer to where it is tracked
 
 [[known_failure]]
@@ -54,3 +56,18 @@ drops every payload-less end-of-coherent-set marker (RTPS 2.5 §9.6.4.2), so it 
 ends a set only when the next set starts, and a repaired sample that arrives \
 out of order is delivered outside its set (docs/implementation_status.md, \
 "TOPIC and INSTANCE coherent sets to one other implementation")."""
+
+[[known_failure]]
+vendor = "hdds"
+direction = "pub"
+lanes = ["tsan"]
+tests = [
+    "Test_Lifespan_6",
+    "Test_Lifespan_7",
+]
+reason = """Intermittent, best-effort writer with a 400 ms write period: when \
+the publisher's participant sends nothing for about 200 ms after its first \
+samples, the subscriber removes it as stale, far inside its announced lease \
+(RTPS 2.5 §8.5.3.3 and §8.5.5.2 remove a participant only after its \
+leaseDuration), unregisters the writer and delivers none of its later \
+samples. Seen only under ThreadSanitizer timing."""

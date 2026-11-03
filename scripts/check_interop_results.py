@@ -3,7 +3,8 @@
 
 Usage:
     check_interop_results.py <report.xml> [--tsan-log-dir <dir>]
-        [--known-failures <file.toml> --vendor <name> --direction pub|sub]
+        [--known-failures <file.toml> --vendor <name> --direction pub|sub
+         [--lane normal|tsan|debug-allocator]]
 
 Failure output from each test (the pexpect-captured shape_main output, which
 includes any ThreadSanitizer warnings when the binary is built with
@@ -12,7 +13,8 @@ sanitize_thread) is extracted from the JUnit XML and printed in full.
 With --known-failures, a failing test listed there for this vendor and
 direction is a known failure: reported, but not a failure of this check,
 unless its output shows a sanitizer report or a crash. A listed test that
-passes is reported too, so the entry can be removed. See
+passes is reported too, so the entry can be removed. An entry limited to
+some CI lanes applies only when --lane names one of them. See
 .github/interop-known-failures.toml for the format.
 
 When run under GitHub Actions (GITHUB_ACTIONS=true):
@@ -21,6 +23,9 @@ When run under GitHub Actions (GITHUB_ACTIONS=true):
     and listed tests that passed as ::warning:: annotations.
   - Any TSAN log files found in --tsan-log-dir are printed the same way.
   - A results table is appended to the job summary ($GITHUB_STEP_SUMMARY).
+  - The step output failed_tests ($GITHUB_OUTPUT) counts the failing tests,
+    known failures included, so a later step can keep a failed run's files
+    even when the check passes.
 """
 
 import sys
@@ -59,6 +64,13 @@ def gha_summary(lines):
     if IN_GHA and path:
         with open(path, "a") as f:
             f.write("\n".join(lines) + "\n")
+
+
+def gha_output(name, value):
+    path = os.environ.get("GITHUB_OUTPUT")
+    if IN_GHA and path:
+        with open(path, "a") as f:
+            f.write(f"{name}={value}\n")
 
 
 def strip_html(text):
@@ -121,15 +133,25 @@ def test_name(case):
     return m.group(1) if m else case.name
 
 
-def load_known_failures(path, vendor, direction):
+LANES = ("normal", "tsan", "debug-allocator")
+
+
+def load_known_failures(path, vendor, direction, lane):
     """Return {test name: reason} listed in `path` for this vendor (matched as
-    a prefix of the CI vendor matrix name) and direction."""
+    a prefix of the CI vendor matrix name), direction and lane. An entry
+    without `lanes` applies to every lane; one with `lanes` applies only when
+    `lane` is listed."""
     with open(path, "rb") as f:
         data = tomllib.load(f)
     known = {}
     for entry in data.get("known_failure", []):
         if entry["direction"] not in ("pub", "sub"):
             sys.exit(f"{path}: direction must be pub or sub, got {entry['direction']!r}")
+        lanes = entry.get("lanes")
+        if lanes is not None and (not lanes or any(l not in LANES for l in lanes)):
+            sys.exit(f"{path}: lanes must be a non-empty list of {LANES}, got {lanes!r}")
+        if lanes is not None and lane not in lanes:
+            continue
         if vendor.startswith(entry["vendor"]) and entry["direction"] == direction:
             for name in entry["tests"]:
                 known[name] = entry["reason"]
@@ -189,17 +211,20 @@ def main():
     ap.add_argument("--vendor", help="CI vendor matrix name (release asset name without _shape_main_linux.zip)")
     ap.add_argument("--direction", choices=("pub", "sub"),
                     help="pub: zzdds publishes; sub: zzdds subscribes")
+    ap.add_argument("--lane", choices=LANES,
+                    help="CI lane, for known failures limited to some lanes")
     args = ap.parse_args()
     if args.known_failures and not (args.vendor and args.direction):
         ap.error("--known-failures needs --vendor and --direction")
 
     ok = True
 
-    known = (load_known_failures(args.known_failures, args.vendor, args.direction)
+    known = (load_known_failures(args.known_failures, args.vendor, args.direction, args.lane)
              if args.known_failures else {})
     total, real_failures, known_failures, known_passed, vendor_skipped = \
         check_junit(args.report, known)
     passed = total - len(real_failures) - len(known_failures) - len(vendor_skipped)
+    gha_output("failed_tests", len(real_failures) + len(known_failures))
     print(f"Interop results: {passed}/{total} passed"
           + (f", {len(known_failures)} known failures" if known_failures else "")
           + (f", {len(vendor_skipped)} vendor-skipped" if vendor_skipped else ""))

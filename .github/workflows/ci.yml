@@ -1325,7 +1325,8 @@ jobs:
           python3 zzdds/scripts/check_interop_results.py \
             /tmp/interop-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml \
             --known-failures zzdds/.github/interop-known-failures.toml \
-            --vendor "${{ matrix.vendor.name }}" --direction ${{ matrix.direction }}
+            --vendor "${{ matrix.vendor.name }}" --direction ${{ matrix.direction }} \
+            --lane normal
 
       - name: Upload report
         if: always()
@@ -1397,6 +1398,20 @@ jobs:
       - name: Make binaries executable
         run: chmod +x bins/zzdds_shape_main_linux bins/${{ matrix.vendor.binary }}
 
+      # A failure that only the runner reproduces needs its packets: capture
+      # every UDP datagram of the run, and keep it if a test fails, known
+      # failures included. The job log's per-test result lines give each
+      # test's window in it.
+      - name: Start packet capture
+        run: |
+          command -v tcpdump >/dev/null || sudo apt-get install -y tcpdump
+          sudo timeout -s INT 3600 tcpdump -i any -U -w /tmp/interop-tsan.pcap udp > /tmp/tcpdump.log 2>&1 &
+          for _ in $(seq 50); do [ -s /tmp/interop-tsan.pcap ] && break; sleep 0.1; done
+          if ! pgrep -x tcpdump >/dev/null || [ ! -s /tmp/interop-tsan.pcap ]; then
+            echo "::warning::Packet capture did not start; a failure will have no packets"
+            cat /tmp/tcpdump.log || true
+          fi
+
       - name: Run interop TSan (${{ matrix.direction }})
         working-directory: dds-rtps
         env:
@@ -1412,12 +1427,21 @@ jobs:
           python3 interoperability_report.py -P "$PUB" -S "$SUB" \
             -o /tmp/interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
 
+      - name: Stop packet capture
+        if: always()
+        run: |
+          sudo pkill -INT -x tcpdump || true
+          for _ in $(seq 50); do pgrep -x tcpdump >/dev/null || break; sleep 0.1; done
+          cat /tmp/tcpdump.log || true
+
       - name: Check results
+        id: check
         run: |
           python3 zzdds/scripts/check_interop_results.py \
             /tmp/interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml \
             --known-failures zzdds/.github/interop-known-failures.toml \
-            --vendor "${{ matrix.vendor.name }}" --direction ${{ matrix.direction }}
+            --vendor "${{ matrix.vendor.name }}" --direction ${{ matrix.direction }} \
+            --lane tsan
 
       - name: Upload TSan report
         if: always()
@@ -1425,6 +1449,14 @@ jobs:
         with:
           name: interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}
           path: /tmp/interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
+
+      - name: Upload packet capture
+        if: failure() || (success() && steps.check.outputs.failed_tests != '0')
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-tsan-capture-${{ matrix.vendor.name }}-${{ matrix.direction }}
+          path: /tmp/interop-tsan.pcap
+          retention-days: 7
 
   # ── Interop: Zenzen DDS (DebugAllocator) vs vendor ────────────────────────
   #
@@ -1512,7 +1544,8 @@ jobs:
           python3 zzdds/scripts/check_interop_results.py \
             /tmp/interop-debug-allocator-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml \
             --known-failures zzdds/.github/interop-known-failures.toml \
-            --vendor "${{ matrix.vendor.name }}" --direction ${{ matrix.direction }}
+            --vendor "${{ matrix.vendor.name }}" --direction ${{ matrix.direction }} \
+            --lane debug-allocator
 
       - name: Upload DebugAllocator report
         if: always()
