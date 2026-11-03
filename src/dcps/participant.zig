@@ -54,7 +54,8 @@ const CloseLatch = @import("../runtime/close_latch.zig").CloseLatch;
 const listener_lane = @import("listener_lane.zig");
 const zidl_rt = @import("zidl_rt");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
-const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
+const listener_box_mod = @import("../util/listener_box.zig");
+const ListenerBox = listener_box_mod.ListenerBox;
 const listener_fallback = @import("../util/listener_fallback.zig");
 
 pub const Guid = guid_mod.Guid;
@@ -5597,7 +5598,7 @@ pub const DomainParticipantImpl = struct {
         const self = cast(ctx);
         self.listener_mu.lock();
         defer self.listener_mu.unlock();
-        return self.listener_box.listener;
+        return listener_box_mod.handOut(self.listener_box.listener);
     }
 
     /// Installs `new_listener`, releasing whatever it replaces. Safe against

@@ -22,7 +22,8 @@ const ListenerGroup = @import("listener_lane.zig").Group;
 const ListenerCall = @import("listener_lane.zig").Call;
 const ListenerTraversal = @import("listener_lane.zig").Traversal;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
-const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
+const listener_box_mod = @import("../util/listener_box.zig");
+const ListenerBox = listener_box_mod.ListenerBox;
 const listener_fallback = @import("../util/listener_fallback.zig");
 const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 const participant_mod = @import("participant.zig");
@@ -827,7 +828,7 @@ pub const SubscriberImpl = struct {
         const self = cast(ctx);
         self.listener_mu.lock();
         defer self.listener_mu.unlock();
-        return self.listener_box.listener;
+        return listener_box_mod.handOut(self.listener_box.listener);
     }
 
     /// Installs `new_listener`, releasing whatever it replaces. Safe against

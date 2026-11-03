@@ -69,6 +69,8 @@ const cpp_impl_override_args = [_][]const u8{
     "--cpp-impl-override", "DDS::ContentFilteredTopic=::zzdds::detail::ContentFilteredTopicSupport",
     "--cpp-impl-override", "DDS::DomainParticipant=::zzdds::detail::DomainParticipantSupport",
     "--cpp-impl-include",  "zzdds_cpp.hpp",
+    // Wrappers of deleted entities are dropped and retired (src/c_abi/extensions.zig).
+    "--handle-retire-hook", "zzdds_handle_retire",
 };
 
 fn typesupportModule(b: *std.Build, package: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, rt: *std.Build.Module) *std.Build.Module {
@@ -1317,7 +1319,7 @@ pub fn build(b: *std.Build) void {
         // forbids a named package from referencing the unnamed one, which
         // is why dcps.idl gets a real package too, not just the extension.
         const gen_dcps_java = b.addRunArtifact(zidl_exe);
-        gen_dcps_java.addArgs(&.{ "-b", "java", "--generate-interfaces", "--java-jni-library", "zzdds_jni", "--java-package", "io.zzdds.dcps", "-o" });
+        gen_dcps_java.addArgs(&.{ "-b", "java", "--generate-interfaces", "--java-jni-library", "zzdds_jni", "--java-package", "io.zzdds.dcps", "--handle-retire-hook", "zzdds_handle_retire", "-o" });
         const gen_java_dir = gen_dcps_java.addOutputDirectoryArg("zzdds-java-binding");
         if (xtypes) gen_dcps_java.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
         gen_dcps_java.addFileArg(dcps_idl);
@@ -1335,7 +1337,8 @@ pub fn build(b: *std.Build) void {
             "--generate-interfaces", "--java-jni-library",
             "zzdds_jni",             "--java-package",
             "io.zzdds.ext",          "--java-import-package",
-            "DDS=io.zzdds.dcps",     "-o",
+            "DDS=io.zzdds.dcps",     "--handle-retire-hook",
+            "zzdds_handle_retire",   "-o",
         });
         const gen_zzdds_ext_java_dir = gen_zzdds_ext_java.addOutputDirectoryArg("zzdds-ext-java-binding");
         gen_zzdds_ext_java.addFileArg(b.path("idl/zzdds.idl"));

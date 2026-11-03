@@ -172,10 +172,14 @@ int main() {
         ::DDS::DataReaderQos::default_value(), nullptr, 0);
     CHECK(dr);
     CHECK(dr->set_listener(std::make_shared<BlockingListener>(), ::DDS::SUBSCRIPTION_MATCHED_STATUS) == ::DDS::RETCODE_OK);
+    auto direct = std::make_shared<DirectListener>();
     auto dr_direct = sub->create_datareader(
         std::static_pointer_cast<::zzdds::TopicImpl>(topic_r)->as_topic_description(),
-        ::DDS::DataReaderQos::default_value(), std::make_shared<DirectListener>(), ::DDS::SUBSCRIPTION_MATCHED_STATUS);
+        ::DDS::DataReaderQos::default_value(), direct, ::DDS::SUBSCRIPTION_MATCHED_STATUS);
     CHECK(dr_direct);
+    // get_listener reads the core's registration, so a listener installed
+    // by create_datareader comes back too.
+    CHECK(dr_direct->get_listener() == direct);
 
     auto dw = pub->create_datawriter(topic_w, ::DDS::DataWriterQos::default_value(), nullptr, 0);
     CHECK(dw);
@@ -198,10 +202,24 @@ int main() {
     CHECK(wait_until([] { return g_destroyed.load(); }));
     CHECK(wait_until([] { return g_direct_matches.load() > 0; }));
 
+    CHECK(dr->get_listener() == nullptr);
+
+    // A deleted entity's wrapper no longer reaches the core: the core frees
+    // the handle and reports it, and the binding retires the wrapper.
     CHECK(pub->delete_datawriter(dw) == ::DDS::RETCODE_OK);
+    CHECK(dw->enable() == ::DDS::RETCODE_ALREADY_DELETED);
     CHECK(sub->delete_datareader(dr) == ::DDS::RETCODE_OK);
-    CHECK(sub->delete_datareader(dr_direct) == ::DDS::RETCODE_OK);
     CHECK(dp_w->delete_contained_entities() == ::DDS::RETCODE_OK);
+    // The same for entities a cascading delete takes, which never pass
+    // through the binding.
+    CHECK(dp_r->delete_contained_entities() == ::DDS::RETCODE_OK);
+    CHECK(dr_direct->enable() == ::DDS::RETCODE_ALREADY_DELETED);
+    CHECK(dr_direct->get_listener() == nullptr);
+    CHECK(sub->enable() == ::DDS::RETCODE_ALREADY_DELETED);
+    // A new subscriber gets a wrapper of its own, even at a reused address.
+    auto sub2 = dp_r->create_subscriber(::DDS::SubscriberQos::default_value(), nullptr, 0);
+    CHECK(sub2 && sub2 != sub);
+    CHECK(sub2->enable() == ::DDS::RETCODE_OK);
     CHECK(dp_r->delete_contained_entities() == ::DDS::RETCODE_OK);
     CHECK(factory->delete_participant(dp_w) == ::DDS::RETCODE_OK);
     CHECK(factory->delete_participant(dp_r) == ::DDS::RETCODE_OK);

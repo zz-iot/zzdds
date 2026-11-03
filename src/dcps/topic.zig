@@ -12,7 +12,8 @@ const nil = @import("nil.zig");
 const waitset = @import("waitset.zig");
 const filter_mod = @import("filter.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
-const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
+const listener_box_mod = @import("../util/listener_box.zig");
+const ListenerBox = listener_box_mod.ListenerBox;
 const Mutex = @import("../util/mutex.zig").Mutex;
 const extensions_mod = @import("../c_abi/extensions.zig");
 
@@ -251,7 +252,7 @@ pub const TopicImpl = struct {
         const self = cast(ctx);
         self.listener_mu.lock();
         defer self.listener_mu.unlock();
-        return self.listener_box.listener;
+        return listener_box_mod.handOut(self.listener_box.listener);
     }
 
     /// Installs `new_listener`, releasing whatever it replaces. Safe against

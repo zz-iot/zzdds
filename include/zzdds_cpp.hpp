@@ -173,19 +173,24 @@ public:
     // that generic Entity would never compare identity-equal to this object.
     // Identifies this class's entries in the family's shared cache.
     static const void* _familyTag() noexcept { static const char t = 0; return &t; }
+    // Retires both halves, when the core frees the handle: the inherited
+    // zzdds wrapper and dds_. Recorded with this class's cache entries.
+    static void _zidlRetire(void* o) noexcept {
+        auto* self = static_cast<TopicSupport*>(o);
+        TopicImpl::_zidlRetire(static_cast<TopicImpl*>(self));
+        ::DDS::TopicImpl::_zidlRetire(&self->dds_);
+    }
 
     static std::shared_ptr<TopicSupport> _getOrCreate(DDS_Topic h) {
         if (!h) return nullptr;
         DDS_Entity _fh = DDS_Topic_as_DDS_Entity(h);
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
-        auto& _cache = ::DDS::EntityImpl::_familyCache();
-        auto _it = _cache.find(_fh);
-        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
-            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<TopicSupport>(_base, static_cast<TopicSupport*>(_it->second.obj));
+        if (auto* _e = ::DDS::EntityImpl::_familyFind(_fh, _familyTag())) {
+            if (auto _base = _e->ref.lock()) return std::shared_ptr<TopicSupport>(_base, static_cast<TopicSupport*>(_e->obj));
         }
         auto _sp = std::allocate_shared<TopicSupport>(
             std::pmr::polymorphic_allocator<TopicSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
+        ::DDS::EntityImpl::_familyInsert(_fh, {_sp, _familyTag(), _sp.get(), &_zidlRetire});
         return _sp;
     }
 
@@ -263,19 +268,24 @@ public:
     // See TopicSupport's matching comment.
     // Identifies this class's entries in the family's shared cache.
     static const void* _familyTag() noexcept { static const char t = 0; return &t; }
+    // Retires both halves, when the core frees the handle: the inherited
+    // zzdds wrapper and dds_. Recorded with this class's cache entries.
+    static void _zidlRetire(void* o) noexcept {
+        auto* self = static_cast<DataWriterSupport*>(o);
+        DataWriterImpl::_zidlRetire(static_cast<DataWriterImpl*>(self));
+        ::DDS::DataWriterImpl::_zidlRetire(&self->dds_);
+    }
 
     static std::shared_ptr<DataWriterSupport> _getOrCreate(DDS_DataWriter h) {
         if (!h) return nullptr;
         DDS_Entity _fh = DDS_DataWriter_as_DDS_Entity(h);
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
-        auto& _cache = ::DDS::EntityImpl::_familyCache();
-        auto _it = _cache.find(_fh);
-        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
-            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<DataWriterSupport>(_base, static_cast<DataWriterSupport*>(_it->second.obj));
+        if (auto* _e = ::DDS::EntityImpl::_familyFind(_fh, _familyTag())) {
+            if (auto _base = _e->ref.lock()) return std::shared_ptr<DataWriterSupport>(_base, static_cast<DataWriterSupport*>(_e->obj));
         }
         auto _sp = std::allocate_shared<DataWriterSupport>(
             std::pmr::polymorphic_allocator<DataWriterSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
+        ::DDS::EntityImpl::_familyInsert(_fh, {_sp, _familyTag(), _sp.get(), &_zidlRetire});
         return _sp;
     }
 
@@ -388,19 +398,24 @@ public:
     // See TopicSupport's matching comment.
     // Identifies this class's entries in the family's shared cache.
     static const void* _familyTag() noexcept { static const char t = 0; return &t; }
+    // Retires both halves, when the core frees the handle: the inherited
+    // zzdds wrapper and dds_. Recorded with this class's cache entries.
+    static void _zidlRetire(void* o) noexcept {
+        auto* self = static_cast<DataReaderSupport*>(o);
+        DataReaderImpl::_zidlRetire(static_cast<DataReaderImpl*>(self));
+        ::DDS::DataReaderImpl::_zidlRetire(&self->dds_);
+    }
 
     static std::shared_ptr<DataReaderSupport> _getOrCreate(DDS_DataReader h) {
         if (!h) return nullptr;
         DDS_Entity _fh = DDS_DataReader_as_DDS_Entity(h);
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
-        auto& _cache = ::DDS::EntityImpl::_familyCache();
-        auto _it = _cache.find(_fh);
-        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
-            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<DataReaderSupport>(_base, static_cast<DataReaderSupport*>(_it->second.obj));
+        if (auto* _e = ::DDS::EntityImpl::_familyFind(_fh, _familyTag())) {
+            if (auto _base = _e->ref.lock()) return std::shared_ptr<DataReaderSupport>(_base, static_cast<DataReaderSupport*>(_e->obj));
         }
         auto _sp = std::allocate_shared<DataReaderSupport>(
             std::pmr::polymorphic_allocator<DataReaderSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
+        ::DDS::EntityImpl::_familyInsert(_fh, {_sp, _familyTag(), _sp.get(), &_zidlRetire});
         return _sp;
     }
 
@@ -461,19 +476,24 @@ public:
     // See TopicSupport's matching comment.
     // Identifies this class's entries in the family's shared cache.
     static const void* _familyTag() noexcept { static const char t = 0; return &t; }
+    // Retires both halves, when the core frees the handle: the inherited
+    // zzdds wrapper and dds_. Recorded with this class's cache entries.
+    static void _zidlRetire(void* o) noexcept {
+        auto* self = static_cast<PublisherSupport*>(o);
+        PublisherImpl::_zidlRetire(static_cast<PublisherImpl*>(self));
+        ::DDS::PublisherImpl::_zidlRetire(&self->dds_);
+    }
 
     static std::shared_ptr<PublisherSupport> _getOrCreate(DDS_Publisher h) {
         if (!h) return nullptr;
         DDS_Entity _fh = DDS_Publisher_as_DDS_Entity(h);
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
-        auto& _cache = ::DDS::EntityImpl::_familyCache();
-        auto _it = _cache.find(_fh);
-        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
-            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<PublisherSupport>(_base, static_cast<PublisherSupport*>(_it->second.obj));
+        if (auto* _e = ::DDS::EntityImpl::_familyFind(_fh, _familyTag())) {
+            if (auto _base = _e->ref.lock()) return std::shared_ptr<PublisherSupport>(_base, static_cast<PublisherSupport*>(_e->obj));
         }
         auto _sp = std::allocate_shared<PublisherSupport>(
             std::pmr::polymorphic_allocator<PublisherSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
+        ::DDS::EntityImpl::_familyInsert(_fh, {_sp, _familyTag(), _sp.get(), &_zidlRetire});
         return _sp;
     }
 
@@ -538,19 +558,24 @@ public:
     // See TopicSupport's matching comment.
     // Identifies this class's entries in the family's shared cache.
     static const void* _familyTag() noexcept { static const char t = 0; return &t; }
+    // Retires both halves, when the core frees the handle: the inherited
+    // zzdds wrapper and dds_. Recorded with this class's cache entries.
+    static void _zidlRetire(void* o) noexcept {
+        auto* self = static_cast<SubscriberSupport*>(o);
+        SubscriberImpl::_zidlRetire(static_cast<SubscriberImpl*>(self));
+        ::DDS::SubscriberImpl::_zidlRetire(&self->dds_);
+    }
 
     static std::shared_ptr<SubscriberSupport> _getOrCreate(DDS_Subscriber h) {
         if (!h) return nullptr;
         DDS_Entity _fh = DDS_Subscriber_as_DDS_Entity(h);
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
-        auto& _cache = ::DDS::EntityImpl::_familyCache();
-        auto _it = _cache.find(_fh);
-        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
-            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<SubscriberSupport>(_base, static_cast<SubscriberSupport*>(_it->second.obj));
+        if (auto* _e = ::DDS::EntityImpl::_familyFind(_fh, _familyTag())) {
+            if (auto _base = _e->ref.lock()) return std::shared_ptr<SubscriberSupport>(_base, static_cast<SubscriberSupport*>(_e->obj));
         }
         auto _sp = std::allocate_shared<SubscriberSupport>(
             std::pmr::polymorphic_allocator<SubscriberSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
+        ::DDS::EntityImpl::_familyInsert(_fh, {_sp, _familyTag(), _sp.get(), &_zidlRetire});
         return _sp;
     }
 
@@ -588,19 +613,24 @@ public:
     // the generated ::DDS::ContentFilteredTopicImpl does.
     // Identifies this class's entries in the family's shared cache.
     static const void* _familyTag() noexcept { static const char t = 0; return &t; }
+    // Retires both halves, when the core frees the handle: the inherited
+    // zzdds wrapper and dds_. Recorded with this class's cache entries.
+    static void _zidlRetire(void* o) noexcept {
+        auto* self = static_cast<ContentFilteredTopicSupport*>(o);
+        ContentFilteredTopicImpl::_zidlRetire(static_cast<ContentFilteredTopicImpl*>(self));
+        ::DDS::ContentFilteredTopicImpl::_zidlRetire(&self->dds_);
+    }
 
     static std::shared_ptr<ContentFilteredTopicSupport> _getOrCreate(DDS_ContentFilteredTopic h) {
         if (!h) return nullptr;
         DDS_TopicDescription _fh = DDS_ContentFilteredTopic_as_DDS_TopicDescription(h);
         std::lock_guard<std::mutex> _lock(::DDS::TopicDescriptionImpl::_familyMutex());
-        auto& _cache = ::DDS::TopicDescriptionImpl::_familyCache();
-        auto _it = _cache.find(_fh);
-        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
-            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<ContentFilteredTopicSupport>(_base, static_cast<ContentFilteredTopicSupport*>(_it->second.obj));
+        if (auto* _e = ::DDS::TopicDescriptionImpl::_familyFind(_fh, _familyTag())) {
+            if (auto _base = _e->ref.lock()) return std::shared_ptr<ContentFilteredTopicSupport>(_base, static_cast<ContentFilteredTopicSupport*>(_e->obj));
         }
         auto _sp = std::allocate_shared<ContentFilteredTopicSupport>(
             std::pmr::polymorphic_allocator<ContentFilteredTopicSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
+        ::DDS::TopicDescriptionImpl::_familyInsert(_fh, {_sp, _familyTag(), _sp.get(), &_zidlRetire});
         return _sp;
     }
 
@@ -707,19 +737,24 @@ public:
     // See TopicSupport's matching comment.
     // Identifies this class's entries in the family's shared cache.
     static const void* _familyTag() noexcept { static const char t = 0; return &t; }
+    // Retires both halves, when the core frees the handle: the inherited
+    // zzdds wrapper and dds_. Recorded with this class's cache entries.
+    static void _zidlRetire(void* o) noexcept {
+        auto* self = static_cast<DomainParticipantSupport*>(o);
+        DomainParticipantImpl::_zidlRetire(static_cast<DomainParticipantImpl*>(self));
+        ::DDS::DomainParticipantImpl::_zidlRetire(&self->dds_);
+    }
 
     static std::shared_ptr<DomainParticipantSupport> _getOrCreate(DDS_DomainParticipant h) {
         if (!h) return nullptr;
         DDS_Entity _fh = DDS_DomainParticipant_as_DDS_Entity(h);
         std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
-        auto& _cache = ::DDS::EntityImpl::_familyCache();
-        auto _it = _cache.find(_fh);
-        if (_it != _cache.end() && _it->second.tag == _familyTag()) {
-            if (auto _base = _it->second.ref.lock()) return std::shared_ptr<DomainParticipantSupport>(_base, static_cast<DomainParticipantSupport*>(_it->second.obj));
+        if (auto* _e = ::DDS::EntityImpl::_familyFind(_fh, _familyTag())) {
+            if (auto _base = _e->ref.lock()) return std::shared_ptr<DomainParticipantSupport>(_base, static_cast<DomainParticipantSupport*>(_e->obj));
         }
         auto _sp = std::allocate_shared<DomainParticipantSupport>(
             std::pmr::polymorphic_allocator<DomainParticipantSupport>(std::pmr::get_default_resource()), h);
-        _cache[_fh] = {_sp, _familyTag(), _sp.get()};
+        ::DDS::EntityImpl::_familyInsert(_fh, {_sp, _familyTag(), _sp.get(), &_zidlRetire});
         return _sp;
     }
 
@@ -1023,8 +1058,9 @@ inline std::shared_ptr<::DDS::GuardCondition> wrapGuardConditionHandle(DDS_Guard
     // it" race to reconcile against.
     {
         std::lock_guard<std::mutex> _lock(::DDS::ConditionImpl::_familyMutex());
-        ::DDS::ConditionImpl::_familyCache()[DDS_GuardCondition_as_DDS_Condition(handle)] =
-            {sp, ::DDS::GuardConditionImpl::_familyTag(), static_cast<::DDS::GuardConditionImpl*>(sp.get())};
+        ::DDS::ConditionImpl::_familyInsert(
+            DDS_GuardCondition_as_DDS_Condition(handle),
+            {sp, ::DDS::GuardConditionImpl::_familyTag(), static_cast<::DDS::GuardConditionImpl*>(sp.get()), &::DDS::GuardConditionImpl::_zidlRetire});
     }
     return sp;
 }

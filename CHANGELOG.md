@@ -8,6 +8,20 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-03
+
+- C++ and Java wrappers of deleted entities are retired. The core reports every entity
+  handle it frees, cascading deletes included (`zzdds_handle_retire_observe`, zidl's
+  handle-retire hook), and the binding drops the handle's wrapper: its operations return
+  `RETCODE_ALREADY_DELETED` without reaching the core, and a new entity at the same address
+  gets a new wrapper. Fixes the Java `ignore-entities` test's intermittent
+  `IncompatibleClassChangeError` on Windows, where a new `DataWriter` came back as the
+  wrapper of a deleted `DataReader`.
+- C++ `get_listener()` returns the listener installed on the entity, including one passed
+  to `create_*`. `get_listener` retains a registration it hands out to a binding
+  (`retain_listener_data`), so a concurrent `set_listener` cannot free it.
+- Builds against zidl 0.3.25.
+
 ## 2026-11-02
 
 - Listener identity in the C++ and Java bindings: one application listener object is one
