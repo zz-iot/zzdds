@@ -137,7 +137,7 @@ fn hasName(items: anytype, name: []const u8) bool {
     for (items) |item| if (std.mem.eql(u8, item.name, name)) return true;
     return false;
 }
-const fields = [_][]const u8{ "reliability", "history_depth", "max_samples", "max_instances", "max_samples_per_instance" };
+const fields = [_][]const u8{ "reliability", "history_depth", "max_samples", "max_instances", "max_samples_per_instance", "data_representation" };
 const Winner = struct { location: ?generic.Location = null, profile: ?[]const u8 = null };
 const Resolver = struct {
     a: std.mem.Allocator,
@@ -200,6 +200,12 @@ const Resolver = struct {
                 qos.reliability = switch (v) {
                     .BEST_EFFORT_RELIABILITY_QOS => .BEST_EFFORT_RELIABILITY_QOS,
                     .RELIABLE_RELIABILITY_QOS => .RELIABLE_RELIABILITY_QOS,
+                    else => return ctx.fail(error.InvalidEnum, prefix),
+                };
+            } else if (comptime std.mem.eql(u8, field, "data_representation")) {
+                qos.data_representation = switch (v) {
+                    .XCDR1 => .XCDR1,
+                    .XCDR2 => .XCDR2,
                     else => return ctx.fail(error.InvalidEnum, prefix),
                 };
             } else @field(qos, field) = v;

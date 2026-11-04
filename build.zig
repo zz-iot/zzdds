@@ -431,7 +431,11 @@ pub fn build(b: *std.Build) void {
         },
     });
     zzdds_mod.addOptions("build_options", build_options);
-    if (typesupport_mod) |ts| zzdds_mod.addImport("zidl_typesupport", ts);
+    if (typesupport_mod) |ts| {
+        zzdds_mod.addImport("zidl_typesupport", ts);
+        // Downstream linked providers must use this exact ABI/runtime module.
+        b.modules.put(b.graph.arena, b.dupe("zidl_typesupport"), ts) catch @panic("OOM");
+    }
     zzdds_mod.link_libc = true;
     var resource_authoring_source: ?std.Build.LazyPath = null;
     if (resource_authoring) {
@@ -1570,8 +1574,8 @@ pub fn build(b: *std.Build) void {
         plan_output.addArg("plan");
         plan_output.addFileArg(b.path("examples/zig/resource-inspect/reading.toml"));
         plan_output.addArgs(&.{ "--library", "project_a=/no-such-provider-a", "--library", "project_b=/no-such-provider-b", "--bind", "main/LibraryTest::Reading=project_b/LibraryTest::Reading", "--bind", "main/LibraryTest::Pulse=project_a/LibraryTest::Pulse" });
-        plan_output.expectStdErrMatch("writer reading topic=reading reliability=RELIABLE_RELIABILITY_QOS depth=3 max_samples=24 max_instances=4 max_samples_per_instance=6");
-        plan_output.expectStdErrMatch("reader reading topic=reading reliability=BEST_EFFORT_RELIABILITY_QOS depth=2 max_samples=30 max_instances=5 max_samples_per_instance=6");
+        plan_output.expectStdErrMatch("writer reading topic=reading reliability=RELIABLE_RELIABILITY_QOS depth=3 max_samples=24 max_instances=4 max_samples_per_instance=6 data_representation=XCDR2");
+        plan_output.expectStdErrMatch("reader reading topic=reading reliability=BEST_EFFORT_RELIABILITY_QOS depth=2 max_samples=30 max_instances=5 max_samples_per_instance=6 data_representation=XCDR2");
         inspect_tests.dependOn(&plan_output.step);
         test_step.dependOn(&plan_output.step);
         test_step.dependOn(&offline.step);

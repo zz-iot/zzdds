@@ -268,3 +268,35 @@ fn takeSample(dr: zzdds.DDS.DataReader) !zzdds.OwnedRawSample {
         try testing.expectEqual(zzdds.DDS.RETCODE_OK, ws.toDDSWaitSet().wait(&active, .{ .sec = 5, .nanosec = 0 }));
     }
 }
+
+test "representation defaults profiles overrides and invalid values" {
+    const input =
+        \\schema_version=1
+        \\name='encoding'
+        \\[profiles.Base.writer_qos]
+        \\data_representation='XCDR2'
+        \\[profiles.Base.reader_qos]
+        \\data_representation='XCDR2'
+        \\[profiles.Derived]
+        \\base='Base'
+        \\[participants.main]
+        \\domain_id=42
+        \\types={Probe={}}
+        \\topics={t={topic_name='Probe',type_ref='Probe'}}
+        \\publishers={pub={}}
+        \\subscribers={sub={}}
+        \\writers={inherited={container_ref='pub',topic_ref='t',profile_ref='Derived'},override={container_ref='pub',topic_ref='t',profile_ref='Base',qos={data_representation='XCDR1'}},default={container_ref='pub',topic_ref='t'}}
+        \\readers={r={container_ref='sub',topic_ref='t',profile_ref='Base'}}
+    ;
+    var diag: A.Diagnostic = .{};
+    var parsed = try A.parse(testing.allocator, "encoding.toml", input, &diag);
+    defer parsed.deinit();
+    var resolved = try parsed.resolve(testing.allocator, .{}, &diag);
+    defer resolved.deinit();
+    const p = resolved.plan.application.participants[0];
+    for (p.writers) |w| try testing.expectEqual(if (std.mem.eql(u8, w.name, "inherited")) R.DataRepresentation.XCDR2 else R.DataRepresentation.XCDR1, w.qos.data_representation);
+    try testing.expectEqual(R.DataRepresentation.XCDR2, p.readers[0].qos.data_representation);
+    const invalid = try std.mem.replaceOwned(u8, testing.allocator, input, "XCDR2", "XCDR3");
+    defer testing.allocator.free(invalid);
+    try testing.expectError(error.InvalidEnum, A.parse(testing.allocator, "invalid.toml", invalid, &diag));
+}

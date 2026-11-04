@@ -10,6 +10,8 @@ comptime {
         @compileError("experimental resource construction currently requires the default -Dxtypes=true build");
 }
 
+pub const Incremental = @import("incremental.zig").Incremental;
+
 pub const providers = if (@import("build_options").typesupport_library) @import("providers.zig") else struct {};
 
 pub const authoring = if (@import("build_options").resource_authoring) @import("authoring.zig") else struct {};
@@ -23,10 +25,28 @@ pub const Endpoint = struct {
     topic_ref: []const u8,
     qos: EndpointQos = .{},
 };
-/// Deliberately finite, pointer-free first-slice QoS subset. Volatile durability,
-/// KEEP_LAST history, default partitions and XCDR1 only; other policies deferred.
+/// Encoding selected for one endpoint; this does not transcode serialized samples.
+pub const DataRepresentation = enum {
+    XCDR1,
+    XCDR2,
+
+    pub fn capability(self: DataRepresentation) u32 {
+        return switch (self) {
+            .XCDR1 => 1,
+            .XCDR2 => 2,
+        };
+    }
+    pub fn ddsValue(self: DataRepresentation) i16 {
+        return switch (self) {
+            .XCDR1 => 0,
+            .XCDR2 => 2,
+        };
+    }
+};
+/// Finite, pointer-free QoS subset: volatile durability, KEEP_LAST and default partitions.
 pub const EndpointQos = struct {
     reliability: DDS.ReliabilityQosPolicyKind = .BEST_EFFORT_RELIABILITY_QOS,
+    data_representation: DataRepresentation = .XCDR1,
     history_depth: i32 = 1,
     max_samples: i32 = 32,
     max_instances: i32 = 1,
@@ -155,8 +175,9 @@ pub const Plan = struct {
 };
 
 /// The callback must install independent participant-owned support. Its context
-/// is borrowed only for build(); do not pass an owned context to registration
-/// repeatedly. No callback or native context appears in the portable Plan.
+/// is borrowed for registration; keep it available through whole-graph build or
+/// incremental owner cleanup. Do not transfer the same owned context repeatedly.
+/// No callback or native context appears in the portable Plan.
 pub const StaticBinding = struct {
     /// Null applies to every participant; a name restricts this binding to that scope.
     participant: ?[]const u8 = null,
@@ -219,19 +240,12 @@ pub const Instance = struct {
     /// partial entities and cleanup_error. Call deinit even after build failure.
     pub fn build(self: *Instance, bindings: []const StaticBinding) !void {
         if (self.state != .empty) return error.InvalidState;
-        // All bindings validated before entity creation, independent of input order.
-        for (bindings, 0..) |b, i| for (bindings[0..i]) |other| {
-            if (std.mem.eql(u8, b.type_name, other.type_name) and
-                (b.participant == null or other.participant == null or std.mem.eql(u8, b.participant.?, other.participant.?))) return error.DuplicateBinding;
-        };
-        for (self.plan.application.participants) |p| for (p.types) |t| {
-            var found = false;
-            for (bindings) |b| if (std.mem.eql(u8, b.type_name, t.name) and (b.participant == null or std.mem.eql(u8, b.participant.?, p.name))) {
-                found = true;
-                break;
-            };
-            if (!found) return error.MissingBinding;
-        };
+        try constructors.validateBindings(self.plan, bindings);
+        // Reject unsupported representation configuration before creating entities.
+        for (self.plan.application.participants) |p| {
+            for (p.writers) |e| if (!@hasField(DDS.DataWriterQos, "data_representation") and e.qos.data_representation != .XCDR1) return error.UnsupportedRepresentation;
+            for (p.readers) |e| if (!@hasField(DDS.DataReaderQos, "data_representation") and e.qos.data_representation != .XCDR1) return error.UnsupportedRepresentation;
+        }
         try self.checkpoint();
         self.state = .building;
         errdefer {
@@ -246,16 +260,9 @@ pub const Instance = struct {
             if (nil.isNil(dp)) return error.ParticipantCreationFailed;
             l.participant = dp;
             try self.checkpoint();
-            for (p.types) |t| {
-                for (bindings) |b| if (std.mem.eql(u8, b.type_name, t.name) and (b.participant == null or std.mem.eql(u8, b.participant.?, p.name))) {
-                    try b.register(b.context, dp, t.name);
-                    break;
-                };
-                try self.checkpoint();
-            }
+            try constructors.registerTypes(dp, p, bindings, &self.cancelled);
             for (l.topics, p.topics) |*out, t| {
-                out.* = dp.create_topic(terminated(t.topic_name), terminated(t.type_ref), .{}, null, 0);
-                if (nil.isNil(out.*)) return error.TopicCreationFailed;
+                out.* = try constructors.topic(dp, t);
                 try self.checkpoint();
             }
             for (l.publishers) |*out| {
@@ -268,43 +275,12 @@ pub const Instance = struct {
                 if (nil.isNil(out.*)) return error.SubscriberCreationFailed;
                 try self.checkpoint();
             }
-            // Borrowed DDS sequences need only remain live through creation.
-            var representation = [_]i16{0};
             for (l.writers, p.writers) |*out, e| {
-                var qos = DDS.DataWriterQos{};
-                e.qos.apply(&qos);
-                if (@hasField(DDS.DataWriterQos, "data_representation")) qos.data_representation.value = .{
-                    ._maximum = 1,
-                    ._length = 1,
-                    ._buffer = &representation,
-                    ._release = false,
-                };
-                out.* = l.publishers[index(p.publishers, e.container_ref).?].create_datawriter(
-                    l.topics[index(p.topics, e.topic_ref).?],
-                    qos,
-                    null,
-                    0,
-                );
-                if (nil.isNil(out.*)) return error.WriterCreationFailed;
+                out.* = try constructors.writer(l.publishers[index(p.publishers, e.container_ref).?], l.topics[index(p.topics, e.topic_ref).?], e.qos);
                 try self.checkpoint();
             }
             for (l.readers, p.readers) |*out, e| {
-                var qos = DDS.DataReaderQos{};
-                e.qos.apply(&qos);
-                if (@hasField(DDS.DataReaderQos, "data_representation")) qos.data_representation.value = .{
-                    ._maximum = 1,
-                    ._length = 1,
-                    ._buffer = &representation,
-                    ._release = false,
-                };
-                const topic = p.topics[index(p.topics, e.topic_ref).?];
-                out.* = l.subscribers[index(p.subscribers, e.container_ref).?].create_datareader(
-                    dp.lookup_topicdescription(terminated(topic.topic_name)),
-                    qos,
-                    null,
-                    0,
-                );
-                if (nil.isNil(out.*)) return error.ReaderCreationFailed;
+                out.* = try constructors.reader(l.subscribers[index(p.subscribers, e.container_ref).?], dp, p.topics[index(p.topics, e.topic_ref).?], e.qos);
                 try self.checkpoint();
             }
         }
@@ -384,5 +360,57 @@ pub const Instance = struct {
         const p = index(self.plan.application.participants, participant_name) orelse return error.UnknownReference;
         const e = index(self.plan.application.participants[p].readers, endpoint_name) orelse return error.UnknownReference;
         return self.local[p].readers[e];
+    }
+};
+
+/// Shared construction primitives for resource owners. Returned handles must be
+/// recorded before cancellation checks; callers own rollback and deletion.
+/// Internal helpers require definitions from an owned Plan (sentinel strings).
+pub const constructors = struct {
+    pub fn validateBindings(plan: *const Plan, bindings: []const StaticBinding) !void {
+        for (bindings, 0..) |b, i| for (bindings[0..i]) |other| {
+            if (std.mem.eql(u8, b.type_name, other.type_name) and
+                (b.participant == null or other.participant == null or std.mem.eql(u8, b.participant.?, other.participant.?))) return error.DuplicateBinding;
+        };
+        for (plan.application.participants) |p| for (p.types) |t| {
+            var found = false;
+            for (bindings) |b| if (std.mem.eql(u8, b.type_name, t.name) and (b.participant == null or std.mem.eql(u8, b.participant.?, p.name))) {
+                found = true;
+                break;
+            };
+            if (!found) return error.MissingBinding;
+        };
+    }
+    pub fn registerTypes(dp: DDS.DomainParticipant, p: Participant, bindings: []const StaticBinding, cancelled: *const bool) !void {
+        for (p.types) |t| {
+            for (bindings) |b| if (std.mem.eql(u8, b.type_name, t.name) and (b.participant == null or std.mem.eql(u8, b.participant.?, p.name))) {
+                try b.register(b.context, dp, t.name);
+                break;
+            };
+            if (cancelled.*) return error.Cancelled;
+        }
+    }
+    pub fn topic(dp: DDS.DomainParticipant, definition: Topic) !DDS.Topic {
+        const result = dp.create_topic(terminated(definition.topic_name), terminated(definition.type_ref), .{}, null, 0);
+        if (nil.isNil(result)) return error.TopicCreationFailed;
+        return result;
+    }
+    pub fn writer(parent: DDS.Publisher, topic_: DDS.Topic, qos_: EndpointQos) !DDS.DataWriter {
+        var qos = DDS.DataWriterQos{};
+        qos_.apply(&qos);
+        var representation = [_]i16{qos_.data_representation.ddsValue()};
+        qos.data_representation.value = .{ ._maximum = 1, ._length = 1, ._buffer = &representation, ._release = false };
+        const result = parent.create_datawriter(topic_, qos, null, 0);
+        if (nil.isNil(result)) return error.WriterCreationFailed;
+        return result;
+    }
+    pub fn reader(parent: DDS.Subscriber, dp: DDS.DomainParticipant, topic_: Topic, qos_: EndpointQos) !DDS.DataReader {
+        var qos = DDS.DataReaderQos{};
+        qos_.apply(&qos);
+        var representation = [_]i16{qos_.data_representation.ddsValue()};
+        qos.data_representation.value = .{ ._maximum = 1, ._length = 1, ._buffer = &representation, ._release = false };
+        const result = parent.create_datareader(dp.lookup_topicdescription(terminated(topic_.topic_name)), qos, null, 0);
+        if (nil.isNil(result)) return error.ReaderCreationFailed;
+        return result;
     }
 };

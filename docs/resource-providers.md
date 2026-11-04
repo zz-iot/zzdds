@@ -49,7 +49,10 @@ There is no automatic graph reload or callback swap.
 
 Each binding can require an exact `expected_identifier` (15 bytes: EK_MINIMAL plus
 its 14-byte hash), additional `required_representations`, and wire validation. The
-current resource endpoint model uses XCDR1, so every selected source must support it.
+required representation mask is inferred from all writers/readers using that type,
+plus the explicitly requested mask (default zero). A type used by both XCDR1 and
+XCDR2 endpoints must support both; XCDR2-only endpoints do not require XCDR1.
+Unused types impose no endpoint encoding requirement.
 Different Minimal identifiers fail exact-identity checks; no assignability or
 CompleteTypeObject equivalence is inferred. Type identity also does not establish
 native ABI compatibility; the existing loader checks its separate descriptor ABI.
@@ -181,3 +184,24 @@ The emitted baseline-CPU LLVM binary passes Valgrind. Local kcov measures 99.4% 
 coverage of `providers.zig`. These are local Linux results, not hosted CI or a release
 claim. The next zzdds release can wait for the concurrency work without blocking this
 branch or further integration using a pinned commit/local checkout.
+
+## Incremental provider-backed resources
+
+`prepared.incremental(allocator, factory, capacity)` creates an empty incremental
+owner borrowing the preparation's plan and binding contexts. Keep the preparation
+alive and stable through successful owner cleanup. Create participant/topic/
+container/endpoint handles through that owner, then call
+`prepared.writeIncremental(&owner, writer_handle, .alive, encapsulated_sample)`.
+This uses the retained selection and the same wire validation, key hashing and
+encoding checks as whole-graph writes. Compiled adapters still use their generated
+typed writer API. Removing or destroying the provider manager does not invalidate
+the preparation. No XRCE framing, ID assignment or session lifecycle is implied.
+
+## Downstream linked-provider builds
+
+With `-Dtypesupport-library=true`, downstream builds can obtain
+`zzdds_dep.module("zidl_typesupport")` alongside `module("zidl_rt")` and
+`artifact("zidl")`. Import those exact module instances when compiling generated
+linked providers; creating another runtime/ABI graph can produce incompatible
+Zig types or duplicate module imports. The XRCE agent integration exercises this
+build contract.

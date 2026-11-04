@@ -309,29 +309,31 @@ test "bookkeeping allocation failure creates no DDS entities" {
 }
 
 test "concrete QoS is applied through the public endpoint constructor" {
-    var p = definition(true);
-    p.writers = &.{.{
-        .name = "endpoint",
-        .container_ref = "pub",
-        .topic_ref = "announcement",
-        .qos = .{ .reliability = .RELIABLE_RELIABILITY_QOS, .history_depth = 3, .max_samples = 6, .max_instances = 2, .max_samples_per_instance = 3 },
-    }};
-    var plan = try R.Plan.resolve(testing.allocator, .{ .name = "app", .participants = (&p)[0..1] }, .{});
-    defer plan.deinit();
-    var delivery = try zzdds.intraprocess.IntraProcessDelivery.init(testing.allocator);
-    defer delivery.deinit();
-    const a = try Side.init(&delivery);
-    defer a.deinit();
-    var instance = try R.Instance.init(testing.allocator, &plan, a.factory.toDDSFactory());
-    defer instance.deinit() catch @panic("cleanup");
-    try instance.build(&bindings);
-    var qos: DDS.DataWriterQos = .{};
-    try testing.expectEqual(DDS.RETCODE_OK, (try instance.writer("main", "endpoint")).get_qos(&qos));
-    defer qos.deinit(testing.allocator);
-    try testing.expectEqual(DDS.ReliabilityQosPolicyKind.RELIABLE_RELIABILITY_QOS, qos.reliability.kind);
-    try testing.expectEqual(@as(i32, 3), qos.history.depth);
-    try testing.expectEqual(@as(i32, 6), qos.resource_limits.max_samples);
-    try testing.expectEqual(@as(i16, 0), qos.data_representation.value._buffer.?[0]);
+    inline for (.{ R.DataRepresentation.XCDR1, R.DataRepresentation.XCDR2 }) |representation| {
+        var p = definition(true);
+        p.writers = &.{.{
+            .name = "endpoint",
+            .container_ref = "pub",
+            .topic_ref = "announcement",
+            .qos = .{ .data_representation = representation, .reliability = .RELIABLE_RELIABILITY_QOS, .history_depth = 3, .max_samples = 6, .max_instances = 2, .max_samples_per_instance = 3 },
+        }};
+        var plan = try R.Plan.resolve(testing.allocator, .{ .name = "app", .participants = (&p)[0..1] }, .{});
+        defer plan.deinit();
+        var delivery = try zzdds.intraprocess.IntraProcessDelivery.init(testing.allocator);
+        defer delivery.deinit();
+        const a = try Side.init(&delivery);
+        defer a.deinit();
+        var instance = try R.Instance.init(testing.allocator, &plan, a.factory.toDDSFactory());
+        defer instance.deinit() catch @panic("cleanup");
+        try instance.build(&bindings);
+        var qos: DDS.DataWriterQos = .{};
+        try testing.expectEqual(DDS.RETCODE_OK, (try instance.writer("main", "endpoint")).get_qos(&qos));
+        defer qos.deinit(testing.allocator);
+        try testing.expectEqual(DDS.ReliabilityQosPolicyKind.RELIABLE_RELIABILITY_QOS, qos.reliability.kind);
+        try testing.expectEqual(@as(i32, 3), qos.history.depth);
+        try testing.expectEqual(@as(i32, 6), qos.resource_limits.max_samples);
+        try testing.expectEqual(representation.ddsValue(), qos.data_representation.value._buffer.?[0]);
+    }
 }
 
 // Shared-runtime delivery may complete after write returns. Wait on the public
@@ -352,4 +354,182 @@ fn takeSample(dr: zzdds.DDS.DataReader) !zzdds.OwnedRawSample {
         }
         try testing.expectEqual(zzdds.DDS.RETCODE_OK, ws.toDDSWaitSet().wait(&active, .{ .sec = 5, .nanosec = 0 }));
     }
+}
+
+test "incremental construction creates only requests and rejects stale foreign and dependent handles" {
+    const p = definition(true);
+    var plan = try R.Plan.resolve(testing.allocator, .{ .name = "incremental", .participants = &.{p} }, .{});
+    defer plan.deinit();
+    var delivery = try zzdds.intraprocess.IntraProcessDelivery.init(testing.allocator);
+    defer delivery.deinit();
+    const a = try Side.init(&delivery);
+    defer a.deinit();
+    const b = try Side.init(&delivery);
+    defer b.deinit();
+    var owner = try R.Incremental.init(testing.allocator, &plan, a.factory.toDDSFactory(), &bindings, 8);
+    defer owner.deinit() catch @panic("cleanup");
+    var other = try R.Incremental.init(testing.allocator, &plan, b.factory.toDDSFactory(), &bindings, 8);
+    defer other.deinit() catch @panic("cleanup");
+    try testing.expectEqual(@as(usize, 0), owner.count());
+    const dp = try owner.createParticipant("main");
+    try testing.expectEqual(@as(usize, 1), owner.count());
+    try testing.expectError(error.WrongOwner, other.createTopic(dp, "announcement"));
+    try testing.expectError(error.UnknownReference, owner.createTopic(dp, "missing"));
+    const pub_ = try owner.createPublisher(dp, "pub");
+    try testing.expectError(error.WrongKind, owner.createWriter(pub_, dp, "endpoint"));
+    const topic = try owner.createTopic(dp, "announcement");
+    try testing.expectError(error.AlreadyExists, owner.createTopic(dp, "announcement"));
+    const writer = try owner.createWriter(pub_, topic, "endpoint");
+    try testing.expectEqual(@as(usize, 4), owner.count());
+    try testing.expectError(error.LiveDependents, owner.delete(dp));
+    try testing.expectError(error.LiveDependents, owner.delete(pub_));
+    try testing.expectError(error.LiveDependents, owner.delete(topic));
+    try owner.delete(writer);
+    const replacement = try owner.createWriter(pub_, topic, "endpoint");
+    try testing.expectError(error.StaleHandle, owner.writer(writer));
+    _ = try owner.writer(replacement);
+    try owner.delete(replacement);
+    try owner.delete(pub_);
+    try owner.delete(topic);
+    try owner.delete(dp);
+    try testing.expectEqual(@as(usize, 0), owner.count());
+    try testing.expectError(error.StaleHandle, owner.createPublisher(dp, "pub"));
+}
+
+test "incremental failed registration retains cleanup owner and blocks new work until retry" {
+    inline for (.{ false, true }) |fail_cleanup| {
+        const p = definition(true);
+        var plan = try R.Plan.resolve(testing.allocator, .{ .name = "app", .participants = &.{p} }, .{});
+        defer plan.deinit();
+        var delivery = try zzdds.intraprocess.IntraProcessDelivery.init(testing.allocator);
+        defer delivery.deinit();
+        const a = try Side.init(&delivery);
+        defer a.deinit();
+        const factory = a.factory.toDDSFactory();
+        var probe = FactoryProbe{ .inner = factory, .vtable = factory.vtable.*, .fail_delete = fail_cleanup };
+        var factory_qos: DDS.DomainParticipantFactoryQos = .{};
+        factory_qos.entity_factory.autoenable_created_entities = false;
+        try testing.expectEqual(DDS.RETCODE_OK, factory.set_qos(factory_qos));
+        const Fail = struct {
+            calls: usize = 0,
+            fn install(ctx: ?*anyopaque, _: DDS.DomainParticipant, _: []const u8) !void {
+                const self: *@This() = @ptrCast(@alignCast(ctx.?));
+                self.calls += 1;
+                if (self.calls == 2) return error.InjectedFailure;
+            }
+        };
+        var failure: Fail = .{};
+        const failed_bindings = [_]R.StaticBinding{.{ .type_name = "Probe", .context = &failure, .register = Fail.install }};
+        var owner = try R.Incremental.init(testing.allocator, &plan, probe.handle(), &failed_bindings, 2);
+        defer owner.deinit() catch @panic("cleanup");
+        const first = try owner.createParticipant("main");
+        try testing.expectError(error.InjectedFailure, owner.createParticipant("main"));
+        try testing.expectEqual(@as(usize, if (fail_cleanup) 2 else 1), owner.count());
+        if (fail_cleanup) {
+            try testing.expectEqual(error.CleanupFailed, owner.cleanup_error.?);
+            try testing.expectError(error.InvalidState, owner.createParticipant("main"));
+        } else {
+            try testing.expect(owner.cleanup_error == null);
+            try testing.expectEqualStrings("main", try owner.participantName(first));
+            _ = try owner.createParticipant("main"); // Only the failed candidate was rolled back.
+        }
+        try owner.destroy();
+        try testing.expectEqual(@as(usize, 0), owner.count());
+        try testing.expectEqual(@as(usize, 3), probe.deletes);
+    }
+}
+
+test "incremental bookkeeping limits allocation failures and reentrant cancellation" {
+    const p = definition(true);
+    var plan = try R.Plan.resolve(testing.allocator, .{ .name = "app", .participants = &.{p} }, .{});
+    defer plan.deinit();
+    var delivery = try zzdds.intraprocess.IntraProcessDelivery.init(testing.allocator);
+    defer delivery.deinit();
+    const a = try Side.init(&delivery);
+    defer a.deinit();
+    const factory = a.factory.toDDSFactory();
+    var probe = FactoryProbe{ .inner = factory, .vtable = factory.vtable.* };
+    const Run = struct {
+        fn run(alloc: std.mem.Allocator, plan_: *const R.Plan, f: DDS.DomainParticipantFactory) !void {
+            var owner = try R.Incremental.init(alloc, plan_, f, &bindings, 4);
+            defer owner.deinit() catch @panic("cleanup");
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{ &plan, probe.handle() });
+    try testing.expectEqual(@as(usize, 0), probe.creates);
+    try testing.expectError(error.MissingBinding, R.Incremental.init(testing.allocator, &plan, factory, &.{}, 2));
+    try testing.expectError(error.ResourceLimit, R.Incremental.init(testing.allocator, &plan, factory, &bindings, 0));
+    var owner = try R.Incremental.init(testing.allocator, &plan, factory, &bindings, 1);
+    defer owner.deinit() catch @panic("cleanup");
+    const dp = try owner.createParticipant("main");
+    try testing.expectError(error.ResourceLimit, owner.createTopic(dp, "announcement"));
+    try testing.expectEqual(@as(usize, 1), owner.count());
+    try owner.destroy();
+    const Cancel = struct {
+        fn install(ctx: ?*anyopaque, _: DDS.DomainParticipant, _: []const u8) !void {
+            const graph: *R.Incremental = @ptrCast(@alignCast(ctx.?));
+            try testing.expectError(error.ConstructionInProgress, graph.destroy());
+        }
+    };
+    var cb = [_]R.StaticBinding{.{ .type_name = "Probe", .register = Cancel.install }};
+    var cancelled = try R.Incremental.init(testing.allocator, &plan, factory, &cb, 2);
+    defer cancelled.deinit() catch @panic("cleanup");
+    cb[0].context = &cancelled;
+    try testing.expectError(error.Cancelled, cancelled.createParticipant("main"));
+    try testing.expectEqual(@as(usize, 0), cancelled.count());
+    try testing.expectError(error.Cancelled, cancelled.createParticipant("main"));
+}
+
+test "incremental repeated definitions remain distinct and cross-participant endpoints are rejected" {
+    const p = definition(true);
+    var plan = try R.Plan.resolve(testing.allocator, .{ .name = "app", .participants = &.{p} }, .{});
+    defer plan.deinit();
+    var delivery = try zzdds.intraprocess.IntraProcessDelivery.init(testing.allocator);
+    defer delivery.deinit();
+    const a = try Side.init(&delivery);
+    defer a.deinit();
+    const b = try Side.init(&delivery);
+    defer b.deinit();
+    // Inject independent plugin pairs for two enabled participants. The memory
+    // transport/discovery plugins each support one participant per factory.
+    const Pair = struct {
+        first: DDS.DomainParticipantFactory,
+        second: DDS.DomainParticipantFactory,
+        first_dp: ?DDS.DomainParticipant = null,
+        vtable: DDS.DomainParticipantFactory.Vtable,
+        fn create(ctx: *anyopaque, id: DDS.DomainId_t, qos: *const DDS.DomainParticipantQos, listener: ?*const DDS.DomainParticipantListener, mask: DDS.StatusMask) DDS.DomainParticipant {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.first_dp == null) {
+                const dp = self.first.vtable.create_participant(self.first.ptr, id, qos, listener, mask);
+                self.first_dp = dp;
+                return dp;
+            }
+            return self.second.vtable.create_participant(self.second.ptr, id, qos, listener, mask);
+        }
+        fn delete(ctx: *anyopaque, dp: DDS.DomainParticipant) DDS.ReturnCode_t {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return if (dp.ptr == self.first_dp.?.ptr) self.first.delete_participant(dp) else self.second.delete_participant(dp);
+        }
+    };
+    var pair = Pair{ .first = a.factory.toDDSFactory(), .second = b.factory.toDDSFactory(), .vtable = a.factory.toDDSFactory().vtable.* };
+    pair.vtable.create_participant = Pair.create;
+    pair.vtable.delete_participant = Pair.delete;
+    const f = DDS.DomainParticipantFactory{ .ptr = &pair, .vtable = &pair.vtable };
+    var owner = try R.Incremental.init(testing.allocator, &plan, f, &bindings, 10);
+    defer owner.deinit() catch @panic("cleanup");
+    const first = try owner.createParticipant("main");
+    const second = try owner.createParticipant("main");
+    try testing.expect(first.slot != second.slot);
+    const pub_ = try owner.createPublisher(first, "pub");
+    const other_topic = try owner.createTopic(second, "announcement");
+    try testing.expectError(error.WrongParent, owner.createWriter(pub_, other_topic, "endpoint"));
+    try testing.expectEqual(@as(usize, 4), owner.count());
+    // Reuse a low slot for a new child; destroy must follow dependencies, not slots.
+    try owner.delete(other_topic);
+    try owner.delete(second);
+    const topic = try owner.createTopic(first, "announcement");
+    try testing.expect(topic.slot < pub_.slot);
+    _ = try owner.createWriter(pub_, topic, "endpoint");
+    try owner.destroy();
+    try testing.expectEqual(@as(usize, 0), owner.count());
 }

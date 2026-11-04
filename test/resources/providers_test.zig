@@ -9,6 +9,9 @@ const paths = @import("library_paths");
 const reading = "LibraryTest::Reading";
 const pulse = "LibraryTest::Pulse";
 fn plan(alloc: std.mem.Allocator) !R.Plan {
+    return planFor(alloc, .XCDR1);
+}
+fn planFor(alloc: std.mem.Allocator, representation: R.DataRepresentation) !R.Plan {
     return R.Plan.resolve(alloc, .{ .name = "multi", .participants = &.{.{
         .name = "main",
         .domain_id = 184,
@@ -16,8 +19,8 @@ fn plan(alloc: std.mem.Allocator) !R.Plan {
         .topics = &.{ .{ .name = "reading", .topic_name = "Reading", .type_ref = reading }, .{ .name = "pulse", .topic_name = "Pulse", .type_ref = pulse } },
         .publishers = &.{.{ .name = "pub" }},
         .subscribers = &.{.{ .name = "sub" }},
-        .readers = &.{ .{ .name = "reading", .container_ref = "sub", .topic_ref = "reading" }, .{ .name = "pulse", .container_ref = "sub", .topic_ref = "pulse" } },
-        .writers = &.{ .{ .name = "reading", .container_ref = "pub", .topic_ref = "reading" }, .{ .name = "pulse", .container_ref = "pub", .topic_ref = "pulse" } },
+        .readers = &.{ .{ .name = "reading", .container_ref = "sub", .topic_ref = "reading", .qos = .{ .data_representation = representation } }, .{ .name = "pulse", .container_ref = "sub", .topic_ref = "pulse", .qos = .{ .data_representation = representation } } },
+        .writers = &.{ .{ .name = "reading", .container_ref = "pub", .topic_ref = "reading", .qos = .{ .data_representation = representation } }, .{ .name = "pulse", .container_ref = "pub", .topic_ref = "pulse", .qos = .{ .data_representation = representation } } },
     }} }, .{});
 }
 const bindings = [_]P.Binding{
@@ -138,44 +141,73 @@ test "environment admits explicit linked providers and rolls back failures" {
     try testing.expectError(error.NoArtifactHash, P.Environment.init(testing.allocator, &.{no_file_hash}, .{}));
 }
 test "prepared multi-library types still exchange samples after their manager is destroyed" {
-    var p = try plan(testing.allocator);
-    defer p.deinit();
-    var ready = blk: {
-        var m = try manager(testing.allocator);
-        defer m.deinit();
-        break :blk try P.Prepared.init(testing.allocator, &p, &m, &bindings, .{});
-    };
-    defer ready.deinit();
-    var delivery = try dds.intraprocess.IntraProcessDelivery.init(testing.allocator);
-    defer delivery.deinit();
-    const transport = try delivery.newTransport();
-    defer transport.deinit();
-    const discovery = try delivery.newDiscovery();
-    defer discovery.deinit();
-    const factory = try dds.dcps.DomainParticipantFactoryImpl.init(testing.allocator, transport.transport(), discovery.toDiscovery(), dds.noop_security.noop_security_plugins, .spec_random, .{});
-    defer factory.deinit();
-    const peer_transport = try delivery.newTransport();
-    defer peer_transport.deinit();
-    const peer_discovery = try delivery.newDiscovery();
-    defer peer_discovery.deinit();
-    const peer_factory = try dds.dcps.DomainParticipantFactoryImpl.init(testing.allocator, peer_transport.transport(), peer_discovery.toDiscovery(), dds.noop_security.noop_security_plugins, .spec_random, .{});
-    defer peer_factory.deinit();
-    var peer = try ready.instantiate(testing.allocator, peer_factory.toDDSFactory());
-    defer peer.deinit() catch @panic("peer cleanup");
-    var instance = try ready.instantiate(testing.allocator, factory.toDDSFactory());
-    defer instance.deinit() catch @panic("cleanup");
-    try ready.build(&instance);
-    try ready.build(&peer);
-    const sample = [_]u8{ 0, 1, 0, 0, 0, 0, 128, 63, 42, 0, 0, 0 };
-    try ready.write(&instance, "main", "reading", .alive, &sample);
-    try ready.write(&instance, "main", "pulse", .alive, &.{ 0, 1, 0, 0, 9, 0, 0, 0 });
-    const received_reading = try take(try peer.reader("main", "reading"));
-    defer received_reading.deinit();
-    const received_pulse = try take(try peer.reader("main", "pulse"));
-    defer received_pulse.deinit();
-    try testing.expectEqualSlices(u8, &sample, received_reading.data);
-    try testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0, 9, 0, 0, 0 }, received_pulse.data);
-    try testing.expectError(error.InvalidSample, ready.write(&instance, "main", "reading", .alive, &.{ 0, 1, 0, 0 }));
+    inline for (.{ R.DataRepresentation.XCDR1, R.DataRepresentation.XCDR2 }) |representation| {
+        var p = try planFor(testing.allocator, representation);
+        defer p.deinit();
+        var ready = blk: {
+            var m = try manager(testing.allocator);
+            defer m.deinit();
+            break :blk try P.Prepared.init(testing.allocator, &p, &m, &bindings, .{});
+        };
+        defer ready.deinit();
+        var delivery = try dds.intraprocess.IntraProcessDelivery.init(testing.allocator);
+        defer delivery.deinit();
+        const transport = try delivery.newTransport();
+        defer transport.deinit();
+        const discovery = try delivery.newDiscovery();
+        defer discovery.deinit();
+        const factory = try dds.dcps.DomainParticipantFactoryImpl.init(testing.allocator, transport.transport(), discovery.toDiscovery(), dds.noop_security.noop_security_plugins, .spec_random, .{});
+        defer factory.deinit();
+        const peer_transport = try delivery.newTransport();
+        defer peer_transport.deinit();
+        const peer_discovery = try delivery.newDiscovery();
+        defer peer_discovery.deinit();
+        const peer_factory = try dds.dcps.DomainParticipantFactoryImpl.init(testing.allocator, peer_transport.transport(), peer_discovery.toDiscovery(), dds.noop_security.noop_security_plugins, .spec_random, .{});
+        defer peer_factory.deinit();
+        var peer = try ready.incremental(testing.allocator, peer_factory.toDDSFactory(), 10);
+        defer peer.deinit() catch @panic("peer cleanup");
+        var instance = try ready.instantiate(testing.allocator, factory.toDDSFactory());
+        defer instance.deinit() catch @panic("cleanup");
+        try ready.build(&instance);
+        const peer_dp = try peer.createParticipant("main");
+        try testing.expectEqual(@as(usize, 1), peer.count());
+        const peer_reading_topic = try peer.createTopic(peer_dp, "reading");
+        const peer_sub = try peer.createSubscriber(peer_dp, "sub");
+        const peer_reading = try peer.createReader(peer_sub, peer_reading_topic, "reading");
+        try testing.expectEqual(@as(usize, 4), peer.count()); // Pulse was not created eagerly.
+        const peer_pulse_topic = try peer.createTopic(peer_dp, "pulse");
+        const peer_pulse = try peer.createReader(peer_sub, peer_pulse_topic, "pulse");
+        var writer_qos: dds.DDS.DataWriterQos = .{};
+        try testing.expectEqual(dds.DDS.RETCODE_OK, (try instance.writer("main", "reading")).get_qos(&writer_qos));
+        defer writer_qos.deinit(testing.allocator);
+        var reader_qos: dds.DDS.DataReaderQos = .{};
+        try testing.expectEqual(dds.DDS.RETCODE_OK, (try peer.reader(peer_reading)).get_qos(&reader_qos));
+        defer reader_qos.deinit(testing.allocator);
+        try testing.expectEqual(representation.ddsValue(), writer_qos.data_representation.value._buffer.?[0]);
+        try testing.expectEqual(representation.ddsValue(), reader_qos.data_representation.value._buffer.?[0]);
+        const encoding: u8 = if (representation == .XCDR1) 1 else 7;
+        const sample = [_]u8{ 0, encoding, 0, 0, 0, 0, 128, 63, 42, 0, 0, 0 };
+        try ready.write(&instance, "main", "reading", .alive, &sample);
+        try ready.write(&instance, "main", "pulse", .alive, &.{ 0, encoding, 0, 0, 9, 0, 0, 0 });
+        const received_reading = try take(try peer.reader(peer_reading));
+        defer received_reading.deinit();
+        const received_pulse = try take(try peer.reader(peer_pulse));
+        defer received_pulse.deinit();
+        try testing.expectEqualSlices(u8, &sample, received_reading.data);
+        const peer_pub = try peer.createPublisher(peer_dp, "pub");
+        const peer_writer = try peer.createWriter(peer_pub, peer_reading_topic, "reading");
+        try ready.writeIncremental(&peer, peer_writer, .alive, &sample);
+        const reverse_sample = try take(try instance.reader("main", "reading"));
+        defer reverse_sample.deinit();
+        try testing.expectEqualSlices(u8, &sample, reverse_sample.data);
+        try testing.expectError(error.InvalidSample, ready.writeIncremental(&peer, peer_writer, .alive, &.{ 0, 1, 0, 0 }));
+        var wrong_encoding = sample;
+        wrong_encoding[1] = if (representation == .XCDR1) 7 else 1;
+        try testing.expectError(error.UnsupportedRepresentation, ready.write(&instance, "main", "reading", .alive, &wrong_encoding));
+        try testing.expectError(error.UnsupportedRepresentation, ready.writeIncremental(&peer, peer_writer, .alive, &wrong_encoding));
+        try testing.expectEqualSlices(u8, &.{ 0, encoding, 0, 0, 9, 0, 0, 0 }, received_pulse.data);
+        try testing.expectError(error.InvalidSample, ready.write(&instance, "main", "reading", .alive, &.{ 0, 1, 0, 0 }));
+    }
 }
 test "dynamic startup resolves explicit files and checks expected hashes before loading" {
     if (!paths.dynamic_enabled) return error.SkipZigTest;
@@ -337,4 +369,26 @@ test "failed identity and capability requirements never leave generation pins" {
     bad[0].source = .{ .compiled = .{ .binding = .{ .type_name = reading, .register = Noop.install }, .representations = 2 } };
     try testing.expectError(error.UnsupportedRepresentation, P.validate(&p, &bad, .{}));
     try testing.expectEqual(@as(usize, 2), m.liveGenerations());
+}
+
+test "selected endpoint representations determine compiled provider requirements" {
+    var p = try planFor(testing.allocator, .XCDR2);
+    defer p.deinit();
+    const Noop = struct {
+        fn install(_: ?*anyopaque, _: dds.DDS.DomainParticipant, _: []const u8) !void {}
+    };
+    var b = bindings;
+    for (&b) |*binding| binding.source = .{ .compiled = .{ .binding = .{ .type_name = binding.type_name, .register = Noop.install }, .representations = 2 } };
+    try P.validate(&p, &b, .{}); // XCDR2-only support is sufficient.
+    b[0].source.compiled.representations = 1;
+    try testing.expectError(error.UnsupportedRepresentation, P.validate(&p, &b, .{}));
+    b[0].source.compiled.representations = 2;
+    b[0].required_representations = 1; // Explicit extra requirements still apply.
+    try testing.expectError(error.UnsupportedRepresentation, P.validate(&p, &b, .{}));
+    b[0].required_representations = 0;
+    // Mixed writer/reader representations require both capabilities for the type.
+    @constCast(p.application.participants[0].readers)[0].qos.data_representation = .XCDR1;
+    try testing.expectError(error.UnsupportedRepresentation, P.validate(&p, &b, .{}));
+    b[0].source.compiled.representations = 3;
+    try P.validate(&p, &b, .{});
 }
