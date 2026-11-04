@@ -2178,6 +2178,13 @@ fn reportRecvThreadExit(entry: *const SocketEntry, os_error: i32) void {
     log.transport.warn("udp: receive thread for port {d} stopped: OS error {d}; this socket no longer receives", .{ entry.port, os_error });
 }
 
+/// As `reportRecvThreadExit`, for a poll that reported only `revents`, which
+/// carry no OS error code.
+fn reportRecvThreadPollExit(entry: *const SocketEntry, revents: i16) void {
+    if (entry.stopping.load(.acquire)) return;
+    log.transport.warn("udp: receive thread for port {d} stopped: poll events 0x{x}; this socket no longer receives", .{ entry.port, @as(u16, @bitCast(revents)) });
+}
+
 fn recvThread(entry: *SocketEntry) void {
     var buf: [RECV_BUF]u8 = undefined;
     var src_store: posix.sockaddr.storage = undefined;
@@ -2214,7 +2221,7 @@ fn recvThread(entry: *SocketEntry) void {
             };
             if (n_ready == 0) continue :outer;
             if (pfds[0].revents & posix.POLL.IN == 0) {
-                reportRecvThreadExit(entry, 0);
+                reportRecvThreadPollExit(entry, pfds[0].revents);
                 break :outer;
             }
         }
