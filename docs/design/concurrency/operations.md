@@ -784,9 +784,14 @@ object ownership when entering the operation; no mechanism makes arbitrary stale
 handles callable.
 
 Do not promise that a returned wrapper can operate on a logically deleted native
-condition. Safe deleted-handle invocation requires the separate lifetime-aware handle
-contract. In particular, a shared_ptr or Java reference protects wrapper storage, not
-automatically the native DDS object's operational lifetime.
+condition. A shared_ptr or Java reference protects wrapper storage, not the native
+DDS object's operational lifetime. What the C++ and Java bindings do guarantee is
+zidl's handle-retire contract (`docs/design/handle-lifetime.md` in the zidl
+repository): once the core frees an entity's handle, including through a cascading
+delete, it reports the handle, and the binding retires that handle's wrapper, whose
+operations then return ALREADY_DELETED without reaching the core. A call already
+under way when the handle is freed is not covered; that remains the application's
+synchronization.
 
 <a id="completion-versus-conversion-failure"></a>
 ### Completion versus conversion failure

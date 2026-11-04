@@ -27,7 +27,8 @@ const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 const Hook = @import("../runtime/core.zig").Hook;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
-const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
+const listener_box_mod = @import("../util/listener_box.zig");
+const ListenerBox = listener_box_mod.ListenerBox;
 const listener_fallback = @import("../util/listener_fallback.zig");
 const subscriber_mod = @import("subscriber.zig");
 const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
@@ -45,6 +46,7 @@ pub fn listenerExFromBase(l: DDS.DataReaderListener) ZZDDS.DataReaderListenerEx 
         .listener_data = l.listener_data,
         .release_listener_data = l.release_listener_data,
         .listener_identity = l.listener_identity,
+        .retain_listener_data = l.retain_listener_data,
         .on_requested_deadline_missed = l.on_requested_deadline_missed,
         .on_requested_incompatible_qos = l.on_requested_incompatible_qos,
         .on_sample_rejected = l.on_sample_rejected,
@@ -63,6 +65,7 @@ fn baseFromListenerEx(l: ZZDDS.DataReaderListenerEx) DDS.DataReaderListener {
         .listener_data = l.listener_data,
         .release_listener_data = l.release_listener_data,
         .listener_identity = l.listener_identity,
+        .retain_listener_data = l.retain_listener_data,
         .on_requested_deadline_missed = l.on_requested_deadline_missed,
         .on_requested_incompatible_qos = l.on_requested_incompatible_qos,
         .on_sample_rejected = l.on_sample_rejected,
@@ -3274,7 +3277,7 @@ pub const DataReaderImpl = struct {
         const self = cast(ctx);
         self.listener_mu.lock();
         defer self.listener_mu.unlock();
-        return baseFromListenerEx(self.listener_ex_box.listener);
+        return listener_box_mod.handOut(baseFromListenerEx(self.listener_ex_box.listener));
     }
 
     /// Installs `new_listener` (widened from the base OMG type — the

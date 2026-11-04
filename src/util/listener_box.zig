@@ -23,6 +23,19 @@ const std = @import("std");
 const listener_lifecycle = @import("listener_lifecycle.zig");
 const listener_identity = @import("listener_identity.zig");
 
+/// What a `get_listener` returns for the installed `listener`: the same
+/// registration, retained for the caller when it asks for that
+/// (`retain_listener_data`). The caller then owns that reference and drops it
+/// with `release_listener_data`, so a concurrent replacement releasing the
+/// installed reference cannot free the registration under it. Call while
+/// holding the entity's listener lock, so `listener` is still installed.
+pub fn handOut(listener: anytype) @TypeOf(listener) {
+    if (listener.retain_listener_data) |retain| {
+        if (listener.listener_data != null) retain(listener.listener_data);
+    }
+    return listener;
+}
+
 pub fn ListenerBox(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -130,6 +143,27 @@ test "ListenerBox: release only fires once, after the last outstanding acquire" 
     try testing.expectEqual(@as(u32, 0), released);
     box.releaseRef(testing.allocator); // the in-flight dispatch finishing -- last
     try testing.expectEqual(@as(u32, 1), released);
+}
+
+test "handOut retains a registration that asks for it, and only one that does" {
+    const S = struct {
+        var retained: u32 = 0;
+        fn retain(_: ?*anyopaque) callconv(.c) void {
+            retained += 1;
+        }
+    };
+    const Listener = struct {
+        listener_data: ?*anyopaque = null,
+        retain_listener_data: ?*const fn (?*anyopaque) callconv(.c) void = null,
+    };
+    var reg: u8 = 0;
+    const out = handOut(Listener{ .listener_data = &reg, .retain_listener_data = S.retain });
+    try testing.expect(out.listener_data == @as(?*anyopaque, &reg));
+    try testing.expectEqual(@as(u32, 1), S.retained);
+    // No hook (a raw C/Zig registration), or no listener: nothing to retain.
+    _ = handOut(Listener{ .listener_data = &reg });
+    _ = handOut(Listener{ .retain_listener_data = S.retain });
+    try testing.expectEqual(@as(u32, 1), S.retained);
 }
 
 test "ListenerBox: a null release_listener_data is a no-op, not a crash" {

@@ -205,7 +205,12 @@ public class JavaSmoke {
         Dcps.DDS.DataReader second = subscriber.create_datareader(topicReader, readerQos, null, 0);
         check(second != null, "second create_datareader() returned non-null");
         check(second.set_listener(listener, Dcps.DDS.DATA_AVAILABLE_STATUS.value) == 0, "set_listener() of an already-registered listener rc == 0");
+        check(second.get_listener() == listener, "get_listener() returns the installed listener object");
         check(subscriber.delete_datareader(second) == 0, "delete_datareader(second) rc == 0");
+        // The core reports the freed handle and the binding retires the
+        // wrapper: it no longer reaches the core.
+        check(second.enable() == Dcps.DDS.RETCODE_ALREADY_DELETED.value, "a deleted reader's enable() returns ALREADY_DELETED");
+        check(second.get_listener() == null, "a deleted reader has no listener");
         final int dataBeforeDispose = dataCount.get();
 
         // Sanity/link-level regression guard for zidl PR #39's Greptile
@@ -294,6 +299,23 @@ public class JavaSmoke {
         check("id < %0".equals(cft.get_filter_expression()), "rejected expression left the filter unchanged");
         check(dpReader.delete_contentfilteredtopic(cft) == 0, "delete_contentfilteredtopic() rc == 0");
         System.out.println("  ContentFilteredTopic.set_filter_expression: OK");
+
+        // Entities a cascading delete takes never pass through the binding;
+        // their wrappers are retired all the same, and a new entity gets a
+        // wrapper of its own even at a reused address.
+        check(rawWriter.enable() == Dcps.DDS.RETCODE_ALREADY_DELETED.value, "a deleted writer's enable() returns ALREADY_DELETED");
+        Dcps.DDS.Subscriber extraSub = dpReader.create_subscriber(null, null, 0);
+        Dcps.DDS.DataReader extraReader = extraSub.create_datareader(topicReader, readerQos, null, 0);
+        check(extraReader != null, "extra create_datareader() returned non-null");
+        check(extraSub.delete_contained_entities() == 0, "delete_contained_entities() rc == 0");
+        check(extraReader.enable() == Dcps.DDS.RETCODE_ALREADY_DELETED.value,
+              "a reader deleted by its subscriber's delete_contained_entities() is retired");
+        Dcps.DDS.DataReader nextReader = extraSub.create_datareader(topicReader, readerQos, null, 0);
+        check(nextReader != null && nextReader != extraReader, "a new reader gets a wrapper of its own");
+        check(nextReader.enable() == 0, "the new reader reaches the core");
+        check(extraSub.delete_contained_entities() == 0, "second delete_contained_entities() rc == 0");
+        check(dpReader.delete_subscriber(extraSub) == 0, "delete_subscriber(extraSub) rc == 0");
+        System.out.println("  deleted entities' wrappers are retired: OK");
 
         System.out.println("All Java binding smoke checks passed.");
     }

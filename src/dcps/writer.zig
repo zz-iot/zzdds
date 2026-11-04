@@ -20,7 +20,8 @@ const waitset = @import("waitset.zig");
 const time_mod = @import("../util/time.zig");
 const Hook = @import("../runtime/core.zig").Hook;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
-const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
+const listener_box_mod = @import("../util/listener_box.zig");
+const ListenerBox = listener_box_mod.ListenerBox;
 const listener_fallback = @import("../util/listener_fallback.zig");
 const publisher_mod = @import("publisher.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
@@ -52,6 +53,7 @@ pub fn listenerExFromBase(l: DDS.DataWriterListener) ZZDDS.DataWriterListenerEx 
         .listener_data = l.listener_data,
         .release_listener_data = l.release_listener_data,
         .listener_identity = l.listener_identity,
+        .retain_listener_data = l.retain_listener_data,
         .on_offered_deadline_missed = l.on_offered_deadline_missed,
         .on_offered_incompatible_qos = l.on_offered_incompatible_qos,
         .on_liveliness_lost = l.on_liveliness_lost,
@@ -67,6 +69,7 @@ fn baseFromListenerEx(l: ZZDDS.DataWriterListenerEx) DDS.DataWriterListener {
         .listener_data = l.listener_data,
         .release_listener_data = l.release_listener_data,
         .listener_identity = l.listener_identity,
+        .retain_listener_data = l.retain_listener_data,
         .on_offered_deadline_missed = l.on_offered_deadline_missed,
         .on_offered_incompatible_qos = l.on_offered_incompatible_qos,
         .on_liveliness_lost = l.on_liveliness_lost,
@@ -1076,7 +1079,7 @@ pub const DataWriterImpl = struct {
         const self = cast(ctx);
         self.listener_mu.lock();
         defer self.listener_mu.unlock();
-        return baseFromListenerEx(self.listener_ex_box.listener);
+        return listener_box_mod.handOut(baseFromListenerEx(self.listener_ex_box.listener));
     }
 
     // Neither navigational getter below is gated on enabled state -- see

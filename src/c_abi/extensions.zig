@@ -10,6 +10,16 @@ const c_abi_handle = @import("../util/c_abi_handle.zig");
 
 const config_generated = @import("../config/generated.zig");
 const config_mod = @import("../config/schema.zig");
+
+// The handle-retire hook the generated C++ and Java bindings use
+// (`--handle-retire-hook zzdds_handle_retire`, see zidl's
+// docs/design/handle-lifetime.md): zzdds_handle_retire_observe/_unobserve.
+// Every entity handle zzdds frees goes through zidl_rt.freeEntityBox
+// (util/c_abi_handle.zig), which reports it before the memory is reused, so a
+// binding drops and retires its wrapper even for a cascading delete.
+comptime {
+    zidl_rt.exportHandleRetireHook("zzdds_handle_retire");
+}
 const process_config = @import("../config/process.zig");
 const DomainParticipantFactoryImpl = @import("../dcps/factory.zig").DomainParticipantFactoryImpl;
 const participant_mod = @import("../dcps/participant.zig");
