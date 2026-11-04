@@ -101,6 +101,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-10-30
 
+- Re-export the enabled zidl typesupport ABI module for downstream linked-provider
+  builds, sharing the exact runtime/ABI instance used by zzdds.
+
 - Add bounded incremental resource construction with owner-scoped, generation-checked
   handles, explicit dependencies, leaf deletion and retryable cleanup. Share topic,
   registration and endpoint construction with whole-graph Instances. Add checked

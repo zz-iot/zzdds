@@ -431,7 +431,11 @@ pub fn build(b: *std.Build) void {
         },
     });
     zzdds_mod.addOptions("build_options", build_options);
-    if (typesupport_mod) |ts| zzdds_mod.addImport("zidl_typesupport", ts);
+    if (typesupport_mod) |ts| {
+        zzdds_mod.addImport("zidl_typesupport", ts);
+        // Downstream linked providers must use this exact ABI/runtime module.
+        b.modules.put(b.graph.arena, b.dupe("zidl_typesupport"), ts) catch @panic("OOM");
+    }
     zzdds_mod.link_libc = true;
     var resource_authoring_source: ?std.Build.LazyPath = null;
     if (resource_authoring) {

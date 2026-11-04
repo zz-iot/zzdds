@@ -196,3 +196,12 @@ This uses the retained selection and the same wire validation, key hashing and
 encoding checks as whole-graph writes. Compiled adapters still use their generated
 typed writer API. Removing or destroying the provider manager does not invalidate
 the preparation. No XRCE framing, ID assignment or session lifecycle is implied.
+
+## Downstream linked-provider builds
+
+With `-Dtypesupport-library=true`, downstream builds can obtain
+`zzdds_dep.module("zidl_typesupport")` alongside `module("zidl_rt")` and
+`artifact("zidl")`. Import those exact module instances when compiling generated
+linked providers; creating another runtime/ABI graph can produce incompatible
+Zig types or duplicate module imports. The XRCE agent integration exercises this
+build contract.

@@ -157,8 +157,9 @@ zig build test -Dresource-construction=true
 
 The focused target fails explicitly if its opt-in is omitted. The enabled tests
 also join the ordinary test step and emitted native test artifacts. TSan uses LLVM.
-The dedicated workflow runs native Debug/ReleaseSafe on Linux, Windows and macOS;
-remote execution is separate evidence from local Linux checks.
+The dedicated workflow runs native Debug/ReleaseSafe on Linux, Windows and macOS,
+plus Linux ThreadSanitizer and shared-runtime construction/authoring/provider checks.
+Remote execution is separate evidence from local Linux checks.
 
 The [acceptance fixture](../test/dcps/resource_construction_test.zig) builds a static
 [zidl-generated Probe](../test/resources/resource_probe.idl), instantiates separate
