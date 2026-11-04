@@ -72,6 +72,13 @@ uint32_t parse_domain(int argc, char **argv) {
 
 } // namespace
 
+// A writer's current matched count, as discovery has it, whatever its listener has been told.
+template <typename Writer>
+static int writer_matched(const Writer &dw) {
+    ::DDS::PublicationMatchedStatus status{};
+    return dw->get_publication_matched_status(status) == ::DDS::RETCODE_OK ? status.current_count : -1;
+}
+
 int main(int argc, char **argv) {
     uint32_t domain_id = parse_domain(argc, argv);
 
@@ -153,6 +160,7 @@ int main(int argc, char **argv) {
     // -- Wait for the late-joining reader to match. --
     for (int waited_ms = 0; !state.ever_matched.load(); waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= MATCH_TIMEOUT_MS) {
+            std::fprintf(stderr, "  matched: writer listener=%d status=%d\n", state.matched_current_count.load(), writer_matched(dw));
             std::fprintf(stderr, "FAIL: no reader matched within %ds\n", MATCH_TIMEOUT_MS / 1000);
             return 1;
         }

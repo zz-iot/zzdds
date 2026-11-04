@@ -35,6 +35,18 @@ public class Publisher {
         return 0;
     }
 
+    /** A writer's current matched count, as discovery has it, whatever its listener has been told. */
+    private static int writerMatched(Dcps.DDS.DataWriter dw) {
+        Dcps.DDS.PublicationMatchedStatus status = new Dcps.DDS.PublicationMatchedStatus();
+        return dw.get_publication_matched_status(status) == Dcps.DDS.RETCODE_OK.value ? status.get_current_count() : -1;
+    }
+
+    /** A reader's current matched count, for saying which endpoint a timeout is about. */
+    private static int readerMatched(Dcps.DDS.DataReader dr) {
+        Dcps.DDS.SubscriptionMatchedStatus status = new Dcps.DDS.SubscriptionMatchedStatus();
+        return dr.get_subscription_matched_status(status) == Dcps.DDS.RETCODE_OK.value ? status.get_current_count() : -1;
+    }
+
     public static void main(String[] args) throws Exception {
         int domainId = parseDomain(args);
 
@@ -125,6 +137,7 @@ public class Publisher {
         long deadline = System.currentTimeMillis() + MATCH_TIMEOUT_MS;
         while (state.matchedCurrentCount.get() < 2) {
             if (System.currentTimeMillis() > deadline) {
+                System.err.println("  matched: writer listener=" + state.matchedCurrentCount.get() + " status=" + writerMatched(dw) + " GoTopic_reader=" + readerMatched(goDr));
                 System.err.println("FAIL: fewer than 2 readers matched within " + (MATCH_TIMEOUT_MS / 1000) + "s (got " + state.matchedCurrentCount.get() + ")");
                 System.exit(1);
             }

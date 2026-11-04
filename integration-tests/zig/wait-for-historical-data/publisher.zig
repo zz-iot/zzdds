@@ -58,6 +58,12 @@ fn parseDomain(process_args: std.process.Args, arena: std.mem.Allocator) u32 {
     return 0;
 }
 
+/// A writer's current matched count, as discovery has it, whatever its listener has been told.
+fn writerMatched(dw: anytype) i32 {
+    var status: DDS.PublicationMatchedStatus = undefined;
+    return if (dw.get_publication_matched_status(&status) == DDS.RETCODE_OK) status.current_count else -1;
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -151,6 +157,7 @@ pub fn main(init: std.process.Init) !void {
     const match_deadline = monoNs(io) + MATCH_TIMEOUT_NS;
     while (!state.ever_matched.load(.acquire)) {
         if (monoNs(io) > match_deadline) {
+            std.debug.print("  matched: writer listener={d} status={d}\n", .{ state.matched_current_count.load(.acquire), writerMatched(dw) });
             std.debug.print("FAIL: no reader matched within 20s\n", .{});
             std.process.exit(1);
         }

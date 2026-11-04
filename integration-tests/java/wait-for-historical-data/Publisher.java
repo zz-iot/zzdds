@@ -34,6 +34,12 @@ public class Publisher {
         return 0;
     }
 
+    /** A writer's current matched count, as discovery has it, whatever its listener has been told. */
+    private static int writerMatched(Dcps.DDS.DataWriter dw) {
+        Dcps.DDS.PublicationMatchedStatus status = new Dcps.DDS.PublicationMatchedStatus();
+        return dw.get_publication_matched_status(status) == Dcps.DDS.RETCODE_OK.value ? status.get_current_count() : -1;
+    }
+
     public static void main(String[] args) throws Exception {
         int domainId = parseDomain(args);
 
@@ -128,6 +134,7 @@ public class Publisher {
         long deadline = System.currentTimeMillis() + MATCH_TIMEOUT_MS;
         while (!state.everMatched.get()) {
             if (System.currentTimeMillis() > deadline) {
+                System.err.println("  matched: writer listener=" + state.matchedCurrentCount.get() + " status=" + writerMatched(dw));
                 System.err.println("FAIL: no reader matched within " + (MATCH_TIMEOUT_MS / 1000) + "s");
                 System.exit(1);
             }

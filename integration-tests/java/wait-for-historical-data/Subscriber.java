@@ -69,6 +69,12 @@ public class Subscriber {
         }
     }
 
+    /** A reader's current matched count, for saying which endpoint a timeout is about. */
+    private static int readerMatched(Dcps.DDS.DataReader dr) {
+        Dcps.DDS.SubscriptionMatchedStatus status = new Dcps.DDS.SubscriptionMatchedStatus();
+        return dr.get_subscription_matched_status(status) == Dcps.DDS.RETCODE_OK.value ? status.get_current_count() : -1;
+    }
+
     public static void main(String[] args) throws Exception {
         int domainId = parseDomain(args);
 
@@ -200,6 +206,7 @@ public class Subscriber {
         long deadline = System.currentTimeMillis() + RECEIVE_TIMEOUT_MS;
         while (!allDone.get()) {
             if (System.currentTimeMillis() > deadline) {
+                System.err.println("  matched: reader=" + readerMatched(rawReader));
                 System.err.println("FAIL: did not observe the full live batch within " + (RECEIVE_TIMEOUT_MS / 1000) + "s");
                 System.exit(1);
             }

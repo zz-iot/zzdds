@@ -126,6 +126,13 @@ uint32_t parse_domain(int argc, char **argv) {
 
 } // namespace
 
+// A reader's current matched count, for saying which endpoint a timeout is about.
+template <typename Reader>
+static int reader_matched(const Reader &dr) {
+    ::DDS::SubscriptionMatchedStatus status{};
+    return dr->get_subscription_matched_status(status) == ::DDS::RETCODE_OK ? status.current_count : -1;
+}
+
 int main(int argc, char **argv) {
     uint32_t domain_id = parse_domain(argc, argv);
 
@@ -239,6 +246,7 @@ int main(int argc, char **argv) {
 
     for (int waited_ms = 0; !state.all_done.load(); waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= RECEIVE_TIMEOUT_MS) {
+            std::fprintf(stderr, "  matched: reader=%d\n", reader_matched(dr));
             std::fprintf(stderr, "FAIL: did not observe the full live batch within %ds\n", RECEIVE_TIMEOUT_MS / 1000);
             return 1;
         }

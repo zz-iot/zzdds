@@ -106,6 +106,20 @@ uint32_t parse_domain(int argc, char **argv) {
 
 } // namespace
 
+// A reader's current matched count, for saying which endpoint a timeout is about.
+template <typename Reader>
+static int reader_matched(const Reader &dr) {
+    ::DDS::SubscriptionMatchedStatus status{};
+    return dr->get_subscription_matched_status(status) == ::DDS::RETCODE_OK ? status.current_count : -1;
+}
+
+// A writer's current matched count, as discovery has it, whatever its listener has been told.
+template <typename Writer>
+static int writer_matched(const Writer &dw) {
+    ::DDS::PublicationMatchedStatus status{};
+    return dw->get_publication_matched_status(status) == ::DDS::RETCODE_OK ? status.current_count : -1;
+}
+
 int main(int argc, char **argv) {
     uint32_t domain_id = parse_domain(argc, argv);
 
@@ -237,6 +251,7 @@ int main(int argc, char **argv) {
     // really were sent and really did arrive over the wire. --
     for (int waited_ms = 0; witness_state.count.load() < PHASE1_COUNT; waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= WITNESS_TIMEOUT_MS) {
+            std::fprintf(stderr, "  matched: witness=%d filtered=%d GoTopic_writer=%d\n", reader_matched(witness_dr), reader_matched(filtered_dr), writer_matched(go_dw));
             std::fprintf(stderr, "FAIL: witness reader only saw %d/%d phase1 samples within %ds\n", witness_state.count.load(), PHASE1_COUNT, WITNESS_TIMEOUT_MS / 1000);
             return 1;
         }
@@ -282,6 +297,7 @@ int main(int argc, char **argv) {
     // -- Phase 2: wait for the witness reader to see all 10 total. --
     for (int waited_ms = 0; witness_state.count.load() < TOTAL_COUNT; waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= FINAL_TIMEOUT_MS) {
+            std::fprintf(stderr, "  matched: witness=%d filtered=%d GoTopic_writer=%d\n", reader_matched(witness_dr), reader_matched(filtered_dr), writer_matched(go_dw));
             std::fprintf(stderr, "FAIL: witness reader only saw %d/%d total samples within %ds\n", witness_state.count.load(), TOTAL_COUNT, FINAL_TIMEOUT_MS / 1000);
             return 1;
         }
@@ -298,6 +314,7 @@ int main(int argc, char **argv) {
     // this nondeterministically (found via Greptile review).
     for (int waited_ms = 0; filtered_state.count.load() < PHASE2_COUNT; waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= FINAL_TIMEOUT_MS) {
+            std::fprintf(stderr, "  matched: witness=%d filtered=%d GoTopic_writer=%d\n", reader_matched(witness_dr), reader_matched(filtered_dr), writer_matched(go_dw));
             std::fprintf(stderr, "FAIL: filtered reader only saw %d/%d phase2 samples within %ds\n", filtered_state.count.load(), PHASE2_COUNT, FINAL_TIMEOUT_MS / 1000);
             return 1;
         }
