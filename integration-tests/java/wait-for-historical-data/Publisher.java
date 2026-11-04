@@ -156,6 +156,7 @@ public class Publisher {
         deadline = System.currentTimeMillis() + DRAIN_TIMEOUT_MS;
         while (!(state.everMatched.get() && state.matchedCurrentCount.get() == 0)) {
             if (System.currentTimeMillis() > deadline) {
+                System.err.println("  matched: writer listener=" + state.matchedCurrentCount.get() + " ever=" + state.everMatched.get() + " status=" + writerMatched(dw));
                 System.err.println("FAIL: subscriber did not disconnect within " + (DRAIN_TIMEOUT_MS / 1000) + "s");
                 System.exit(1);
             }

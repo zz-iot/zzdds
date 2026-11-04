@@ -183,6 +183,7 @@ int main(int argc, char **argv) {
          !(state.ever_matched.load() && state.matched_current_count.load() == 0);
          waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= DRAIN_TIMEOUT_MS) {
+            std::fprintf(stderr, "  matched: writer listener=%d ever=%d status=%d\n", state.matched_current_count.load(), state.ever_matched.load() ? 1 : 0, writer_matched(dw));
             std::fprintf(stderr, "FAIL: subscriber did not disconnect within %ds\n", DRAIN_TIMEOUT_MS / 1000);
             return 1;
         }

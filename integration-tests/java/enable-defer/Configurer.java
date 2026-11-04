@@ -54,6 +54,12 @@ public class Configurer {
         };
     }
 
+    /** A writer's current matched count, as discovery has it, whatever its listener has been told. */
+    private static int writerMatched(Dcps.DDS.DataWriter dw) {
+        Dcps.DDS.PublicationMatchedStatus status = new Dcps.DDS.PublicationMatchedStatus();
+        return dw.get_publication_matched_status(status) == Dcps.DDS.RETCODE_OK.value ? status.get_current_count() : -1;
+    }
+
     public static void main(String[] args) throws Exception {
         int domainId = parseDomain(args);
 
@@ -223,6 +229,7 @@ public class Configurer {
         deadline = System.currentTimeMillis() + DRAIN_TIMEOUT_MS;
         while (writerState.matchedCurrentCount.get() != 0 || !writerState.everMatched.get()) {
             if (System.currentTimeMillis() > deadline) {
+                System.err.println("  matched: writer listener=" + writerState.matchedCurrentCount.get() + " ever=" + writerState.everMatched.get() + " status=" + writerMatched(dw));
                 System.err.println("FAIL: subscriber did not disconnect within " + (DRAIN_TIMEOUT_MS / 1000) + "s");
                 System.exit(1);
             }

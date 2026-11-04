@@ -2,6 +2,7 @@
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -136,6 +137,16 @@ class MetaFileTests(unittest.TestCase):
             meta = (Path(tmp) / "sub.log.meta").read_text()
             for key in ("cmd:", "pid:", "started_utc:", "stopped_utc:", "returncode: 0", "stopped_externally: false"):
                 self.assertIn(key, meta)
+
+    def test_meta_records_exit_time_not_stop_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "sub.log"
+            proc = LiveProcess([sys.executable, "-c", "pass"], log_path=log)
+            proc.wait(30)
+            time.sleep(0.2)  # the process is long gone when stop() runs
+            proc.stop()
+            fields = dict(line.split(": ", 1) for line in (Path(tmp) / "sub.log.meta").read_text().splitlines())
+            self.assertLess(fields["exited_utc"], fields["stopped_utc"])
 
 
 if __name__ == "__main__":

@@ -114,6 +114,13 @@ std::shared_ptr<::DDS::DataWriter> create_writer(std::shared_ptr<::DDS::DomainPa
 
 } // namespace
 
+// A writer's current matched count, as discovery has it, whatever its listener has been told.
+template <typename Writer>
+static int writer_matched(const Writer &dw) {
+    ::DDS::PublicationMatchedStatus status{};
+    return dw->get_publication_matched_status(status) == ::DDS::RETCODE_OK ? status.current_count : -1;
+}
+
 int main(int argc, char **argv) {
     uint32_t domain_id = parse_domain(argc, argv);
 
@@ -212,6 +219,8 @@ int main(int argc, char **argv) {
 
     for (int waited_ms = 0; auto_state.matched_current_count.load() != 0 || manual_state.matched_current_count.load() != 0; waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= DRAIN_TIMEOUT_MS) {
+            std::fprintf(stderr, "  matched: automatic listener=%d status=%d\n", auto_state.matched_current_count.load(), writer_matched(auto_dw));
+            std::fprintf(stderr, "  matched: manual listener=%d status=%d\n", manual_state.matched_current_count.load(), writer_matched(manual_dw));
             std::fprintf(stderr, "FAIL: subscriber did not disconnect within %ds\n", DRAIN_TIMEOUT_MS / 1000);
             return 1;
         }

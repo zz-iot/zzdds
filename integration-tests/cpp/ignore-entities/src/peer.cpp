@@ -204,6 +204,7 @@ int main(int argc, char **argv) {
         }
         if (control_status.current_count == 0) break;
         if (waited_ms >= DRAIN_TIMEOUT_MS) {
+            std::fprintf(stderr, "  matched: control writer status=%d\n", control_status.current_count);
             std::fprintf(stderr, "FAIL: ignorer did not disconnect within %ds\n", DRAIN_TIMEOUT_MS / 1000);
             return 1;
         }

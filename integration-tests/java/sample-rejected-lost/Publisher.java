@@ -51,6 +51,12 @@ public class Publisher {
         };
     }
 
+    /** A writer's current matched count, as discovery has it, whatever its listener has been told. */
+    private static int writerMatched(Dcps.DDS.DataWriter dw) {
+        Dcps.DDS.PublicationMatchedStatus status = new Dcps.DDS.PublicationMatchedStatus();
+        return dw.get_publication_matched_status(status) == Dcps.DDS.RETCODE_OK.value ? status.get_current_count() : -1;
+    }
+
     public static void main(String[] args) throws Exception {
         int domainId = parseDomain(args);
 
@@ -196,6 +202,9 @@ public class Publisher {
                  syncState.everMatched.get() && syncState.matchedCurrentCount.get() == 0 &&
                  lostState.everMatched.get() && lostState.matchedCurrentCount.get() == 0)) {
             if (System.currentTimeMillis() > deadline) {
+                System.err.println("  matched: Rejected listener=" + rejectedState.matchedCurrentCount.get() + " ever=" + rejectedState.everMatched.get() + " status=" + writerMatched(rejectedDw));
+                System.err.println("  matched: Sync listener=" + syncState.matchedCurrentCount.get() + " ever=" + syncState.everMatched.get() + " status=" + writerMatched(syncDw));
+                System.err.println("  matched: Lost listener=" + lostState.matchedCurrentCount.get() + " ever=" + lostState.everMatched.get() + " status=" + writerMatched(lostDw));
                 System.err.println("FAIL: subscriber did not disconnect within " + (DRAIN_TIMEOUT_MS / 1000) + "s");
                 System.exit(1);
             }

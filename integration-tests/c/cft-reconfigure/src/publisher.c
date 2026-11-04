@@ -234,6 +234,7 @@ int main(int argc, char **argv) {
 
     for (int waited_ms = 0; atomic_load(&state.matched_current_count) != 0; waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= DRAIN_TIMEOUT_MS) {
+            fprintf(stderr, "  matched: writer listener=%d status=%d\n", atomic_load(&state.matched_current_count), writer_matched(dw));
             fprintf(stderr, "FAIL: subscriber did not disconnect within %ds\n", DRAIN_TIMEOUT_MS / 1000);
             return 1;
         }

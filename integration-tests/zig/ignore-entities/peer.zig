@@ -208,6 +208,7 @@ pub fn main(init: std.process.Init) !void {
         }
         if (control_status.current_count == 0) break;
         if (monoNs(io) > drain_deadline) {
+            std.debug.print("  matched: control writer status={d}\n", .{control_status.current_count});
             std.debug.print("FAIL: ignorer did not disconnect within {d}s\n", .{@divTrunc(DRAIN_TIMEOUT_NS, std.time.ns_per_s)});
             std.process.exit(1);
         }

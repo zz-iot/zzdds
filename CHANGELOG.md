@@ -10,6 +10,10 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-04
 
+- **"Did not disconnect" test timeouts say what each side knew.** They now print each writer's
+  listener and status matched counts, and the process metadata beside integration test logs
+  records when each process really exited. This tells a listener that wasn't told, a match
+  discovery kept and a peer still shutting down apart.
 - **A UDP receive thread that stops now says so.** An unexpected `recvfrom` or `poll` error
   ended a socket's receive thread silently, leaving the socket deaf for the rest of the
   process. It now logs a transport warning with the port and OS error code, and other

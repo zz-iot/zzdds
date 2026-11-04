@@ -206,6 +206,7 @@ pub fn main(init: std.process.Init) !void {
     const drain_deadline = monoNs(io) + DRAIN_TIMEOUT_NS;
     while (state.matched_current_count.load(.acquire) != 0) {
         if (monoNs(io) > drain_deadline) {
+            std.debug.print("  matched: writer listener={d} status={d}\n", .{ state.matched_current_count.load(.acquire), writerMatched(dw) });
             std.debug.print("FAIL: subscriber did not disconnect within 15s\n", .{});
             std.process.exit(1);
         }
