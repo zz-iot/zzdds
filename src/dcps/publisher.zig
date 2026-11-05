@@ -255,6 +255,7 @@ pub const PublisherImpl = struct {
     /// immediately unless a child DataWriterImpl (or an in-flight fallback
     /// dispatch) still holds one, in which case that release runs it.
     pub fn deinit(self: *Self) void {
+        self.quiesce.close();
         // Tear owned DataWriters down synchronously first: each w.deinit()
         // drops the lifetime ref it holds on us (writer.zig init), so by
         // beginTeardown the only refs left are our own "alive" one and any
@@ -265,6 +266,8 @@ pub const PublisherImpl = struct {
             w.deinit();
         }
         self.writers.clearRetainingCapacity();
+        self.c_abi.retire();
+        if (self.status_cond) |sc| sc.c_abi.retire();
         self.quiesce.beginTeardown(self, reallyDeinit);
     }
 

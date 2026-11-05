@@ -299,6 +299,8 @@ pub const WaitSetImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.quiesce.close();
+        self.ws_c_abi.retire();
         self.quiesce.beginTeardown(self, reallyDeinit);
     }
 
@@ -430,7 +432,7 @@ pub const WaitSetImpl = struct {
             self.mu.lock();
             var triggered: std.ArrayListUnmanaged(DDS.Condition) = .empty;
             for (self.conditions.items) |entry| {
-                if (entry.cond.get_trigger_value()) {
+                if (!conditionRetired(entry.cond) and entry.cond.get_trigger_value()) {
                     triggered.append(self.alloc, entry.cond) catch {
                         triggered.deinit(self.alloc);
                         self.mu.unlock();
@@ -528,11 +530,16 @@ pub const WaitSetImpl = struct {
     /// ctx synchronously, on its own stack, needs no callback at all.
     pub fn attachConditionWithRelease(
         self: *Self,
-        cond: DDS.Condition,
+        input: DDS.Condition,
         release_ctx: ?*anyopaque,
         release_fn: ?*const fn (?*anyopaque) callconv(.c) void,
         out_accepted: ?*bool,
     ) DDS.ReturnCode_t {
+        const cond = canonicalCondition(input);
+        if (conditionRetired(cond)) {
+            if (out_accepted) |accepted| accepted.* = false;
+            return DDS.RETCODE_ALREADY_DELETED;
+        }
         self.mu.lock();
         defer self.mu.unlock();
         for (self.conditions.items) |entry| {
@@ -599,8 +606,35 @@ pub const WaitSetImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtDetach(ctx: *anyopaque, cond: DDS.Condition) DDS.ReturnCode_t {
+    // A C-ABI QueryCondition view has qc as its context; native attachment
+    // bookkeeping uses its embedded ReadCondition, including detach/invalidate.
+    fn canonicalCondition(cond: DDS.Condition) DDS.Condition {
+        if (cond.vtable == &QueryConditionImpl.cond_thunk_vtable) {
+            const qc: *QueryConditionImpl = @ptrCast(@alignCast(cond.ptr));
+            return qc.toCondition();
+        }
+        return cond;
+    }
+
+    fn conditionRetired(cond: DDS.Condition) bool {
+        if (cond.vtable == &StatusConditionImpl.cond_vtable) {
+            const sc: *StatusConditionImpl = @ptrCast(@alignCast(cond.ptr));
+            return sc.c_abi.retired.load(.acquire);
+        }
+        if (cond.vtable == &GuardConditionImpl.cond_vtable) {
+            const gc: *GuardConditionImpl = @ptrCast(@alignCast(cond.ptr));
+            return gc.c_abi.retired.load(.acquire);
+        }
+        if (cond.vtable == &ReadConditionImpl.cond_vtable) {
+            const rc: *ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
+            return if (rc.owner_qc) |qc| qc.c_abi.retired.load(.acquire) else rc.c_abi.retired.load(.acquire);
+        }
+        return false;
+    }
+
+    fn vtDetach(ctx: *anyopaque, input: DDS.Condition) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        const cond = canonicalCondition(input);
         var removed: ?AttachedCondition = null;
         self.mu.lock();
         for (self.conditions.items, 0..) |entry, i| {
@@ -636,9 +670,18 @@ pub const WaitSetImpl = struct {
         const n = self.conditions.items.len;
         if (n == 0) return DDS.RETCODE_OK;
         const buf = self.alloc.alloc(DDS.Condition, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        for (self.conditions.items, 0..) |entry, i| buf[i] = entry.cond;
+        var count: usize = 0;
+        for (self.conditions.items) |entry| {
+            if (conditionRetired(entry.cond)) continue;
+            buf[count] = entry.cond;
+            count += 1;
+        }
+        if (count == 0) {
+            self.alloc.free(buf);
+            return DDS.RETCODE_OK;
+        }
         seq._buffer = buf.ptr;
-        seq._length = @intCast(n);
+        seq._length = @intCast(count);
         seq._maximum = @intCast(n);
         seq._release = true;
         return DDS.RETCODE_OK;
@@ -855,6 +898,7 @@ pub const GuardConditionImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.quiesce.close();
         // invalidateAll() stays eager/unconditional here (not gated behind
         // quiesce, unlike reallyDeinit below) -- it's what releases the
         // quiesce reference each still-attached WaitSet acquired at attach
@@ -868,6 +912,7 @@ pub const GuardConditionImpl = struct {
         // for a WaitSet that's concurrently, itself, mid-teardown (see
         // unregisterFromCondition's matching comment).
         self.wakeups.invalidateAll(self);
+        self.c_abi.retire();
         self.quiesce.beginTeardown(self, reallyDeinit);
     }
 
@@ -1772,4 +1817,46 @@ test "WaitSet: a second condition's drain() still succeeds and invalidates itsel
     // (drain() above consumed the only slot), so this doesn't touch `ws`
     // (now fully freed) at all. Safe regardless.
     gc_a.deinit();
+}
+
+test "waitset and guard handles retire while native references defer cleanup" {
+    const rt = @import("zidl_rt");
+    const alloc = std.testing.allocator;
+    const guard = try GuardConditionImpl.init(alloc);
+    var guard_deleted = false;
+    defer if (!guard_deleted) guard.deinit();
+    const ws = try WaitSetImpl.init(alloc);
+    var ws_deleted = false;
+    defer if (!ws_deleted) ws.deinit();
+    const g = guard.toDDSGuardCondition();
+    const w = ws.toDDSWaitSet();
+    const Record = struct {
+        handles: [2]*anyopaque,
+        calls: [2]std.atomic.Value(u32) = @splat(.init(0)),
+        fn retired(ctx: ?*anyopaque, h: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            for (self.handles, 0..) |expected, i| {
+                if (h == expected) _ = self.calls[i].fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var record: Record = .{ .handles = .{ g.vtable.get_c_abi_handle(g.ptr), w.vtable.get_c_abi_handle(w.ptr) } };
+    try std.testing.expect(rt.observeHandleRetire(Record.retired, &record));
+    defer _ = rt.unobserveHandleRetire(Record.retired, &record);
+    try std.testing.expect(guard.quiesce.acquire());
+    var guard_held = true;
+    defer if (guard_held) guard.quiesce.release(guard, GuardConditionImpl.reallyDeinit);
+    try std.testing.expect(ws.quiesce.acquire());
+    var ws_held = true;
+    defer if (ws_held) ws.quiesce.release(ws, WaitSetImpl.reallyDeinit);
+    guard.deinit();
+    guard_deleted = true;
+    ws.deinit();
+    ws_deleted = true;
+    for (&record.calls) |*count| try std.testing.expectEqual(@as(u32, 1), count.load(.acquire));
+    guard.quiesce.release(guard, GuardConditionImpl.reallyDeinit);
+    guard_held = false;
+    ws.quiesce.release(ws, WaitSetImpl.reallyDeinit);
+    ws_held = false;
+    for (&record.calls) |*count| try std.testing.expectEqual(@as(u32, 1), count.load(.acquire));
 }

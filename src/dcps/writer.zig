@@ -309,8 +309,11 @@ pub const DataWriterImpl = struct {
     /// it instead once it finishes (see entity_quiesce.zig).
     pub fn deinit(self: *Self) void {
         self.listeners.close();
+        self.quiesce.close();
         // Hold no entity lock here: the listener may call back into it.
         self.listeners.awaitIdle();
+        self.c_abi.retire();
+        if (self.status_cond) |sc| sc.c_abi.retire();
         self.quiesce.beginTeardown(self, reallyDeinit);
     }
 

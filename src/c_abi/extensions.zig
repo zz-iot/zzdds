@@ -14,9 +14,9 @@ const config_mod = @import("../config/schema.zig");
 // The handle-retire hook the generated C++ and Java bindings use
 // (`--handle-retire-hook zzdds_handle_retire`, see zidl's
 // docs/design/handle-lifetime.md): zzdds_handle_retire_observe/_unobserve.
-// Every entity handle zzdds frees goes through zidl_rt.freeEntityBox
-// (util/c_abi_handle.zig), which reports it before the memory is reused, so a
-// binding drops and retires its wrapper even for a cascading delete.
+// CachedCAbiHandle reports logical deletion before deferred native cleanup,
+// retaining the box until native references drain. Bindings retire wrappers
+// before delete returns, including cascading deletes (util/c_abi_handle.zig).
 comptime {
     zidl_rt.exportHandleRetireHook("zzdds_handle_retire");
 }

@@ -204,8 +204,8 @@ int main() {
 
     CHECK(dr->get_listener() == nullptr);
 
-    // A deleted entity's wrapper no longer reaches the core: the core frees
-    // the handle and reports it, and the binding retires the wrapper.
+    // Deletion retires the wrapper before returning, even if native references
+    // postpone freeing the handle. Its calls no longer reach the core.
     CHECK(pub->delete_datawriter(dw) == ::DDS::RETCODE_OK);
     CHECK(dw->enable() == ::DDS::RETCODE_ALREADY_DELETED);
     CHECK(sub->delete_datareader(dr) == ::DDS::RETCODE_OK);

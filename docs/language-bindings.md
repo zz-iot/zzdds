@@ -101,6 +101,14 @@ handle and keeps widened-view accessors like `get_entity()` from leaking a
 fresh box on every call.  See zidl's `docs/ecosystem.md` ("`--zig-generate-c-api`
 C-ABI export layer") for the full design and rationale.
 
+**Deletion and deferred cleanup:** zzdds enables zidl's retirement notification
+and query for generated C++ and Java bindings. Successful deletion retires the
+wrappers even when an admitted native callback keeps storage alive. A late
+callback cannot create a fresh wrapper for that deleted entity; a callback
+already running in application code may finish. Physical box cleanup follows
+once native references drain. Raw C and Zig callers must still synchronize
+entity deletion with their own use of the entity.
+
 **Cross-view identity:** for `@shared_c_abi_box`-annotated interfaces (every real DDS
 entity/condition type as of 2026-08-12 — see `zidl/docs/design/binding-c-abi-identity.md`), a concrete impl caches *one* box shared across every interface view it
 presents, not one box per view — so a `GuardCondition` handle and the `Condition` handle

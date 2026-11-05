@@ -640,8 +640,18 @@ pub const DataReaderImpl = struct {
     /// it instead once it finishes (see entity_quiesce.zig).
     pub fn deinit(self: *Self) void {
         self.listeners.close();
+        self.quiesce.close();
         // Hold no entity lock here: the listener may call back into it.
         self.listeners.awaitIdle();
+        self.c_abi.retire();
+        if (self.status_cond) |sc| sc.c_abi.retire();
+        // Conditions belong to the reader even when its storage is pinned.
+        self.mu.lock();
+        for (self.read_conditions.items) |cond| {
+            const rc: *waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
+            if (rc.owner_qc) |qc| qc.c_abi.retire() else rc.c_abi.retire();
+        }
+        self.mu.unlock();
         self.quiesce.beginTeardown(self, reallyDeinit);
     }
 
@@ -3171,6 +3181,13 @@ pub const DataReaderImpl = struct {
         self.mu.lock();
         defer self.mu.unlock();
         self.read_conditions.append(self.alloc, cond) catch return false;
+        // A create admitted before close() can reach tracking after deinit's
+        // retirement pass. Serialize both cases with mu: either that pass
+        // sees this entry, or we retire it here and leave it for final cleanup.
+        if (self.quiesce.tearingDown()) {
+            const rc: *waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
+            if (rc.owner_qc) |qc| qc.c_abi.retire() else rc.c_abi.retire();
+        }
         return true;
     }
 
@@ -4642,26 +4659,9 @@ test "checkDeletePrecondition: PRECONDITION_NOT_MET while a loan is outstanding,
     try testing.expectEqual(DDS.RETCODE_OK, dr.checkDeletePrecondition());
 }
 
-test "vtCreateReadCondition: a condition tracked while deinit() is racing is still torn down, not left dangling" {
-    // Regression for a real race Greptile flagged on zzdds PR #60: without
-    // vtCreateReadCondition holding a quiesce reference across its own
-    // trackReadCondition() append, a create racing this reader's own
-    // deinit() could track a new condition into read_conditions *after*
-    // reallyDeinit() already snapshotted-and-cleared it -- left un-torn-
-    // down, holding a reader_ctx pointing at freed memory the moment the
-    // reader itself finished tearing down.
-    //
-    // A real two-thread version of this test isn't safe: an unsynchronized
-    // delete_datareader() can legitimately win outright and free the whole
-    // reader before a spawned thread doing the create is even scheduled --
-    // a different, and for a raw handle with no other synchronization
-    // fundamentally unfixable, hazard, not the one this fix addresses
-    // (confirmed directly: a real-thread version of this test segfaulted on
-    // quiesce.acquire() dereferencing an already-freed reader even with the
-    // fix in place). Driving the exact interleaving deterministically by
-    // hand -- mirroring vtCreateReadCondition's own acquire()/track/release
-    // sequence -- tests the actual mechanism without depending on OS thread
-    // scheduling luck, and without ever risking a genuinely dangling `dr`.
+test "late read and query conditions retire while reader storage remains pinned" {
+    // Pause a create after admission, delete the reader, then finish tracking.
+    // A second native reference keeps storage alive after the create returns.
     const alloc = testing.allocator;
     var clock = time_test.ManualClock.init(0);
     const dr = try alloc.create(DataReaderImpl);
@@ -4692,16 +4692,15 @@ test "vtCreateReadCondition: a condition tracked while deinit() is racing is sti
     // validly entered (dr is still fully alive -- nothing has started
     // tearing it down yet) and successfully acquired a quiesce reference.
     try testing.expect(dr.quiesce.acquire());
+    try testing.expect(dr.quiesce.acquire());
+    defer dr.quiesce.release(dr, DataReaderImpl.reallyDeinit);
 
     // Now race in the reader's own deinit(). Our simulated create above
     // still holds a reference, so this must NOT free `dr` yet -- if it did,
     // everything below would be a use-after-free.
     dr.deinit();
 
-    // Simulate the rest of vtCreateReadCondition: build a real condition
-    // and track it, exactly like trackReadCondition() does (inlined here
-    // rather than calling it directly, to also exercise mu locking exactly
-    // as production code does).
+    // Finish both creation paths after the retirement loop has already run.
     const rc = try waitset.ReadConditionImpl.init(
         alloc,
         dr.toDDSDataReader(),
@@ -4716,20 +4715,36 @@ test "vtCreateReadCondition: a condition tracked while deinit() is racing is sti
         DataReaderImpl.readerQuiesceAcquire,
         DataReaderImpl.readerQuiesceRelease,
     );
-    dr.mu.lock();
-    try dr.read_conditions.append(alloc, rc.toCondition());
-    dr.mu.unlock();
+    try testing.expect(dr.trackReadCondition(rc.toCondition()));
+    const qc = try waitset.QueryConditionImpl.init(
+        alloc,
+        dr.toDDSDataReader(),
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        "",
+        .{},
+        DataReaderImpl.hasPendingDataFn,
+        dr,
+        DataReaderImpl.addDataNotifier,
+        DataReaderImpl.removeDataNotifier,
+        DataReaderImpl.removeReadCondition,
+        DataReaderImpl.readerQuiesceAcquire,
+        DataReaderImpl.readerQuiesceRelease,
+    );
+    try testing.expect(dr.trackReadCondition(qc.toCondition()));
+    dr.quiesce.release(dr, DataReaderImpl.reallyDeinit); // create returns
+    try testing.expectEqual(@as(usize, 2), dr.read_conditions.items.len);
 
-    // Release our simulated create's reference -- the last one outstanding
-    // (deinit() already dropped its own), so this must synchronously
-    // trigger reallyDeinit() now, which must find and tear down the
-    // condition just tracked above.
-    dr.quiesce.release(dr, DataReaderImpl.reallyDeinit);
-
-    // If reallyDeinit() had incorrectly already run before the track above
-    // (the bug this regresses), this test would already have use-after-freed
-    // `dr` and leaked `rc` -- testing.allocator's DebugAllocator catches
-    // both.
+    const ws = try waitset.WaitSetImpl.init(alloc);
+    defer ws.deinit();
+    for ([_]DDS.Condition{ rc.toCondition(), qc.toCondition() }) |condition| {
+        const h = condition.vtable.get_c_abi_handle(condition.ptr);
+        try testing.expect(@import("zidl_rt").isEntityBoxRetired(h));
+        try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, ws.toDDSWaitSet().attach_condition(condition));
+    }
+    // The remaining reference's deferred release frees both tracked conditions;
+    // testing.allocator catches a leak or double free during that cleanup.
 }
 
 test "vtDeleteReadCondition: winning the race removes the condition before reallyDeinit's bulk loop can double-free it" {

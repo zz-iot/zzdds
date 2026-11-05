@@ -255,6 +255,7 @@ pub const SubscriberImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.quiesce.close();
         // Tear owned DataReaders down synchronously first (see PublisherImpl's
         // matching comment): each r.deinit() drops the lifetime ref it holds
         // on us, so by beginTeardown only our "alive" ref and any in-flight
@@ -264,6 +265,8 @@ pub const SubscriberImpl = struct {
             r.deinit();
         }
         self.readers.clearRetainingCapacity();
+        self.c_abi.retire();
+        if (self.status_cond) |sc| sc.c_abi.retire();
         self.quiesce.beginTeardown(self, reallyDeinit);
     }
 
