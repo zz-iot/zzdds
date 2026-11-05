@@ -1708,7 +1708,10 @@ pub const DomainParticipantImpl = struct {
         // those running elsewhere return before entities are torn down. From
         // inside one, the rest follows the last of them, so no listener of
         // this participant runs while its entities are torn down.
-        if (self.runtime != null and !self.listener_group.close()) {
+        const listeners_deferred = self.runtime != null and !self.listener_group.close();
+        self.c_abi.retire();
+        if (self.status_cond) |sc| sc.c_abi.retire();
+        if (listeners_deferred) {
             self.listener_group.finishWith(.{ .ctx = self, .run = teardownHook });
             return;
         }

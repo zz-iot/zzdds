@@ -10,6 +10,10 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-05
 
+- Retire C++/Java entity handles when deletion completes, even when an in-flight
+  native operation delays freeing storage. Cover deferred containers, participant
+  teardown and owned conditions; waitsets no longer return retired conditions.
+  Keep retirement notifications single-shot and add deterministic lifetime tests.
 - The mock-loopback tests use `c_allocator` under Valgrind. `std.testing.allocator` captures
   a stack trace on every alloc and free, which under Valgrind made delivery slow enough for
   discovery's timers to outrun it, so a test could time out intermittently. Memcheck also

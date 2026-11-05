@@ -115,6 +115,13 @@ pub const EntityQuiesce = struct {
         return self.state.load(.acquire) & tearing_down_bit != 0;
     }
 
+    /// Reject new operations while retaining the owner's reference. This lets
+    /// deinit retire public handles before a final callback can free storage.
+    /// Follow with beginTeardown once logical deletion is complete.
+    pub fn close(self: *EntityQuiesce) void {
+        _ = self.state.fetchOr(tearing_down_bit, .acq_rel);
+    }
+
     /// Call once, from `deinit()`: marks the entity as no longer accepting
     /// new acquires, then drops its own "alive" reference exactly like
     /// `release()` would. The flag-set and the refcount-drop are still two
@@ -125,7 +132,7 @@ pub const EntityQuiesce = struct {
     /// window where it inspects the flag and count from two different
     /// points in time.
     pub fn beginTeardown(self: *EntityQuiesce, ctx: *anyopaque, comptime on_last: fn (*anyopaque) void) void {
-        _ = self.state.fetchOr(tearing_down_bit, .acq_rel);
+        self.close();
         self.release(ctx, on_last);
     }
 };
@@ -248,4 +255,21 @@ test "EntityQuiesce: acquireIfAlive fails once the entity is fully torn down" {
     // have been freed by on_last) -- acquireIfAlive() must refuse just like
     // acquire() does, not just "as long as teardown hasn't started."
     try testing.expect(!q.acquireIfAlive());
+}
+
+test "EntityQuiesce: close rejects admission without releasing the owner" {
+    var q: EntityQuiesce = .{};
+    var freed = false;
+    const OnLast = struct {
+        fn run(ctx: *anyopaque) void {
+            const flag: *bool = @ptrCast(@alignCast(ctx));
+            flag.* = true;
+        }
+    };
+    q.close();
+    try testing.expect(q.tearingDown());
+    try testing.expect(!q.acquire());
+    try testing.expect(!freed);
+    q.beginTeardown(&freed, OnLast.run);
+    try testing.expect(freed);
 }

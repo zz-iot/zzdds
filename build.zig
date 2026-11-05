@@ -1880,6 +1880,7 @@ pub fn build(b: *std.Build) void {
         "test/dcps/factory_vtable_test.zig",
         "test/dcps/participant_vtable_test.zig",
         "test/dcps/writer_vtable_test.zig",
+        "test/dcps/handle_retirement_test.zig",
         "test/dcps/discovery_race_test.zig",
     };
     const resource_test_step = b.step("test-resource-construction", "Test programmatic resource resolution and construction (requires -Dresource-construction=true)");
@@ -1900,7 +1901,11 @@ pub fn build(b: *std.Build) void {
             }),
         });
         t.root_module.link_libc = true;
-        test_step.dependOn(&addTestRun(b, t, &dcps_test_domain).step);
+        const run = addTestRun(b, t, &dcps_test_domain);
+        test_step.dependOn(&run.step);
+        if (std.mem.eql(u8, src, "test/dcps/handle_retirement_test.zig")) {
+            b.step("test-handle-retirement", "Check logical handle retirement and deferred entity cleanup").dependOn(&run.step);
+        }
         emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests" } },
         }).step);
@@ -2469,7 +2474,11 @@ pub fn build(b: *std.Build) void {
             },
         }), .use_llvm = true });
         t.root_module.link_libc = true;
-        tsan_step.dependOn(&addTestRun(b, t, &tsan_dcps_test_domain).step);
+        const run = addTestRun(b, t, &tsan_dcps_test_domain);
+        tsan_step.dependOn(&run.step);
+        if (std.mem.eql(u8, src, "test/dcps/handle_retirement_test.zig")) {
+            b.step("test-handle-retirement-tsan", "Check deferred handle retirement with ThreadSanitizer").dependOn(&run.step);
+        }
     }
 
     // `zig build test-tsan-self-check` — regression guard proving TSan

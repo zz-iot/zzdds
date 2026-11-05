@@ -1,7 +1,8 @@
 //! Shared helper implementing the cache-and-reuse pattern for zidl's
 //! `get_c_abi_handle` vtable slot: lazily box a (ptr, vtable) pair on first
 //! request, reuse the same boxed handle on every subsequent call, free it
-//! once via `deinit`.
+//! once after native references drain. `retire` invalidates binding wrappers
+//! earlier, when logical deletion completes.
 //!
 //! This is what makes a C-ABI handle returned from an accessor operation
 //! identity-stable across repeated calls (e.g. `get_topic()` called twice
@@ -20,6 +21,7 @@ const zidl_rt = @import("zidl_rt");
 
 pub const CachedCAbiHandle = struct {
     handle: std.atomic.Value(?*anyopaque) = std.atomic.Value(?*anyopaque).init(null),
+    retired: std.atomic.Value(bool) = .init(false),
 
     /// Return the cached handle, boxing `(ptr, vtable)` on first call.
     ///
@@ -29,6 +31,7 @@ pub const CachedCAbiHandle = struct {
     /// here would let two threads both box and one leak. Resolved via CAS:
     /// the loser frees its box and reuses whichever one won.
     pub fn get(self: *CachedCAbiHandle, alloc: std.mem.Allocator, ptr: *anyopaque, vtable: *const anyopaque) *anyopaque {
+        std.debug.assert(!self.retired.load(.acquire));
         if (self.handle.load(.acquire)) |h| return h;
         // get_c_abi_handle's vtable signature can't express allocation
         // failure (no error union, no optional) — the box is two words, so
@@ -42,10 +45,23 @@ pub const CachedCAbiHandle = struct {
         return h;
     }
 
-    /// Free the cached handle, if one was ever created. Call from the owning
-    /// object's `deinit`, once no concurrent `get()` calls remain.
+    /// Invalidate binding wrappers at logical deletion, without releasing the
+    /// box while an in-flight native operation still holds the entity alive.
+    /// Close callback admission and await admitted listeners before calling;
+    /// no caller may export this entity's handle again afterwards.
+    pub fn retire(self: *CachedCAbiHandle) void {
+        if (self.retired.swap(true, .acq_rel)) return;
+        if (self.handle.load(.acquire)) |h| zidl_rt.notifyHandleRetired(h);
+    }
+
+    /// Free storage once no native references remain. Retirement may already
+    /// have happened on the deleting thread; report each handle only once.
     pub fn free(self: *CachedCAbiHandle, alloc: std.mem.Allocator) void {
-        if (self.handle.load(.acquire)) |h| zidl_rt.freeEntityBox(alloc, h);
-        self.handle.store(null, .release);
+        self.retire();
+        if (self.handle.swap(null, .acq_rel)) |h| {
+            // The cache owns this zidl EntityBox. freeEntityBox would report
+            // retirement a second time, so release its storage directly.
+            alloc.destroy(@as(*zidl_rt.EntityBox, @ptrCast(@alignCast(h))));
+        }
     }
 };
