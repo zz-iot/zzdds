@@ -35,6 +35,15 @@ const time_mod = zzdds.util.time;
 
 const noop_security = zzdds.noop_security.noop_security_plugins;
 
+/// `std.testing.allocator`, except under Valgrind. There, memcheck tracks each
+/// malloc block, so it reports a read past the end or after free, which it
+/// cannot see inside that allocator's buckets. It also spares these tests that
+/// allocator's stack capture on every alloc and free, which under Valgrind makes
+/// delivery slow enough for discovery's timers to outrun it.
+fn testAllocator() std.mem.Allocator {
+    return if (std.valgrind.runningOnValgrind() != 0) std.heap.c_allocator else std.testing.allocator;
+}
+
 const IP_W: [4]u8 = .{ 127, 0, 0, 10 };
 const IP_R: [4]u8 = .{ 127, 0, 0, 11 };
 const PORT_META_W: u16 = 7410;
@@ -175,7 +184,7 @@ test "mock_loopback: BEST_EFFORT single sample" {
     // regardless of what durability the writer offers.
     dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     const p: []const u8 = &PAYLOAD_A;
-    try runMockLoopback(std.testing.allocator, dw_qos, dr_qos, &.{p}, &.{p});
+    try runMockLoopback(testAllocator(), dw_qos, dr_qos, &.{p}, &.{p});
 }
 
 test "mock_loopback: RELIABLE single sample" {
@@ -189,7 +198,7 @@ test "mock_loopback: RELIABLE single sample" {
     // regardless of what durability the writer offers.
     dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     const p: []const u8 = &PAYLOAD_A;
-    try runMockLoopback(std.testing.allocator, dw_qos, dr_qos, &.{p}, &.{p});
+    try runMockLoopback(testAllocator(), dw_qos, dr_qos, &.{p}, &.{p});
 }
 
 test "mock_loopback: RELIABLE KEEP_ALL three samples" {
@@ -205,7 +214,7 @@ test "mock_loopback: RELIABLE KEEP_ALL three samples" {
     // regardless of what durability the writer offers.
     dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     try runMockLoopback(
-        std.testing.allocator,
+        testAllocator(),
         dw_qos,
         dr_qos,
         &.{ &PAYLOAD_A, &PAYLOAD_B, &PAYLOAD_C },
@@ -214,7 +223,7 @@ test "mock_loopback: RELIABLE KEEP_ALL three samples" {
 }
 
 test "mock_loopback: incompatible QoS — best_effort writer vs reliable reader" {
-    const alloc = std.testing.allocator;
+    const alloc = testAllocator();
     var dw_qos = DDS.DataWriterQos{};
     var dr_qos = DDS.DataReaderQos{};
     dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
@@ -322,7 +331,7 @@ test "mock_loopback: incompatible QoS detected when writer discovered before rea
     // (unlike onWriterDiscovered) it never called ar.incompat_qos.notify().
     // This orders writer creation (and discovery) strictly before reader
     // creation to exercise that retroactive path specifically.
-    const alloc = std.testing.allocator;
+    const alloc = testAllocator();
     var dw_qos = DDS.DataWriterQos{};
     var dr_qos = DDS.DataReaderQos{};
     dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
@@ -418,7 +427,7 @@ test "mock_loopback: suspend_publications holds writes across end_coherent_chang
     // Regression for the suspend_active fix.  Without it, end_coherent_changes
     // cleared coherent_active on the writer and write B bypassed suspension,
     // arriving at the reader before resume_publications was called.
-    const alloc = std.testing.allocator;
+    const alloc = testAllocator();
 
     const net = try MockNetwork.init(alloc);
     defer net.deinit();
@@ -528,7 +537,7 @@ test "mock_loopback: coherent sets from two writers are buffered independently" 
     // Publisher A writes A1+A2 as one coherent set (coherent_set_sn=2).
     // Publisher B writes B1 as a separate coherent set (coherent_set_sn=1).
     // The subscriber must receive two independent, non-mixed sets.
-    const alloc = std.testing.allocator;
+    const alloc = testAllocator();
 
     const net = try MockNetwork.init(alloc);
     defer net.deinit();
@@ -657,7 +666,7 @@ test "mock_loopback: coherent sets from two writers are buffered independently" 
 }
 
 test "mock_loopback: coherent set delivered atomically via begin_access" {
-    const alloc = std.testing.allocator;
+    const alloc = testAllocator();
 
     const net = try MockNetwork.init(alloc);
     defer net.deinit();
@@ -787,7 +796,7 @@ test "mock_loopback: ordered access sorts pending queue via begin_access" {
     // Both samples go directly to pending (no coherent buffering since
     // coherent_access=false).  begin_access sorts by instance then group_seq_num,
     // which exercises pendingInstanceLessThan on equal instance handles.
-    const alloc = std.testing.allocator;
+    const alloc = testAllocator();
 
     const net = try MockNetwork.init(alloc);
     defer net.deinit();
@@ -924,7 +933,7 @@ test "mock_loopback: pre-coherent-window writes not tagged as part of coherent s
     // After end_coherent_changes + delivery the reader must see:
     //   - PAYLOAD_A in pending (plain write, not coherent-buffered)
     //   - PAYLOAD_B in coherent_committed (1-sample coherent set)
-    const alloc = std.testing.allocator;
+    const alloc = testAllocator();
 
     const net = try MockNetwork.init(alloc);
     defer net.deinit();
@@ -1057,7 +1066,7 @@ fn onReaderReadyForReadyTest(_: DDS.InstanceHandle_t, ready: bool, ld: ?*anyopaq
 }
 
 test "mock_loopback: on_reliable_reader_ready fires after AckNack handshake, strictly after on_publication_matched" {
-    const alloc = std.testing.allocator;
+    const alloc = testAllocator();
     var dw_qos = DDS.DataWriterQos{};
     var dr_qos = DDS.DataReaderQos{};
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
@@ -1174,7 +1183,7 @@ fn onWriterReadyForReadyTest(_: DDS.InstanceHandle_t, ready: bool, ld: ?*anyopaq
 }
 
 test "mock_loopback: on_reliable_writer_ready fires after a targeted heartbeat, strictly after on_subscription_matched" {
-    const alloc = std.testing.allocator;
+    const alloc = testAllocator();
     var dw_qos = DDS.DataWriterQos{};
     var dr_qos = DDS.DataReaderQos{};
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
@@ -1286,7 +1295,7 @@ fn driveUntilDone(net: *MockNetwork, state: *ReentrancyState) void {
 }
 
 test "mock_loopback: on_reliable_writer_ready callback can safely re-enter a participant API (participant.mu not held)" {
-    const alloc = std.testing.allocator;
+    const alloc = testAllocator();
     var dw_qos = DDS.DataWriterQos{};
     var dr_qos = DDS.DataReaderQos{};
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
@@ -1396,7 +1405,7 @@ test "mock_loopback: onParticipantLost fires on_reliable_writer_ready(false) whe
     // after participant.mu is released, not just the mechanism in
     // isolation (see the reentrancy test above, and reader_sm_test.zig's
     // unit-level protocol_ready coverage).
-    const alloc = std.testing.allocator;
+    const alloc = testAllocator();
     var dw_qos = DDS.DataWriterQos{};
     var dr_qos = DDS.DataReaderQos{};
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
@@ -1504,7 +1513,7 @@ test "mock_loopback: disabled DataWriter never announces or matches until enable
     // announcement to reach the peer, confirmed empirically here rather than
     // assumed (this project's own established discipline after the
     // coherent-sets scenario's wrong SPDP hypothesis).
-    const alloc = std.testing.allocator;
+    const alloc = testAllocator();
     var dw_qos = DDS.DataWriterQos{};
     var dr_qos = DDS.DataReaderQos{};
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
@@ -1691,15 +1700,18 @@ const Pubsub = struct {
         try std.testing.expect(pumpUntil(net, self, struct {
             fn f(s: *Pubsub) bool {
                 const dr: *DataReaderImpl = @ptrCast(@alignCast(s.dr.ptr));
-                if (s.got == null) {
-                    if (dr.takeRaw()) |sample| s.got = sample.data;
+                while (s.got == null) {
+                    const sample = dr.takeRaw() orelse break;
+                    // A not-alive change, when a late announcement let the
+                    // writer's lease lapse, is not the data written.
+                    if (sample.info.valid_data) s.got = sample.data else testAllocator().free(sample.data);
                 }
                 return s.got != null;
             }
         }.f));
         const got = self.got.?;
         self.got = null;
-        defer std.testing.allocator.free(got);
+        defer testAllocator().free(got);
         try std.testing.expectEqualSlices(u8, payload, got);
     }
 
@@ -1718,7 +1730,7 @@ const Pubsub = struct {
 
 test "mock_loopback: each factory creates again after deleting all it created, and the new entities discover each other and exchange data" {
     var f: Factories = undefined;
-    try f.init(std.testing.allocator);
+    try f.init(testAllocator());
     defer f.deinit();
     const payloads = [_][]const u8{ &PAYLOAD_A, &PAYLOAD_B };
     // Participants twice from the same factories, which keep their
@@ -1740,7 +1752,7 @@ test "mock_loopback: each factory creates again after deleting all it created, a
 
 test "mock_loopback: a participant from a factory whose discovery serves another fails creation, and the first keeps discovering" {
     var f: Factories = undefined;
-    try f.init(std.testing.allocator);
+    try f.init(testAllocator());
     defer f.deinit();
     const dp_r = try f.create(Factories.R);
     const dp_w = try f.create(Factories.W);

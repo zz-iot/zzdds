@@ -8,6 +8,15 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-05
+
+- The mock-loopback tests use `c_allocator` under Valgrind. `std.testing.allocator` captures
+  a stack trace on every alloc and free, which under Valgrind made delivery slow enough for
+  discovery's timers to outrun it, so a test could time out intermittently. Memcheck also
+  now sees these tests' individual allocations, so it reports reads past the end or after
+  free. The test that recreates entities also skips the not-alive sample a lapsed lease
+  produces instead of comparing it to the data written.
+
 ## 2026-11-04
 
 - **"Did not disconnect" test timeouts say what each side knew.** They now print each writer's
