@@ -124,6 +124,12 @@ fn parseDomain(process_args: std.process.Args, arena: std.mem.Allocator) u32 {
     return 0;
 }
 
+/// A reader's current matched count, for saying which endpoint a timeout is about.
+fn readerMatched(dr: anytype) i32 {
+    var status: DDS.SubscriptionMatchedStatus = undefined;
+    return if (dr.get_subscription_matched_status(&status) == DDS.RETCODE_OK) status.current_count else -1;
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -244,6 +250,7 @@ pub fn main(init: std.process.Init) !void {
     const deadline = monoNs(io) + RECEIVE_TIMEOUT_NS;
     while (!state.all_done.load(.acquire)) {
         if (monoNs(io) > deadline) {
+            std.debug.print("  matched: reader={d}\n", .{readerMatched(dr)});
             std.debug.print("FAIL: did not observe the full live batch within 30s\n", .{});
             std.process.exit(1);
         }

@@ -223,6 +223,7 @@ int main(int argc, char **argv) {
         }
         if (control_status.current_count == 0) break;
         if (waited_ms >= DRAIN_TIMEOUT_MS) {
+            fprintf(stderr, "  matched: control writer status=%d\n", control_status.current_count);
             fprintf(stderr, "FAIL: ignorer did not disconnect within %ds\n", DRAIN_TIMEOUT_MS / 1000);
             return 1;
         }

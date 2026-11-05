@@ -137,6 +137,13 @@ pub fn lastError() Error {
     };
 }
 
+/// The OS's own code for the socket call that just failed on this thread, for
+/// reporting an error `lastError` has no name for.
+pub fn lastErrorCode() i32 {
+    if (comptime is_windows) return ws.WSAGetLastError();
+    return @backingInt(posix.errno(@as(c_int, -1)));
+}
+
 /// Whether a nonblocking connect that failed with `err` is under way.
 pub fn connectPending(err: Error) bool {
     return err == .in_progress or (is_windows and err == .would_block);

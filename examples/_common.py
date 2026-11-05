@@ -29,6 +29,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -181,10 +182,20 @@ class LiveProcess:
             stdout, stderr = None, None
         self._started = _utc_now()
         self.proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=stdout, stderr=stderr)
+        # When the process really ended, which stop() can't say: a caller may
+        # stop this process long after waiting on another one.
+        self._exited: str | None = None
+        self._exit_watcher: threading.Thread | None = None
         if log_path is not None:
+            self._exit_watcher = threading.Thread(target=self._note_exit, daemon=True)
+            self._exit_watcher.start()
             # Written now as well as at stop(), so a process that is never stopped
             # (or whose script dies first) still has its start time on record.
             self._write_meta(None)
+
+    def _note_exit(self) -> None:
+        self.proc.wait()
+        self._exited = _utc_now()
 
     def poll(self) -> int | None:
         return self.proc.poll()
@@ -265,6 +276,8 @@ class LiveProcess:
             self._log_file.flush()
             self._log_file.close()
             self._log_file = None
+            if self._exit_watcher is not None:
+                self._exit_watcher.join(timeout=1)
             self._write_meta(killed_while_running)
         return self.proc.returncode if self.proc.returncode is not None else -1
 
@@ -282,6 +295,7 @@ class LiveProcess:
         if killed_while_running is not None:
             rc = self.proc.returncode
             lines += [
+                f"exited_utc: {self._exited or 'unknown'}",
                 f"stopped_utc: {_utc_now()}",
                 f"returncode: {rc if rc is not None else 'unknown'}",
                 f"stopped_externally: {str(killed_while_running).lower()}",

@@ -8,6 +8,22 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-04
+
+- **"Did not disconnect" test timeouts say what each side knew.** They now print each writer's
+  listener and status matched counts, and the process metadata beside integration test logs
+  records when each process really exited. This tells a listener that wasn't told, a match
+  discovery kept and a peer still shutting down apart.
+- **A UDP receive thread that stops now says so.** An unexpected `recvfrom` or `poll` error
+  ended a socket's receive thread silently, leaving the socket deaf for the rest of the
+  process. It now logs a transport warning with the port and OS error code, and other
+  unexpected receive errors are reported once per socket. Receiving behaves as before.
+- **Integration-test timeouts name what was and wasn't matched.** On timeout, the
+  `cft-reconfigure`, `source-timestamp` and `wait-for-historical-data` apps in all four
+  bindings print each local endpoint's matched count. Writers waiting on their listener print
+  both the listener's count and the status count, which separates a listener that wasn't told
+  from a match discovery never made.
+
 ## 2026-11-03
 
 - C++ and Java wrappers of deleted entities are retired. The core reports every entity

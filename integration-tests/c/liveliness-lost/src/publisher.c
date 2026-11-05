@@ -132,6 +132,12 @@ static DDS_DataWriter create_writer(DDS_DomainParticipant dp, DDS_Publisher pub,
     return dw;
 }
 
+/* A writer's current matched count, as discovery has it, whatever its listener has been told. */
+static int writer_matched(DDS_DataWriter dw) {
+    DDS_PublicationMatchedStatus status = {0};
+    return DDS_DataWriter_get_publication_matched_status(dw, &status) == DDS_RETCODE_OK ? status.current_count : -1;
+}
+
 int main(int argc, char **argv) {
     uint32_t domain_id = parse_domain(argc, argv);
 
@@ -226,6 +232,8 @@ int main(int argc, char **argv) {
 
     for (int waited_ms = 0; atomic_load(&auto_state.matched_current_count) != 0 || atomic_load(&manual_state.matched_current_count) != 0; waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= DRAIN_TIMEOUT_MS) {
+            fprintf(stderr, "  matched: automatic listener=%d status=%d\n", atomic_load(&auto_state.matched_current_count), writer_matched(auto_dw));
+            fprintf(stderr, "  matched: manual listener=%d status=%d\n", atomic_load(&manual_state.matched_current_count), writer_matched(manual_dw));
             fprintf(stderr, "FAIL: subscriber did not disconnect within %ds\n", DRAIN_TIMEOUT_MS / 1000);
             return 1;
         }

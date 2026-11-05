@@ -177,6 +177,7 @@ public class Peer {
             }
             if (controlStatus.get_current_count() == 0) break;
             if (System.currentTimeMillis() > deadline) {
+                System.err.println("  matched: control writer status=" + controlStatus.get_current_count());
                 System.err.println("FAIL: ignorer did not disconnect within " + (DRAIN_TIMEOUT_MS / 1000) + "s");
                 System.exit(1);
             }

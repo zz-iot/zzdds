@@ -84,6 +84,12 @@ fn createWriterEx(publisher: DDS.Publisher, topic: DDS.Topic, qos: DDS.DataWrite
     }), DDS.PUBLICATION_MATCHED_STATUS);
 }
 
+/// A writer's current matched count, as discovery has it, whatever its listener has been told.
+fn writerMatched(dw: anytype) i32 {
+    var status: DDS.PublicationMatchedStatus = undefined;
+    return if (dw.get_publication_matched_status(&status) == DDS.RETCODE_OK) status.current_count else -1;
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -242,6 +248,9 @@ pub fn main(init: std.process.Init) !void {
         sync_state.ever_matched.load(.acquire) and sync_state.matched_current_count.load(.acquire) == 0))
     {
         if (monoNs(io) > drain_deadline) {
+            std.debug.print("  matched: Rejected listener={d} ever={any} status={d}\n", .{ rejected_state.matched_current_count.load(.acquire), rejected_state.ever_matched.load(.acquire), writerMatched(rejected_dw) });
+            std.debug.print("  matched: Sync listener={d} ever={any} status={d}\n", .{ sync_state.matched_current_count.load(.acquire), sync_state.ever_matched.load(.acquire), writerMatched(sync_dw) });
+            std.debug.print("  matched: Lost listener={d} ever={any} status={d}\n", .{ lost_state.matched_current_count.load(.acquire), lost_state.ever_matched.load(.acquire), writerMatched(lost_dw) });
             std.debug.print("FAIL: subscriber did not disconnect within 15s\n", .{});
             std.process.exit(1);
         }

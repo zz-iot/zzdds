@@ -74,6 +74,13 @@ uint32_t parse_domain(int argc, char **argv) {
 
 } // namespace
 
+// A writer's current matched count, as discovery has it, whatever its listener has been told.
+template <typename Writer>
+static int writer_matched(const Writer &dw) {
+    ::DDS::PublicationMatchedStatus status{};
+    return dw->get_publication_matched_status(status) == ::DDS::RETCODE_OK ? status.current_count : -1;
+}
+
 int main(int argc, char **argv) {
     uint32_t domain_id = parse_domain(argc, argv);
 
@@ -222,6 +229,9 @@ int main(int argc, char **argv) {
          waited_ms += POLL_PERIOD_MS)
     {
         if (waited_ms >= DRAIN_TIMEOUT_MS) {
+            std::fprintf(stderr, "  matched: Rejected listener=%d ever=%d status=%d\n", rejected_state.matched_current_count.load(), rejected_state.ever_matched.load() ? 1 : 0, writer_matched(rejected_dw));
+            std::fprintf(stderr, "  matched: Sync listener=%d ever=%d status=%d\n", sync_state.matched_current_count.load(), sync_state.ever_matched.load() ? 1 : 0, writer_matched(sync_dw));
+            std::fprintf(stderr, "  matched: Lost listener=%d ever=%d status=%d\n", lost_state.matched_current_count.load(), lost_state.ever_matched.load() ? 1 : 0, writer_matched(lost_dw));
             std::fprintf(stderr, "FAIL: subscriber did not disconnect within %ds\n", DRAIN_TIMEOUT_MS / 1000);
             return 1;
         }

@@ -81,6 +81,18 @@ public class Subscriber {
         return 0;
     }
 
+    /** A reader's current matched count, for saying which endpoint a timeout is about. */
+    private static int readerMatched(Dcps.DDS.DataReader dr) {
+        Dcps.DDS.SubscriptionMatchedStatus status = new Dcps.DDS.SubscriptionMatchedStatus();
+        return dr.get_subscription_matched_status(status) == Dcps.DDS.RETCODE_OK.value ? status.get_current_count() : -1;
+    }
+
+    /** A writer's current matched count, as discovery has it, whatever its listener has been told. */
+    private static int writerMatched(Dcps.DDS.DataWriter dw) {
+        Dcps.DDS.PublicationMatchedStatus status = new Dcps.DDS.PublicationMatchedStatus();
+        return dw.get_publication_matched_status(status) == Dcps.DDS.RETCODE_OK.value ? status.get_current_count() : -1;
+    }
+
     public static void main(String[] args) throws Exception {
         int domainId = parseDomain(args);
 
@@ -212,6 +224,7 @@ public class Subscriber {
         long deadline = System.currentTimeMillis() + WITNESS_TIMEOUT_MS;
         while (witnessState.count.get() < PHASE1_COUNT) {
             if (System.currentTimeMillis() > deadline) {
+                System.err.println("  matched: witness=" + readerMatched(witnessDr) + " filtered=" + readerMatched(filteredDr) + " GoTopic_writer=" + writerMatched(goDw));
                 System.err.println("FAIL: witness reader only saw " + witnessState.count.get() + "/" + PHASE1_COUNT + " phase1 samples within " + (WITNESS_TIMEOUT_MS / 1000) + "s");
                 System.exit(1);
             }
@@ -258,6 +271,7 @@ public class Subscriber {
         deadline = System.currentTimeMillis() + FINAL_TIMEOUT_MS;
         while (witnessState.count.get() < TOTAL_COUNT) {
             if (System.currentTimeMillis() > deadline) {
+                System.err.println("  matched: witness=" + readerMatched(witnessDr) + " filtered=" + readerMatched(filteredDr) + " GoTopic_writer=" + writerMatched(goDw));
                 System.err.println("FAIL: witness reader only saw " + witnessState.count.get() + "/" + TOTAL_COUNT + " total samples within " + (FINAL_TIMEOUT_MS / 1000) + "s");
                 System.exit(1);
             }
@@ -275,6 +289,7 @@ public class Subscriber {
         deadline = System.currentTimeMillis() + FINAL_TIMEOUT_MS;
         while (filteredState.count.get() < PHASE2_COUNT) {
             if (System.currentTimeMillis() > deadline) {
+                System.err.println("  matched: witness=" + readerMatched(witnessDr) + " filtered=" + readerMatched(filteredDr) + " GoTopic_writer=" + writerMatched(goDw));
                 System.err.println("FAIL: filtered reader only saw " + filteredState.count.get() + "/" + PHASE2_COUNT + " phase2 samples within " + (FINAL_TIMEOUT_MS / 1000) + "s");
                 System.exit(1);
             }

@@ -138,6 +138,12 @@ static uint32_t parse_domain(int argc, char **argv) {
     return 0;
 }
 
+/* A reader's current matched count, for saying which endpoint a timeout is about. */
+static int reader_matched(DDS_DataReader dr) {
+    DDS_SubscriptionMatchedStatus status = {0};
+    return DDS_DataReader_get_subscription_matched_status(dr, &status) == DDS_RETCODE_OK ? status.current_count : -1;
+}
+
 int main(int argc, char **argv) {
     uint32_t domain_id = parse_domain(argc, argv);
 
@@ -259,6 +265,7 @@ int main(int argc, char **argv) {
 
     for (int waited_ms = 0; !atomic_load(&state.all_done); waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= RECEIVE_TIMEOUT_MS) {
+            fprintf(stderr, "  matched: reader=%d\n", reader_matched(dr));
             fprintf(stderr, "FAIL: did not observe the full live batch within %ds\n", RECEIVE_TIMEOUT_MS / 1000);
             return 1;
         }

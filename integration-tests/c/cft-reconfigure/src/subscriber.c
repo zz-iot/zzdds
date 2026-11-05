@@ -122,6 +122,18 @@ static uint32_t parse_domain(int argc, char **argv) {
     return 0;
 }
 
+/* A reader's current matched count, for saying which endpoint a timeout is about. */
+static int reader_matched(DDS_DataReader dr) {
+    DDS_SubscriptionMatchedStatus status = {0};
+    return DDS_DataReader_get_subscription_matched_status(dr, &status) == DDS_RETCODE_OK ? status.current_count : -1;
+}
+
+/* A writer's current matched count, as discovery has it, whatever its listener has been told. */
+static int writer_matched(DDS_DataWriter dw) {
+    DDS_PublicationMatchedStatus status = {0};
+    return DDS_DataWriter_get_publication_matched_status(dw, &status) == DDS_RETCODE_OK ? status.current_count : -1;
+}
+
 int main(int argc, char **argv) {
     uint32_t domain_id = parse_domain(argc, argv);
 
@@ -282,6 +294,7 @@ int main(int argc, char **argv) {
      * really were sent and really did arrive over the wire. -- */
     for (int waited_ms = 0; atomic_load(&witness_state.count) < PHASE1_COUNT; waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= WITNESS_TIMEOUT_MS) {
+            fprintf(stderr, "  matched: witness=%d filtered=%d GoTopic_writer=%d\n", reader_matched(witness_dr), reader_matched(filtered_dr), writer_matched(go_dw));
             fprintf(stderr, "FAIL: witness reader only saw %d/%d phase1 samples within %ds\n", atomic_load(&witness_state.count), PHASE1_COUNT, WITNESS_TIMEOUT_MS / 1000);
             return 1;
         }
@@ -334,6 +347,7 @@ int main(int argc, char **argv) {
     /* -- Phase 2: wait for the witness reader to see all 10 total. -- */
     for (int waited_ms = 0; atomic_load(&witness_state.count) < TOTAL_COUNT; waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= FINAL_TIMEOUT_MS) {
+            fprintf(stderr, "  matched: witness=%d filtered=%d GoTopic_writer=%d\n", reader_matched(witness_dr), reader_matched(filtered_dr), writer_matched(go_dw));
             fprintf(stderr, "FAIL: witness reader only saw %d/%d total samples within %ds\n", atomic_load(&witness_state.count), TOTAL_COUNT, FINAL_TIMEOUT_MS / 1000);
             return 1;
         }
@@ -351,6 +365,7 @@ int main(int argc, char **argv) {
      * Greptile review). -- */
     for (int waited_ms = 0; atomic_load(&filtered_state.count) < PHASE2_COUNT; waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= FINAL_TIMEOUT_MS) {
+            fprintf(stderr, "  matched: witness=%d filtered=%d GoTopic_writer=%d\n", reader_matched(witness_dr), reader_matched(filtered_dr), writer_matched(go_dw));
             fprintf(stderr, "FAIL: filtered reader only saw %d/%d phase2 samples within %ds\n", atomic_load(&filtered_state.count), PHASE2_COUNT, FINAL_TIMEOUT_MS / 1000);
             return 1;
         }

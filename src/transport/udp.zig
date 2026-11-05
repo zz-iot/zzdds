@@ -188,6 +188,16 @@ test "socketClose releases a bound UDP port" {
     try socketBind(replacement, @ptrCast(&addr), len);
 }
 
+test "a failed receive reports the OS's error code" {
+    const fd = try socketCreate(posix.AF.INET, posix.SOCK.DGRAM);
+    socketClose(fd);
+    var buf: [1]u8 = undefined;
+    var src: posix.sockaddr.storage = undefined;
+    var src_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    try std.testing.expectError(error.RecvFailed, socketRecvFrom(fd, &buf, @ptrCast(&src), &src_len));
+    try std.testing.expect(sock.lastErrorCode() != 0);
+}
+
 /// setsockopt wrapper. Uses std.c.setsockopt directly because
 /// posix.setsockopt emits @compileError("use std.Io instead") on Windows.
 fn sockOpt(fd: posix.socket_t, level: i32, optname: u32, value: []const u8) !void {
@@ -254,6 +264,8 @@ const SocketEntry = struct {
     /// For multicast: zeroes (INADDR_ANY / IN6ADDR_ANY).
     bound_ip: [16]u8,
     stopping: std.atomic.Value(bool),
+    /// Set once an unexpected receive error on this socket has been reported.
+    recv_error_reported: std.atomic.Value(bool) = .init(false),
     /// What receives on the socket: its own thread, or the backend the
     /// transport is attached to (UdpTransport.backend).
     receiver: union(enum) {
@@ -2133,7 +2145,12 @@ fn serviceSource(ctx: *anyopaque, budget: u32) u32 {
             error.Interrupted => continue,
             // Receiving took the socket's pending error (an ICMP report of
             // an earlier send), so the socket is not left readable.
+            error.ConnectionResetByPeer => {
+                handled += 1;
+                continue;
+            },
             else => {
+                reportRecvError(entry, sock.lastErrorCode());
                 handled += 1;
                 continue;
             },
@@ -2146,6 +2163,27 @@ fn serviceSource(ctx: *anyopaque, budget: u32) u32 {
 }
 
 // ── Receive thread ────────────────────────────────────────────────────────────
+
+/// Reports an unexpected receive error once per socket: one that persists
+/// would otherwise repeat for as long as the socket lives.
+fn reportRecvError(entry: *SocketEntry, os_error: i32) void {
+    if (entry.recv_error_reported.swap(true, .monotonic)) return;
+    log.transport.warn("udp: receive error on port {d}: OS error {d}", .{ entry.port, os_error });
+}
+
+/// Reports `recvThread` ending while its socket is still in use: nothing
+/// receives on the socket from then on, so a peer's traffic to it is lost.
+fn reportRecvThreadExit(entry: *const SocketEntry, os_error: i32) void {
+    if (entry.stopping.load(.acquire)) return;
+    log.transport.warn("udp: receive thread for port {d} stopped: OS error {d}; this socket no longer receives", .{ entry.port, os_error });
+}
+
+/// As `reportRecvThreadExit`, for a poll that reported only `revents`, which
+/// carry no OS error code.
+fn reportRecvThreadPollExit(entry: *const SocketEntry, revents: i16) void {
+    if (entry.stopping.load(.acquire)) return;
+    log.transport.warn("udp: receive thread for port {d} stopped: poll events 0x{x}; this socket no longer receives", .{ entry.port, @as(u16, @bitCast(revents)) });
+}
 
 fn recvThread(entry: *SocketEntry) void {
     var buf: [RECV_BUF]u8 = undefined;
@@ -2166,7 +2204,9 @@ fn recvThread(entry: *SocketEntry) void {
                 // from a prior send).  Drain the pending error so WSAPoll does not
                 // keep returning POLLERR on subsequent calls, then keep listening.
                 src_len = @sizeOf(posix.sockaddr.storage);
-                _ = socketRecvFrom(entry.fd, &buf, @ptrCast(&src_store), &src_len) catch {};
+                _ = socketRecvFrom(entry.fd, &buf, @ptrCast(&src_store), &src_len) catch |err| {
+                    if (err != error.ConnectionResetByPeer) reportRecvError(entry, sock.lastErrorCode());
+                };
                 continue :outer;
             }
         } else {
@@ -2175,9 +2215,15 @@ fn recvThread(entry: *SocketEntry) void {
                 .events = posix.POLL.IN,
                 .revents = 0,
             }};
-            const n_ready = posix.poll(&pfds, POLL_TIMEOUT_MS) catch break :outer;
+            const n_ready = posix.poll(&pfds, POLL_TIMEOUT_MS) catch {
+                reportRecvThreadExit(entry, sock.lastErrorCode());
+                break :outer;
+            };
             if (n_ready == 0) continue :outer;
-            if (pfds[0].revents & posix.POLL.IN == 0) break :outer;
+            if (pfds[0].revents & posix.POLL.IN == 0) {
+                reportRecvThreadPollExit(entry, pfds[0].revents);
+                break :outer;
+            }
         }
 
         src_len = @sizeOf(posix.sockaddr.storage);
@@ -2192,6 +2238,7 @@ fn recvThread(entry: *SocketEntry) void {
             // can surface here when the OS presents it as readable data rather than
             // POLLERR.  It is non-fatal for a UDP socket; keep listening.
             if (err == error.ConnectionResetByPeer) continue;
+            reportRecvThreadExit(entry, sock.lastErrorCode());
             break;
         };
 

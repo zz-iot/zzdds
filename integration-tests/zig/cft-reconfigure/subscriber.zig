@@ -92,6 +92,18 @@ fn parseDomain(process_args: std.process.Args, arena: std.mem.Allocator) u32 {
     return 0;
 }
 
+/// A reader's current matched count, for saying which endpoint a timeout is about.
+fn readerMatched(dr: anytype) i32 {
+    var status: DDS.SubscriptionMatchedStatus = undefined;
+    return if (dr.get_subscription_matched_status(&status) == DDS.RETCODE_OK) status.current_count else -1;
+}
+
+/// A writer's current matched count, as discovery has it, whatever its listener has been told.
+fn writerMatched(dw: anytype) i32 {
+    var status: DDS.PublicationMatchedStatus = undefined;
+    return if (dw.get_publication_matched_status(&status) == DDS.RETCODE_OK) status.current_count else -1;
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -243,6 +255,7 @@ pub fn main(init: std.process.Init) !void {
     const witness_deadline = monoNs(io) + WITNESS_TIMEOUT_NS;
     while (witness_state.count.load(.acquire) < PHASE1_COUNT) {
         if (monoNs(io) > witness_deadline) {
+            std.debug.print("  matched: witness={d} filtered={d} GoTopic_writer={d}\n", .{ readerMatched(witness_dr), readerMatched(filtered_dr), writerMatched(go_dw) });
             std.debug.print("FAIL: witness reader only saw {d}/{d} phase1 samples within {d}s\n", .{ witness_state.count.load(.acquire), PHASE1_COUNT, @divExact(WITNESS_TIMEOUT_NS, std.time.ns_per_s) });
             std.process.exit(1);
         }
@@ -286,6 +299,7 @@ pub fn main(init: std.process.Init) !void {
     const final_deadline = monoNs(io) + FINAL_TIMEOUT_NS;
     while (witness_state.count.load(.acquire) < TOTAL_COUNT) {
         if (monoNs(io) > final_deadline) {
+            std.debug.print("  matched: witness={d} filtered={d} GoTopic_writer={d}\n", .{ readerMatched(witness_dr), readerMatched(filtered_dr), writerMatched(go_dw) });
             std.debug.print("FAIL: witness reader only saw {d}/{d} total samples within 20s\n", .{ witness_state.count.load(.acquire), TOTAL_COUNT });
             std.process.exit(1);
         }
@@ -302,6 +316,7 @@ pub fn main(init: std.process.Init) !void {
     const filtered_deadline = monoNs(io) + FINAL_TIMEOUT_NS;
     while (filtered_state.count.load(.acquire) < PHASE2_COUNT) {
         if (monoNs(io) > filtered_deadline) {
+            std.debug.print("  matched: witness={d} filtered={d} GoTopic_writer={d}\n", .{ readerMatched(witness_dr), readerMatched(filtered_dr), writerMatched(go_dw) });
             std.debug.print("FAIL: filtered reader only saw {d}/{d} phase2 samples within {d}s\n", .{ filtered_state.count.load(.acquire), PHASE2_COUNT, @divExact(FINAL_TIMEOUT_NS, std.time.ns_per_s) });
             std.process.exit(1);
         }
