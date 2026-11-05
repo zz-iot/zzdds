@@ -558,7 +558,6 @@ public class ShapeMain {
             Thread.sleep(opts.readPeriodMs);
         }
 
-        if (cft != null) dp.delete_contentfilteredtopic(cft);
         return 0;
     }
 

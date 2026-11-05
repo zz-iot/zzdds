@@ -41,6 +41,10 @@ pub const ParticipantCbs = struct {
     /// DomainParticipantImpl's `enabled` flag.
     is_participant_enabled: *const fn (ctx: *anyopaque) bool,
 
+    /// Takes the reference a new DataReader holds on its Topic or
+    /// ContentFilteredTopic; null when it is not this participant's.
+    retain_topic: *const fn (ctx: *anyopaque, topic: *anyopaque) ?topic_mod.TopicUse,
+
     /// Allocate and start an RTPS ProtocolReader for a topic.
     create_proto_reader: *const fn (
         ctx: *anyopaque,
@@ -419,6 +423,8 @@ pub const SubscriberImpl = struct {
     ) DDS.DataReader {
         // See publisher.zig's identical comment on create_datawriter: not
         // gated on this Subscriber's own enabled state, for the same reason.
+        // First, before `a_topic` is read: it may not be this participant's.
+        const topic_use = self.cbs.retain_topic(self.cbs.ctx, a_topic.ptr) orelse return nil.nil_datareader;
         const topic_name = a_topic.get_name();
         const type_name = a_topic.get_type_name();
         const presentation = self.qos.presentation;
@@ -432,11 +438,15 @@ pub const SubscriberImpl = struct {
             presentation,
             &subscription_handle,
             &guid,
-        ) catch return nil.nil_datareader;
+        ) catch {
+            topic_use.release();
+            return nil.nil_datareader;
+        };
         // Before the reader is published, so a reader whose announcement
         // cannot be reserved is never created.
         self.prepareDataReader(subscription_handle) catch {
             self.cbs.destroy_proto_reader(self.cbs.ctx, subscription_handle);
+            topic_use.release();
             return nil.nil_datareader;
         };
         const dr = reader_mod.DataReaderImpl.init(
@@ -453,8 +463,10 @@ pub const SubscriberImpl = struct {
             presentation,
         ) catch {
             self.cbs.destroy_proto_reader(self.cbs.ctx, subscription_handle);
+            topic_use.release();
             return nil.nil_datareader;
         };
+        dr.topic_use = topic_use;
         dr.timers_changed = self.cbs.timers_changed;
         if (self.cbs.listener_group) |g| dr.listeners.attach(g);
         self.cbs.register_incompat_qos(

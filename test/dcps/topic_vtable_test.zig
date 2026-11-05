@@ -273,6 +273,148 @@ test "CFT: toTopicDescription get_participant returns the owning participant" {
     try testing.expect(dp2.ptr == fx.dp.ptr);
 }
 
+// ── Deletion while in use (DDS 1.4 2.2.2.2.1.6, 2.2.2.2.1.8) ─────────────────
+
+fn deleteTopic(dp: DDS.DomainParticipant, topic: DDS.Topic) DDS.ReturnCode_t {
+    return dp.vtable.delete_topic(dp.ptr, topic);
+}
+
+fn deleteCft(dp: DDS.DomainParticipant, cft: DDS.ContentFilteredTopic) DDS.ReturnCode_t {
+    return dp.vtable.delete_contentfilteredtopic(dp.ptr, cft);
+}
+
+test "delete_topic: refused while a DataWriter uses the Topic" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("UsedByWriter", "T", .{}, null, 0);
+    const pub_ = fx.dp.create_publisher(.{}, null, 0);
+    const dw = pub_.create_datawriter(topic, .{}, null, 0);
+    try testing.expect(dw.ptr != nil.nil_datawriter.ptr);
+
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, deleteTopic(fx.dp, topic));
+    try testing.expectEqualStrings("UsedByWriter", topic.get_name());
+
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.delete_datawriter(dw));
+    try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(fx.dp, topic));
+}
+
+test "delete_topic: refused while a DataReader uses the Topic" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("UsedByReader", "T", .{}, null, 0);
+    const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const sub = fx.dp.create_subscriber(.{}, null, 0);
+    const dr = sub.create_datareader(impl.toTopicDescription(), .{}, null, 0);
+    try testing.expect(dr.ptr != nil.nil_datareader.ptr);
+
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, deleteTopic(fx.dp, topic));
+
+    try testing.expectEqual(DDS.RETCODE_OK, sub.delete_datareader(dr));
+    try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(fx.dp, topic));
+}
+
+test "delete_topic: refused while a ContentFilteredTopic relates to the Topic" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("UsedByCft", "T", .{}, null, 0);
+    const cft = fx.dp.create_contentfilteredtopic("UsedByCft_f", topic, "x = 1", &DDS.StringSeq{});
+
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, deleteTopic(fx.dp, topic));
+    try testing.expectEqualStrings("UsedByCft", cft.get_related_topic().get_name());
+
+    try testing.expectEqual(DDS.RETCODE_OK, deleteCft(fx.dp, cft));
+    try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(fx.dp, topic));
+}
+
+test "delete_contentfilteredtopic: refused while a DataReader uses it" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("CftUsed", "T", .{}, null, 0);
+    const cft = fx.dp.create_contentfilteredtopic("CftUsed_f", topic, "x = 1", &DDS.StringSeq{});
+    const cft_impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft.ptr));
+    const sub = fx.dp.create_subscriber(.{}, null, 0);
+    const dr = sub.create_datareader(cft_impl.toTopicDescription(), .{}, null, 0);
+    try testing.expect(dr.ptr != nil.nil_datareader.ptr);
+
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, deleteCft(fx.dp, cft));
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, deleteTopic(fx.dp, topic));
+
+    try testing.expectEqual(DDS.RETCODE_OK, sub.delete_datareader(dr));
+    try testing.expectEqual(DDS.RETCODE_OK, deleteCft(fx.dp, cft));
+    try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(fx.dp, topic));
+}
+
+test "delete_topic and delete_contentfilteredtopic: another participant's is refused and unharmed" {
+    var a = try Fixture.init(testing.allocator);
+    defer a.deinit();
+    var b = try Fixture.init(testing.allocator);
+    defer b.deinit();
+    const topic = a.dp.create_topic("OtherParticipant", "T", .{}, null, 0);
+    const cft = a.dp.create_contentfilteredtopic("OtherParticipant_f", topic, "x = 1", &DDS.StringSeq{});
+
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, deleteCft(b.dp, cft));
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, deleteTopic(b.dp, topic));
+    try testing.expectEqualStrings("OtherParticipant_f", cft.get_name());
+    try testing.expectEqualStrings("OtherParticipant", topic.get_name());
+
+    try testing.expectEqual(DDS.RETCODE_OK, deleteCft(a.dp, cft));
+    try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(a.dp, topic));
+}
+
+test "delete_topic and delete_contentfilteredtopic: a nil handle is a bad parameter" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, deleteTopic(fx.dp, nil.nil_topic));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, deleteCft(fx.dp, nil.nil_cft));
+}
+
+test "creating on another participant's Topic fails and takes no reference" {
+    var a = try Fixture.init(testing.allocator);
+    defer a.deinit();
+    var b = try Fixture.init(testing.allocator);
+    defer b.deinit();
+    const topic = a.dp.create_topic("Foreign", "T", .{}, null, 0);
+    const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const cft = a.dp.create_contentfilteredtopic("Foreign_f", topic, "x = 1", &DDS.StringSeq{});
+    const cft_impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft.ptr));
+
+    const pub_ = b.dp.create_publisher(.{}, null, 0);
+    const sub = b.dp.create_subscriber(.{}, null, 0);
+    try testing.expectEqual(nil.nil_datawriter.ptr, pub_.create_datawriter(topic, .{}, null, 0).ptr);
+    try testing.expectEqual(nil.nil_datareader.ptr, sub.create_datareader(impl.toTopicDescription(), .{}, null, 0).ptr);
+    try testing.expectEqual(nil.nil_datareader.ptr, sub.create_datareader(cft_impl.toTopicDescription(), .{}, null, 0).ptr);
+    try testing.expectEqual(nil.nil_cft.ptr, b.dp.create_contentfilteredtopic("Foreign_g", topic, "x = 1", &DDS.StringSeq{}).ptr);
+
+    try testing.expectEqual(DDS.RETCODE_OK, deleteCft(a.dp, cft));
+    try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(a.dp, topic));
+}
+
+test "a reader with a delivery in flight keeps its filter through delete_contained_entities" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("InFlight", "T", .{}, null, 0);
+    const topic_impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const cft = fx.dp.create_contentfilteredtopic("InFlight_f", topic, "x = 1", &DDS.StringSeq{});
+    const cft_impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft.ptr));
+    const sub = fx.dp.create_subscriber(.{}, null, 0);
+    const dr = sub.create_datareader(cft_impl.toTopicDescription(), .{}, null, 0);
+    const dr_impl: *zzdds.dcps.DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    // What a delivery holds while it evaluates the filter.
+    try testing.expect(dr_impl.acquireQuiesce());
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.delete_contained_entities());
+
+    // The participant's references are gone; the reader's and, through the
+    // filter, its related Topic's remain. The allocator reports a leak if the
+    // last release below does not free them.
+    try testing.expectEqual(@as(u32, 1), cft_impl.refs.load(.acquire));
+    try testing.expectEqual(@as(u32, 1), topic_impl.refs.load(.acquire));
+    try testing.expectEqualStrings("InFlight_f", cft_impl.name);
+    try testing.expectEqualStrings("InFlight", topic_impl.topic_name);
+
+    dr_impl.releaseQuiesce();
+}
+
 test "CFT: set_expression_parameters replaces pre-existing params" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);

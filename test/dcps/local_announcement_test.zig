@@ -385,6 +385,8 @@ test "a writer whose announcement cannot be reserved is not created" {
     try testing.expect(pub_.lookup_datawriter(TOPIC).ptr == zzdds.dcps.NIL_PTR);
     // Only the rollback's retract, which finds nothing prepared.
     try testing.expectEqualSlices(Op, &.{.retract_writer}, rec.recorded());
+    // And nothing keeps using the Topic.
+    try testing.expect(!@as(*zzdds.dcps.TopicImpl, @ptrCast(@alignCast(fx.topic_a.ptr))).inUse());
 }
 
 test "a reader whose announcement cannot be reserved is not created" {
@@ -398,6 +400,8 @@ test "a reader whose announcement cannot be reserved is not created" {
     try testing.expect(dr.ptr == zzdds.dcps.NIL_PTR);
     try testing.expect(sub.lookup_datareader(TOPIC).ptr == zzdds.dcps.NIL_PTR);
     try testing.expectEqualSlices(Op, &.{.retract_reader}, rec.recorded());
+    // And nothing keeps using the Topic.
+    try testing.expect(!@as(*zzdds.dcps.TopicImpl, @ptrCast(@alignCast(fx.topic_a.ptr))).inUse());
 }
 
 fn partitionNames(names: []const [*:0]const u8) DDS.PartitionQosPolicy {

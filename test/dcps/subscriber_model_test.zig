@@ -73,6 +73,11 @@ const Harness = struct {
                     return true;
                 }
             }.f,
+            .retain_topic = struct {
+                fn f(_: *anyopaque, _: *anyopaque) ?zzdds.dcps.TopicUse {
+                    return .none;
+                }
+            }.f,
             .create_proto_reader = createProtoReader,
             .destroy_proto_reader = destroyProtoReader,
             .register_incompat_qos = registerIncompatQos,

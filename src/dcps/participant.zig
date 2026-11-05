@@ -243,6 +243,11 @@ const BuiltinSubscriberState = struct {
         const noop_cbs = subscriber_mod.ParticipantCbs{
             .ctx = @ptrCast(participant),
             .is_participant_enabled = DomainParticipantImpl.participantIsEnabledCb,
+            .retain_topic = struct {
+                fn f(_: *anyopaque, _: *anyopaque) ?topic_mod.TopicUse {
+                    return .none;
+                }
+            }.f,
             .create_proto_reader = struct {
                 fn f(_: *anyopaque, _: []const u8, _: []const u8, _: DDS.DataReaderQos, _: DDS.PresentationQosPolicy, handle: *DDS.InstanceHandle_t, guid: *Guid) anyerror!proto.ProtocolReader {
                     handle.* = DDS.HANDLE_NIL;
@@ -1751,9 +1756,9 @@ pub const DomainParticipantImpl = struct {
         pubs.deinit(self.alloc);
         for (subs.items) |s| s.deinit();
         subs.deinit(self.alloc);
-        for (tops.items) |t| t.deinit();
+        for (tops.items) |t| t.release();
         tops.deinit(self.alloc);
-        for (cfts.items) |c| c.deinit();
+        for (cfts.items) |c| c.release();
         cfts.deinit(self.alloc);
 
         // Drop the "installed" listener_box reference only now that every
@@ -4824,6 +4829,7 @@ pub const DomainParticipantImpl = struct {
         return .{
             .ctx = self,
             .is_participant_enabled = participantIsEnabledCb,
+            .retain_topic = retainTopicUse,
             .create_proto_writer = pubCreateProtoWriter,
             .destroy_proto_writer = pubDestroyProtoWriter,
             .register_incompat_qos = pubRegisterWriterIncompatQos,
@@ -4844,6 +4850,7 @@ pub const DomainParticipantImpl = struct {
         return .{
             .ctx = self,
             .is_participant_enabled = participantIsEnabledCb,
+            .retain_topic = retainTopicUse,
             .create_proto_reader = subCreateProtoReader,
             .destroy_proto_reader = subDestroyProtoReader,
             .register_incompat_qos = subRegisterReaderIncompatQos,
@@ -5319,7 +5326,7 @@ pub const DomainParticipantImpl = struct {
         self.mu.lock();
         self.topics.append(self.alloc, t) catch {
             self.mu.unlock();
-            t.deinit();
+            t.release();
             return nil.nil_topic;
         };
         // Register in discovered_topics so get_discovered_topics / get_discovered_topic_data
@@ -5384,6 +5391,12 @@ pub const DomainParticipantImpl = struct {
         self.mu.lock();
         for (self.topics.items, 0..) |t, i| {
             if (t.toDDSTopic().ptr == a_topic.ptr) {
+                // Spec §2.2.2.2.1.6: not while a DataWriter, DataReader or
+                // ContentFilteredTopic uses it.
+                if (t.inUse()) {
+                    self.mu.unlock();
+                    return DDS.RETCODE_PRECONDITION_NOT_MET;
+                }
                 _ = self.topics.swapRemove(i);
                 found = t;
                 break;
@@ -5391,10 +5404,36 @@ pub const DomainParticipantImpl = struct {
         }
         self.mu.unlock();
         if (found) |t| {
-            t.deinit();
+            t.release();
             return DDS.RETCODE_OK;
         }
+        // Spec §2.2.2.2.1.6: a Topic of another participant. Told by the
+        // handle alone: it may already be deleted, so `ptr` is not read.
+        if (a_topic.vtable == &topic_mod.TopicImpl.topic_vtable) return DDS.RETCODE_PRECONDITION_NOT_MET;
         return DDS.RETCODE_BAD_PARAMETER;
+    }
+
+    /// The reference a new endpoint holds on its topic; null unless `topic`
+    /// is one of this participant's Topics or ContentFilteredTopics
+    /// (spec §2.2.2.4.1.5, §2.2.2.5.2.5). Compared by address, so a handle
+    /// already deleted is refused rather than read.
+    fn retainTopicUse(ctx: *anyopaque, topic: *anyopaque) ?topic_mod.TopicUse {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.topics.items) |t| {
+            if (@as(*anyopaque, t) == topic) {
+                t.retain();
+                return .{ .topic = t };
+            }
+        }
+        for (self.cft_topics.items) |c| {
+            if (@as(*anyopaque, c) == topic) {
+                c.retain();
+                return .{ .cft = c };
+            }
+        }
+        return null;
     }
 
     fn vtFindTopic(ctx: *anyopaque, topic_name: [*:0]const u8, _: *const DDS.Duration_t) DDS.Topic {
@@ -5442,18 +5481,31 @@ pub const DomainParticipantImpl = struct {
         const name_s = std.mem.span(name);
         const filter_s = std.mem.span(filter_expression);
         const empty_seq = DDS.StringSeq{};
+        // The related Topic must be this participant's, and stays until the
+        // ContentFilteredTopic is gone.
+        const related = switch (retainTopicUse(ctx, related_topic.ptr) orelse return nil.nil_cft) {
+            .topic => |t| t,
+            .cft => |c| {
+                c.release();
+                return nil.nil_cft;
+            },
+            .none => unreachable,
+        };
         const cft = topic_mod.ContentFilteredTopicImpl.init(
             self.alloc,
             name_s,
-            related_topic,
+            related,
             filter_s,
             if (expression_parameters) |p| p.* else empty_seq,
             self.toDDSParticipant(),
-        ) catch return nil.nil_cft;
+        ) catch {
+            related.release();
+            return nil.nil_cft;
+        };
         self.mu.lock();
         self.cft_topics.append(self.alloc, cft) catch {
             self.mu.unlock();
-            cft.deinit();
+            cft.release();
             return nil.nil_cft;
         };
         self.mu.unlock();
@@ -5470,11 +5522,15 @@ pub const DomainParticipantImpl = struct {
         defer self.mu.unlock();
         for (self.cft_topics.items, 0..) |c, i| {
             if (c.toDDSContentFilteredTopic().ptr == a_cft.ptr) {
+                // Spec §2.2.2.2.1.8: not while a DataReader uses it.
+                if (c.inUse()) return DDS.RETCODE_PRECONDITION_NOT_MET;
                 _ = self.cft_topics.swapRemove(i);
-                c.deinit();
+                c.release();
                 return DDS.RETCODE_OK;
             }
         }
+        // Spec §2.2.2.2.1.8: one of another participant; see vtDeleteTopic.
+        if (a_cft.vtable == &topic_mod.ContentFilteredTopicImpl.cft_vtable) return DDS.RETCODE_PRECONDITION_NOT_MET;
         return DDS.RETCODE_BAD_PARAMETER;
     }
 
@@ -5552,9 +5608,9 @@ pub const DomainParticipantImpl = struct {
         pubs.deinit(self.alloc);
         for (subs.items) |s| s.deinit();
         subs.deinit(self.alloc);
-        for (tops.items) |t| t.deinit();
+        for (tops.items) |t| t.release();
         tops.deinit(self.alloc);
-        for (cfts.items) |c| c.deinit();
+        for (cfts.items) |c| c.release();
         cfts.deinit(self.alloc);
         return DDS.RETCODE_OK;
     }

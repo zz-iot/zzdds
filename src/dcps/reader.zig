@@ -461,6 +461,10 @@ pub const DataReaderImpl = struct {
     /// rather than mutating a previously-built CftFilterState in place.
     cft_ptr: ?*topic_mod.ContentFilteredTopicImpl = null,
 
+    /// The reference this reader holds on its topic, dropped at the end of
+    /// `reallyDeinit`, so `cft_ptr` outlives any delivery still in flight.
+    topic_use: topic_mod.TopicUse = .none,
+
     /// ContentFilteredTopic filter; null when no CFT or no get_field fn
     /// currently registered. Populated/refreshed exclusively by
     /// refreshGetFieldFn, under `mu` -- read under `mu` everywhere else
@@ -763,7 +767,9 @@ pub const DataReaderImpl = struct {
         // subDestroyProtoReader callback), not by DataReaderImpl.
         const pinned = self.parent_pinned;
         const subscriber = self.subscriber;
+        const topic_use = self.topic_use;
         self.alloc.destroy(self);
+        topic_use.release();
         if (pinned) subscriber_mod.SubscriberImpl.quiesceReleaseFn(subscriber.ptr);
     }
 
