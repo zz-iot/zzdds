@@ -80,6 +80,8 @@ test "writer and status condition retire before the final native reference is re
     defer if (held) native.releaseQuiesce();
     try testing.expectEqual(DDS.RETCODE_OK, pub_.delete_datawriter(writer));
     try observed.expect_once();
+    try testing.expect(rt.isEntityBoxRetired(writer_handle));
+    try testing.expectEqual(writer_handle, handle(writer));
     try testing.expectEqual(writer.ptr, rt.unboxEntity(writer_handle).ptr);
     native.releaseQuiesce();
     held = false;
@@ -122,6 +124,7 @@ test "reader retirement includes its status read and query conditions" {
     try testing.expect(status.get_trigger_value());
     try testing.expectEqual(DDS.RETCODE_OK, sub.delete_datareader(reader));
     try observed.expect_once();
+    for (observed.handles) |h| try testing.expect(rt.isEntityBoxRetired(h));
     var listed: DDS.ConditionSeq = .{};
     defer listed.deinit(alloc);
     try testing.expectEqual(DDS.RETCODE_OK, waitset.get_conditions(&listed));

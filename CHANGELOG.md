@@ -10,6 +10,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-05
 
+- Update zidl to 0.3.27 and enable its retirement query for C++ and Java bindings.
+  Late callbacks cannot recreate wrappers for deleted entities, including when a
+  callback first exports its native handle after deletion.
 - Retire C++/Java entity handles when deletion completes, even when an in-flight
   native operation delays freeing storage. Cover deferred containers, participant
   teardown and owned conditions; waitsets no longer return retired conditions.
