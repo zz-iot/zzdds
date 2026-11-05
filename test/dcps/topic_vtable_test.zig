@@ -415,6 +415,75 @@ test "a reader with a delivery in flight keeps its filter through delete_contain
     dr_impl.releaseQuiesce();
 }
 
+test "delete_topic: a deleted DataWriter still finishing no longer uses the Topic" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("WriterFinishing", "T", .{}, null, 0);
+    const topic_impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const pub_ = fx.dp.create_publisher(.{}, null, 0);
+    const dw = pub_.create_datawriter(topic, .{}, null, 0);
+    const dw_impl: *zzdds.dcps.DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    // What a background callback holds while it runs.
+    try testing.expect(dw_impl.acquireQuiesce());
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.delete_datawriter(dw));
+    try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(fx.dp, topic));
+
+    // The writer's reference keeps the Topic's memory, not the Topic: its name
+    // is free again. The allocator reports a leak if the last release below
+    // does not free it.
+    try testing.expectEqual(@as(u32, 1), topic_impl.refs.load(.acquire));
+    try testing.expectEqualStrings("WriterFinishing", topic_impl.topic_name);
+    const again = fx.dp.create_topic("WriterFinishing", "T", .{}, null, 0);
+    try testing.expect(again.ptr != nil.nil_topic.ptr);
+    try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(fx.dp, again));
+
+    dw_impl.releaseQuiesce();
+}
+
+test "delete_topic: a deleted DataReader still finishing no longer uses the Topic" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("ReaderFinishing", "T", .{}, null, 0);
+    const topic_impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const sub = fx.dp.create_subscriber(.{}, null, 0);
+    const dr = sub.create_datareader(topic_impl.toTopicDescription(), .{}, null, 0);
+    const dr_impl: *zzdds.dcps.DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    try testing.expect(dr_impl.acquireQuiesce());
+    try testing.expectEqual(DDS.RETCODE_OK, sub.delete_datareader(dr));
+    try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(fx.dp, topic));
+    try testing.expectEqual(@as(u32, 1), topic_impl.refs.load(.acquire));
+    try testing.expectEqualStrings("ReaderFinishing", topic_impl.topic_name);
+
+    dr_impl.releaseQuiesce();
+}
+
+test "a deleted DataReader still finishing no longer uses its filter, nor the filter its Topic" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("FilterFinishing", "T", .{}, null, 0);
+    const topic_impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const cft = fx.dp.create_contentfilteredtopic("FilterFinishing_f", topic, "x = 1", &DDS.StringSeq{});
+    const cft_impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft.ptr));
+    const sub = fx.dp.create_subscriber(.{}, null, 0);
+    const dr = sub.create_datareader(cft_impl.toTopicDescription(), .{}, null, 0);
+    const dr_impl: *zzdds.dcps.DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    try testing.expect(dr_impl.acquireQuiesce());
+    try testing.expectEqual(DDS.RETCODE_OK, sub.delete_datareader(dr));
+    try testing.expectEqual(DDS.RETCODE_OK, deleteCft(fx.dp, cft));
+    try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(fx.dp, topic));
+
+    // The delivery still evaluates the filter, which still reads its Topic.
+    try testing.expectEqual(@as(u32, 1), cft_impl.refs.load(.acquire));
+    try testing.expectEqual(@as(u32, 1), topic_impl.refs.load(.acquire));
+    try testing.expectEqualStrings("FilterFinishing_f", cft_impl.name);
+    try testing.expectEqualStrings("FilterFinishing", topic_impl.topic_name);
+
+    dr_impl.releaseQuiesce();
+}
+
 test "CFT: set_expression_parameters replaces pre-existing params" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);

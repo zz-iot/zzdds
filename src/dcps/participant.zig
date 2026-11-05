@@ -1758,7 +1758,7 @@ pub const DomainParticipantImpl = struct {
         subs.deinit(self.alloc);
         for (tops.items) |t| t.release();
         tops.deinit(self.alloc);
-        for (cfts.items) |c| c.release();
+        for (cfts.items) |c| c.deleted();
         cfts.deinit(self.alloc);
 
         // Drop the "installed" listener_box reference only now that every
@@ -5483,10 +5483,11 @@ pub const DomainParticipantImpl = struct {
         const empty_seq = DDS.StringSeq{};
         // The related Topic must be this participant's, and stays until the
         // ContentFilteredTopic is gone.
-        const related = switch (retainTopicUse(ctx, related_topic.ptr) orelse return nil.nil_cft) {
+        const use = retainTopicUse(ctx, related_topic.ptr) orelse return nil.nil_cft;
+        const related = switch (use) {
             .topic => |t| t,
-            .cft => |c| {
-                c.release();
+            .cft => {
+                use.abandon();
                 return nil.nil_cft;
             },
             .none => unreachable,
@@ -5499,13 +5500,13 @@ pub const DomainParticipantImpl = struct {
             if (expression_parameters) |p| p.* else empty_seq,
             self.toDDSParticipant(),
         ) catch {
-            related.release();
+            use.abandon();
             return nil.nil_cft;
         };
         self.mu.lock();
         self.cft_topics.append(self.alloc, cft) catch {
             self.mu.unlock();
-            cft.release();
+            cft.deleted();
             return nil.nil_cft;
         };
         self.mu.unlock();
@@ -5525,7 +5526,7 @@ pub const DomainParticipantImpl = struct {
                 // Spec §2.2.2.2.1.8: not while a DataReader uses it.
                 if (c.inUse()) return DDS.RETCODE_PRECONDITION_NOT_MET;
                 _ = self.cft_topics.swapRemove(i);
-                c.release();
+                c.deleted();
                 return DDS.RETCODE_OK;
             }
         }
@@ -5610,7 +5611,7 @@ pub const DomainParticipantImpl = struct {
         subs.deinit(self.alloc);
         for (tops.items) |t| t.release();
         tops.deinit(self.alloc);
-        for (cfts.items) |c| c.release();
+        for (cfts.items) |c| c.deleted();
         cfts.deinit(self.alloc);
         return DDS.RETCODE_OK;
     }

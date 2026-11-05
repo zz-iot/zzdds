@@ -318,6 +318,7 @@ pub const DataWriterImpl = struct {
         self.listeners.awaitIdle();
         self.c_abi.retire();
         if (self.status_cond) |sc| sc.c_abi.retire();
+        self.topic_use.end();
         self.quiesce.beginTeardown(self, reallyDeinit);
     }
 

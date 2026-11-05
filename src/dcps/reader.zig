@@ -656,6 +656,7 @@ pub const DataReaderImpl = struct {
             if (rc.owner_qc) |qc| qc.c_abi.retire() else rc.c_abi.retire();
         }
         self.mu.unlock();
+        self.topic_use.end();
         self.quiesce.beginTeardown(self, reallyDeinit);
     }
 

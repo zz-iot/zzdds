@@ -455,7 +455,7 @@ pub const PublisherImpl = struct {
     pub fn createProtoWriter(self: *Self, a_topic: DDS.Topic, qos: *const DDS.DataWriterQos) !ProtoWriterParts {
         // First, before `a_topic` is read: it may not be this participant's.
         const topic_use = self.cbs.retain_topic(self.cbs.ctx, a_topic.ptr) orelse return error.TopicOfAnotherParticipant;
-        errdefer topic_use.release();
+        errdefer topic_use.abandon();
         var parts: ProtoWriterParts = .{ .pw = undefined, .publication_handle = DDS.HANDLE_NIL, .guid = undefined, .topic_use = topic_use };
         parts.pw = try self.cbs.create_proto_writer(
             self.cbs.ctx,
@@ -502,7 +502,7 @@ pub const PublisherImpl = struct {
             self.cbs.timer_clock,
         ) catch {
             self.cbs.destroy_proto_writer(self.cbs.ctx, publication_handle);
-            parts.topic_use.release();
+            parts.topic_use.abandon();
             return nil.nil_datawriter;
         };
         dw.topic_use = parts.topic_use;

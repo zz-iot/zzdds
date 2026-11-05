@@ -439,14 +439,14 @@ pub const SubscriberImpl = struct {
             &subscription_handle,
             &guid,
         ) catch {
-            topic_use.release();
+            topic_use.abandon();
             return nil.nil_datareader;
         };
         // Before the reader is published, so a reader whose announcement
         // cannot be reserved is never created.
         self.prepareDataReader(subscription_handle) catch {
             self.cbs.destroy_proto_reader(self.cbs.ctx, subscription_handle);
-            topic_use.release();
+            topic_use.abandon();
             return nil.nil_datareader;
         };
         const dr = reader_mod.DataReaderImpl.init(
@@ -463,7 +463,7 @@ pub const SubscriberImpl = struct {
             presentation,
         ) catch {
             self.cbs.destroy_proto_reader(self.cbs.ctx, subscription_handle);
-            topic_use.release();
+            topic_use.abandon();
             return nil.nil_datareader;
         };
         dr.topic_use = topic_use;
