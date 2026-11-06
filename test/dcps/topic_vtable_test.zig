@@ -23,10 +23,10 @@ const Fixture = struct {
     dp: DDS.DomainParticipant,
 
     fn init(alloc: std.mem.Allocator) !Fixture {
-        return initWithQos(alloc, .{});
+        return initWithFactoryQos(alloc, .{});
     }
 
-    fn initWithQos(alloc: std.mem.Allocator, qos: DDS.DomainParticipantQos) !Fixture {
+    fn initWithFactoryQos(alloc: std.mem.Allocator, factory_qos: DDS.DomainParticipantFactoryQos) !Fixture {
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
         const t = try delivery.newTransport();
@@ -35,7 +35,8 @@ const Fixture = struct {
         errdefer d.deinit();
         const factory = try DomainParticipantFactoryImpl.init(alloc, t.transport(), d.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory.deinit();
-        const dp = factory.toDDSFactory().create_participant(test_domain.get(), qos, null, 0);
+        try testing.expectEqual(DDS.RETCODE_OK, factory.toDDSFactory().set_qos(factory_qos));
+        const dp = factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         return .{ .alloc = alloc, .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp };
     }
 
@@ -553,18 +554,18 @@ test "create_datawriter: an announcement that cannot be prepared leaves the Topi
     try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(fx.dp, topic));
 }
 
-/// A disabled participant, so nothing else allocates through what a test
-/// swaps. `fa` is what entities created under it keep allocating through, so
-/// it must outlive them; declare it before this.
+/// A participant never enabled, so it runs no thread that could allocate through
+/// what a test swaps. The factory's QoS decides that; the participant's own only
+/// governs what it creates. Stays disabled through `fx.deinit()`, which frees what
+/// is left without the deletes a disabled participant refuses.
+/// `fa` is what entities created under it keep allocating through, so it must
+/// outlive them; declare it before this, and reset it before `fx.deinit()`.
 fn initForFailingAllocations(alloc: std.mem.Allocator) !Fixture {
-    return Fixture.initWithQos(alloc, .{ .entity_factory = .{ .autoenable_created_entities = false } });
-}
-
-/// Deletes what a test created, which a disabled participant would refuse.
-fn deleteAllForFailingAllocations(fx: *Fixture, fa: *std.testing.FailingAllocator, backing: std.mem.Allocator) !void {
-    fa.* = .init(backing, .{});
-    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.enable());
-    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.delete_contained_entities());
+    var fx = try Fixture.initWithFactoryQos(alloc, .{ .entity_factory = .{ .autoenable_created_entities = false } });
+    errdefer fx.deinit();
+    const dp_impl: *zzdds.dcps.DomainParticipantImpl = @ptrCast(@alignCast(fx.dp.ptr));
+    try testing.expect(!dp_impl.enabled.load(.acquire));
+    return fx;
 }
 
 /// Runs `ctx.create()` with each allocation through `target` failing in turn,
@@ -609,7 +610,7 @@ test "create_datawriter: running out of memory leaves the Topic as it was" {
     };
     const backing = pub_impl.alloc;
     try expectFailedCreatesLeaveTopic(&fa, &pub_impl.alloc, impl, Create{ .pub_ = pub_, .topic = topic });
-    try deleteAllForFailingAllocations(&fx, &fa, backing);
+    fa = .init(backing, .{});
 }
 
 test "create_datareader: running out of memory leaves the Topic as it was" {
@@ -629,7 +630,7 @@ test "create_datareader: running out of memory leaves the Topic as it was" {
     };
     const backing = sub_impl.alloc;
     try expectFailedCreatesLeaveTopic(&fa, &sub_impl.alloc, impl, Create{ .sub = sub, .description = impl.toTopicDescription() });
-    try deleteAllForFailingAllocations(&fx, &fa, backing);
+    fa = .init(backing, .{});
 }
 
 test "create_contentfilteredtopic: running out of memory leaves the related Topic as it was" {
@@ -648,7 +649,7 @@ test "create_contentfilteredtopic: running out of memory leaves the related Topi
     };
     const backing = dp_impl.alloc;
     try expectFailedCreatesLeaveTopic(&fa, &dp_impl.alloc, impl, Create{ .dp = fx.dp, .topic = topic });
-    try deleteAllForFailingAllocations(&fx, &fa, backing);
+    fa = .init(backing, .{});
 }
 
 test "create_topic: running out of memory leaves no Topic behind" {
@@ -669,7 +670,7 @@ test "create_topic: running out of memory leaves no Topic behind" {
         if (!fa.has_induced_failure) break;
     }
     try testing.expect(fail_index > 0);
-    try deleteAllForFailingAllocations(&fx, &fa, backing);
+    fa = .init(backing, .{});
 }
 
 test "a reader with a delivery in flight keeps its filter through delete_contained_entities" {
