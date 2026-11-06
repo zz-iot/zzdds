@@ -26,8 +26,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   to another participant. They used to free it regardless, leaving a reader on a deleted
   ContentFilteredTopic to evaluate a freed filter on its next sample. `create_datawriter`,
   `create_datareader` and `create_contentfilteredtopic` now fail on a topic of another
-  participant, or a nil one. A reader with a delivery in flight keeps its topic alive through
-  `delete_contained_entities` and `delete_participant`.
+  participant, or a nil one. A reader on the builtin Subscriber counts as a user like any other.
+  A reader with a delivery in flight keeps its topic alive through `delete_contained_entities`
+  and `delete_participant`.
 - The mock-loopback tests use `c_allocator` under Valgrind. `std.testing.allocator` captures
   a stack trace on every alloc and free, which under Valgrind made delivery slow enough for
   discovery's timers to outrun it, so a test could time out intermittently. Memcheck also

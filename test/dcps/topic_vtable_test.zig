@@ -23,6 +23,10 @@ const Fixture = struct {
     dp: DDS.DomainParticipant,
 
     fn init(alloc: std.mem.Allocator) !Fixture {
+        return initWithQos(alloc, .{});
+    }
+
+    fn initWithQos(alloc: std.mem.Allocator, qos: DDS.DomainParticipantQos) !Fixture {
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
         const t = try delivery.newTransport();
@@ -31,7 +35,7 @@ const Fixture = struct {
         errdefer d.deinit();
         const factory = try DomainParticipantFactoryImpl.init(alloc, t.transport(), d.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory.deinit();
-        const dp = factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
+        const dp = factory.toDDSFactory().create_participant(test_domain.get(), qos, null, 0);
         return .{ .alloc = alloc, .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp };
     }
 
@@ -384,9 +388,288 @@ test "creating on another participant's Topic fails and takes no reference" {
     try testing.expectEqual(nil.nil_datareader.ptr, sub.create_datareader(impl.toTopicDescription(), .{}, null, 0).ptr);
     try testing.expectEqual(nil.nil_datareader.ptr, sub.create_datareader(cft_impl.toTopicDescription(), .{}, null, 0).ptr);
     try testing.expectEqual(nil.nil_cft.ptr, b.dp.create_contentfilteredtopic("Foreign_g", topic, "x = 1", &DDS.StringSeq{}).ptr);
+    const builtin = b.dp.get_builtin_subscriber();
+    try testing.expectEqual(nil.nil_datareader.ptr, builtin.create_datareader(impl.toTopicDescription(), .{}, null, 0).ptr);
+    try testing.expectEqual(nil.nil_datareader.ptr, builtin.create_datareader(cft_impl.toTopicDescription(), .{}, null, 0).ptr);
 
     try testing.expectEqual(DDS.RETCODE_OK, deleteCft(a.dp, cft));
     try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(a.dp, topic));
+}
+
+test "delete_topic and delete_contentfilteredtopic: refused while a reader on the builtin Subscriber uses them" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("BuiltinUsed", "T", .{}, null, 0);
+    const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const cft = fx.dp.create_contentfilteredtopic("BuiltinUsed_f", topic, "x = 1", &DDS.StringSeq{});
+    const cft_impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft.ptr));
+    const builtin = fx.dp.get_builtin_subscriber();
+    const on_topic = builtin.create_datareader(impl.toTopicDescription(), .{}, null, 0);
+    const on_cft = builtin.create_datareader(cft_impl.toTopicDescription(), .{}, null, 0);
+    try testing.expect(on_topic.ptr != nil.nil_datareader.ptr);
+    try testing.expect(on_cft.ptr != nil.nil_datareader.ptr);
+
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, deleteCft(fx.dp, cft));
+    try testing.expectEqual(DDS.RETCODE_OK, builtin.delete_datareader(on_cft));
+    try testing.expectEqual(DDS.RETCODE_OK, deleteCft(fx.dp, cft));
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, deleteTopic(fx.dp, topic));
+    try testing.expectEqualStrings("BuiltinUsed", on_topic.get_topicdescription().get_name());
+    try testing.expectEqual(DDS.RETCODE_OK, builtin.delete_datareader(on_topic));
+    try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(fx.dp, topic));
+}
+
+test "the builtin Subscriber takes its own topic descriptions, but no other participant's" {
+    var a = try Fixture.init(testing.allocator);
+    defer a.deinit();
+    var b = try Fixture.init(testing.allocator);
+    defer b.deinit();
+    const builtin = a.dp.get_builtin_subscriber();
+    const description = builtin.lookup_datareader("DCPSPublication").get_topicdescription();
+    const reader = builtin.create_datareader(description, .{}, null, 0);
+    try testing.expect(reader.ptr != nil.nil_datareader.ptr);
+    try testing.expectEqualStrings("DCPSPublication", reader.get_topicdescription().get_name());
+    try testing.expectEqual(DDS.RETCODE_OK, builtin.delete_datareader(reader));
+
+    const other = b.dp.get_builtin_subscriber();
+    try testing.expectEqual(nil.nil_datareader.ptr, other.create_datareader(description, .{}, null, 0).ptr);
+}
+
+test "a reader left on the builtin Subscriber keeps its Topic through delete_contained_entities and delete_participant" {
+    // The builtin Subscriber is not a contained entity, so its reader stays
+    // until the participant goes. testing.allocator catches a leak or double
+    // free when Fixture.deinit tears it down.
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("BuiltinKept", "T", .{}, null, 0);
+    const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const reader = fx.dp.get_builtin_subscriber().create_datareader(impl.toTopicDescription(), .{}, null, 0);
+    try testing.expect(reader.ptr != nil.nil_datareader.ptr);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.delete_contained_entities());
+    try testing.expectEqualStrings("BuiltinKept", reader.get_topicdescription().get_name());
+}
+
+test "create_contentfilteredtopic: a ContentFilteredTopic as the related Topic is refused and left unused" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("RelatedCft", "T", .{}, null, 0);
+    const cft = fx.dp.create_contentfilteredtopic("RelatedCft_f", topic, "x = 1", &DDS.StringSeq{});
+    const cft_impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft.ptr));
+    const related = DDS.Topic{ .ptr = cft.ptr, .vtable = topic.vtable };
+
+    try testing.expectEqual(nil.nil_cft.ptr, fx.dp.create_contentfilteredtopic("RelatedCft_g", related, "x = 1", &DDS.StringSeq{}).ptr);
+    try testing.expect(!cft_impl.inUse());
+    try testing.expectEqual(DDS.RETCODE_OK, deleteCft(fx.dp, cft));
+    try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(fx.dp, topic));
+}
+
+// ── A create that fails leaves its Topic as it found it ─────────────────
+
+fn failProtoReader(
+    _: *anyopaque,
+    _: []const u8,
+    _: []const u8,
+    _: DDS.DataReaderQos,
+    _: DDS.PresentationQosPolicy,
+    _: *DDS.InstanceHandle_t,
+    _: *zzdds.protocol.Guid,
+) anyerror!zzdds.protocol.ProtocolReader {
+    return error.OutOfMemory;
+}
+
+test "create_datareader: a protocol reader that cannot be created leaves the Topic and ContentFilteredTopic unused" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("NoProtoReader", "T", .{}, null, 0);
+    const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const cft = fx.dp.create_contentfilteredtopic("NoProtoReader_f", topic, "x = 1", &DDS.StringSeq{});
+    const cft_impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft.ptr));
+    const sub = fx.dp.create_subscriber(.{}, null, 0);
+    const sub_impl: *zzdds.dcps.SubscriberImpl = @ptrCast(@alignCast(sub.ptr));
+    sub_impl.cbs.create_proto_reader = failProtoReader;
+
+    try testing.expectEqual(nil.nil_datareader.ptr, sub.create_datareader(cft_impl.toTopicDescription(), .{}, null, 0).ptr);
+    try testing.expectEqual(DDS.RETCODE_OK, deleteCft(fx.dp, cft));
+    try testing.expectEqual(nil.nil_datareader.ptr, sub.create_datareader(impl.toTopicDescription(), .{}, null, 0).ptr);
+    try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(fx.dp, topic));
+}
+
+test "create_datareader: an announcement that cannot be prepared leaves the Topic unused" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("NoReaderAnnouncement", "T", .{}, null, 0);
+    const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const sub = fx.dp.create_subscriber(.{}, null, 0);
+    const sub_impl: *zzdds.dcps.SubscriberImpl = @ptrCast(@alignCast(sub.ptr));
+    const Fail = struct {
+        fn prepare(_: *anyopaque, _: []const DDS.InstanceHandle_t, _: []const []const u8, _: DDS.PresentationQosPolicy) anyerror!void {
+            return error.OutOfMemory;
+        }
+    };
+    sub_impl.cbs.prepare_readers = Fail.prepare;
+
+    try testing.expectEqual(nil.nil_datareader.ptr, sub.create_datareader(impl.toTopicDescription(), .{}, null, 0).ptr);
+    try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(fx.dp, topic));
+}
+
+test "create_datawriter: a protocol writer that cannot be created leaves the Topic unused" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("NoProtoWriter", "T", .{}, null, 0);
+    const pub_ = fx.dp.create_publisher(.{}, null, 0);
+    const pub_impl: *zzdds.dcps.PublisherImpl = @ptrCast(@alignCast(pub_.ptr));
+    const Fail = struct {
+        fn create(
+            _: *anyopaque,
+            _: []const u8,
+            _: []const u8,
+            _: DDS.DataWriterQos,
+            _: DDS.PresentationQosPolicy,
+            _: *DDS.InstanceHandle_t,
+            _: *zzdds.protocol.Guid,
+        ) anyerror!zzdds.protocol.ProtocolWriter {
+            return error.OutOfMemory;
+        }
+    };
+    pub_impl.cbs.create_proto_writer = Fail.create;
+
+    try testing.expectEqual(nil.nil_datawriter.ptr, pub_.create_datawriter(topic, .{}, null, 0).ptr);
+    try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(fx.dp, topic));
+}
+
+test "create_datawriter: an announcement that cannot be prepared leaves the Topic unused" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("NoWriterAnnouncement", "T", .{}, null, 0);
+    const pub_ = fx.dp.create_publisher(.{}, null, 0);
+    const pub_impl: *zzdds.dcps.PublisherImpl = @ptrCast(@alignCast(pub_.ptr));
+    const Fail = struct {
+        fn prepare(_: *anyopaque, _: []const DDS.InstanceHandle_t, _: DDS.InstanceHandle_t, _: []const []const u8, _: DDS.PresentationQosPolicy) anyerror!void {
+            return error.OutOfMemory;
+        }
+    };
+    pub_impl.cbs.prepare_writers = Fail.prepare;
+
+    try testing.expectEqual(nil.nil_datawriter.ptr, pub_.create_datawriter(topic, .{}, null, 0).ptr);
+    try testing.expectEqual(DDS.RETCODE_OK, deleteTopic(fx.dp, topic));
+}
+
+/// A disabled participant, so nothing else allocates through what a test
+/// swaps. `fa` is what entities created under it keep allocating through, so
+/// it must outlive them; declare it before this.
+fn initForFailingAllocations(alloc: std.mem.Allocator) !Fixture {
+    return Fixture.initWithQos(alloc, .{ .entity_factory = .{ .autoenable_created_entities = false } });
+}
+
+/// Deletes what a test created, which a disabled participant would refuse.
+fn deleteAllForFailingAllocations(fx: *Fixture, fa: *std.testing.FailingAllocator, backing: std.mem.Allocator) !void {
+    fa.* = .init(backing, .{});
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.enable());
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.delete_contained_entities());
+}
+
+/// Runs `ctx.create()` with each allocation through `target` failing in turn,
+/// until one run reaches no failure. A create that fails must leave `topic` as
+/// it found it. One that succeeds despite a failure it could tolerate is kept.
+fn expectFailedCreatesLeaveTopic(fa: *std.testing.FailingAllocator, target: *std.mem.Allocator, topic: *TopicImpl, ctx: anytype) !void {
+    const backing = target.*;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        const users = topic.users.load(.acquire);
+        const refs = topic.refs.load(.acquire);
+        fa.* = .init(backing, .{ .fail_index = fail_index });
+        target.* = fa.allocator();
+        const created = ctx.create();
+        target.* = backing;
+        if (!created) {
+            try testing.expectEqual(users, topic.users.load(.acquire));
+            try testing.expectEqual(refs, topic.refs.load(.acquire));
+        }
+        if (!fa.has_induced_failure) {
+            try testing.expect(created);
+            break;
+        }
+    }
+    try testing.expect(fail_index > 0);
+}
+
+test "create_datawriter: running out of memory leaves the Topic as it was" {
+    var fa: std.testing.FailingAllocator = undefined;
+    var fx = try initForFailingAllocations(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("WriterOom", "T", .{}, null, 0);
+    const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const pub_ = fx.dp.create_publisher(.{}, null, 0);
+    const pub_impl: *zzdds.dcps.PublisherImpl = @ptrCast(@alignCast(pub_.ptr));
+    const Create = struct {
+        pub_: DDS.Publisher,
+        topic: DDS.Topic,
+        fn create(self: @This()) bool {
+            return self.pub_.create_datawriter(self.topic, .{}, null, 0).ptr != nil.nil_datawriter.ptr;
+        }
+    };
+    const backing = pub_impl.alloc;
+    try expectFailedCreatesLeaveTopic(&fa, &pub_impl.alloc, impl, Create{ .pub_ = pub_, .topic = topic });
+    try deleteAllForFailingAllocations(&fx, &fa, backing);
+}
+
+test "create_datareader: running out of memory leaves the Topic as it was" {
+    var fa: std.testing.FailingAllocator = undefined;
+    var fx = try initForFailingAllocations(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("ReaderOom", "T", .{}, null, 0);
+    const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const sub = fx.dp.create_subscriber(.{}, null, 0);
+    const sub_impl: *zzdds.dcps.SubscriberImpl = @ptrCast(@alignCast(sub.ptr));
+    const Create = struct {
+        sub: DDS.Subscriber,
+        description: DDS.TopicDescription,
+        fn create(self: @This()) bool {
+            return self.sub.create_datareader(self.description, .{}, null, 0).ptr != nil.nil_datareader.ptr;
+        }
+    };
+    const backing = sub_impl.alloc;
+    try expectFailedCreatesLeaveTopic(&fa, &sub_impl.alloc, impl, Create{ .sub = sub, .description = impl.toTopicDescription() });
+    try deleteAllForFailingAllocations(&fx, &fa, backing);
+}
+
+test "create_contentfilteredtopic: running out of memory leaves the related Topic as it was" {
+    var fa: std.testing.FailingAllocator = undefined;
+    var fx = try initForFailingAllocations(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("CftOom", "T", .{}, null, 0);
+    const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const dp_impl: *zzdds.dcps.DomainParticipantImpl = @ptrCast(@alignCast(fx.dp.ptr));
+    const Create = struct {
+        dp: DDS.DomainParticipant,
+        topic: DDS.Topic,
+        fn create(self: @This()) bool {
+            return self.dp.create_contentfilteredtopic("CftOom_f", self.topic, "x = 1", &DDS.StringSeq{}).ptr != nil.nil_cft.ptr;
+        }
+    };
+    const backing = dp_impl.alloc;
+    try expectFailedCreatesLeaveTopic(&fa, &dp_impl.alloc, impl, Create{ .dp = fx.dp, .topic = topic });
+    try deleteAllForFailingAllocations(&fx, &fa, backing);
+}
+
+test "create_topic: running out of memory leaves no Topic behind" {
+    var fa: std.testing.FailingAllocator = undefined;
+    var fx = try initForFailingAllocations(testing.allocator);
+    defer fx.deinit();
+    const dp_impl: *zzdds.dcps.DomainParticipantImpl = @ptrCast(@alignCast(fx.dp.ptr));
+    const backing = dp_impl.alloc;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        const before = dp_impl.topics.items.len;
+        fa = .init(backing, .{ .fail_index = fail_index });
+        dp_impl.alloc = fa.allocator();
+        const topic = fx.dp.create_topic("TopicOom", "T", .{}, null, 0);
+        dp_impl.alloc = backing;
+        // testing.allocator catches the Topic itself leaking.
+        if (topic.ptr == nil.nil_topic.ptr) try testing.expectEqual(before, dp_impl.topics.items.len);
+        if (!fa.has_induced_failure) break;
+    }
+    try testing.expect(fail_index > 0);
+    try deleteAllForFailingAllocations(&fx, &fa, backing);
 }
 
 test "a reader with a delivery in flight keeps its filter through delete_contained_entities" {

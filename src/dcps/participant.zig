@@ -244,8 +244,14 @@ const BuiltinSubscriberState = struct {
             .ctx = @ptrCast(participant),
             .is_participant_enabled = DomainParticipantImpl.participantIsEnabledCb,
             .retain_topic = struct {
-                fn f(_: *anyopaque, _: *anyopaque) ?topic_mod.TopicUse {
-                    return .none;
+                // Its own descriptions outlive its readers and count no users.
+                // Anything else is treated as by any other Subscriber.
+                fn f(ctx: *anyopaque, topic: *anyopaque) ?topic_mod.TopicUse {
+                    const bs = DomainParticipantImpl.cast(ctx).builtin_sub.?;
+                    for ([_]*BuiltinTopicDescImpl{ &bs.part_desc, &bs.topic_desc, &bs.pub_desc, &bs.sub_desc }) |desc| {
+                        if (@as(*anyopaque, desc) == topic) return .none;
+                    }
+                    return DomainParticipantImpl.retainTopicUse(ctx, topic);
                 }
             }.f,
             .create_proto_reader = struct {
