@@ -647,17 +647,23 @@ pub const DataReaderImpl = struct {
         self.quiesce.close();
         // Hold no entity lock here: the listener may call back into it.
         self.listeners.awaitIdle();
-        self.c_abi.retire();
-        if (self.status_cond) |sc| sc.c_abi.retire();
-        // Conditions belong to the reader even when its storage is pinned.
-        self.mu.lock();
-        for (self.read_conditions.items) |cond| {
-            const rc: *waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
-            if (rc.owner_qc) |qc| qc.c_abi.retire() else rc.c_abi.retire();
-        }
-        self.mu.unlock();
+        self.retireHandles();
         self.topic_use.end();
         self.quiesce.beginTeardown(self, reallyDeinit);
+    }
+
+    /// This reader is being deleted, and with it every condition it still
+    /// owns, even when its storage is pinned. `mu` keeps a condition deleted
+    /// concurrently from being freed under this.
+    pub fn retireHandles(self: *Self) void {
+        self.c_abi.retire();
+        if (self.status_cond) |sc| sc.c_abi.retire();
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.read_conditions.items) |cond| {
+            const rc: *waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
+            rc.retireHandle();
+        }
     }
 
     /// Acquire/release pair for any application-facing call that touches
@@ -3193,7 +3199,7 @@ pub const DataReaderImpl = struct {
         // sees this entry, or we retire it here and leave it for final cleanup.
         if (self.quiesce.tearingDown()) {
             const rc: *waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
-            if (rc.owner_qc) |qc| qc.c_abi.retire() else rc.c_abi.retire();
+            rc.retireHandle();
         }
         return true;
     }

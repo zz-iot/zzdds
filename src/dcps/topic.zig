@@ -142,6 +142,16 @@ pub const TopicImpl = struct {
         _ = self.users.fetchSub(1, .acq_rel);
     }
 
+    /// Drops the owning participant's reference: this Topic is deleted, so its
+    /// wrappers retire now, even if a deleted user still finishing keeps it
+    /// alive a while longer.
+    pub fn deleted(self: *Self) void {
+        self.c_abi.retire();
+        self.td_c_abi.retire();
+        if (self.status_cond) |sc| sc.c_abi.retire();
+        self.release();
+    }
+
     /// Drops a reference, freeing the Topic with the last one.
     pub fn release(self: *Self) void {
         if (self.refs.fetchSub(1, .acq_rel) == 1) self.destroy();
@@ -316,7 +326,7 @@ pub const TopicImpl = struct {
     }
 
     fn vtDeinit(ctx: *anyopaque) void {
-        cast(ctx).release();
+        cast(ctx).deleted();
     }
 
     // ── DDS.TopicDescription vtable ──────────────────────────────────────────
@@ -528,9 +538,10 @@ pub const ContentFilteredTopicImpl = struct {
     }
 
     /// Drops the owning participant's reference: this ContentFilteredTopic is
-    /// deleted, so it no longer uses its related Topic, even if a reader still
-    /// finishing keeps it alive a while longer.
+    /// deleted, so it no longer uses its related Topic and its wrapper retires,
+    /// even if a reader still finishing keeps it alive a while longer.
     pub fn deleted(self: *Self) void {
+        self.c_abi.retire();
         self.related_impl.endUse();
         self.release();
     }

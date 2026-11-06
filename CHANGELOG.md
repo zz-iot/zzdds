@@ -17,6 +17,10 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   native operation delays freeing storage. Cover deferred containers, participant
   teardown and owned conditions; waitsets no longer return retired conditions.
   Keep retirement notifications single-shot and add deterministic lifetime tests.
+- Deleting a Topic or ContentFilteredTopic retires its wrappers before the delete returns,
+  even when a deleted reader or writer still finishing keeps it alive. Deleting a participant
+  does the same for its builtin subscriber, readers and topic descriptions when its teardown
+  is deferred.
 - `delete_topic` and `delete_contentfilteredtopic` return `PRECONDITION_NOT_MET` while a
   DataWriter, DataReader or (for a Topic) ContentFilteredTopic uses it, and for one belonging
   to another participant. They used to free it regardless, leaving a reader on a deleted

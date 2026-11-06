@@ -269,9 +269,13 @@ pub const SubscriberImpl = struct {
             r.deinit();
         }
         self.readers.clearRetainingCapacity();
+        self.retireHandles();
+        self.quiesce.beginTeardown(self, reallyDeinit);
+    }
+
+    pub fn retireHandles(self: *Self) void {
         self.c_abi.retire();
         if (self.status_cond) |sc| sc.c_abi.retire();
-        self.quiesce.beginTeardown(self, reallyDeinit);
     }
 
     pub fn quiesceAcquireFn(ctx: *anyopaque) bool {

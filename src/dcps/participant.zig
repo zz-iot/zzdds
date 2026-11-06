@@ -394,6 +394,14 @@ const BuiltinSubscriberState = struct {
         for ([_]*reader_mod.DataReaderImpl{ self.part_dr, self.topic_dr, self.pub_dr, self.sub_dr }) |r| r.listeners.attach(group);
     }
 
+    /// These stay open until the participant's deferred teardown runs, which
+    /// also keeps them alive for a callback exporting a handle before then.
+    fn retireHandles(self: *@This()) void {
+        self.sub.retireHandles();
+        for ([_]*reader_mod.DataReaderImpl{ self.part_dr, self.topic_dr, self.pub_dr, self.sub_dr }) |dr| dr.retireHandles();
+        for ([_]*BuiltinTopicDescImpl{ &self.part_desc, &self.topic_desc, &self.pub_desc, &self.sub_desc }) |desc| desc.c_abi.retire();
+    }
+
     fn deinit(self: *@This()) void {
         // sub.deinit() calls destroy_proto_reader (noop) + r.deinit() for each
         // reader in sub.readers, which covers our four DataReaderImpls.
@@ -1716,6 +1724,7 @@ pub const DomainParticipantImpl = struct {
         const listeners_deferred = self.runtime != null and !self.listener_group.close();
         self.c_abi.retire();
         if (self.status_cond) |sc| sc.c_abi.retire();
+        if (self.builtin_sub) |bs| bs.retireHandles();
         if (listeners_deferred) {
             self.listener_group.finishWith(.{ .ctx = self, .run = teardownHook });
             return;
@@ -1756,7 +1765,7 @@ pub const DomainParticipantImpl = struct {
         pubs.deinit(self.alloc);
         for (subs.items) |s| s.deinit();
         subs.deinit(self.alloc);
-        for (tops.items) |t| t.release();
+        for (tops.items) |t| t.deleted();
         tops.deinit(self.alloc);
         for (cfts.items) |c| c.deleted();
         cfts.deinit(self.alloc);
@@ -5404,7 +5413,7 @@ pub const DomainParticipantImpl = struct {
         }
         self.mu.unlock();
         if (found) |t| {
-            t.release();
+            t.deleted();
             return DDS.RETCODE_OK;
         }
         // Spec §2.2.2.2.1.6: a Topic of another participant. Told by the
@@ -5609,7 +5618,7 @@ pub const DomainParticipantImpl = struct {
         pubs.deinit(self.alloc);
         for (subs.items) |s| s.deinit();
         subs.deinit(self.alloc);
-        for (tops.items) |t| t.release();
+        for (tops.items) |t| t.deleted();
         tops.deinit(self.alloc);
         for (cfts.items) |c| c.deleted();
         cfts.deinit(self.alloc);

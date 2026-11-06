@@ -163,3 +163,53 @@ test "cascading deletion retires containers while their children still pin stora
         try observed.expect_once();
     }
 }
+
+test "topic retirement includes its description, status condition and filtered topic" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const topic: *dds.dcps.TopicImpl = @ptrCast(@alignCast(f.topic.ptr));
+    var params: DDS.StringSeq = .{};
+    const filtered = f.participant.create_contentfilteredtopic("RetirementFiltered", f.topic, "x = 1", &params);
+    const filtered_impl: *dds.dcps.ContentFilteredTopicImpl = @ptrCast(@alignCast(filtered.ptr));
+    const sub = f.participant.create_subscriber(.{}, null, 0);
+    const reader = sub.create_datareader(filtered_impl.toTopicDescription(), .{}, null, 0);
+    const native: *dds.dcps.DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    var observed: Observed = .{ .handles = &.{ handle(f.topic), handle(topic.toTopicDescription()), handle(f.topic.get_statuscondition()), handle(filtered) } };
+    try observed.start();
+    defer observed.stop();
+    // The reader's references keep both topics alive past their deletes.
+    try testing.expect(native.acquireQuiesce());
+    var held = true;
+    defer if (held) native.releaseQuiesce();
+    try testing.expectEqual(DDS.RETCODE_OK, sub.delete_datareader(reader));
+    try testing.expectEqual(DDS.RETCODE_OK, f.participant.delete_contentfilteredtopic(filtered));
+    try testing.expectEqual(DDS.RETCODE_OK, f.participant.delete_topic(f.topic));
+    try observed.expect_once();
+    for (observed.handles) |h| try testing.expect(rt.isEntityBoxRetired(h));
+    native.releaseQuiesce();
+    held = false;
+    try observed.expect_once();
+}
+
+test "cascading deletion retires topics while a deleted reader still pins them" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const topic: *dds.dcps.TopicImpl = @ptrCast(@alignCast(f.topic.ptr));
+    var params: DDS.StringSeq = .{};
+    const filtered = f.participant.create_contentfilteredtopic("RetirementFiltered", f.topic, "x = 1", &params);
+    const filtered_impl: *dds.dcps.ContentFilteredTopicImpl = @ptrCast(@alignCast(filtered.ptr));
+    const sub = f.participant.create_subscriber(.{}, null, 0);
+    const reader = sub.create_datareader(filtered_impl.toTopicDescription(), .{}, null, 0);
+    const native: *dds.dcps.DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    var observed: Observed = .{ .handles = &.{ handle(f.topic), handle(topic.toTopicDescription()), handle(f.topic.get_statuscondition()), handle(filtered) } };
+    try observed.start();
+    defer observed.stop();
+    try testing.expect(native.acquireQuiesce());
+    var held = true;
+    defer if (held) native.releaseQuiesce();
+    try testing.expectEqual(DDS.RETCODE_OK, f.participant.delete_contained_entities());
+    try observed.expect_once();
+    native.releaseQuiesce();
+    held = false;
+    try observed.expect_once();
+}
