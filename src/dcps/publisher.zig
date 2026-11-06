@@ -14,6 +14,7 @@ const DDS = @import("zzdds_generated").DDS;
 const nil = @import("nil.zig");
 const proto = @import("../protocol/interface.zig");
 const writer_mod = @import("writer.zig");
+const topic_mod = @import("topic.zig");
 const qos_change = @import("qos_change.zig");
 const ZZDDS = @import("zzdds_ext_generated").zzdds;
 const extensions_mod = @import("../c_abi/extensions.zig");
@@ -41,6 +42,10 @@ pub const ParticipantCbs = struct {
     /// enable a child before its own factory entity). Reads the owning
     /// DomainParticipantImpl's `enabled` flag.
     is_participant_enabled: *const fn (ctx: *anyopaque) bool,
+
+    /// Takes the reference a new DataWriter holds on its Topic; null when the
+    /// Topic is not this participant's.
+    retain_topic: *const fn (ctx: *anyopaque, topic: *anyopaque) ?topic_mod.TopicUse,
 
     /// Allocate and start an RTPS ProtocolWriter for a topic.
     /// Called on create_datawriter; the returned ProtocolWriter is owned by
@@ -440,6 +445,7 @@ pub const PublisherImpl = struct {
         pw: proto.ProtocolWriter,
         publication_handle: DDS.InstanceHandle_t,
         guid: proto.Guid,
+        topic_use: topic_mod.TopicUse,
     };
 
     /// First step of `createDataWriter`: creates the protocol writer, which
@@ -447,7 +453,10 @@ pub const PublisherImpl = struct {
     /// until `finishDataWriter` has registered its matched notify. Separate
     /// so tests can deliver discovery between the two steps.
     pub fn createProtoWriter(self: *Self, a_topic: DDS.Topic, qos: *const DDS.DataWriterQos) !ProtoWriterParts {
-        var parts: ProtoWriterParts = .{ .pw = undefined, .publication_handle = DDS.HANDLE_NIL, .guid = undefined };
+        // First, before `a_topic` is read: it may not be this participant's.
+        const topic_use = self.cbs.retain_topic(self.cbs.ctx, a_topic.ptr) orelse return error.TopicOfAnotherParticipant;
+        errdefer topic_use.abandon();
+        var parts: ProtoWriterParts = .{ .pw = undefined, .publication_handle = DDS.HANDLE_NIL, .guid = undefined, .topic_use = topic_use };
         parts.pw = try self.cbs.create_proto_writer(
             self.cbs.ctx,
             a_topic.get_name(),
@@ -493,8 +502,10 @@ pub const PublisherImpl = struct {
             self.cbs.timer_clock,
         ) catch {
             self.cbs.destroy_proto_writer(self.cbs.ctx, publication_handle);
+            parts.topic_use.abandon();
             return nil.nil_datawriter;
         };
+        dw.topic_use = parts.topic_use;
         dw.timers_changed = self.cbs.timers_changed;
         if (self.cbs.listener_group) |g| dw.listeners.attach(g);
         self.cbs.register_incompat_qos(

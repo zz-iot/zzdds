@@ -851,6 +851,8 @@ const SelfDelete = struct {
     dp: DDS.DomainParticipant = undefined,
     deleted: bool = false,
     rc: DDS.ReturnCode_t = DDS.RETCODE_OK,
+    /// What the delete had reported as retired when it returned.
+    retired: ?*Retired = null,
 
     fn listener(self: *SelfDelete) DDS.DataReaderListener {
         return .{ .listener_data = self, .on_data_available = onDataAvailable };
@@ -873,6 +875,30 @@ const SelfDelete = struct {
         self.deleted = true;
         self.rc = self.dp.delete_contained_entities();
         if (self.rc == DDS.RETCODE_OK) self.rc = self.node.factory.toDDSFactory().delete_participant(self.dp);
+        if (self.retired) |r| r.snapshot();
+    }
+};
+
+/// Counts retire reports of a participant's handles.
+const Retired = struct {
+    participant: *anyopaque,
+    builtin_subscriber: *anyopaque,
+    builtin_reader: *anyopaque,
+    builtin_description: *anyopaque,
+    status_condition: *anyopaque,
+    seen: std.atomic.Value(u32) = .init(0),
+    at_return: u32 = 0,
+
+    fn on(ctx: ?*anyopaque, handle: *anyopaque) callconv(.c) void {
+        const self: *Retired = @ptrCast(@alignCast(ctx.?));
+        const handles = [_]*anyopaque{ self.participant, self.builtin_subscriber, self.builtin_reader, self.builtin_description, self.status_condition };
+        for (handles, 0..) |h, i| {
+            if (h == handle) _ = self.seen.fetchOr(@as(u32, 1) << @intCast(i), .monotonic);
+        }
+    }
+
+    fn snapshot(self: *Retired) void {
+        self.at_return = self.seen.load(.monotonic);
     }
 };
 
@@ -916,6 +942,60 @@ test "a participant deleted from its own listener is freed after that turn" {
     try testing.expectEqual(DDS.RETCODE_OK, dp_w.delete_contained_entities());
     try w.delete(dp_w);
     try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
+test "a participant deleted from its own listener retires its wrappers before the delete returns" {
+    var m: Manual = undefined;
+    m.init();
+    var delivery = try IntraProcessDelivery.init(alloc);
+    defer delivery.deinit();
+    var w = try Node.init(&delivery);
+    defer w.deinit();
+    var r = try Node.init(&delivery);
+    defer r.deinit();
+    try w.factory.selectRuntime(&m.runtime);
+    try r.factory.selectRuntime(&m.runtime);
+    const dp_w = w.create();
+    const dp_r = r.create();
+    try w.factory.selectRuntime(null);
+    try r.factory.selectRuntime(null);
+    m.runtime.releaseOwner();
+
+    const builtin = dp_r.get_builtin_subscriber();
+    const cond = dp_r.get_statuscondition();
+    const builtin_reader = builtin.lookup_datareader("DCPSPublication");
+    try testing.expect(builtin_reader.ptr != zzdds.dcps.nil_datareader.ptr);
+    const description = builtin_reader.get_topicdescription();
+    var retired = Retired{
+        .participant = dp_r.vtable.get_c_abi_handle(dp_r.ptr),
+        .builtin_subscriber = builtin.vtable.get_c_abi_handle(builtin.ptr),
+        .builtin_reader = builtin_reader.vtable.get_c_abi_handle(builtin_reader.ptr),
+        .builtin_description = description.vtable.get_c_abi_handle(description.ptr),
+        .status_condition = cond.vtable.get_c_abi_handle(cond.ptr),
+    };
+    try testing.expect(zzdds.zidl_rt.observeHandleRetire(Retired.on, &retired));
+    defer _ = zzdds.zidl_rt.unobserveHandleRetire(Retired.on, &retired);
+
+    var sd = SelfDelete{ .node = &r, .dp = dp_r, .retired = &retired };
+    const topic_w = dp_w.create_topic("SliceTopic", "SliceType", .{}, null, 0);
+    const topic_r = dp_r.create_topic("SliceTopic", "SliceType", .{}, null, 0);
+    const sub = dp_r.create_subscriber(.{}, null, 0);
+    const desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
+    _ = sub.create_datareader(desc_r, .{}, sd.listener(), DDS.DATA_AVAILABLE_STATUS);
+    const publisher = dp_w.create_publisher(.{}, null, 0);
+    const dw: *DataWriterImpl = @ptrCast(@alignCast(publisher.create_datawriter(topic_w, .{}, null, 0).ptr));
+
+    const payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0x00 };
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), history.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &payload);
+    var drives: usize = 0;
+    while (!sd.deleted and drives < 100) : (drives += 1) _ = try m.runtime.drive(64, 0);
+    try testing.expect(sd.deleted);
+    try testing.expectEqual(DDS.RETCODE_OK, sd.rc);
+    try testing.expectEqual(@as(u32, 0b11111), retired.at_return);
+
+    try testing.expectEqual(DDS.RETCODE_OK, dp_w.delete_contained_entities());
+    try w.delete(dp_w);
     m.runtime.deinit();
 }
 

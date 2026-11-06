@@ -17,6 +17,7 @@ const qos_change = @import("qos_change.zig");
 const proto = @import("../protocol/interface.zig");
 const history_mod = @import("../rtps/history.zig");
 const waitset = @import("waitset.zig");
+const topic_mod = @import("topic.zig");
 const time_mod = @import("../util/time.zig");
 const Hook = @import("../runtime/core.zig").Hook;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
@@ -82,6 +83,9 @@ pub const DataWriterImpl = struct {
     topic_name: []const u8, // borrowed from TopicImpl
     type_name: []const u8, // borrowed from TopicImpl
     topic: DDS.Topic,
+    /// The reference this writer holds on `topic`, dropped at the end of
+    /// `reallyDeinit`.
+    topic_use: topic_mod.TopicUse = .none,
     publisher: DDS.Publisher,
     /// Whether init() took a lifetime quiesce ref on `publisher` (false for
     /// hand-built impls in tests that skip init()).
@@ -314,6 +318,7 @@ pub const DataWriterImpl = struct {
         self.listeners.awaitIdle();
         self.c_abi.retire();
         if (self.status_cond) |sc| sc.c_abi.retire();
+        self.topic_use.end();
         self.quiesce.beginTeardown(self, reallyDeinit);
     }
 
@@ -344,7 +349,9 @@ pub const DataWriterImpl = struct {
         // pubDestroyProtoWriter callback), not by DataWriterImpl.
         const pinned = self.parent_pinned;
         const publisher = self.publisher;
+        const topic_use = self.topic_use;
         self.alloc.destroy(self);
+        topic_use.release();
         // Drop the parent-publisher lifetime ref taken in init(). After
         // destroy(self) so a reentrant PublisherImpl.reallyDeinit (if this
         // was its last ref) never sees this half-freed writer.

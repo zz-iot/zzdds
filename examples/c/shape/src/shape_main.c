@@ -859,7 +859,6 @@ static int run_subscriber(DDS_DomainParticipant dp, DDS_Topic base_topic, const 
         sleep_ms((int)(opts->read_period_ms));
     }
 
-    if (cft) DDS_DomainParticipant_delete_contentfilteredtopic(dp, cft);
     extra_topics_free(&et);
     return 0;
 }

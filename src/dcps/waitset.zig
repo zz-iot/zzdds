@@ -1153,6 +1153,12 @@ pub const ReadConditionImpl = struct {
         self.deinitAssumeReaderQuiescing();
     }
 
+    /// The owning reader is being deleted; see `CachedCAbiHandle.retire`. A
+    /// QueryCondition's one box is its own, not this embedded `rc`'s.
+    pub fn retireHandle(self: *Self) void {
+        if (self.owner_qc) |qc| qc.c_abi.retire() else self.c_abi.retire();
+    }
+
     /// Actual teardown. Called by deinit() above once it's established (via
     /// a fresh acquire) that it's safe to touch the owning reader, *or*
     /// directly by the reader's own reallyDeinit() bulk loop, which runs

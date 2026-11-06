@@ -461,6 +461,10 @@ pub const DataReaderImpl = struct {
     /// rather than mutating a previously-built CftFilterState in place.
     cft_ptr: ?*topic_mod.ContentFilteredTopicImpl = null,
 
+    /// The reference this reader holds on its topic, dropped at the end of
+    /// `reallyDeinit`, so `cft_ptr` outlives any delivery still in flight.
+    topic_use: topic_mod.TopicUse = .none,
+
     /// ContentFilteredTopic filter; null when no CFT or no get_field fn
     /// currently registered. Populated/refreshed exclusively by
     /// refreshGetFieldFn, under `mu` -- read under `mu` everywhere else
@@ -643,16 +647,23 @@ pub const DataReaderImpl = struct {
         self.quiesce.close();
         // Hold no entity lock here: the listener may call back into it.
         self.listeners.awaitIdle();
+        self.retireHandles();
+        self.topic_use.end();
+        self.quiesce.beginTeardown(self, reallyDeinit);
+    }
+
+    /// This reader is being deleted, and with it every condition it still
+    /// owns, even when its storage is pinned. `mu` keeps a condition deleted
+    /// concurrently from being freed under this.
+    pub fn retireHandles(self: *Self) void {
         self.c_abi.retire();
         if (self.status_cond) |sc| sc.c_abi.retire();
-        // Conditions belong to the reader even when its storage is pinned.
         self.mu.lock();
+        defer self.mu.unlock();
         for (self.read_conditions.items) |cond| {
             const rc: *waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
-            if (rc.owner_qc) |qc| qc.c_abi.retire() else rc.c_abi.retire();
+            rc.retireHandle();
         }
-        self.mu.unlock();
-        self.quiesce.beginTeardown(self, reallyDeinit);
     }
 
     /// Acquire/release pair for any application-facing call that touches
@@ -763,7 +774,9 @@ pub const DataReaderImpl = struct {
         // subDestroyProtoReader callback), not by DataReaderImpl.
         const pinned = self.parent_pinned;
         const subscriber = self.subscriber;
+        const topic_use = self.topic_use;
         self.alloc.destroy(self);
+        topic_use.release();
         if (pinned) subscriber_mod.SubscriberImpl.quiesceReleaseFn(subscriber.ptr);
     }
 
@@ -3186,7 +3199,7 @@ pub const DataReaderImpl = struct {
         // sees this entry, or we retire it here and leave it for final cleanup.
         if (self.quiesce.tearingDown()) {
             const rc: *waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
-            if (rc.owner_qc) |qc| qc.c_abi.retire() else rc.c_abi.retire();
+            rc.retireHandle();
         }
         return true;
     }

@@ -787,11 +787,12 @@ Do not promise that a returned wrapper can operate on a logically deleted native
 condition. A shared_ptr or Java reference protects wrapper storage, not the native
 DDS object's operational lifetime. What the C++ and Java bindings do guarantee is
 zidl's handle-retire contract (`docs/design/handle-lifetime.md` in the zidl
-repository): once the core frees an entity's handle, including through a cascading
-delete, it reports the handle, and the binding retires that handle's wrapper, whose
-operations then return ALREADY_DELETED without reaching the core. A call already
-under way when the handle is freed is not covered; that remains the application's
-synchronization.
+repository): before deleting an entity returns, including through a cascading delete,
+the core reports its handle, and the binding retires that handle's wrapper, whose
+operations then return ALREADY_DELETED without reaching the core. This holds even when
+a callback in flight defers the entity's teardown: the handle stays valid until then,
+and the binding will not make a new wrapper from it. A call already under way when the
+wrapper retires is not covered; that remains the application's synchronization.
 
 <a id="completion-versus-conversion-failure"></a>
 ### Completion versus conversion failure

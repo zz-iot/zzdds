@@ -27,6 +27,15 @@ pub const TopicImpl = struct {
     topic_name: [:0]u8, // owned, null-terminated for C API compatibility
     type_name: [:0]u8, // owned, null-terminated for C API compatibility
     participant_ptr: *anyopaque, // borrowed — points to ParticipantImpl
+    /// The DataWriters, DataReaders and ContentFilteredTopics using this
+    /// Topic; `delete_topic` refuses while there are any (DDS 1.4
+    /// 2.2.2.2.1.6). One stops counting when it is deleted, whether or not a
+    /// background callback is still finishing inside it.
+    users: std.atomic.Value(u32) = .init(0),
+    /// One for the owning participant's list, and one for each user. A deleted
+    /// user still finishing, such as a reader with a delivery in flight, keeps
+    /// the Topic alive through its own until it is done.
+    refs: std.atomic.Value(u32) = .init(1),
     get_participant_fn: *const fn (*anyopaque) DDS.DomainParticipant,
     /// Entity::enable()'s "factory not enabled" precondition -- reads the
     /// owning DomainParticipantImpl's `enabled` flag. A function pointer
@@ -115,7 +124,40 @@ pub const TopicImpl = struct {
         return self;
     }
 
-    pub fn deinit(self: *Self) void {
+    /// Counts a new endpoint or ContentFilteredTopic as using this Topic, and
+    /// takes a reference for it. With the owning participant's `mu` held, and
+    /// only for a Topic found in its list, so it cannot race `delete_topic`.
+    pub fn retain(self: *Self) void {
+        _ = self.users.fetchAdd(1, .monotonic);
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    /// Whether anything still uses this Topic.
+    pub fn inUse(self: *const Self) bool {
+        return self.users.load(.acquire) != 0;
+    }
+
+    /// A user was deleted. Its reference stays until `release`.
+    pub fn endUse(self: *Self) void {
+        _ = self.users.fetchSub(1, .acq_rel);
+    }
+
+    /// Drops the owning participant's reference: this Topic is deleted, so its
+    /// wrappers retire now, even if a deleted user still finishing keeps it
+    /// alive a while longer.
+    pub fn deleted(self: *Self) void {
+        self.c_abi.retire();
+        self.td_c_abi.retire();
+        if (self.status_cond) |sc| sc.c_abi.retire();
+        self.release();
+    }
+
+    /// Drops a reference, freeing the Topic with the last one.
+    pub fn release(self: *Self) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) self.destroy();
+    }
+
+    fn destroy(self: *Self) void {
         self.listener_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.c_abi.free(self.alloc);
@@ -284,7 +326,7 @@ pub const TopicImpl = struct {
     }
 
     fn vtDeinit(ctx: *anyopaque) void {
-        cast(ctx).deinit();
+        cast(ctx).deleted();
     }
 
     // ── DDS.TopicDescription vtable ──────────────────────────────────────────
@@ -352,6 +394,39 @@ pub fn asCft(td: DDS.TopicDescription) ?*ContentFilteredTopicImpl {
     return null;
 }
 
+/// A DataWriter's or DataReader's use of its topic. `.none` for an endpoint
+/// whose topic is not a participant's: built-in readers, and test fixtures.
+pub const TopicUse = union(enum) {
+    none,
+    topic: *TopicImpl,
+    cft: *ContentFilteredTopicImpl,
+
+    /// The endpoint is being deleted, so the topic can be too. Before the
+    /// delete returns, which can be well before `release`.
+    pub fn end(self: TopicUse) void {
+        switch (self) {
+            .none => {},
+            .topic => |t| t.endUse(),
+            .cft => |c| c.endUse(),
+        }
+    }
+
+    /// Drops the endpoint's reference, at the end of its teardown.
+    pub fn release(self: TopicUse) void {
+        switch (self) {
+            .none => {},
+            .topic => |t| t.release(),
+            .cft => |c| c.release(),
+        }
+    }
+
+    /// For an endpoint that was never created.
+    pub fn abandon(self: TopicUse) void {
+        self.end();
+        self.release();
+    }
+};
+
 /// A ContentFilteredTopic restricts the set of samples delivered to a DataReader
 /// to those that match a filter expression (SQL-subset on topic fields).
 pub const ContentFilteredTopicImpl = struct {
@@ -377,6 +452,15 @@ pub const ContentFilteredTopicImpl = struct {
     /// One string per change. Guarded by `params_lock`.
     retired_exprs: std.ArrayListUnmanaged([:0]u8) = .empty,
     related: DDS.Topic,
+    /// This ContentFilteredTopic's use of `related`, which ends when it is
+    /// deleted, and the reference it holds on it until it is freed.
+    related_impl: *TopicImpl,
+    /// The DataReaders using this ContentFilteredTopic; see `TopicImpl.users`.
+    users: std.atomic.Value(u32) = .init(0),
+    /// One for the owning participant's list, and one for each user; see
+    /// `TopicImpl.refs`. A reader still finishing evaluates the filter through
+    /// its own.
+    refs: std.atomic.Value(u32) = .init(1),
     participant: DDS.DomainParticipant,
     /// Parsed AST of `filter_expr`; null when expression is empty or the
     /// content-subscription profile is disabled.  AST node slices borrow from
@@ -392,7 +476,7 @@ pub const ContentFilteredTopicImpl = struct {
     pub fn init(
         alloc: std.mem.Allocator,
         name: []const u8,
-        related: DDS.Topic,
+        related_impl: *TopicImpl,
         filter_expr: []const u8,
         expr_params: DDS.StringSeq,
         participant: DDS.DomainParticipant,
@@ -427,14 +511,49 @@ pub const ContentFilteredTopicImpl = struct {
             .name = name_copy,
             .filter_expr = expr_copy,
             .expr_params = params,
-            .related = related,
+            .related = related_impl.toDDSTopic(),
+            .related_impl = related_impl,
             .participant = participant,
             .parsed_expr = parsed,
         };
         return self;
     }
 
-    pub fn deinit(self: *Self) void {
+    /// Counts a new DataReader as using this ContentFilteredTopic, and takes a
+    /// reference for it. With the owning participant's `mu` held, and only for
+    /// one found in its list, so it cannot race `delete_contentfilteredtopic`.
+    pub fn retain(self: *Self) void {
+        _ = self.users.fetchAdd(1, .monotonic);
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    /// Whether any DataReader still uses this ContentFilteredTopic.
+    pub fn inUse(self: *const Self) bool {
+        return self.users.load(.acquire) != 0;
+    }
+
+    /// A DataReader was deleted. Its reference stays until `release`.
+    pub fn endUse(self: *Self) void {
+        _ = self.users.fetchSub(1, .acq_rel);
+    }
+
+    /// Drops the owning participant's reference: this ContentFilteredTopic is
+    /// deleted, so it no longer uses its related Topic and its wrapper retires,
+    /// even if a reader still finishing keeps it alive a while longer.
+    pub fn deleted(self: *Self) void {
+        self.c_abi.retire();
+        self.related_impl.endUse();
+        self.release();
+    }
+
+    /// Drops a reference, freeing the ContentFilteredTopic with the last one,
+    /// and with it the reference to its related Topic.
+    pub fn release(self: *Self) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) self.destroy();
+    }
+
+    fn destroy(self: *Self) void {
+        const related_impl = self.related_impl;
         // Free the AST before the expression string (AST slices borrow from it).
         if (self.parsed_expr) |ast| filter_mod.freeAst(self.alloc, ast);
         for (self.retired_exprs.items) |e| self.alloc.free(e);
@@ -445,6 +564,7 @@ pub const ContentFilteredTopicImpl = struct {
         self.alloc.free(self.filter_expr);
         self.alloc.free(self.name);
         self.alloc.destroy(self);
+        related_impl.release();
     }
 
     /// Evaluate the filter expression against a sample.
@@ -672,7 +792,7 @@ pub const ContentFilteredTopicImpl = struct {
         return cast(ctx).related;
     }
     fn cftDeinit(ctx: *anyopaque) void {
-        cast(ctx).deinit();
+        cast(ctx).deleted();
     }
 
     fn cast(ctx: *anyopaque) *Self {

@@ -16,6 +16,7 @@ pub const CoherentWipEntry = @import("reader.zig").CoherentWipEntry;
 pub const TakenSample = @import("reader.zig").TakenSample;
 pub const TopicImpl = @import("topic.zig").TopicImpl;
 pub const ContentFilteredTopicImpl = @import("topic.zig").ContentFilteredTopicImpl;
+pub const TopicUse = @import("topic.zig").TopicUse;
 pub const filter = @import("filter.zig");
 pub const WaitSetImpl = @import("waitset.zig").WaitSetImpl;
 pub const GuardConditionImpl = @import("waitset.zig").GuardConditionImpl;

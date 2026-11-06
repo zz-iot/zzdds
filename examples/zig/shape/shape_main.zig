@@ -590,9 +590,6 @@ fn runSubscriber(
         if (isNilCft(c)) return error.ContentFilteredTopicFailed;
         break :blk c;
     };
-    defer {
-        if (cft) |c| _ = dp.delete_contentfilteredtopic(c);
-    }
 
     const sub_presentation = DDS.PresentationQosPolicy{
         .access_scope = switch (opts.access_scope) {

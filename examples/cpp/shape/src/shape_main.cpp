@@ -718,7 +718,6 @@ int run_subscriber(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr
         sleep_ms(static_cast<int>(opts.read_period_ms));
     }
 
-    if (cft) dp->delete_contentfilteredtopic(cft);
     return 0;
 }
 
