@@ -791,12 +791,24 @@ jobs:
   # CI-sized parameters. run_all.py's own xfail list keeps a currently-known
   # zzdds bug (see stress-tests/README.md "Findings") from reddening the gate
   # while still exercising it. The nightly `schedule` trigger runs a heavier
-  # matrix below.
+  # matrix below. As with `examples`, it all also runs on a -Dshared-runtime
+  # build.
   stress:
-    name: stress
+    name: stress${{ matrix.runtime == 'shared' && ' (shared runtime)' || '' }}
     needs: test-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [threaded, shared]
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      # The stress apps build their own zzdds, so run.py passes them
+      # -Dshared-runtime too (examples/_common.py's shared_runtime_args).
+      ZZDDS_SHARED_RUNTIME: ${{ matrix.runtime == 'shared' && '1' || '0' }}
+      # A process that outlives its timeout logs its stacks before it is killed
+      # (examples/_common.py's dump_stacks).
+      ZZDDS_TEST_LOG_STUCK_STACKS: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -818,7 +830,14 @@ jobs:
         run: sudo sysctl -w vm.mmap_rnd_bits=28
 
       - name: Build zzdds (native, DebugAllocator)
-        run: zig build -Ddebug-allocator=true install
+        run: zig build -Ddebug-allocator=true -Dshared-runtime=${{ matrix.runtime == 'shared' }} install
+
+      # gdb for stuck-process stack dumps. ptrace_scope=0 lets it attach to a
+      # test process it didn't start. Best-effort: never fails the job.
+      - name: Prepare failure diagnostics
+        run: |
+          command -v gdb >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends gdb || true; }
+          echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope || true
 
       - name: Run stress suite (strict)
         run: stress-tests/run_all.py --strict
@@ -856,7 +875,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stress-logs
+          name: stress-logs-${{ matrix.runtime }}
           path: |
             /tmp/elc-stress*/**
             /tmp/churn-stress*/**

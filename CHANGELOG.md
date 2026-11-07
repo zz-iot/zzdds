@@ -21,6 +21,8 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   even when a deleted reader or writer still finishing keeps it alive. Deleting a participant
   does the same for its builtin subscriber, readers and topic descriptions when its teardown
   is deferred.
+- CI runs the stress tests on a `-Dshared-runtime` build too, and logs the stacks of a stress
+  process that outlives its timeout.
 - CI runs the unit tests on a `-Dshared-runtime` build, plain and under ThreadSanitizer, except
   the files in `build.zig`'s `not_yet_on_shared_runtime`. The mock transport can run on the
   shared runtime, and the lossy transport can when the transport under it can.
