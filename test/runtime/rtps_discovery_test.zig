@@ -154,10 +154,6 @@ const Gate = struct {
     const spdp_writer = [_]u8{ 0x00, 0x01, 0x00, 0xc2 };
 };
 
-/// The lossy shim, presented as runnable on the runtime: it has no work of
-/// its own, and the memory transport under it neither.
-var gated_vtable: Transport.Vtable = undefined;
-
 /// One participant's in-process transport behind a gate, RTPS discovery and
 /// factory. Must not move after `init`.
 const Node = struct {
@@ -176,10 +172,7 @@ const Node = struct {
         errdefer self.memory.deinit();
         self.lossy = try LossyTransport.init(alloc, self.memory.transport(), self.gate.policy());
         errdefer self.lossy.deinit(alloc);
-        var t = self.lossy.transport();
-        gated_vtable = t.vtable.*;
-        gated_vtable.shared_runtime_ready = true;
-        t.vtable = &gated_vtable;
+        const t = self.lossy.transport();
         self.disc = try SpdpSedpDiscovery.init(alloc, t, 0, announcement_period_ms);
         errdefer self.disc.deinit();
         self.factory = try DomainParticipantFactoryImpl.init(alloc, t, self.disc.toDiscovery(), noop_security, .spec_random, .{});

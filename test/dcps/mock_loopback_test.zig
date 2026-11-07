@@ -393,12 +393,19 @@ test "mock_loopback: incompatible QoS detected when writer discovered before rea
     // never onWriterDiscovered's live-match loop (nothing in
     // active_readers for it to scan).
     const disc_deadline_ns = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
+    const discoveredWriters = struct {
+        fn f(dp: *DomainParticipantImpl) usize {
+            dp.mu.lock();
+            defer dp.mu.unlock();
+            return dp.discovered_writers.items.len;
+        }
+    }.f;
     while (time_mod.nanoTimestamp() < disc_deadline_ns) {
         net.deliverAll();
-        if (dp_r_impl.discovered_writers.items.len > 0) break;
+        if (discoveredWriters(dp_r_impl) > 0) break;
         time_mod.sleepNs(20 * std.time.ns_per_ms);
     }
-    try std.testing.expect(dp_r_impl.discovered_writers.items.len > 0);
+    try std.testing.expect(discoveredWriters(dp_r_impl) > 0);
 
     // Now create the reader -- subAnnounceProtoReader's retroactive-match
     // loop should notice the already-discovered incompatible writer.
@@ -1041,28 +1048,49 @@ test "mock_loopback: pre-coherent-window writes not tagged as part of coherent s
 
 // ── on_reliable_reader_ready extended listener ────────────────────────────────
 
-const ReaderReadyState = struct {
-    seq: usize = 0,
-    matched_calls: usize = 0,
-    matched_seq: ?usize = null,
-    ready_calls: usize = 0,
-    ready_seq: ?usize = null,
-    last_ready: bool = false,
+/// What the ready tests' listeners record, for the test to poll. Atomic: they
+/// run on the runtime's workers, or on the SPDP timer thread for a lost
+/// participant. A `_seq` of 0 means not yet.
+const ReadyState = struct {
+    seq: std.atomic.Value(usize) = .init(0),
+    matched_calls: std.atomic.Value(usize) = .init(0),
+    matched_seq: std.atomic.Value(usize) = .init(0),
+    ready_calls: std.atomic.Value(usize) = .init(0),
+    ready_seq: std.atomic.Value(usize) = .init(0),
+    last_ready: std.atomic.Value(bool) = .init(false),
+
+    fn onMatched(self: *ReadyState) void {
+        const seq = self.seq.fetchAdd(1, .acq_rel) + 1;
+        _ = self.matched_seq.cmpxchgStrong(0, seq, .acq_rel, .monotonic);
+        _ = self.matched_calls.fetchAdd(1, .release);
+    }
+
+    fn onReady(self: *ReadyState, ready: bool) void {
+        const seq = self.seq.fetchAdd(1, .acq_rel) + 1;
+        self.last_ready.store(ready, .release);
+        _ = self.ready_seq.cmpxchgStrong(0, seq, .acq_rel, .monotonic);
+        _ = self.ready_calls.fetchAdd(1, .release);
+    }
+
+    fn matchedAndReady(self: *const ReadyState) bool {
+        return self.matched_calls.load(.acquire) != 0 and self.ready_calls.load(.acquire) != 0;
+    }
+
+    /// The match was reported, and before the first ready.
+    fn expectMatchedBeforeReady(self: *const ReadyState) !void {
+        try std.testing.expect(self.matched_calls.load(.acquire) > 0);
+        try std.testing.expect(self.matched_seq.load(.acquire) < self.ready_seq.load(.acquire));
+    }
 };
 
 fn onPubMatchedForReadyTest(_: *anyopaque, _: *const DDS.PublicationMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
-    const state: *ReaderReadyState = @ptrCast(@alignCast(ld.?));
-    state.seq += 1;
-    state.matched_calls += 1;
-    if (state.matched_seq == null) state.matched_seq = state.seq;
+    const state: *ReadyState = @ptrCast(@alignCast(ld.?));
+    state.onMatched();
 }
 
 fn onReaderReadyForReadyTest(_: DDS.InstanceHandle_t, ready: bool, ld: ?*anyopaque) callconv(.c) void {
-    const state: *ReaderReadyState = @ptrCast(@alignCast(ld.?));
-    state.seq += 1;
-    state.ready_calls += 1;
-    state.last_ready = ready;
-    if (state.ready_seq == null) state.ready_seq = state.seq;
+    const state: *ReadyState = @ptrCast(@alignCast(ld.?));
+    state.onReady(ready);
 }
 
 test "mock_loopback: on_reliable_reader_ready fires after AckNack handshake, strictly after on_publication_matched" {
@@ -1121,7 +1149,7 @@ test "mock_loopback: on_reliable_reader_ready fires after AckNack handshake, str
     const dw = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
-    var state = ReaderReadyState{};
+    var state = ReadyState{};
     dw_impl.setListenerEx(.{
         .listener_data = &state,
         .on_publication_matched = onPubMatchedForReadyTest,
@@ -1131,55 +1159,30 @@ test "mock_loopback: on_reliable_reader_ready fires after AckNack handshake, str
     // Drive discovery + the AckNack/Heartbeat handshake until both callbacks
     // have fired (or timeout).
     const deadline = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
-    while ((state.matched_calls == 0 or state.ready_calls == 0) and time_mod.nanoTimestamp() < deadline) {
+    while (!state.matchedAndReady() and time_mod.nanoTimestamp() < deadline) {
         net.deliverAll();
         time_mod.sleepNs(20 * std.time.ns_per_ms);
     }
 
-    try std.testing.expect(state.matched_calls > 0);
-    try std.testing.expectEqual(@as(usize, 1), state.ready_calls);
-    try std.testing.expect(state.last_ready == true);
+    try std.testing.expectEqual(@as(usize, 1), state.ready_calls.load(.acquire));
+    try std.testing.expect(state.last_ready.load(.acquire));
     // The protocol-ready signal must never fire before (or in the same
     // "tick" as) the discovery-time match — it requires the real AckNack
     // round trip on top of SEDP matching, which on_publication_matched alone
     // does not wait for.
-    try std.testing.expect(state.matched_seq.? < state.ready_seq.?);
+    try state.expectMatchedBeforeReady();
 }
 
 // ── on_reliable_writer_ready extended listener ────────────────────────────────
 
-const WriterReadyState = struct {
-    // seq/matched_calls/matched_seq are only ever touched same-thread (both
-    // driven synchronously by net.deliverAll() in the first test below).
-    // ready_calls/last_ready are also read from the onParticipantLost test's
-    // main thread while written from the *reader participant's own real
-    // SPDP timer thread* (checkLeases -> onParticipantLost, a genuine
-    // background thread, unlike the net.deliverAll()-driven callbacks
-    // everywhere else in this file) -- confirmed by TSan, hence atomic.
-    seq: usize = 0,
-    matched_calls: usize = 0,
-    matched_seq: ?usize = null,
-    ready_calls: std.atomic.Value(usize) = .init(0),
-    ready_seq: ?usize = null,
-    last_ready: std.atomic.Value(bool) = .init(false),
-};
-
 fn onSubMatchedForReadyTest(_: *anyopaque, _: *const DDS.SubscriptionMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
-    const state: *WriterReadyState = @ptrCast(@alignCast(ld.?));
-    state.seq += 1;
-    state.matched_calls += 1;
-    if (state.matched_seq == null) state.matched_seq = state.seq;
+    const state: *ReadyState = @ptrCast(@alignCast(ld.?));
+    state.onMatched();
 }
 
 fn onWriterReadyForReadyTest(_: DDS.InstanceHandle_t, ready: bool, ld: ?*anyopaque) callconv(.c) void {
-    const state: *WriterReadyState = @ptrCast(@alignCast(ld.?));
-    state.seq += 1;
-    // release: publishes this function's preceding plain writes (seq,
-    // ready_seq) to whatever thread later observes ready_calls via a
-    // matching acquire load -- see WriterReadyState's doc comment.
-    state.last_ready.store(ready, .release);
-    _ = state.ready_calls.fetchAdd(1, .release);
-    if (state.ready_seq == null) state.ready_seq = state.seq;
+    const state: *ReadyState = @ptrCast(@alignCast(ld.?));
+    state.onReady(ready);
 }
 
 test "mock_loopback: on_reliable_writer_ready fires after a targeted heartbeat, strictly after on_subscription_matched" {
@@ -1238,7 +1241,7 @@ test "mock_loopback: on_reliable_writer_ready fires after a targeted heartbeat, 
     const topic_w = dp_w.create_topic("MockTopic", "MockType", .{}, null, 0);
     _ = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
 
-    var state = WriterReadyState{};
+    var state = ReadyState{};
     dr_impl.setListenerEx(.{
         .listener_data = &state,
         .on_subscription_matched = onSubMatchedForReadyTest,
@@ -1248,19 +1251,18 @@ test "mock_loopback: on_reliable_writer_ready fires after a targeted heartbeat, 
     // Drive discovery + the writer's Heartbeat cycle until both callbacks
     // have fired (or timeout).
     const deadline = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
-    while ((state.matched_calls == 0 or state.ready_calls.load(.acquire) == 0) and time_mod.nanoTimestamp() < deadline) {
+    while (!state.matchedAndReady() and time_mod.nanoTimestamp() < deadline) {
         net.deliverAll();
         time_mod.sleepNs(20 * std.time.ns_per_ms);
     }
 
-    try std.testing.expect(state.matched_calls > 0);
     try std.testing.expectEqual(@as(usize, 1), state.ready_calls.load(.acquire));
-    try std.testing.expect(state.last_ready.load(.acquire) == true);
+    try std.testing.expect(state.last_ready.load(.acquire));
     // The protocol-ready signal must never fire before (or in the same
     // "tick" as) the discovery-time match -- it requires a real targeted
     // Heartbeat naming this reader on top of SEDP matching, which
     // on_subscription_matched alone does not wait for.
-    try std.testing.expect(state.matched_seq.? < state.ready_seq.?);
+    try state.expectMatchedBeforeReady();
 }
 
 // ── on_reliable_writer_ready: participant.mu must not be held during it ──────
@@ -1464,7 +1466,7 @@ test "mock_loopback: onParticipantLost fires on_reliable_writer_ready(false) whe
     const topic_w = dp_w.create_topic("MockTopic", "MockType", .{}, null, 0);
     _ = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
 
-    var state = WriterReadyState{};
+    var state = ReadyState{};
     dr_impl.setListenerEx(.{
         .listener_data = &state,
         .on_subscription_matched = onSubMatchedForReadyTest,
@@ -1473,7 +1475,7 @@ test "mock_loopback: onParticipantLost fires on_reliable_writer_ready(false) whe
 
     // Drive discovery + the writer's Heartbeat cycle until matched AND ready.
     const match_deadline = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
-    while ((state.matched_calls == 0 or state.ready_calls.load(.acquire) == 0) and time_mod.nanoTimestamp() < match_deadline) {
+    while (!state.matchedAndReady() and time_mod.nanoTimestamp() < match_deadline) {
         net.deliverAll();
         time_mod.sleepNs(20 * std.time.ns_per_ms);
     }
@@ -1573,7 +1575,7 @@ test "mock_loopback: disabled DataWriter never announces or matches until enable
         net.deliverAll();
         time_mod.sleepNs(20 * std.time.ns_per_ms);
     }
-    try std.testing.expectEqual(@as(i32, 0), dr_impl.sub_matched_current);
+    try std.testing.expectEqual(@as(i32, 0), subMatchedCurrent(dr_impl));
 
     // A second, real (enabled-by-default) Publisher/DataWriter pair on the
     // same participant proves the mock network + reader are otherwise
@@ -1587,22 +1589,28 @@ test "mock_loopback: disabled DataWriter never announces or matches until enable
     // budget; both positive waits still return immediately when matched.
     const match_timeout_ns = 20 * std.time.ns_per_s;
     const control_deadline = time_mod.nanoTimestamp() + match_timeout_ns;
-    while (dr_impl.sub_matched_current < 1 and time_mod.nanoTimestamp() < control_deadline) {
+    while (subMatchedCurrent(dr_impl) < 1 and time_mod.nanoTimestamp() < control_deadline) {
         net.deliverAll();
         time_mod.sleepNs(20 * std.time.ns_per_ms);
     }
-    try std.testing.expectEqual(@as(i32, 1), dr_impl.sub_matched_current);
+    try std.testing.expectEqual(@as(i32, 1), subMatchedCurrent(dr_impl));
 
     // Now enable() the previously-disabled writer -- it must announce and
     // match too.
     try std.testing.expectEqual(DDS.RETCODE_OK, dw.enable());
     try std.testing.expect(dw_impl.enabled.load(.acquire));
     const enable_deadline = time_mod.nanoTimestamp() + match_timeout_ns;
-    while (dr_impl.sub_matched_current < 2 and time_mod.nanoTimestamp() < enable_deadline) {
+    while (subMatchedCurrent(dr_impl) < 2 and time_mod.nanoTimestamp() < enable_deadline) {
         net.deliverAll();
         time_mod.sleepNs(20 * std.time.ns_per_ms);
     }
-    try std.testing.expectEqual(@as(i32, 2), dr_impl.sub_matched_current);
+    try std.testing.expectEqual(@as(i32, 2), subMatchedCurrent(dr_impl));
+}
+
+fn subMatchedCurrent(dr: *DataReaderImpl) i32 {
+    dr.mu.lock();
+    defer dr.mu.unlock();
+    return dr.sub_matched_current;
 }
 
 // ── Creating again after deleting ─────────────────────────────────────────────

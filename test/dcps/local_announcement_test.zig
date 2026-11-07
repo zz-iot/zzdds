@@ -44,6 +44,7 @@ const Recorder = struct {
     before_ctx: *anyopaque = undefined,
 
     const vtable: disc.Discovery.Vtable = .{
+        .shared_runtime_ready = true,
         .start = start,
         .stop = stop,
         .prepare_writer = prepareWriter,

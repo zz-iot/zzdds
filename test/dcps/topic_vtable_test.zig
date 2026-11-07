@@ -560,10 +560,13 @@ test "create_datawriter: an announcement that cannot be prepared leaves the Topi
 /// is left without the deletes a disabled participant refuses.
 /// `fa` is what entities created under it keep allocating through, so it must
 /// outlive them; declare it before this, and reset it before `fx.deinit()`.
+/// Skips on a runtime: its worker delivers what creating a Topic pushes to the
+/// builtin reader, reading the participant's allocator as a test swaps it.
 fn initForFailingAllocations(alloc: std.mem.Allocator) !Fixture {
     var fx = try Fixture.initWithFactoryQos(alloc, .{ .entity_factory = .{ .autoenable_created_entities = false } });
     errdefer fx.deinit();
     const dp_impl: *zzdds.dcps.DomainParticipantImpl = @ptrCast(@alignCast(fx.dp.ptr));
+    if (dp_impl.runtime != null) return error.SkipZigTest;
     try testing.expect(!dp_impl.enabled.load(.acquire));
     return fx;
 }

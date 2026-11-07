@@ -120,11 +120,23 @@ pub const LossyTransport = struct {
         alloc.destroy(self);
     }
 
+    /// Runnable on the shared runtime exactly when the inner transport is: the
+    /// shim has no work of its own.
     pub fn transport(self: *LossyTransport) Transport {
-        return .{ .ctx = self, .vtable = &lossy_vtable };
+        return .{ .ctx = self, .vtable = if (self.inner.vtable.shared_runtime_ready) &ready_vtable else &lossy_vtable };
     }
 
     // ── Vtable implementations ────────────────────────────────────────────────
+
+    fn vtAttachBackend(ctx: *anyopaque, backend: @import("../runtime/backend.zig").ProgressBackend) anyerror!void {
+        const self: *LossyTransport = @ptrCast(@alignCast(ctx));
+        return self.inner.attachBackend(backend);
+    }
+
+    fn vtAttachRuntime(ctx: *anyopaque, rt: *@import("../runtime/core.zig").Runtime) void {
+        const self: *LossyTransport = @ptrCast(@alignCast(ctx));
+        self.inner.attachRuntime(rt);
+    }
 
     fn vtCanReach(ctx: *anyopaque, loc: *const Locator) bool {
         const self: *LossyTransport = @ptrCast(@alignCast(ctx));
@@ -217,7 +229,15 @@ const lossy_vtable = Transport.Vtable{
     .unlisten = LossyTransport.vtUnlisten,
     .unicast_locators = LossyTransport.vtUnicastLocators,
     .set_locator_change_handler = LossyTransport.vtSetLocatorChangeHandler,
+    .attach_backend = LossyTransport.vtAttachBackend,
+    .attach_runtime = LossyTransport.vtAttachRuntime,
     .close = LossyTransport.vtClose,
+};
+
+const ready_vtable = blk: {
+    var v = lossy_vtable;
+    v.shared_runtime_ready = true;
+    break :blk v;
 };
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

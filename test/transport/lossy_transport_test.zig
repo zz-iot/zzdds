@@ -183,6 +183,59 @@ test "LossyTransport: pass-through vtable methods reach inner transport" {
     try testing.expectEqual(@as(usize, 1), stub.closes);
 }
 
+// ── Shared runtime ────────────────────────────────────────────────────────────
+
+const AttachStub = struct {
+    var backends: usize = 0;
+    var runtimes: usize = 0;
+
+    fn backend(_: *anyopaque, _: zzdds.runtime.ProgressBackend) anyerror!void {
+        backends += 1;
+    }
+    fn runtime(_: *anyopaque, _: *zzdds.runtime.Runtime) void {
+        runtimes += 1;
+    }
+};
+
+test "LossyTransport: runs on the shared runtime exactly when its inner transport does" {
+    var stub = StubCtx{};
+    var policy = DropNone{};
+    var inner = stub.transport();
+    const threaded = try LossyTransport.init(testing.allocator, inner, policy.packetPolicy());
+    defer threaded.deinit(testing.allocator);
+    try testing.expect(!threaded.transport().vtable.shared_runtime_ready);
+
+    var ready_vtable = inner.vtable.*;
+    ready_vtable.shared_runtime_ready = true;
+    inner.vtable = &ready_vtable;
+    const ready = try LossyTransport.init(testing.allocator, inner, policy.packetPolicy());
+    defer ready.deinit(testing.allocator);
+    try testing.expect(ready.transport().vtable.shared_runtime_ready);
+}
+
+test "LossyTransport: attaching to a runtime reaches the inner transport" {
+    var stub = StubCtx{};
+    var policy = DropNone{};
+    var inner = stub.transport();
+    var vtable = inner.vtable.*;
+    vtable.attach_backend = AttachStub.backend;
+    vtable.attach_runtime = AttachStub.runtime;
+    inner.vtable = &vtable;
+    const lossy = try LossyTransport.init(testing.allocator, inner, policy.packetPolicy());
+    defer lossy.deinit(testing.allocator);
+
+    var sb = zzdds.runtime.ScriptedBackend.init(0);
+    var rt = zzdds.runtime.Runtime.init(sb.clock(), sb.backend(), .{ .mode = .manual });
+    defer rt.releaseOwner();
+    AttachStub.backends = 0;
+    AttachStub.runtimes = 0;
+    const t = lossy.transport();
+    try t.attachBackend(sb.backend());
+    t.attachRuntime(&rt);
+    try testing.expectEqual(@as(usize, 1), AttachStub.backends);
+    try testing.expectEqual(@as(usize, 1), AttachStub.runtimes);
+}
+
 // ── sendOnChannel ─────────────────────────────────────────────────────────────
 
 const dummy_channel = iface.Channel{ .token = 0xdead_beef, .generation = 1 };
