@@ -96,6 +96,28 @@ jobs:
       - name: DebugAllocator lane (default allocator path only, additive to the matrix above)
         run: zig build test -Ddebug-allocator=true
 
+  # ── Unit tests on the shared runtime (the contributor migration switch) ───
+  # Every test file but build.zig's `not_yet_on_shared_runtime`, on hosted
+  # workers unless the test selects a runtime.
+  test-linux-shared-runtime:
+    name: Linux x86_64 (shared runtime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: "0.17.0"
+
+      - name: Unit tests
+        run: zig build test -Dshared-runtime=true
+
+      - name: Unit tests under ThreadSanitizer
+        run: zig build test-tsan -Dshared-runtime=true
+
   # ── Unit tests: remaining platforms (independent of interop) ──────────────
   test-other:
     name: ${{ matrix.name }}

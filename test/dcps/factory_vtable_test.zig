@@ -27,6 +27,7 @@ const alloc = testing.allocator;
 var noop_disc_sentinel: u8 = 0;
 
 const noop_vtable = iface.Discovery.Vtable{
+    .shared_runtime_ready = true,
     .start = struct {
         fn f(_: *anyopaque, _: *const iface.ParticipantAnnouncement, _: *const iface.Callbacks) anyerror!void {}
     }.f,

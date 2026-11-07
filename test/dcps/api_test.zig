@@ -48,6 +48,7 @@ const DURATION_ZERO: DDS.Duration_t = .{ .sec = 0, .nanosec = 0 };
 var noop_disc_sentinel: u8 = 0;
 
 const noop_disc_vtable = iface.Discovery.Vtable{
+    .shared_runtime_ready = true,
     .start = noopDiscStart,
     .stop = noopDiscStop,
     .prepare_writer = noopDiscPrepareWriter,

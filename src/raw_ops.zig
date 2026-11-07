@@ -674,6 +674,8 @@ test "asZzddsDataWriter: null for a handle not issued by this implementation" {
 // version of this test never delivered anything at all). Mirrors
 // test/dcps/qos_runtime_test.zig's `Fixture`.
 test "TypeSupport.get_field wires cft_filter automatically: reader delivers only matching samples" {
+    // Expects delivery on the writing thread; see build.zig's not_yet_on_shared_runtime.
+    if (@import("build_options").shared_runtime) return error.SkipZigTest;
     const nil = @import("dcps/nil.zig");
     const alloc = testing.allocator;
 
@@ -769,6 +771,8 @@ test "TypeSupport.get_field wires cft_filter automatically: reader delivers only
 // instead of a ContentFilteredTopic -- proves the reader-side
 // take_w_condition path applies the query independently of CFT.
 test "takeWithQueryConditionRaw: only samples matching the QueryCondition's expression are returned" {
+    // Expects delivery on the writing thread; see build.zig's not_yet_on_shared_runtime.
+    if (@import("build_options").shared_runtime) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var delivery = try intraprocess.IntraProcessDelivery.init(alloc);
