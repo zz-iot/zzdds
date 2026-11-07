@@ -1938,7 +1938,7 @@ pub fn build(b: *std.Build) void {
         });
         t.root_module.link_libc = true;
         const run = addTestRun(b, t, &dcps_test_domain);
-        if (runsTestFile(shared_runtime, src)) test_step.dependOn(&run.step);
+        test_step.dependOn(if (runsTestFile(shared_runtime, src)) &run.step else &t.step);
         if (std.mem.eql(u8, src, "test/dcps/handle_retirement_test.zig")) {
             b.step("test-handle-retirement", "Check logical handle retirement and deferred entity cleanup").dependOn(&run.step);
         }
