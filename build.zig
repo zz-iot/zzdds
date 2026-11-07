@@ -2511,7 +2511,7 @@ pub fn build(b: *std.Build) void {
         }), .use_llvm = true });
         t.root_module.link_libc = true;
         const run = addTestRun(b, t, &tsan_dcps_test_domain);
-        if (runsTestFile(shared_runtime, src)) tsan_step.dependOn(&run.step);
+        tsan_step.dependOn(if (runsTestFile(shared_runtime, src)) &run.step else &t.step);
         if (std.mem.eql(u8, src, "test/dcps/handle_retirement_test.zig")) {
             b.step("test-handle-retirement-tsan", "Check deferred handle retirement with ThreadSanitizer").dependOn(&run.step);
         }
