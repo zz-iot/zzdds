@@ -142,8 +142,8 @@ timer-driven listener"). `--scenario`:
 native + `-Ddebug-allocator`, then `stress-tests/run_all.py --strict` with **CI-sized**
 parameters (small N, short durations) and a hard `timeout-minutes`. The weekly `schedule`
 trigger runs a heavier matrix (larger N, longer runs, `--large`). Following
-`examples-tsan`, ThreadSanitizer variants of `lifecycle_churn` run in that lane —
-`reentrant`, plus `listener` and `cft` (each pins a data-race fix, see Findings).
+`examples-tsan`, ThreadSanitizer variants of every `lifecycle_churn` scenario run in that
+lane (`reentrant`, `listener` and `cft` each pin a data-race fix, see Findings).
 
 The job also runs all of that on a `-Dshared-runtime` build. To do the same locally, set
 `ZZDDS_SHARED_RUNTIME=1`, which makes each `run.py` build its app with that option. Set
