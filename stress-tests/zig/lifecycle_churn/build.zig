@@ -13,11 +13,13 @@ pub fn build(b: *std.Build) void {
     // Zig 0.16's self-hosted backend silently no-ops sanitize_thread without
     // this (confirmed upstream in zzdds's build.zig).
     const use_llvm: ?bool = if (sanitize_thread) true else null;
+    const shared_runtime = b.option(bool, "shared-runtime", "Build zzdds with -Dshared-runtime (contributors only; default: false)") orelse false;
 
     const zzdds_dep = b.dependency("zzdds", .{
         .target = target,
         .optimize = optimize,
         .@"sanitize-thread" = sanitize_thread,
+        .@"shared-runtime" = shared_runtime,
     });
     const zzdds_mod = zzdds_dep.module("zzdds");
     const zzdds_gen = zzdds_dep.module("zzdds_generated");
