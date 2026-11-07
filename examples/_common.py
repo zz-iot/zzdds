@@ -40,17 +40,19 @@ def zzdds_zig_out() -> Path:
     return Path(os.environ.get("ZZDDS_ZIG_OUT", str(REPO_ROOT.parent / "zig-out")))
 
 
-def zig_build_cmd() -> list[str]:
-    """The `zig build` command for an example or integration-test Zig app.
+def shared_runtime_args() -> list[str]:
+    """The `zig build` arguments that select the runtime for a Zig app.
 
-    ZZDDS_SHARED_RUNTIME=1 (CI's shared-runtime lane) builds the app's own
+    ZZDDS_SHARED_RUNTIME=1 (CI's shared-runtime lanes) builds the app's own
     zzdds dependency with -Dshared-runtime, matching the installed libraries
     the other bindings load.
     """
-    cmd = ["zig", "build", "-Doptimize=ReleaseSafe"]
-    if os.environ.get("ZZDDS_SHARED_RUNTIME") == "1":
-        cmd.append("-Dshared-runtime=true")
-    return cmd
+    return ["-Dshared-runtime=true"] if os.environ.get("ZZDDS_SHARED_RUNTIME") == "1" else []
+
+
+def zig_build_cmd() -> list[str]:
+    """The `zig build` command for an example or integration-test Zig app."""
+    return ["zig", "build", "-Doptimize=ReleaseSafe", *shared_runtime_args()]
 
 
 def executable_path(path: Path) -> Path:

@@ -1124,7 +1124,8 @@ under a manual and a hosted driver: match, delivery, the acknowledgment and data
 missed deadline, and retirement begun from listeners, with the runtime's last owner
 deleted inside its own listener. CI runs the unit tests on the runtime too, plain and under
 ThreadSanitizer, except the files in `build.zig`'s `not_yet_on_shared_runtime`, whose fixtures
-expect delivery on the calling thread. Remaining work is implementation: those tests, the gaps above, then
+expect delivery on the calling thread. It runs the stress tests on the runtime as well.
+Remaining work is implementation: those tests, the gaps above, then
 broader endpoint migration, thread consolidation onto the shared runtime timers,
 optional-profile builds and the measured latency/footprint work. The review-era
 synchronization prototype and bounded models stay on the `concurrency-broker-specs` branch
