@@ -154,29 +154,35 @@ correctness bar instead of that example's demonstration-first one: proving the c
 "unblocks only once durable replay actually lands, not on a timer"
 (`docs/design/dcps-api-coverage-audit.md`'s own phrasing for this scenario).
 
-Two assertions, in order, on the same reader:
+The publisher starts alone and writes its 8-sample historical batch. Only once it prints
+"historical batch written" (which the cross-binding harness polls for -- see
+`interop/wait_for_historical_data_cross_binding_test.py`'s `wait_for_marker()`) does the
+subscriber start, so its reader always joins late and the batch can only reach it by
+TRANSIENT_LOCAL replay. The publisher still asserts it was unmatched when the batch
+finished. An earlier version started the subscriber first, and that assertion
+intermittently failed when discovery matched the reader mid-batch.
+
+Two assertions, in order:
 
 1. **Negative case**: the subscriber calls `wait_for_historical_data()` with a short,
-   non-zero `max_wait` immediately after creating its reader, while the harness guarantees
-   no publisher process exists anywhere on the domain yet -- deterministic, not a timing
-   race, since a call with genuinely zero writers to wait for cannot return `RETCODE_OK` no
-   matter how long it's given. Requires `RETCODE_TIMEOUT`. This closes the
+   non-zero `max_wait` on a TRANSIENT_LOCAL reader of `HistoryEventUnpublished`, a topic no
+   process writes -- deterministic, not a timing race, since a call with no writer to wait
+   for cannot return `RETCODE_OK` no matter how long it's given. The publisher's writer on
+   `HistoryEvent` is already live, so this also shows an unrelated writer doesn't satisfy
+   the wait. Requires `RETCODE_TIMEOUT`. This closes the
    `wait_for_historical_data()`-should-time-out negative case `docs/roadmap.md` recorded as
    deliberately out of scope for the `catchup` example itself, and is the same shape as the
    regression `test/dcps/wait_for_historical_test.zig`'s "non-zero max_wait with no matched
    writer times out" test covers at the Zig-unit level (both exist because an earlier,
    real bug made this case return `RETCODE_OK` immediately purely because discovery hadn't
    matched a writer *yet*, not because there was truly nothing to wait for).
-2. **Positive case**: only once the subscriber has printed its own "ready for publisher"
-   log marker (which the cross-binding harness polls for -- see
-   `interop/wait_for_historical_data_cross_binding_test.py`'s `wait_for_marker()` -- before
-   starting the publisher process at all) does it make a second, generous-timeout call and
-   confirm every one of the 8 historical samples actually arrived by the time that call
-   returns `RETCODE_OK`, not just that the return code itself was `RETCODE_OK`. It takes
-   them from the reader itself, with no listener attached yet: the call promises the
-   samples are in the reader, not that `on_data_available` has run (on the shared
-   runtime, listeners run later, as runtime turns). The listener is attached afterwards,
-   for the live batch.
+2. **Positive case**: the subscriber then creates its reader on `HistoryEvent`, makes a
+   generous-timeout call and confirms every one of the 8 historical samples actually
+   arrived by the time that call returns `RETCODE_OK`, not just that the return code itself
+   was `RETCODE_OK`. It takes them from the reader itself, with no listener attached yet:
+   the call promises the samples are in the reader, not that `on_data_available` has run
+   (on the shared runtime, listeners run later, as runtime turns). The listener is
+   attached afterwards, for the live batch.
 
 Cross-binding matrix: the same 8-pair subset as `coherent-sets`, with subscriber and
 publisher roles assigned per pair the same way `coherent-sets` assigns them.

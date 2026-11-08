@@ -8,23 +8,25 @@ raw_loan_cross_binding_smoke_test.py uses.
 Unlike a demonstration example (examples/*/catchup, which this scenario's
 apps are directly modeled on), each pair here must clear a harder
 correctness bar on wait_for_historical_data(): a negative case (a short,
-non-zero max_wait called while genuinely no writer exists anywhere on the
-domain must return RETCODE_TIMEOUT, not RETCODE_OK) followed by a positive
-case (a generous max_wait must return RETCODE_OK only once the full
-TRANSIENT_LOCAL historical batch has actually been delivered). See
+non-zero max_wait on a reader whose topic no process writes must return
+RETCODE_TIMEOUT, not RETCODE_OK) followed by a positive case (a generous
+max_wait must return RETCODE_OK only once the full TRANSIENT_LOCAL
+historical batch has actually been delivered). See
 docs/design/integration-test-tier.md for the full scenario spec and
 c/wait-for-historical-data/src/subscriber.c for the assertions themselves --
 this script's own checks below are a belt-and-suspenders check on the log
 content, not a substitute.
 
-The negative case is what makes process start *order* load-bearing here,
-unlike every other scenario in this tier: the subscriber must start alone,
-prove the negative case deterministically (no writer can possibly exist yet
-since the publisher process hasn't started), and only then may the
-publisher start. wait_for_marker() below enforces that ordering by polling
-the subscriber's own log for its "ready for publisher" marker -- a real
-signal, not a fixed sleep (see docs/design/integration-test-tier.md's
-Assertion & timing conventions section) -- before launching the publisher.
+Process start *order* is load-bearing here: the publisher must start alone
+and finish writing its historical batch before the subscriber exists, or
+discovery can match the subscriber's reader mid-batch and turn "historical"
+samples into ordinary live delivery. An earlier version started the
+subscriber first, and the publisher, which asserts it was unmatched after
+the batch, intermittently failed when discovery won that race.
+wait_for_marker() below enforces the order by polling the publisher's own
+log for its "historical batch written" marker -- a real signal, not a fixed
+sleep (see docs/design/integration-test-tier.md's Assertion & timing
+conventions section) -- before launching the subscriber.
 
 Usage: ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./wait_for_historical_data_cross_binding_test.py
 """
@@ -55,14 +57,14 @@ SUITE_ROOT = Path(__file__).resolve().parents[1]
 # coherent-sets=18, delete-contained-entities=19, sample-rejected-lost=20,
 # enable-defer=21).
 DOMAIN = "22"
-READY_MARKER = "Subscriber: ready for publisher."
-# Generous margin over subscriber setup + the negative check's own 300ms
-# wait -- this should trip in well under a second in practice.
+READY_MARKER = "Publisher: historical batch written."
+# Generous margin over publisher setup (including JVM start) and its eight
+# writes -- this should trip within a second or two in practice.
 READY_MARKER_TIMEOUT_S = 15
 # Subscriber's own internal deadline chain: negative wait (0.3s) + positive
-# wait_for_historical_data() (15s) + live-batch receive (30s). Publisher's:
-# match wait (20s) + drain wait (15s). 60s gives comfortable margin over the
-# worst case on either side.
+# wait_for_historical_data() (15s) + live-batch receive (30s). Publisher's,
+# after the marker: match wait (20s) + drain wait (15s). 60s gives
+# comfortable margin over the worst case on either side.
 PROC_TIMEOUT_S = 60
 
 ZIG_DIR = SUITE_ROOT / "zig" / "wait-for-historical-data"
@@ -157,8 +159,8 @@ def subscriber_cmd(lang: str, zig_out: Path) -> list[str]:
 def wait_for_marker(proc: LiveProcess, marker: str, timeout: float) -> bool:
     """Polls proc's own log for `marker` -- a real signal that a specific
     phase of the app has completed, not a fixed sleep. See the module
-    docstring for why the subscriber's own "ready for publisher" marker is
-    load-bearing for this scenario specifically."""
+    docstring for why the publisher's own "historical batch written" marker
+    is load-bearing for this scenario specifically."""
     return proc.wait_for_output(marker, timeout)
 
 
@@ -167,17 +169,16 @@ def run_pair(subscriber_lang: str, publisher_lang: str, zig_out: Path) -> bool:
     env = run_env(zig_out)
     logdir = SUITE_ROOT / "interop" / ".smoke-logs" / f"wait-for-historical-data-{subscriber_lang}-{publisher_lang}"
 
-    # Subscriber starts alone -- see the module docstring. The negative
-    # case's whole point is that no writer exists anywhere on this domain
-    # yet, which only holds if the publisher genuinely hasn't started.
-    sub = LiveProcess(subscriber_cmd(subscriber_lang, zig_out) + ["-d", DOMAIN], env=env, log_path=logdir / "sub.log")
+    # Publisher starts alone -- see the module docstring. Its batch is only
+    # historical if no reader exists until it has finished writing.
+    pub = LiveProcess(publisher_cmd(publisher_lang, zig_out) + ["-d", DOMAIN], env=env, log_path=logdir / "pub.log")
 
-    if not wait_for_marker(sub, READY_MARKER, READY_MARKER_TIMEOUT_S):
-        sub_rc = sub.stop()
-        print_fail(label, f"subscriber never printed its ready marker within {READY_MARKER_TIMEOUT_S}s (sub_rc={sub_rc})", ("subscriber", sub))
+    if not wait_for_marker(pub, READY_MARKER, READY_MARKER_TIMEOUT_S):
+        pub_rc = pub.stop()
+        print_fail(label, f"publisher never printed its ready marker within {READY_MARKER_TIMEOUT_S}s (pub_rc={pub_rc})", ("publisher", pub))
         return False
 
-    pub = LiveProcess(publisher_cmd(publisher_lang, zig_out) + ["-d", DOMAIN], env=env, log_path=logdir / "pub.log")
+    sub = LiveProcess(subscriber_cmd(subscriber_lang, zig_out) + ["-d", DOMAIN], env=env, log_path=logdir / "sub.log")
 
     pub.wait(PROC_TIMEOUT_S)
     pub_rc = pub.stop()
@@ -186,7 +187,7 @@ def run_pair(subscriber_lang: str, publisher_lang: str, zig_out: Path) -> bool:
 
     ok = pub_rc == 0 and sub_rc == 0
     ok = ok and "Publisher: done." in pub.log_text()
-    ok = ok and "Subscriber: negative check (no writer yet) correctly returned TIMEOUT." in sub.log_text()
+    ok = ok and "Subscriber: negative check (no writer on its topic) correctly returned TIMEOUT." in sub.log_text()
     ok = ok and "Subscriber: wait_for_historical_data() returned" in sub.log_text()
     ok = ok and "HISTORICAL BATCH COMPLETE (8 samples)" in sub.log_text()
     ok = ok and "Subscriber: observed historical batch then live batch correctly." in sub.log_text()

@@ -5,12 +5,12 @@
  * (negative-then-positive wait_for_historical_data() bar) and
  * docs/design/integration-test-tier.md for the scenario spec.
  *
- * Required stdout markers: "Create topic:", "Create reader for topic:",
- * "Subscriber: negative check (no writer yet) correctly returned TIMEOUT.",
- * "Subscriber: ready for publisher.", "Subscriber: wait_for_historical_data()
- * returned", "HISTORICAL BATCH COMPLETE (8 samples)", "LIVE SAMPLE seq_num=",
- * "Subscriber: observed historical batch then live batch correctly." Any
- * failure path prints a line starting "FAIL:" and exits nonzero.
+ * Required stdout markers: "Create topic:", "Subscriber: negative check (no
+ * writer on its topic) correctly returned TIMEOUT.", "Create reader for
+ * topic:", "Subscriber: wait_for_historical_data() returned", "HISTORICAL
+ * BATCH COMPLETE (8 samples)", "LIVE SAMPLE seq_num=", "Subscriber: observed
+ * historical batch then live batch correctly." Any failure path prints a
+ * line starting "FAIL:" and exits nonzero.
  */
 #include "history_event.hpp"
 #include "zzdds_cpp.hpp"
@@ -44,6 +44,8 @@ constexpr int NEGATIVE_WAIT_NSEC = 300 * 1000 * 1000;
 constexpr int HISTORICAL_WAIT_TIMEOUT_S = 15;
 constexpr int RECEIVE_TIMEOUT_MS = 30000;
 constexpr int POLL_PERIOD_MS = 20;
+// A topic of the same type that no process ever writes, for the negative case.
+constexpr const char *UNPUBLISHED_TOPIC = "HistoryEventUnpublished";
 
 struct SubState {
     HistoryEventDataReader *reader = nullptr;
@@ -175,6 +177,32 @@ int main(int argc, char **argv) {
     SubState state;
     auto listener = std::make_shared<SubListener>(&state);
 
+    // Negative case -- see c/wait-for-historical-data/src/subscriber.c's
+    // header comment. No process writes UNPUBLISHED_TOPIC, so a short,
+    // non-zero max_wait here is guaranteed to time out.
+    auto unpublished = dp->create_topic(UNPUBLISHED_TOPIC, "HistoryEvent", ::DDS::TopicQos::default_value(), nullptr, 0);
+    if (!unpublished) {
+        std::fprintf(stderr, "FAIL: create_topic(%s) failed\n", UNPUBLISHED_TOPIC);
+        return 1;
+    }
+    auto neg_dr = sub->create_datareader(
+        std::static_pointer_cast<::zzdds::TopicImpl>(unpublished)->as_topic_description(), dr_qos, nullptr, 0);
+    if (!neg_dr) {
+        std::fprintf(stderr, "FAIL: create_datareader(%s) failed\n", UNPUBLISHED_TOPIC);
+        return 1;
+    }
+    ::DDS::Duration_t negative_wait;
+    negative_wait.sec = 0;
+    negative_wait.nanosec = NEGATIVE_WAIT_NSEC;
+    ::DDS::ReturnCode_t neg_rc = neg_dr->wait_for_historical_data(negative_wait);
+    if (neg_rc != ::DDS::RETCODE_TIMEOUT) {
+        std::fprintf(stderr, "FAIL: wait_for_historical_data() with no writer matched returned %d, expected RETCODE_TIMEOUT (%d)\n",
+                      static_cast<int>(neg_rc), static_cast<int>(::DDS::RETCODE_TIMEOUT));
+        return 1;
+    }
+    sub->delete_datareader(neg_dr);
+    std::printf("Subscriber: negative check (no writer on its topic) correctly returned TIMEOUT.\n");
+
     // Create with no listener attached yet -- see this file's header
     // comment and c/wait-for-historical-data/src/subscriber.c's matching
     // comment for why.
@@ -191,27 +219,9 @@ int main(int argc, char **argv) {
     HistoryEventDataReader reader(dr_handle);
     state.reader = &reader;
 
-    // Negative case -- see this file's header comment. No writer exists
-    // anywhere on this domain yet (the harness enforces that), so a short,
-    // non-zero max_wait here is guaranteed to time out.
-    ::DDS::Duration_t negative_wait;
-    negative_wait.sec = 0;
-    negative_wait.nanosec = NEGATIVE_WAIT_NSEC;
-    ::DDS::ReturnCode_t neg_rc = dr->wait_for_historical_data(negative_wait);
-    if (neg_rc != ::DDS::RETCODE_TIMEOUT) {
-        std::fprintf(stderr, "FAIL: wait_for_historical_data() with no writer matched returned %d, expected RETCODE_TIMEOUT (%d)\n",
-                      static_cast<int>(neg_rc), static_cast<int>(::DDS::RETCODE_TIMEOUT));
-        return 1;
-    }
-    std::printf("Subscriber: negative check (no writer yet) correctly returned TIMEOUT.\n");
-
-    // Tells the harness it's now safe to start the publisher -- see this
-    // file's header comment and the interop test's wait_for_marker().
-    std::printf("Subscriber: ready for publisher.\n");
-    std::fflush(stdout);
-
-    // The positive case: block until the TRANSIENT_LOCAL historical replay
-    // has actually landed, before taking anything.
+    // The positive case: block until discovery has matched the publisher's
+    // writer and its TRANSIENT_LOCAL historical replay has actually landed,
+    // before taking anything.
     ::DDS::Duration_t max_wait;
     max_wait.sec = HISTORICAL_WAIT_TIMEOUT_S;
     max_wait.nanosec = 0;

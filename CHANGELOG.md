@@ -21,6 +21,10 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   even when a deleted reader or writer still finishing keeps it alive. Deleting a participant
   does the same for its builtin subscriber, readers and topic descriptions when its teardown
   is deferred.
+- The `wait-for-historical-data` integration test starts the publisher first and the
+  subscriber only once the historical batch is written. Starting the subscriber first let
+  discovery match its reader mid-batch, which intermittently failed the test. The negative
+  `wait_for_historical_data()` check now uses a reader on a topic no process writes.
 - CI runs the stress tests on a `-Dshared-runtime` build too, and logs the stacks of a stress
   process that outlives its timeout. Every `lifecycle_churn` scenario now runs under
   ThreadSanitizer, on both builds.

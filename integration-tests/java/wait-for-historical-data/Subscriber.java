@@ -4,12 +4,12 @@
 // (negative-then-positive wait_for_historical_data() bar) and
 // docs/design/integration-test-tier.md for the scenario spec.
 //
-// Required stdout markers: "Create topic:", "Create reader for topic:",
-// "Subscriber: negative check (no writer yet) correctly returned TIMEOUT.",
-// "Subscriber: ready for publisher.", "Subscriber: wait_for_historical_data()
-// returned", "HISTORICAL BATCH COMPLETE (8 samples)", "LIVE SAMPLE seq_num=",
-// "Subscriber: observed historical batch then live batch correctly." Any
-// failure path prints a line starting "FAIL:" and exits nonzero.
+// Required stdout markers: "Create topic:", "Subscriber: negative check (no
+// writer on its topic) correctly returned TIMEOUT.", "Create reader for
+// topic:", "Subscriber: wait_for_historical_data() returned", "HISTORICAL
+// BATCH COMPLETE (8 samples)", "LIVE SAMPLE seq_num=", "Subscriber: observed
+// historical batch then live batch correctly." Any failure path prints a
+// line starting "FAIL:" and exits nonzero.
 
 import io.zzdds.dcps.Dcps;
 
@@ -22,6 +22,8 @@ public class Subscriber {
     static final int HISTORICAL_WAIT_TIMEOUT_S = 15;
     static final int RECEIVE_TIMEOUT_MS = 30000;
     static final int POLL_PERIOD_MS = 20;
+    // A topic of the same type that no process ever writes, for the negative case.
+    static final String UNPUBLISHED_TOPIC = "HistoryEventUnpublished";
 
     // Pure readiness check -- does NOT set allDone itself. See
     // c/wait-for-historical-data/src/subscriber.c's matching comment.
@@ -137,6 +139,30 @@ public class Subscriber {
             }
         };
 
+        // Negative case -- see c/wait-for-historical-data/src/subscriber.c's
+        // header comment. No process writes UNPUBLISHED_TOPIC, so a short,
+        // non-zero max_wait here is guaranteed to time out.
+        Dcps.DDS.Topic unpublished = dp.create_topic(UNPUBLISHED_TOPIC, "HistoryEvent", null, null, 0);
+        if (unpublished == null) {
+            System.err.println("FAIL: create_topic(" + UNPUBLISHED_TOPIC + ") failed");
+            System.exit(1);
+        }
+        Dcps.DDS.DataReader negReader = sub.create_datareader(unpublished, drQos, null, 0);
+        if (negReader == null) {
+            System.err.println("FAIL: create_datareader(" + UNPUBLISHED_TOPIC + ") failed");
+            System.exit(1);
+        }
+        Dcps.DDS.Duration_t negativeWait = new Dcps.DDS.Duration_t();
+        negativeWait.set_sec(0);
+        negativeWait.set_nanosec(NEGATIVE_WAIT_NSEC);
+        int negRc = negReader.wait_for_historical_data(negativeWait);
+        if (negRc != Dcps.DDS.RETCODE_TIMEOUT.value) {
+            System.err.println("FAIL: wait_for_historical_data() with no writer matched returned " + negRc + ", expected RETCODE_TIMEOUT (" + Dcps.DDS.RETCODE_TIMEOUT.value + ")");
+            System.exit(1);
+        }
+        sub.delete_datareader(negReader);
+        System.out.println("Subscriber: negative check (no writer on its topic) correctly returned TIMEOUT.");
+
         // Create with no listener attached yet -- see this file's header
         // comment and c/wait-for-historical-data/src/subscriber.c's
         // matching comment for why.
@@ -149,27 +175,9 @@ public class Subscriber {
 
         readerBox[0] = new HistoryEventDataReader(rawReader);
 
-        // Negative case -- see this file's header comment. No writer exists
-        // anywhere on this domain yet (the harness enforces that), so a
-        // short, non-zero max_wait here is guaranteed to time out.
-        Dcps.DDS.Duration_t negativeWait = new Dcps.DDS.Duration_t();
-        negativeWait.set_sec(0);
-        negativeWait.set_nanosec(NEGATIVE_WAIT_NSEC);
-        int negRc = rawReader.wait_for_historical_data(negativeWait);
-        if (negRc != Dcps.DDS.RETCODE_TIMEOUT.value) {
-            System.err.println("FAIL: wait_for_historical_data() with no writer matched returned " + negRc + ", expected RETCODE_TIMEOUT (" + Dcps.DDS.RETCODE_TIMEOUT.value + ")");
-            System.exit(1);
-        }
-        System.out.println("Subscriber: negative check (no writer yet) correctly returned TIMEOUT.");
-
-        // Tells the harness it's now safe to start the publisher -- see
-        // this file's header comment and the interop test's
-        // wait_for_marker().
-        System.out.println("Subscriber: ready for publisher.");
-        System.out.flush();
-
-        // The positive case: block until the TRANSIENT_LOCAL historical
-        // replay has actually landed, before taking anything.
+        // The positive case: block until discovery has matched the
+        // publisher's writer and its TRANSIENT_LOCAL historical replay has
+        // actually landed, before taking anything.
         Dcps.DDS.Duration_t maxWait = new Dcps.DDS.Duration_t();
         maxWait.set_sec(HISTORICAL_WAIT_TIMEOUT_S);
         maxWait.set_nanosec(0);
