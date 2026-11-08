@@ -37,7 +37,7 @@ concurrency:
 env:
   INTEROP_RELEASE_TAG: v2.1.2026
   # NOTE: When updating the zenzen branch, bump the fallback below to the new branch name.
-  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-44d6146' }}
+  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-76cd6f4' }}
 
 jobs:
   design-validation:
@@ -247,11 +247,26 @@ jobs:
     needs: test-linux
     permissions:
       contents: read
-    uses: zz-iot/rmw_zzdds/.github/workflows/ci.yml@7b7032a69459633f0d48dce13742f5d6f1408628
+    uses: zz-iot/rmw_zzdds/.github/workflows/ci.yml@051b4d45f30c07531043a9faebf1f69b61e36d46
     with:
       mode: zzdds-pr
       zzdds_repo: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
       zzdds_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+  # The same, with zzdds on a -Dshared-runtime build, where every participant
+  # runs on the shared runtime, so a ROS 2 consumer cannot regress on it
+  # unnoticed before it becomes the default.
+  rmw-zzdds-shared-runtime:
+    name: rmw_zzdds (shared runtime)
+    needs: test-linux
+    permissions:
+      contents: read
+    uses: zz-iot/rmw_zzdds/.github/workflows/ci.yml@051b4d45f30c07531043a9faebf1f69b61e36d46
+    with:
+      mode: zzdds-pr
+      zzdds_repo: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+      zzdds_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      zzdds_shared_runtime: true
 
   # ── examples smoke test ──────────────────────────────────────────────────
   #
@@ -1171,6 +1186,11 @@ jobs:
           # See the DebugAllocator lane's comment above vendor-interop-debug-allocator.
           - name: debug-allocator
             build_flags: -Doptimize=Debug -Dlog-level=info -Ddebug-allocator=true
+          # See the shared runtime lane's comment above vendor-interop-shared-runtime.
+          - name: shared-runtime
+            build_flags: -Doptimize=ReleaseSafe -Dshared-runtime=true
+          - name: shared-runtime-tsan
+            build_flags: -Doptimize=Debug -Dlog-level=info -Dsanitize-thread -Dshared-runtime=true
 
     steps:
       - name: Check out zzdds
@@ -1241,6 +1261,12 @@ jobs:
           - name: debug-allocator
             suffix: " + DebugAllocator"
             report: interop-debug-allocator-results
+          - name: shared-runtime
+            suffix: " + shared runtime"
+            report: interop-shared-runtime-results
+          - name: shared-runtime-tsan
+            suffix: " + shared runtime + TSAN"
+            report: interop-shared-runtime-tsan-results
 
     steps:
       - name: Check out zzdds
@@ -1610,3 +1636,92 @@ jobs:
         with:
           name: interop-debug-allocator-${{ matrix.vendor.name }}-${{ matrix.direction }}
           path: /tmp/interop-debug-allocator-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
+
+  # ── Interop: Zenzen DDS (shared runtime) vs vendor ────────────────────────
+  #
+  # Same structure as vendor-interop-normal, on a -Dshared-runtime build, where
+  # every participant runs on the shared runtime (the contributor migration
+  # switch; see docs/roadmap.md), so its wire behavior cannot regress unnoticed
+  # before it becomes the default. Its TSan build runs self-interop only: the
+  # TSan vendor lane moves to the runtime when the default flips.
+  vendor-interop-shared-runtime:
+    name: "Shared runtime: ${{ matrix.vendor.name }} / ${{ matrix.direction }}"
+    needs: [setup-matrix, shape-binaries]
+    # See self-interop: run even if another lane's build failed.
+    if: ${{ !cancelled() && needs.setup-matrix.result == 'success' && needs.shape-binaries.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        vendor: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+        direction: [pub, sub]
+
+    steps:
+      - name: Check out zzdds
+        uses: actions/checkout@v4
+        with:
+          path: zzdds
+          persist-credentials: false
+
+      - name: Check out dds-rtps (${{ env.INTEROP_RTPS_REF }})
+        uses: actions/checkout@v4
+        with:
+          repository: zz-iot/dds-rtps
+          ref: ${{ env.INTEROP_RTPS_REF }}
+          path: dds-rtps
+          persist-credentials: false
+
+      - name: Install Python (match omg-dds/dds-rtps interop workflow)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.4"
+
+      - name: Install Python dependencies
+        run: pip install --requirement dds-rtps/requirements.txt
+
+      - name: Download zzdds binary (shared runtime)
+        uses: actions/download-artifact@v4
+        with:
+          name: zzdds-shape-linux-shared-runtime
+          path: bins/
+
+      - name: Download vendor binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download ${{ env.INTEROP_RELEASE_TAG }} \
+            --repo omg-dds/dds-rtps \
+            --pattern "${{ matrix.vendor.asset }}" \
+            -D bins/
+          unzip -o bins/${{ matrix.vendor.asset }} -d bins/
+
+      - name: Make binaries executable
+        run: chmod +x bins/zzdds_shape_main_linux bins/${{ matrix.vendor.binary }}
+
+      - name: Run interop on the shared runtime (${{ matrix.direction }})
+        working-directory: dds-rtps
+        run: |
+          ZZDDS="$GITHUB_WORKSPACE/bins/zzdds_shape_main_linux"
+          VENDOR="$GITHUB_WORKSPACE/bins/${{ matrix.vendor.binary }}"
+          if [ "${{ matrix.direction }}" = "pub" ]; then
+            PUB="$ZZDDS"; SUB="$VENDOR"
+          else
+            PUB="$VENDOR"; SUB="$ZZDDS"
+          fi
+          python3 interoperability_report.py -P "$PUB" -S "$SUB" \
+            -o /tmp/interop-shared-runtime-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
+
+      - name: Check results
+        run: |
+          python3 zzdds/scripts/check_interop_results.py \
+            /tmp/interop-shared-runtime-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml \
+            --known-failures zzdds/.github/interop-known-failures.toml \
+            --vendor "${{ matrix.vendor.name }}" --direction ${{ matrix.direction }} \
+            --lane shared-runtime
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-shared-runtime-${{ matrix.vendor.name }}-${{ matrix.direction }}
+          path: /tmp/interop-shared-runtime-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml

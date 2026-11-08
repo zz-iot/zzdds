@@ -24,6 +24,8 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 - CI runs the stress tests on a `-Dshared-runtime` build too, and logs the stacks of a stress
   process that outlives its timeout. Every `lifecycle_churn` scenario now runs under
   ThreadSanitizer, on both builds.
+- CI runs rmw_zzdds and the dds-rtps interop suites on a `-Dshared-runtime` build: every vendor,
+  and self-interop under ThreadSanitizer.
 - CI runs the unit tests on a `-Dshared-runtime` build, plain and under ThreadSanitizer, except
   the files in `build.zig`'s `not_yet_on_shared_runtime`. The mock transport can run on the
   shared runtime, and the lossy transport can when the transport under it can.
