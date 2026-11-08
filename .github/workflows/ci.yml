@@ -856,6 +856,22 @@ jobs:
         working-directory: stress-tests/zig/lifecycle_churn
         run: ./run.py --scenario cft --threads 6 --duration 20 --tsan --timeout 300
 
+      - name: lifecycle_churn/entities under ThreadSanitizer
+        working-directory: stress-tests/zig/lifecycle_churn
+        run: ./run.py --scenario entities --threads 4 --duration 20 --tsan --timeout 300
+
+      - name: lifecycle_churn/waitset under ThreadSanitizer
+        working-directory: stress-tests/zig/lifecycle_churn
+        run: ./run.py --scenario waitset --threads 4 --duration 20 --tsan --timeout 300
+
+      - name: lifecycle_churn/participants under ThreadSanitizer
+        working-directory: stress-tests/zig/lifecycle_churn
+        run: ./run.py --scenario participants --threads 4 --duration 20 --tsan --timeout 300
+
+      - name: lifecycle_churn/instance under ThreadSanitizer
+        working-directory: stress-tests/zig/lifecycle_churn
+        run: ./run.py --scenario instance --threads 4 --duration 20 --tsan --timeout 300
+
       # Weekly full-vendor sweep trigger only: heavier, longer, + --large.
       - name: Nightly heavy matrix
         if: github.event_name == 'schedule'
