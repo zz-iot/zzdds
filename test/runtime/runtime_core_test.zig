@@ -1245,6 +1245,56 @@ test "a completion hook runs once the request is done, and may free it" {
     try m.retire();
 }
 
+test "a completion hook run before release has returned by the time the context can close" {
+    var m: Manual = undefined;
+    m.init(.{ .mode = .manual });
+    var ctx = rt.Context.init(&m.runtime, 16);
+    var freed: u32 = 0;
+    // Done in its first turn.
+    const Once = struct {
+        req: rt.Request = rt.Request.init(run),
+        freed: *u32,
+
+        fn run(_: *rt.Request, _: *rt.Turn) rt.Outcome {
+            return .done;
+        }
+
+        fn done(req: *rt.Request) void {
+            const self: *@This() = @fieldParentPtr("req", req);
+            self.freed.* += 1;
+            testing.allocator.destroy(self);
+        }
+    };
+    const o = try testing.allocator.create(Once);
+    o.* = .{ .freed = &freed };
+    o.req.on_done = Once.done;
+    o.req.done_before_release = true;
+    try m.runtime.submit(null, &ctx, &o.req);
+
+    // The owner closes the context as soon as the turn releases it, as a
+    // teardown on another thread may, and then stops using its allocator.
+    const Close = struct {
+        var freed_at_close: ?u32 = null;
+        var closed: bool = false;
+        var counter: *u32 = undefined;
+
+        fn hook(_: *rt.Runtime, c: *rt.Context, _: *rt.Request) void {
+            closed = c.closeDiscarding().closed;
+            freed_at_close = counter.*;
+        }
+    };
+    Close.freed_at_close = null;
+    Close.counter = &freed;
+    m.runtime.test_hooks.before_on_done = Close.hook;
+
+    const r = try m.runtime.drive(10, 0);
+    try testing.expectEqual(@as(u32, 1), r.turns);
+    try testing.expect(Close.closed);
+    try testing.expectEqual(@as(?u32, 1), Close.freed_at_close);
+    ctx.deinit();
+    try m.retire();
+}
+
 // ── Retirement and timer races ────────────────────────────────────────────────
 
 test "a submission admitted as retirement begins runs before the runtime stops" {

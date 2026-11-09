@@ -1320,13 +1320,15 @@ pub const DomainParticipantImpl = struct {
             const item = of(req);
             const p = item.participant;
             userDataOnReceive(p, item.data, item.src, transport_if.Channel.none);
-            // Accounted while the participant is certainly alive; the buffer
-            // itself is freed by `destroy` after the turn.
+            // Accounted here; the buffer itself is freed by `destroy` once
+            // the runtime is finished with the turn.
             p.ingress_budget.release(item.admission);
             return .done;
         }
 
-        /// Does not touch the participant, which may already be gone.
+        /// Runs before the turn releases the context
+        /// (`done_before_release`), so the participant's close waits for it,
+        /// and under the context's gate: it touches nothing but the item.
         fn destroy(req: *runtime_mod.Request) void {
             const item = of(req);
             item.alloc.free(item.data);
@@ -1387,6 +1389,8 @@ pub const DomainParticipantImpl = struct {
         };
         item.* = .{ .alloc = self.alloc, .participant = self, .src = src, .data = data, .admission = adm };
         item.req.on_done = Ingress.destroy;
+        // Freed with the participant's allocator: before its close can finish.
+        item.req.done_before_release = true;
         self.runtime.?.submit(null, &self.ingress, &item.req) catch {
             Ingress.discard(&item.req);
             _ = self.ingress_drops.fetchAdd(1, .monotonic);

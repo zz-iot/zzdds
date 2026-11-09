@@ -45,6 +45,14 @@ pub const Request = struct {
     /// Runs once the runtime is finished with a turn that ended `.done`, so
     /// it may free the request.
     on_done: ?*const fn (req: *Request) void = null,
+    /// `on_done` runs before the turn releases the context, so the context
+    /// cannot close until it has returned: for a request freed with its
+    /// owner's allocator, which the owner may stop using once the context
+    /// has closed. It runs under the context's gate, so it must not call
+    /// into the runtime. Otherwise it runs after the context is released,
+    /// and may do anything, including closing the context, but the owner
+    /// may already have closed it.
+    done_before_release: bool = false,
 
     pub fn init(run: *const fn (req: *Request, turn: *Turn) Outcome) Request {
         return .{ .run = run };
@@ -439,7 +447,8 @@ pub const Runtime = struct {
         /// before its fire is submitted.
         after_timer_pop: ?*const fn (runtime: *Runtime, timer: *Timer) void = null,
         /// Runs once in `runTurn`, after a turn has released its context and
-        /// before the request's `on_done`.
+        /// before the request's `on_done`, unless that ran before the release
+        /// (`done_before_release`).
         before_on_done: ?*const fn (runtime: *Runtime, ctx: *Context, req: *Request) void = null,
     };
 
@@ -731,6 +740,11 @@ pub const Runtime = struct {
                 req.wake_pending = false;
                 if (!req.internal) ctx.pending -= 1;
                 on_done = req.on_done;
+                if (req.done_before_release) {
+                    // A close waits for the turn, so for this too.
+                    if (on_done) |f| f(req);
+                    on_done = null;
+                }
             },
             .yield => ctx.appendLocked(req),
             .wait => if (req.wake_pending) {
