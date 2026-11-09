@@ -36,7 +36,7 @@ SUMMARY_RE = re.compile(r"^SUMMARY: OK role=(pub|sub) teardown_ms=(\d+) ", re.M)
 
 def build() -> Path:
     log = _common.mktemp_logdir("elc-stress") / "build.log"
-    ok = _common.run_build(["zig", "build", *_common.shared_runtime_args()], cwd=APP_DIR, log_path=log)
+    ok = _common.run_build(["zig", "build", *_common.shared_runtime_args(), *_common.debug_allocator_args()], cwd=APP_DIR, log_path=log)
     if not ok:
         print(_common.Path(log).read_text(errors="replace"), file=sys.stderr)
         raise SystemExit("FAIL: elc_stress build failed")

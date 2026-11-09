@@ -50,6 +50,17 @@ def shared_runtime_args() -> list[str]:
     return ["-Dshared-runtime=true"] if os.environ.get("ZZDDS_SHARED_RUNTIME") == "1" else []
 
 
+def debug_allocator_args() -> list[str]:
+    """The `zig build` arguments that put a Zig app's own zzdds dependency on
+    a DebugAllocator.
+
+    ZZDDS_DEBUG_ALLOCATOR=1 (CI's stress lanes) builds that dependency with
+    -Ddebug-allocator, so double-frees and uses after free inside zzdds fail
+    at the call site. The root build's flag does not reach it.
+    """
+    return ["-Ddebug-allocator=true"] if os.environ.get("ZZDDS_DEBUG_ALLOCATOR") == "1" else []
+
+
 def zig_build_cmd() -> list[str]:
     """The `zig build` command for an example or integration-test Zig app."""
     return ["zig", "build", "-Doptimize=ReleaseSafe", *shared_runtime_args()]

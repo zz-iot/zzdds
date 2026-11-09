@@ -57,6 +57,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   `wait_for_historical_data()` check now uses a reader on a topic no process writes.
 - CI runs the stress suite on Linux ARM64 and macOS ARM64, on the default and
   `-Dshared-runtime` builds.
+- In CI's stress lanes, the stress apps' own zzdds now allocates through a DebugAllocator
+  (`ZZDDS_DEBUG_ALLOCATOR=1`). Before, `-Ddebug-allocator` reached only the root build,
+  so double-frees and uses after free inside zzdds went unchecked there.
 - On macOS, every participant on a host can bind the domain's discovery port. The UDP
   transport now sets `SO_REUSEPORT` there as well as `SO_REUSEADDR`. Without it, only the
   first participant got the port, and the others received no multicast SPDP.

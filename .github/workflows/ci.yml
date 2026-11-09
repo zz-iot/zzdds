@@ -830,6 +830,9 @@ jobs:
       # The stress apps build their own zzdds, so run.py passes them
       # -Dshared-runtime too (examples/_common.py's shared_runtime_args).
       ZZDDS_SHARED_RUNTIME: ${{ matrix.runtime == 'shared' && '1' || '0' }}
+      # Likewise -Ddebug-allocator, so zzdds's own allocations in the stress
+      # apps go through a DebugAllocator (debug_allocator_args).
+      ZZDDS_DEBUG_ALLOCATOR: "1"
       # A process that outlives its timeout logs its stacks before it is killed
       # (examples/_common.py's dump_stacks).
       ZZDDS_TEST_LOG_STUCK_STACKS: "1"
@@ -943,6 +946,7 @@ jobs:
     timeout-minutes: 30
     env:
       ZZDDS_SHARED_RUNTIME: ${{ matrix.runtime == 'shared' && '1' || '0' }}
+      ZZDDS_DEBUG_ALLOCATOR: "1"
       ZZDDS_TEST_LOG_STUCK_STACKS: "1"
 
     steps:
