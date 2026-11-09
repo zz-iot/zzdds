@@ -4,9 +4,10 @@
 // docs/design/integration-test-tier.md for the scenario spec.
 //
 // Required stdout markers: "Create topic:", "Create writer for topic:",
-// "Publisher: wrote historical seq_num=", "Publisher: reader matched,
-// writing live batch", "Publisher: wrote live seq_num=", "Publisher: done."
-// Any failure path prints a line starting "FAIL:" and exits nonzero.
+// "Publisher: wrote historical seq_num=", "Publisher: historical batch
+// written.", "Publisher: reader matched, writing live batch", "Publisher:
+// wrote live seq_num=", "Publisher: done." Any failure path prints a line
+// starting "FAIL:" and exits nonzero.
 
 import io.zzdds.dcps.Dcps;
 
@@ -116,19 +117,16 @@ public class Publisher {
             System.out.println("Publisher: wrote historical seq_num=" + seq);
         }
 
-        // Verify the batch above was genuinely historical: the subscriber and its
-        // reader already exist by the time this process starts (see the harness),
-        // so nothing here actually stops discovery from completing fast enough to
-        // match before this fast, unthrottled write loop finishes -- which would
-        // silently turn some or all of it into ordinary live delivery instead of
-        // exercising TRANSIENT_LOCAL replay, without the subscriber's
-        // sequence-number-only check ever noticing (found via Greptile review).
-        // Assert unmatched here instead of just assuming it, so a race like that
-        // fails loudly instead of silently validating nothing.
+        // Verify the batch above was genuinely historical -- see
+        // c/wait-for-historical-data/src/publisher.c's matching comment. The
+        // harness starts the subscriber only after the marker below.
         if (state.matchedCurrentCount.get() != 0) {
             System.err.println("FAIL: reader matched before the historical batch finished writing -- not exercising late-join replay");
             System.exit(1);
         }
+        // Tells the harness it's now safe to start the subscriber.
+        System.out.println("Publisher: historical batch written.");
+        System.out.flush();
 
         // -- Wait for the late-joining reader to match. --
         long deadline = System.currentTimeMillis() + MATCH_TIMEOUT_MS;

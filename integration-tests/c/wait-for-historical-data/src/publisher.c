@@ -8,10 +8,15 @@
  * for the full scenario spec and subscriber.c for the harder correctness bar
  * this scenario adds over the plain catchup example.
  *
+ * Starts alone: the harness waits for the "historical batch written" marker
+ * below before starting the subscriber at all, so no reader can match while
+ * the batch is being written.
+ *
  * Required stdout markers: "Create topic:", "Create writer for topic:",
- * "Publisher: wrote historical seq_num=", "Publisher: reader matched,
- * writing live batch", "Publisher: wrote live seq_num=", "Publisher: done."
- * Any failure path prints a line starting "FAIL:" and exits nonzero.
+ * "Publisher: wrote historical seq_num=", "Publisher: historical batch
+ * written.", "Publisher: reader matched, writing live batch", "Publisher:
+ * wrote live seq_num=", "Publisher: done." Any failure path prints a line
+ * starting "FAIL:" and exits nonzero.
  */
 #include "history_event.h"
 #include "zzdds_c.h"
@@ -143,20 +148,21 @@ int main(int argc, char **argv) {
         printf("Publisher: wrote historical seq_num=%d\n", seq);
     }
 
-    /* -- Verify the batch above was genuinely historical: the subscriber and
-     * its reader already exist by the time this process starts (see the
-     * harness), so nothing here actually stops discovery from completing
-     * fast enough to match before this fast, unthrottled write loop
-     * finishes -- which would silently turn some or all of it into ordinary
-     * live delivery instead of exercising TRANSIENT_LOCAL replay, without
-     * the subscriber's sequence-number-only check ever noticing (found via
-     * Greptile review). Assert unmatched here instead of just assuming it,
-     * so a race like that fails loudly instead of silently validating
-     * nothing. -- */
+    /* -- Verify the batch above was genuinely historical. A reader matched
+     * during the write loop would silently turn some or all of it into
+     * ordinary live delivery instead of exercising TRANSIENT_LOCAL replay,
+     * without the subscriber's sequence-number-only check ever noticing
+     * (found via Greptile review). The harness rules that out by starting
+     * the subscriber only after the marker below; assert it here too, so a
+     * harness change that breaks it fails loudly instead of silently
+     * validating nothing. -- */
     if (atomic_load(&state.matched_current_count) != 0) {
         fprintf(stderr, "FAIL: reader matched before the historical batch finished writing -- not exercising late-join replay\n");
         return 1;
     }
+    /* Tells the harness it's now safe to start the subscriber. */
+    printf("Publisher: historical batch written.\n");
+    fflush(stdout);
 
     /* -- Wait for the late-joining reader to match. -- */
     for (int waited_ms = 0; !atomic_load(&state.ever_matched); waited_ms += POLL_PERIOD_MS) {
