@@ -842,6 +842,10 @@ pub const SubscriberImpl = struct {
 
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.SubscriberListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
+        // A callback the setter waits for may delete this subscriber: the
+        // reference keeps it until the setter is done with it.
+        if (!self.quiesce.acquire()) return DDS.RETCODE_ALREADY_DELETED;
+        defer self.quiesce.release(self, reallyDeinit);
         self.swapListener(if (a_listener) |l| l.* else DDS.noop_SubscriberListener, mask);
         return DDS.RETCODE_OK;
     }

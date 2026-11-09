@@ -147,17 +147,24 @@ pub fn ListenerBox(comptime T: type) type {
 
         /// Ends a use taken with `acquireLocked`. Call with no lock held.
         pub fn releaseRef(self: *Self, alloc: std.mem.Allocator) void {
-            // The last use of a retired registration releases its context
-            // while it still holds that use, so the box outlives the hook.
-            var s = self.state.load(.acquire);
-            while (s & RETIRED != 0 and s & RELEASED == 0 and usesOf(s) == 1) {
-                s = self.state.cmpxchgWeak(s, s | RELEASED, .acq_rel, .acquire) orelse {
-                    listener_lifecycle.release(self.listener);
-                    break;
-                };
-            }
-            const prev = self.state.fetchSub(USE, .seq_cst);
-            std.debug.assert(usesOf(prev) > 0);
+            var s = self.state.load(.seq_cst);
+            const prev = while (true) {
+                std.debug.assert(usesOf(s) > 0);
+                if (s & RETIRED != 0 and s & RELEASED == 0 and usesOf(s) == 1) {
+                    // The last use of a retired registration releases its
+                    // context while it still holds that use, so the box
+                    // outlives the hook. A retired box takes no new use.
+                    if (self.state.cmpxchgWeak(s, s | RELEASED, .seq_cst, .seq_cst)) |cur| {
+                        s = cur;
+                        continue;
+                    }
+                    releaseContext(self.listener);
+                    break self.state.fetchSub(USE, .seq_cst);
+                }
+                // Decrementing in the step that saw the count keeps two last
+                // uses from each leaving the release to the other.
+                s = self.state.cmpxchgWeak(s, s - USE, .seq_cst, .seq_cst) orelse break s;
+            };
             if (usesOf(prev) != 1) return;
             if (holdsOf(prev) == 0) return self.destroy(alloc, prev);
             // Not the last reference: someone else frees the box, and this
@@ -195,8 +202,17 @@ pub fn ListenerBox(comptime T: type) type {
             while (usesOf(self.state.load(.seq_cst)) > 0) wait_cv.wait(&wait_mu);
         }
 
+        /// Runs the release hook as a listener call: it is application
+        /// code, and a setter it calls must not wait, for instance for the
+        /// use whose end is running it.
+        fn releaseContext(listener: T) void {
+            enterCall();
+            defer leaveCall();
+            listener_lifecycle.release(listener);
+        }
+
         fn destroy(self: *Self, alloc: std.mem.Allocator, last: u64) void {
-            if (last & RELEASED == 0) listener_lifecycle.release(self.listener);
+            if (last & RELEASED == 0) releaseContext(self.listener);
             if (self.ident.load(.acquire)) |id| listener_identity.global.release(id);
             alloc.destroy(self);
         }
@@ -351,6 +367,54 @@ test "Retired: a busy replaced registration is released by its last use, not the
     retired.drain(testing.allocator, &mu, upto, false);
     try testing.expect(retired.head == null);
     try testing.expectEqual(@as(u32, 1), released.load(.seq_cst));
+    slot.releaseHold(testing.allocator);
+}
+
+test "Retired: of two uses of a replaced registration, the last releases the context" {
+    var mu: Mutex = .{};
+    var released: std.atomic.Value(u32) = .init(0);
+    var slot = try ListenerBox(TestListener).create(testing.allocator, .{
+        .listener_data = &released,
+        .release_listener_data = countRelease,
+    });
+    const old = slot;
+    mu.lock();
+    _ = old.acquireLocked();
+    _ = old.acquireLocked();
+    mu.unlock();
+    var retired: Retired(TestListener) = .{};
+    _ = retired.install(&mu, &slot, try ListenerBox(TestListener).create(testing.allocator, .{}));
+    old.releaseRef(testing.allocator);
+    try testing.expectEqual(@as(u32, 0), released.load(.seq_cst));
+    // Released by the last use, not left for the list to drop.
+    old.releaseRef(testing.allocator);
+    try testing.expectEqual(@as(u32, 1), released.load(.seq_cst));
+    retired.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 1), released.load(.seq_cst));
+    slot.releaseHold(testing.allocator);
+}
+
+test "ListenerBox: a release hook runs as a listener call" {
+    const S = struct {
+        var in_call: bool = false;
+        fn release(_: ?*anyopaque) callconv(.c) void {
+            in_call = inCall();
+        }
+    };
+    var mu: Mutex = .{};
+    var slot = try ListenerBox(TestListener).create(testing.allocator, .{ .release_listener_data = S.release });
+    const old = slot;
+    mu.lock();
+    _ = old.acquireLocked();
+    mu.unlock();
+    var retired: Retired(TestListener) = .{};
+    _ = retired.install(&mu, &slot, try ListenerBox(TestListener).create(testing.allocator, .{}));
+    // The last use's release, from no callback: the hook is in one.
+    try testing.expect(!inCall());
+    old.releaseRef(testing.allocator);
+    try testing.expect(S.in_call);
+    try testing.expect(!inCall());
+    retired.deinit(testing.allocator);
     slot.releaseHold(testing.allocator);
 }
 

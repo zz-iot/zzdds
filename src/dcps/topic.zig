@@ -289,6 +289,10 @@ pub const TopicImpl = struct {
 
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.TopicListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
+        // A callback the setter waits for may delete this Topic: the
+        // reference keeps it until the setter is done with it.
+        _ = self.refs.fetchAdd(1, .monotonic);
+        defer self.release();
         self.swapListener(if (a_listener) |l| l.* else DDS.noop_TopicListener, mask);
         return DDS.RETCODE_OK;
     }

@@ -3275,6 +3275,10 @@ pub const DataReaderImpl = struct {
 
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.DataReaderListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
+        // A callback the setter waits for may delete this reader: the
+        // reference keeps it until the setter is done with it.
+        if (!self.quiesce.acquire()) return DDS.RETCODE_ALREADY_DELETED;
+        defer self.quiesce.release(self, reallyDeinit);
         self.swapListenerEx(listenerExFromBase(if (a_listener) |l| l.* else DDS.noop_DataReaderListener), mask);
 
         // DDS status conditions/listeners are level-triggered, not
@@ -3315,6 +3319,9 @@ pub const DataReaderImpl = struct {
     /// Backs `zzdds::DataReader::set_listener_ex` (see
     /// src/c_abi/extensions.zig).
     pub fn setListenerEx(self: *Self, listener_ex: ZZDDS.DataReaderListenerEx, mask: DDS.StatusMask) void {
+        // As in vtSetListener.
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         self.swapListenerEx(listener_ex, mask);
     }
 
