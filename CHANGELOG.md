@@ -27,6 +27,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   subscriber only once the historical batch is written. Starting the subscriber first let
   discovery match its reader mid-batch, which intermittently failed the test. The negative
   `wait_for_historical_data()` check now uses a reader on a topic no process writes.
+- On macOS, every participant on a host can bind the domain's discovery port. The UDP
+  transport now sets `SO_REUSEPORT` there as well as `SO_REUSEADDR`. Without it, only the
+  first participant got the port, and the others received no multicast SPDP.
 - CI runs the stress tests on a `-Dshared-runtime` build too, and logs the stacks of a stress
   process that outlives its timeout. Every `lifecycle_churn` scenario now runs under
   ThreadSanitizer, on both builds.
