@@ -209,6 +209,19 @@ fn sockOptInt(fd: posix.socket_t, level: i32, optname: u32, val: i32) !void {
     try sockOpt(fd, level, optname, std.mem.asBytes(&val));
 }
 
+/// Lets several sockets, in this process or others, bind one address and
+/// port, every one of them receiving each multicast datagram to it. On Linux
+/// SO_REUSEADDR alone does that for UDP. Darwin needs SO_REUSEPORT as well,
+/// or every bind after the first fails, so only the first participant on a
+/// host gets the domain's discovery port; there SO_REUSEPORT still delivers
+/// multicast to every socket. Not set on Linux, where SO_REUSEPORT instead
+/// hands each datagram to just one of the sockets.
+fn allowAddrReuse(fd: posix.socket_t) !void {
+    try sockOptInt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, 1);
+    if (comptime builtin.os.tag.isDarwin())
+        try sockOptInt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, 1);
+}
+
 // ── Windows WSAPoll wrapper ───────────────────────────────────────────────────
 // posix.pollfd and posix.POLL are broken on Windows in Zig 0.16.0 (ws2_32.zig
 // does not declare pollfd or POLL). Use WSAPoll directly on Windows.
@@ -2273,7 +2286,7 @@ fn createUnicastSocket(addr_kind: i32, ip: [16]u8, port: u16, recv_buf: u32) !po
     const family: u32 = if (addr_kind == LocatorKind.udp_v4) posix.AF.INET else posix.AF.INET6;
     const fd = try socketCreate(family, posix.SOCK.DGRAM);
     errdefer socketClose(fd);
-    try sockOptInt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, 1);
+    try allowAddrReuse(fd);
     if (recv_buf > 0) sockOptInt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, @intCast(recv_buf)) catch {};
 
     if (addr_kind == LocatorKind.udp_v4) {
@@ -2304,12 +2317,10 @@ fn createMulticastSocket(addr_kind: i32, port: u16, recv_buf: u32) !posix.socket
     const family: u32 = if (addr_kind == LocatorKind.udp_v4) posix.AF.INET else posix.AF.INET6;
     const fd = try socketCreate(family, posix.SOCK.DGRAM);
     errdefer socketClose(fd);
-    // SO_REUSEADDR (not SO_REUSEPORT) lets multiple processes bind to the same
-    // multicast port while preserving fan-out delivery: every joined socket
-    // receives every multicast datagram. SO_REUSEPORT switches to hash-based
-    // load balancing (one socket per datagram), which breaks multi-publisher
-    // discovery — each sender's SPDP packets land on only one of N participants.
-    try sockOptInt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, 1);
+    // Many participants bind the same multicast port, and every one must get
+    // every datagram, each sender's SPDP included: see allowAddrReuse for why
+    // that is SO_REUSEADDR on Linux and SO_REUSEPORT too on Darwin.
+    try allowAddrReuse(fd);
     if (recv_buf > 0) sockOptInt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, @intCast(recv_buf)) catch {};
 
     if (addr_kind == LocatorKind.udp_v4) {
@@ -2925,12 +2936,44 @@ test "vtJoinMulticast and vtLeaveMulticast IPv4 round-trip" {
 
     try t.listen(&listen_loc, h);
     defer t.unlisten(&listen_loc, h);
-    // BindFailed means no multicast-capable interface (common on macOS CI runners).
-    t.joinMulticast(&mc_group) catch |err| switch (err) {
-        error.BindFailed => return,
-        else => |e| return e,
-    };
+    // The multicast socket binds the wildcard address and port the listen
+    // above already holds: Darwin refuses that without SO_REUSEPORT.
+    try t.joinMulticast(&mc_group);
     t.leaveMulticast(&mc_group);
+}
+
+test "two transports join one multicast group on one port" {
+    // Every participant on a host binds its domain's discovery port; on
+    // Darwin all but the first failed to until allowAddrReuse set
+    // SO_REUSEPORT there.
+    const alloc = std.testing.allocator;
+    const mc_port: u16 = 55402;
+    const listen_loc = Locator.udp4(.{ 0, 0, 0, 0 }, mc_port);
+    const mc_group = Locator.udp4(.{ 239, 255, 0, 1 }, mc_port);
+
+    var sentinel: u8 = 0;
+    const h = ReceiveHandler{
+        .ctx = &sentinel,
+        .on_receive = struct {
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
+        }.f,
+    };
+
+    const a = try UdpTransport.init(alloc, .{ .participant_id = 181, .ipv6_enabled = false }, 0, null);
+    defer a.deinit();
+    const b = try UdpTransport.init(alloc, .{ .participant_id = 182, .ipv6_enabled = false }, 0, null);
+    defer b.deinit();
+
+    for ([_]*UdpTransport{ a, b }) |udp| {
+        const t = udp.transport();
+        try t.listen(&listen_loc, h);
+        try t.joinMulticast(&mc_group);
+    }
+    for ([_]*UdpTransport{ a, b }) |udp| {
+        const t = udp.transport();
+        t.leaveMulticast(&mc_group);
+        t.unlisten(&listen_loc, h);
+    }
 }
 
 // ── sendUdp4 / sendUdp6 direct calls ─────────────────────────────────────────
