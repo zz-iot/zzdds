@@ -790,11 +790,13 @@ pub const DataWriterImpl = struct {
     }
 
     /// Backs `zzdds::DataWriter::set_listener_ex` (see src/c_abi/extensions.zig).
-    pub fn setListenerEx(self: *Self, listener_ex: ZZDDS.DataWriterListenerEx, mask: DDS.StatusMask) void {
-        // As in vtSetListener.
-        if (!self.quiesce.acquire()) return;
+    /// As in vtSetListener, a writer already being deleted rejects the
+    /// registration, which stays the caller's.
+    pub fn setListenerEx(self: *Self, listener_ex: ZZDDS.DataWriterListenerEx, mask: DDS.StatusMask) DDS.ReturnCode_t {
+        if (!self.quiesce.acquire()) return DDS.RETCODE_ALREADY_DELETED;
         defer self.quiesce.release(self, reallyDeinit);
         self.swapListenerEx(listener_ex, mask);
+        return DDS.RETCODE_OK;
     }
 
     /// Installs `new_listener_ex` and `mask`, retiring the registration it

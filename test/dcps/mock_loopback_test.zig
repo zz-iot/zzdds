@@ -1150,11 +1150,11 @@ test "mock_loopback: on_reliable_reader_ready fires after AckNack handshake, str
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
     var state = ReadyState{};
-    dw_impl.setListenerEx(.{
+    try std.testing.expectEqual(DDS.RETCODE_OK, dw_impl.setListenerEx(.{
         .listener_data = &state,
         .on_publication_matched = onPubMatchedForReadyTest,
         .on_reliable_reader_ready = onReaderReadyForReadyTest,
-    }, DDS.STATUS_MASK_ALL);
+    }, DDS.STATUS_MASK_ALL));
 
     // Drive discovery + the AckNack/Heartbeat handshake until both callbacks
     // have fired (or timeout).
@@ -1242,11 +1242,11 @@ test "mock_loopback: on_reliable_writer_ready fires after a targeted heartbeat, 
     _ = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
 
     var state = ReadyState{};
-    dr_impl.setListenerEx(.{
+    try std.testing.expectEqual(DDS.RETCODE_OK, dr_impl.setListenerEx(.{
         .listener_data = &state,
         .on_subscription_matched = onSubMatchedForReadyTest,
         .on_reliable_writer_ready = onWriterReadyForReadyTest,
-    }, DDS.STATUS_MASK_ALL);
+    }, DDS.STATUS_MASK_ALL));
 
     // Drive discovery + the writer's Heartbeat cycle until both callbacks
     // have fired (or timeout).
@@ -1353,10 +1353,10 @@ test "mock_loopback: on_reliable_writer_ready callback can safely re-enter a par
     _ = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
 
     var state = ReentrancyState{ .dp_r = dp_r };
-    dr_impl.setListenerEx(.{
+    try std.testing.expectEqual(DDS.RETCODE_OK, dr_impl.setListenerEx(.{
         .listener_data = &state,
         .on_reliable_writer_ready = onWriterReadyReentrant,
-    }, DDS.STATUS_MASK_ALL);
+    }, DDS.STATUS_MASK_ALL));
 
     // Drive discovery on a background thread rather than this one: the
     // callback's reentrant call runs synchronously inside net.deliverAll(),
@@ -1467,11 +1467,11 @@ test "mock_loopback: onParticipantLost fires on_reliable_writer_ready(false) whe
     _ = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
 
     var state = ReadyState{};
-    dr_impl.setListenerEx(.{
+    try std.testing.expectEqual(DDS.RETCODE_OK, dr_impl.setListenerEx(.{
         .listener_data = &state,
         .on_subscription_matched = onSubMatchedForReadyTest,
         .on_reliable_writer_ready = onWriterReadyForReadyTest,
-    }, DDS.STATUS_MASK_ALL);
+    }, DDS.STATUS_MASK_ALL));
 
     // Drive discovery + the writer's Heartbeat cycle until matched AND ready.
     const match_deadline = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;

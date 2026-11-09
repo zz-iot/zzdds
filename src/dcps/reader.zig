@@ -3317,12 +3317,13 @@ pub const DataReaderImpl = struct {
     }
 
     /// Backs `zzdds::DataReader::set_listener_ex` (see
-    /// src/c_abi/extensions.zig).
-    pub fn setListenerEx(self: *Self, listener_ex: ZZDDS.DataReaderListenerEx, mask: DDS.StatusMask) void {
-        // As in vtSetListener.
-        if (!self.quiesce.acquire()) return;
+    /// src/c_abi/extensions.zig). As in vtSetListener, a reader already being
+    /// deleted rejects the registration, which stays the caller's.
+    pub fn setListenerEx(self: *Self, listener_ex: ZZDDS.DataReaderListenerEx, mask: DDS.StatusMask) DDS.ReturnCode_t {
+        if (!self.quiesce.acquire()) return DDS.RETCODE_ALREADY_DELETED;
         defer self.quiesce.release(self, reallyDeinit);
         self.swapListenerEx(listener_ex, mask);
+        return DDS.RETCODE_OK;
     }
 
     fn swapListenerEx(self: *Self, new_listener_ex: ZZDDS.DataReaderListenerEx, mask: DDS.StatusMask) void {

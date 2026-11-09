@@ -1607,7 +1607,7 @@ test "a reliable-ready event reaches the reader's extension listener as a listen
     try pair.init(&m.runtime, .RELIABLE_RELIABILITY_QOS, null);
     m.runtime.releaseOwner();
     var rr: Recorder = .{ .lane = &pair.dr.listeners.ctx };
-    pair.dr.setListenerEx(.{ .listener_data = &rr, .on_reliable_writer_ready = Recorder.onWriterReady }, 0);
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dr.setListenerEx(.{ .listener_data = &rr, .on_reliable_writer_ready = Recorder.onWriterReady }, 0));
 
     var drives: usize = 0;
     while (!rr.writer_ready and drives < 20) : (drives += 1) {
