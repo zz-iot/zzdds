@@ -12,7 +12,7 @@
 #   direction - "pub" (zzdds publishes, the vendor subscribes) or "sub"
 #   tests     - dds-rtps test names
 #   lanes     - optional: the CI lanes it applies to ("normal", "tsan",
-#               "debug-allocator"); without it, every lane
+#               "debug-allocator", "shared-runtime"); without it, every lane
 #   reason    - why, with a pointer to where it is tracked
 
 [[known_failure]]
