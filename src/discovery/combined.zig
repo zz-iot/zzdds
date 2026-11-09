@@ -321,13 +321,14 @@ pub const SpdpSedpDiscovery = struct {
         }
         // The participant stops only what started.
         errdefer self.stopParts();
-        // SEDP must be started first so its metatraffic unicast listen is active
-        // before SPDP fires its initial announcement and the remote peer begins
-        // sending SEDP traffic. WLP follows the same requirement for the same
-        // reason (its own metatraffic unicast listener must be up before any
-        // peer's WLP writer starts sending ParticipantMessageData).
-        try self.sedp.start(local, cbs);
+        // WLP has no listener of its own: it receives through SEDP's, which
+        // hands it what SEDP's endpoints do not take, from the moment SEDP
+        // listens (on the runtime, in a runtime context as that happens). So
+        // its endpoints exist first. SEDP then listens before SPDP fires its
+        // initial announcement and remote peers begin sending SEDP and WLP
+        // traffic.
         try self.wlp.start(local, cbs);
+        try self.sedp.start(local, cbs);
 
         // SPDP deliberately never "discovers" this participant itself (see
         // spdp.zig's processSpdpPayload "ignore our own announcements" check --
