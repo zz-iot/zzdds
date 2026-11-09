@@ -559,10 +559,17 @@ jobs:
   # not attempted here rather than assumed to work. This job covers what it
   # covers; extending it further is a stretch goal, not something this
   # comment claims is done.
-
+  #
+  # As with `examples`, it all also runs on a -Dshared-runtime build, where
+  # every participant runs on the shared runtime: there the races TSan looks
+  # for are between application threads and the runtime's own threads.
   examples-tsan:
-    name: examples (TSAN)
+    name: examples (TSAN${{ matrix.runtime == 'shared' && ', shared runtime' || '' }})
     needs: test-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [threaded, shared]
     runs-on: ubuntu-latest
     # Was 20 for 3 examples (zig/c/cpp waitset); now 8 examples (+shape,
     # +custom-allocator in both C and C++) -- more builds and more runs,
@@ -599,11 +606,13 @@ jobs:
         run: sudo sysctl -w vm.mmap_rnd_bits=28
 
       - name: Build zzdds (C + C++ bindings, ThreadSanitizer)
-        run: zig build -Dc-binding=true -Dcpp-binding=true -Dsanitize-thread=true install
+        run: zig build -Dc-binding=true -Dcpp-binding=true -Dsanitize-thread=true -Dshared-runtime=${{ matrix.runtime == 'shared' }} install
 
+      # The Zig examples build their own zzdds, so they take -Dshared-runtime
+      # themselves; the C and C++ ones link the zig-out build above.
       - name: Build zig/waitset (ThreadSanitizer)
         working-directory: examples/zig/waitset
-        run: zig build -Dsanitize-thread=true
+        run: zig build -Dsanitize-thread=true -Dshared-runtime=${{ matrix.runtime == 'shared' }}
 
       # Two distinct bugs were found and fixed here, both confirmed via
       # standalone local repro (not just code review):
@@ -664,7 +673,7 @@ jobs:
 
       - name: Build zig/shape (ThreadSanitizer)
         working-directory: examples/zig/shape
-        run: zig build -Dsanitize-thread=true
+        run: zig build -Dsanitize-thread=true -Dshared-runtime=${{ matrix.runtime == 'shared' }}
 
       - name: Build cpp/shape (ThreadSanitizer)
         run: |

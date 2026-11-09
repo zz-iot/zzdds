@@ -10,6 +10,8 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-05
 
+- CI runs the ThreadSanitizer examples (waitset, shape and custom-allocator) on a
+  `-Dshared-runtime` build too.
 - Update zidl to 0.3.27 and enable its retirement query for C++ and Java bindings.
   Late callbacks cannot recreate wrappers for deleted entities, including when a
   callback first exports its native handle after deletion.
