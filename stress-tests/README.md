@@ -149,6 +149,9 @@ The job also runs all of that on a `-Dshared-runtime` build. To do the same loca
 `ZZDDS_SHARED_RUNTIME=1`, which makes each `run.py` build its app with that option. Set
 `ZZDDS_TEST_LOG_STUCK_STACKS=1` to log the stacks of a process that outlives its timeout.
 
+Job `stress-other` runs the same `run_all.py --strict` suite on Linux ARM64 and macOS ARM64,
+on both builds, without the ThreadSanitizer steps.
+
 ## Findings
 
 ### `lifecycle_churn --scenario entities` — UAF in the discovery-driven listener dispatch (found + fixed 2026-08-29)
