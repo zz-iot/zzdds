@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -31,6 +32,7 @@ const NIL_IH: history_mod.InstanceHandle = history_mod.INSTANCE_HANDLE_NIL;
 
 const Fixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
 
     t_w: *zzdds.intraprocess.MemoryTransport,
@@ -48,6 +50,10 @@ const Fixture = struct {
     topic_r: DDS.Topic,
 
     fn init(alloc: std.mem.Allocator) !Fixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
 
@@ -88,6 +94,7 @@ const Fixture = struct {
         const topic_r = dp_r.create_topic("ILTopic", "ILType", .{}, null, 0);
 
         return .{
+            .mr = mr,
             .alloc = alloc,
             .delivery = delivery,
             .t_w = t_w,
@@ -108,6 +115,7 @@ const Fixture = struct {
     fn deinit(self: *Fixture) void {
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_w.deinit();
         self.factory_r.deinit();
         self.d_w.deinit();
@@ -115,6 +123,13 @@ const Fixture = struct {
         self.t_w.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *Fixture) void {
+        self.mr.settle();
     }
 
     fn makeWriterReader(
@@ -125,6 +140,8 @@ const Fixture = struct {
         const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
         const dr_raw = self.sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
         const dw_raw = self.pub_w.create_datawriter(self.topic_w, dw_qos, null, 0);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return .{
             .dw = @ptrCast(@alignCast(dw_raw.ptr)),
             .dr = @ptrCast(@alignCast(dr_raw.ptr)),
@@ -149,6 +166,7 @@ test "sample_info: first alive sample has NEW_VIEW, ALIVE, NOT_READ, valid_data"
 
     const pair = fx.makeWriterReader(.{}, .{});
     try writeAlive(pair.dw);
+    fx.settle();
 
     const s = try takeOne(pair.dr);
     defer alloc.free(s.data);
@@ -172,6 +190,7 @@ test "sample_info: second alive sample has NOT_NEW_VIEW" {
     const pair = fx.makeWriterReader(.{}, dr_qos);
     try writeAlive(pair.dw);
     try writeAlive(pair.dw);
+    fx.settle();
 
     const s1 = try takeOne(pair.dr);
     defer alloc.free(s1.data);
@@ -195,11 +214,13 @@ test "sample_info: dispose delivers NOT_ALIVE_DISPOSED, valid_data=false" {
     const pair = fx.makeWriterReader(.{}, .{});
     // Establish the instance.
     try writeAlive(pair.dw);
+    fx.settle();
     const alive = try takeOne(pair.dr);
     defer alloc.free(alive.data);
 
     // Dispose the instance.
     try pair.dw.disposeRaw(RtpsTimestamp.now(), NIL_IH, NIL_KEY);
+    fx.settle();
 
     const disposed = try takeOne(pair.dr);
     defer alloc.free(disposed.data);
@@ -218,14 +239,17 @@ test "sample_info: alive after dispose gets NEW_VIEW (resurrection)" {
 
     const pair = fx.makeWriterReader(.{}, .{});
     try writeAlive(pair.dw);
+    fx.settle();
     const s1 = try takeOne(pair.dr);
     defer alloc.free(s1.data);
     try pair.dw.disposeRaw(RtpsTimestamp.now(), NIL_IH, NIL_KEY);
+    fx.settle();
     const disposed = try takeOne(pair.dr);
     defer alloc.free(disposed.data);
 
     // Write again — instance resurrects, view_state resets to NEW_VIEW.
     try writeAlive(pair.dw);
+    fx.settle();
     const resurrected = try takeOne(pair.dr);
     defer alloc.free(resurrected.data);
 
@@ -245,10 +269,12 @@ test "sample_info: unregister (autodispose=false) delivers NOT_ALIVE_NO_WRITERS"
     const pair = fx.makeWriterReader(dw_qos, .{});
 
     try writeAlive(pair.dw);
+    fx.settle();
     const alive = try takeOne(pair.dr);
     defer alloc.free(alive.data);
 
     try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_IH, NIL_KEY);
+    fx.settle();
 
     const unreg = try takeOne(pair.dr);
     defer alloc.free(unreg.data);
@@ -268,10 +294,12 @@ test "sample_info: unregister (autodispose=true) delivers NOT_ALIVE_DISPOSED" {
     const pair = fx.makeWriterReader(dw_qos, .{});
 
     try writeAlive(pair.dw);
+    fx.settle();
     const alive = try takeOne(pair.dr);
     defer alloc.free(alive.data);
 
     try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_IH, NIL_KEY);
+    fx.settle();
 
     const unreg = try takeOne(pair.dr);
     defer alloc.free(unreg.data);
@@ -288,6 +316,7 @@ test "sample_info: source_timestamp is propagated from writer" {
     const pair = fx.makeWriterReader(.{}, .{});
     const ts = RtpsTimestamp{ .seconds = 1_700_000_000, .fraction = 0 };
     _ = try pair.dw.writeRaw(.alive, ts, NIL_IH, NIL_KEY, &PAYLOAD);
+    fx.settle();
 
     const s = try takeOne(pair.dr);
     defer alloc.free(s.data);
@@ -374,6 +403,7 @@ test "keyless topic: varying-content alive samples are one instance, delivered i
     _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &payload1);
     _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &payload2);
     _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &payload3);
+    fx.settle();
 
     // Delivered in write order, via the listener, not by polling.
     try testing.expectEqualSlices(u8, &.{ 0x10, 0x20, 0x30 }, state.payloads.items);

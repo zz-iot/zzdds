@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -57,6 +58,7 @@ fn countingListener(counts: *Counts) DDS.DataReaderListener {
 
 const SingleFixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
     t: *zzdds.intraprocess.MemoryTransport,
     d: *zzdds.intraprocess.DirectDiscovery,
@@ -66,6 +68,10 @@ const SingleFixture = struct {
     topic: DDS.Topic,
 
     fn init(alloc: std.mem.Allocator) !SingleFixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
         const t = try delivery.newTransport();
@@ -77,25 +83,39 @@ const SingleFixture = struct {
         const dp = factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const sub = dp.create_subscriber(.{}, null, 0);
         const topic = dp.create_topic("RdrVtTopic", "RdrVtType", .{}, null, 0);
-        return .{ .alloc = alloc, .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp, .sub = sub, .topic = topic };
+        return .{ .mr = mr, .alloc = alloc, .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp, .sub = sub, .topic = topic };
     }
 
     fn deinit(self: *SingleFixture) void {
         _ = self.factory.toDDSFactory().delete_participant(self.dp);
+        self.mr.settle();
         self.factory.deinit();
         self.d.deinit();
         self.t.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *SingleFixture) void {
+        self.mr.settle();
     }
 
     fn makeReader(self: *SingleFixture, listener: ?DDS.DataReaderListener, mask: DDS.StatusMask) DDS.DataReader {
         const td = @as(*TopicImpl, @ptrCast(@alignCast(self.topic.ptr))).toTopicDescription();
-        return self.sub.create_datareader(td, .{}, listener, mask);
+        const entity = self.sub.create_datareader(td, .{}, listener, mask);
+        // Matching runs on the runtime too.
+        self.mr.settle();
+        return entity;
     }
 
     fn makeReaderQos(self: *SingleFixture, qos: DDS.DataReaderQos, listener: ?DDS.DataReaderListener, mask: DDS.StatusMask) DDS.DataReader {
         const td = @as(*TopicImpl, @ptrCast(@alignCast(self.topic.ptr))).toTopicDescription();
-        return self.sub.create_datareader(td, qos, listener, mask);
+        const entity = self.sub.create_datareader(td, qos, listener, mask);
+        // Matching runs on the runtime too.
+        self.mr.settle();
+        return entity;
     }
 };
 
@@ -103,6 +123,7 @@ const SingleFixture = struct {
 
 const TwoPartyFixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
 
     t_w: *zzdds.intraprocess.MemoryTransport,
@@ -120,6 +141,10 @@ const TwoPartyFixture = struct {
     topic_r: DDS.Topic,
 
     fn init(alloc: std.mem.Allocator) !TwoPartyFixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
         const t_w = try delivery.newTransport();
@@ -142,6 +167,7 @@ const TwoPartyFixture = struct {
         const sub_r = dp_r.create_subscriber(.{}, null, 0);
         const topic_r = dp_r.create_topic("RdrPubTopic", "RdrPubType", .{}, null, 0);
         return .{
+            .mr = mr,
             .alloc = alloc,
             .delivery = delivery,
             .t_w = t_w,
@@ -162,6 +188,7 @@ const TwoPartyFixture = struct {
     fn deinit(self: *TwoPartyFixture) void {
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_w.deinit();
         self.factory_r.deinit();
         self.d_w.deinit();
@@ -169,6 +196,13 @@ const TwoPartyFixture = struct {
         self.t_w.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *TwoPartyFixture) void {
+        self.mr.settle();
     }
 };
 
@@ -501,6 +535,7 @@ test "DataReader: notifyIncompatibleQos fires listener when mask set" {
     const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
 
     DataReaderImpl.notifyIncompatibleQos(dr, 7);
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), counts.incompat);
 }
 
@@ -515,6 +550,7 @@ test "DataReader: a match fires on_subscription_matched when mask set" {
     const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
 
     dr.recordSubscriptionMatched(42, true);
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), counts.sub_matched);
 }
 
@@ -529,6 +565,7 @@ test "DataReader: notifySampleLost fires listener when mask set" {
     const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
 
     dr.notifySampleLost(3);
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), counts.sample_lost);
 }
 
@@ -543,6 +580,7 @@ test "DataReader: notifyDeadlineMissed fires listener when mask set" {
     const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
 
     dr.notifyDeadlineMissed();
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), counts.deadline);
 }
 
@@ -868,6 +906,8 @@ test "return_loan_raw: releasing the last quiesce ref doesn't touch self afterwa
     const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
     const sub_impl: *zzdds.dcps.SubscriberImpl = @ptrCast(@alignCast(fx.sub.ptr));
     dr.pushCdr(&[_]u8{ 0x00, 0x01, 0x00, 0x00, 0x01 });
+    // The data-available notice it queued holds a pin until it runs.
+    fx.settle();
 
     // Baseline is 3, not 1: on_reliable_writer_ready's registration
     // (subscriber.zig's create_datareader) and the data callback's

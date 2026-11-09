@@ -1,9 +1,11 @@
 //! Phase 32 read/take semantics tests: readRaw(), takeFiltered(), state masks.
 //!
-//! Uses IntraProcessDelivery (synchronous, no pump) for deterministic delivery.
+//! Uses IntraProcessDelivery for deterministic delivery: synchronous on the
+//! default build, and on a manual runtime the tests settle on the runtime.
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -28,6 +30,8 @@ const NIL_IH: history_mod.InstanceHandle = history_mod.INSTANCE_HANDLE_NIL;
 
 const Fixture = struct {
     alloc: std.mem.Allocator,
+    /// Heap-allocated: it must not move, and the fixture is returned by value.
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
 
     t_w: *zzdds.intraprocess.MemoryTransport,
@@ -45,6 +49,10 @@ const Fixture = struct {
     topic_r: DDS.Topic,
 
     fn init(alloc: std.mem.Allocator) !Fixture {
+        const mr = try alloc.create(ManualRuntime);
+        errdefer alloc.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
 
@@ -86,6 +94,7 @@ const Fixture = struct {
 
         return .{
             .alloc = alloc,
+            .mr = mr,
             .delivery = delivery,
             .t_w = t_w,
             .d_w = d_w,
@@ -105,6 +114,7 @@ const Fixture = struct {
     fn deinit(self: *Fixture) void {
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_w.deinit();
         self.factory_r.deinit();
         self.d_w.deinit();
@@ -112,6 +122,13 @@ const Fixture = struct {
         self.t_w.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        self.alloc.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *Fixture) void {
+        self.mr.settle();
     }
 
     fn makeWriterReader(
@@ -122,6 +139,8 @@ const Fixture = struct {
         const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
         const dr_raw = self.sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
         const dw_raw = self.pub_w.create_datawriter(self.topic_w, dw_qos, null, 0);
+        // Matching runs on the runtime too.
+        self.settle();
         return .{
             .dw = @ptrCast(@alignCast(dw_raw.ptr)),
             .dr = @ptrCast(@alignCast(dr_raw.ptr)),
@@ -146,6 +165,7 @@ test "read: non-destructive, sample remains in queue for subsequent take" {
     defer fx.deinit();
     const pair = fx.makeWriterReader(.{}, .{});
     try writeAlive(pair.dw);
+    fx.settle();
 
     var out1: std.ArrayListUnmanaged(TakenSample) = .empty;
     defer freeOut(alloc, &out1);
@@ -164,6 +184,7 @@ test "read: marks sample as READ_SAMPLE_STATE in queue" {
     defer fx.deinit();
     const pair = fx.makeWriterReader(.{}, .{});
     try writeAlive(pair.dw);
+    fx.settle();
 
     // First read: sample is NOT_READ; clone reflects that.
     var out1: std.ArrayListUnmanaged(TakenSample) = .empty;
@@ -195,6 +216,7 @@ test "takeFiltered: removes only NOT_READ samples when filter applied" {
     const pair = fx.makeWriterReader(.{}, dr_qos);
     try writeAlive(pair.dw);
     try writeAlive(pair.dw);
+    fx.settle();
 
     // Read first sample (marks it READ, leaves both in queue).
     var read_out: std.ArrayListUnmanaged(TakenSample) = .empty;
@@ -227,6 +249,7 @@ test "takeFiltered: max_samples limits how many are removed" {
     try writeAlive(pair.dw);
     try writeAlive(pair.dw);
     try writeAlive(pair.dw);
+    fx.settle();
 
     var out: std.ArrayListUnmanaged(TakenSample) = .empty;
     defer freeOut(alloc, &out);
@@ -250,6 +273,7 @@ test "takeFiltered: view_state mask selects NEW_VIEW only" {
     // Two samples: first has NEW_VIEW, second has NOT_NEW_VIEW.
     try writeAlive(pair.dw);
     try writeAlive(pair.dw);
+    fx.settle();
 
     var out: std.ArrayListUnmanaged(TakenSample) = .empty;
     defer freeOut(alloc, &out);
@@ -272,6 +296,7 @@ test "takeFiltered: instance_state mask selects ALIVE only" {
     const pair = fx.makeWriterReader(.{}, dr_qos);
 
     try writeAlive(pair.dw);
+    fx.settle();
     // Drain the alive sample first so queue is at a known state, then dispose.
     const alive = pair.dr.takeRaw() orelse return error.NoSample;
     defer alloc.free(alive.data);
@@ -279,6 +304,7 @@ test "takeFiltered: instance_state mask selects ALIVE only" {
     // Write alive, dispose — queue has alive + disposed.
     try writeAlive(pair.dw);
     try pair.dw.disposeRaw(RtpsTimestamp.now(), NIL_IH, NIL_KEY);
+    fx.settle();
 
     // takeFiltered with ALIVE only.
     var out: std.ArrayListUnmanaged(TakenSample) = .empty;
@@ -304,6 +330,7 @@ test "readRaw: ANY masks returns all samples" {
     const pair = fx.makeWriterReader(.{}, dr_qos);
     try writeAlive(pair.dw);
     try writeAlive(pair.dw);
+    fx.settle();
 
     var out: std.ArrayListUnmanaged(TakenSample) = .empty;
     defer freeOut(alloc, &out);
@@ -337,6 +364,7 @@ test "readNextInstanceRaw: returns one sample from the first instance" {
     const pair = fx.makeWriterReader(.{}, .{});
 
     _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
+    fx.settle();
 
     const s = pair.dr.readNextInstanceRaw(0);
     try testing.expect(s != null);
@@ -361,6 +389,7 @@ test "readNextInstanceRaw: iterates instances in handle order" {
 
     _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
     _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_B, &PAYLOAD);
+    fx.settle();
 
     const ih_a = DataWriterImpl.registerInstanceRaw(KEY_A);
     const ih_b = DataWriterImpl.registerInstanceRaw(KEY_B);
@@ -389,6 +418,7 @@ test "getKeyValueRaw (reader): returns CDR payload for known alive instance" {
     const pair = fx.makeWriterReader(.{}, .{});
 
     _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
+    fx.settle();
 
     const ih = DataWriterImpl.registerInstanceRaw(KEY_A);
     const kv = pair.dr.getKeyValueRaw(ih);
@@ -415,6 +445,7 @@ test "lookupInstance: true for alive instance, false for unknown" {
     const pair = fx.makeWriterReader(.{}, .{});
 
     _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
+    fx.settle();
 
     const ih_a = DataWriterImpl.registerInstanceRaw(KEY_A);
     try testing.expect(pair.dr.lookupInstance(ih_a));
@@ -430,6 +461,7 @@ test "getKeyValueRaw (writer): returns CDR payload after alive write" {
     const pair = fx.makeWriterReader(.{}, .{});
 
     _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
+    fx.settle();
 
     const ih = DataWriterImpl.registerInstanceRaw(KEY_A);
     const kv = pair.dw.getKeyValueRaw(ih);
@@ -492,6 +524,7 @@ test "takeWithReadConditionRaw: plain ReadCondition applies its own state masks"
     const pair = fx.makeWriterReader(.{}, dr_qos);
     try writeAlive(pair.dw);
     try writeAlive(pair.dw);
+    fx.settle();
 
     const dr = pair.dr.toDDSDataReader();
     // Mark the first sample READ, leaving both in queue (mirrors the
@@ -529,6 +562,7 @@ test "takeWithReadConditionRaw: QueryCondition (owner_qc) applies its query filt
     const pair = fx.makeWriterReader(.{}, dr_qos);
     try writeTagged(pair.dw, KEY_A, 1);
     try writeTagged(pair.dw, KEY_B, 2);
+    fx.settle();
 
     const dr = pair.dr.toDDSDataReader();
     var params = [_][*:0]const u8{"2"};
@@ -556,6 +590,7 @@ test "readWithReadConditionRaw: non-destructive, matching sample remains for a l
     defer fx.deinit();
     const pair = fx.makeWriterReader(.{}, .{});
     try writeAlive(pair.dw);
+    fx.settle();
 
     const dr = pair.dr.toDDSDataReader();
     const rc = dr.create_readcondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
@@ -592,6 +627,7 @@ test "takeNextInstanceWithReadConditionRaw: instance selection skips a non-match
     // instance whose only sample doesn't match the condition's own mask.
     _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
     _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_B, &PAYLOAD);
+    fx.settle();
     const ih_a = DataWriterImpl.registerInstanceRaw(KEY_A);
     const ih_b = DataWriterImpl.registerInstanceRaw(KEY_B);
     const first_ih = @min(ih_a, ih_b);
@@ -623,6 +659,7 @@ test "readNextInstanceWithReadConditionRaw: non-destructive, sample remains for 
     defer fx.deinit();
     const pair = fx.makeWriterReader(.{}, .{});
     _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
+    fx.settle();
 
     const dr = pair.dr.toDDSDataReader();
     const rc = dr.create_readcondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
@@ -636,4 +673,50 @@ test "readNextInstanceWithReadConditionRaw: non-destructive, sample remains for 
     const taken = pair.dr.takeNextInstanceRaw(0) orelse return error.NoSample;
     defer alloc.free(taken.data);
     try testing.expectEqual(DDS.READ_SAMPLE_STATE, taken.info.sample_state);
+}
+
+// takeWithQueryConditionRaw on a plain (non-filtered) topic: the reader-side
+// take_w_condition path applies the query independently of a
+// ContentFilteredTopic.
+test "takeWithQueryConditionRaw: only samples matching the QueryCondition's expression are returned" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    try testing.expect(zzdds.registerTypeSupport(fx.dp_r, "RTType", .{
+        .ctx = undefined,
+        .compute_key_hash = TagField.computeKeyHash,
+        .get_field = TagField.get,
+    }));
+    // KEEP_ALL on both sides: the writes share one key.
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(dw_qos, dr_qos);
+    const dr = pair.dr.toDDSDataReader();
+
+    const qc = dr.create_querycondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, "tag = 5", null);
+    try testing.expect(qc.ptr != nil.NIL_PTR);
+    defer _ = dr.delete_readcondition(qc.vtable.as_ReadCondition(qc.ptr));
+
+    try writeTagged(pair.dw, NIL_KEY, 5);
+    try writeTagged(pair.dw, NIL_KEY, 6);
+    fx.settle();
+
+    // An unconditioned take sees both: the query applies only through the
+    // condition, not at delivery (that's a ContentFilteredTopic's job).
+    var all: std.ArrayListUnmanaged(zzdds.OwnedRawSample) = .empty;
+    defer freeOwned(alloc, &all);
+    try zzdds.takeFilteredRaw(dr, &all, -1, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, null, alloc);
+    try testing.expectEqual(@as(usize, 2), all.items.len);
+
+    try writeTagged(pair.dw, NIL_KEY, 5);
+    try writeTagged(pair.dw, NIL_KEY, 6);
+    fx.settle();
+
+    var filtered: std.ArrayListUnmanaged(zzdds.OwnedRawSample) = .empty;
+    defer freeOwned(alloc, &filtered);
+    try zzdds.takeWithQueryConditionRaw(dr, qc, &filtered, -1, alloc);
+    try testing.expectEqual(@as(usize, 1), filtered.items.len);
+    try testing.expectEqual(@as(u8, 5), filtered.items[0].data[filtered.items[0].data.len - 1]);
 }

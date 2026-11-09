@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const testing = std.testing;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
@@ -257,6 +258,7 @@ const Msg = struct {
 /// sides are matched before any inject() call.
 const Fixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
 
     // Writer side (provides the GUID for isWriterMatched checks).
@@ -279,6 +281,10 @@ const Fixture = struct {
     injector: *MemoryTransport,
 
     fn init(alloc: std.mem.Allocator) !Fixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
 
@@ -307,6 +313,7 @@ const Fixture = struct {
         errdefer injector.deinit();
 
         return .{
+            .mr = mr,
             .alloc = alloc,
             .delivery = delivery,
             .t_w = t_w,
@@ -328,6 +335,7 @@ const Fixture = struct {
     fn deinit(self: *Fixture) void {
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
+        self.mr.settle();
         self.factory_r.deinit();
         self.d_r.deinit();
         self.t_r.deinit();
@@ -336,6 +344,13 @@ const Fixture = struct {
         self.t_w.deinit();
         self.injector.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *Fixture) void {
+        self.mr.settle();
     }
 
     /// Create a DataWriter on the writer side for a given topic (used only to trigger
@@ -344,6 +359,8 @@ const Fixture = struct {
         const pub_w = self.dp_w.create_publisher(.{}, null, 0);
         const topic_w = self.dp_w.create_topic("RouteTopic", "RouteType", .{}, null, 0);
         const dw = pub_w.create_datawriter(topic_w, .{}, null, 0);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return @as(*DataWriterImpl, @ptrCast(@alignCast(dw.ptr)));
     }
 
@@ -353,6 +370,8 @@ const Fixture = struct {
         var qos = DDS.DataReaderQos{};
         qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
         const dr = self.sub_r.create_datareader(td, qos, null, 0);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return @as(*DataReaderImpl, @ptrCast(@alignCast(dr.ptr)));
     }
 
@@ -361,6 +380,7 @@ const Fixture = struct {
         const port = self.dp_r_impl.data_listen_port;
         const dest = Locator.udp4(.{ 0, 0, 0, 0 }, port);
         try self.injector.transport().send(&dest, raw);
+        self.settle();
     }
 
     fn pendingCount(dr: *DataReaderImpl) usize {
@@ -403,6 +423,7 @@ const Fixture = struct {
         const port = self.dp_w_impl.data_listen_port;
         const dest = Locator.udp4(.{ 0, 0, 0, 0 }, port);
         try self.injector.transport().send(&dest, raw);
+        self.settle();
     }
 };
 

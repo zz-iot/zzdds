@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const testing = std.testing;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
@@ -74,6 +75,7 @@ const DirectDiscovery = zzdds.intraprocess.DirectDiscovery;
 
 const Fixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
 
     t_a: *MemoryTransport,
@@ -98,6 +100,10 @@ const Fixture = struct {
     topic_r: DDS.Topic,
 
     fn init(alloc: std.mem.Allocator) !Fixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
 
@@ -153,6 +159,7 @@ const Fixture = struct {
         const topic_r = dp_r.create_topic("TSTopic", "TSType", .{}, null, 0);
 
         return .{
+            .mr = mr,
             .alloc = alloc,
             .delivery = delivery,
             .t_a = t_a,
@@ -180,6 +187,7 @@ const Fixture = struct {
         _ = self.factory_a.toDDSFactory().delete_participant(self.dp_a);
         _ = self.factory_b.toDDSFactory().delete_participant(self.dp_b);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_a.deinit();
         self.d_a.deinit();
         self.t_a.deinit();
@@ -190,6 +198,13 @@ const Fixture = struct {
         self.d_r.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *Fixture) void {
+        self.mr.settle();
     }
 
     fn dpImpl(self: *const Fixture, dp: DDS.DomainParticipant) *DomainParticipantImpl {
@@ -199,17 +214,23 @@ const Fixture = struct {
 
     fn makeWriterA(self: *Fixture, qos: DDS.DataWriterQos) *DataWriterImpl {
         const dw = self.pub_a.create_datawriter(self.topic_a, qos, null, 0);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return @ptrCast(@alignCast(dw.ptr));
     }
 
     fn makeWriterB(self: *Fixture, qos: DDS.DataWriterQos) *DataWriterImpl {
         const dw = self.pub_b.create_datawriter(self.topic_b, qos, null, 0);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return @ptrCast(@alignCast(dw.ptr));
     }
 
     fn makeReader(self: *Fixture, qos: DDS.DataReaderQos) *DataReaderImpl {
         const td = @as(*zzdds.dcps.TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
         const dr = self.sub_r.create_datareader(td, qos, null, 0);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return @ptrCast(@alignCast(dr.ptr));
     }
 };
@@ -316,6 +337,7 @@ test "TypeSupport: without TypeSupport, nil-key instances collapse and EXCLUSIVE
 
     try writeNilKey(dw_a, &PAYLOAD_A);
     try writeNilKey(dw_b, &PAYLOAD_B);
+    fx.settle();
 
     try testing.expectEqual(@as(usize, 1), pendingCount(dr));
     dr.mu.lock();
@@ -340,6 +362,7 @@ test "TypeSupport: with TypeSupport, EXCLUSIVE ownership is per-instance (Owners
 
     try writeNilKey(dw_a, &PAYLOAD_A); // instance key 0xAA
     try writeNilKey(dw_b, &PAYLOAD_B); // instance key 0xBB — different instance
+    fx.settle();
 
     try testing.expectEqual(@as(usize, 2), pendingCount(dr));
 }
@@ -364,6 +387,7 @@ test "TypeSupport: non-nil inline key_hash takes precedence over TypeSupport" {
     kh_bb[0] = 0xBB;
     _ = try dw_a.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, kh_bb, &PAYLOAD_A);
     try writeNilKey(dw_b, &PAYLOAD_B); // TypeSupport → 0xAA
+    fx.settle();
 
     // 0xBB (A, from inline) ≠ 0xAA (B, from TypeSupport) → two instances.
     try testing.expectEqual(@as(usize, 2), pendingCount(dr));
@@ -400,6 +424,7 @@ test "TypeSupport: has_key writer sends inline PID_KEY_HASH for a zero-valued ke
 
     try writeNilKey(dw_a, &PAYLOAD_A); // payload[4] = 0xAA — ignored
     try writeNilKey(dw_b, &PAYLOAD_B); // payload[4] = 0xBB — ignored
+    fx.settle();
 
     // Both carry an inline all-zero key hash → same instance → both retained
     // (KEEP_ALL) under one instance handle.
@@ -427,6 +452,7 @@ test "TypeSupport: without has_key, a zero-valued key still falls back to key_ha
 
     try writeNilKey(dw_a, &PAYLOAD_A);
     try writeNilKey(dw_b, &PAYLOAD_B);
+    fx.settle();
 
     try testing.expectEqual(@as(usize, 2), pendingCount(dr));
     dr.mu.lock();
@@ -473,6 +499,7 @@ test "TypeSupport: resolveKeyHash calls compute_key_hash for ALIVE, compute_key_
     try writeNilKeyKind(dw_a, .alive, &PAYLOAD_A);
     try writeNilKeyKind(dw_a, .not_alive_disposed, &PAYLOAD_A);
     try writeNilKeyKind(dw_a, .not_alive_unregistered, &PAYLOAD_A);
+    fx.settle();
 
     try testing.expectEqual(@as(usize, 3), pendingCount(dr));
     dr.mu.lock();
@@ -515,6 +542,7 @@ test "TypeSupport: DISPOSE/UNREGISTER falls back to zero hash, not compute_key_h
     try writeNilKeyKind(dw_a, .not_alive_disposed, &PAYLOAD_A);
     try writeNilKeyKind(dw_a, .not_alive_disposed, &PAYLOAD_B);
     try writeNilKeyKind(dw_a, .alive, &PAYLOAD_A);
+    fx.settle();
 
     try testing.expectEqual(@as(usize, 3), pendingCount(dr));
     dr.mu.lock();

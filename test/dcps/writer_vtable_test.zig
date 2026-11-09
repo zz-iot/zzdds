@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -64,6 +65,7 @@ fn countingWriter(counts: *Counts) DDS.DataWriterListener {
 
 const SingleFixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
     t: *zzdds.intraprocess.MemoryTransport,
     d: *zzdds.intraprocess.DirectDiscovery,
@@ -73,6 +75,10 @@ const SingleFixture = struct {
     topic: DDS.Topic,
 
     fn init(a: std.mem.Allocator) !SingleFixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(a);
         errdefer delivery.deinit();
         const t = try delivery.newTransport();
@@ -92,6 +98,7 @@ const SingleFixture = struct {
         const pub_ = dp.create_publisher(.{}, null, 0);
         const topic = dp.create_topic("WriterTopic", "WriterType", .{}, null, 0);
         return .{
+            .mr = mr,
             .alloc = a,
             .delivery = delivery,
             .t = t,
@@ -105,14 +112,25 @@ const SingleFixture = struct {
 
     fn deinit(self: *SingleFixture) void {
         _ = self.factory.toDDSFactory().delete_participant(self.dp);
+        self.mr.settle();
         self.factory.deinit();
         self.d.deinit();
         self.t.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *SingleFixture) void {
+        self.mr.settle();
     }
 
     fn makeWriter(self: *SingleFixture, qos: DDS.DataWriterQos, listener: ?DDS.DataWriterListener, mask: DDS.StatusMask) DDS.DataWriter {
-        return self.pub_.create_datawriter(self.topic, qos, listener, mask);
+        const entity = self.pub_.create_datawriter(self.topic, qos, listener, mask);
+        // Matching runs on the runtime too.
+        self.mr.settle();
+        return entity;
     }
 };
 
@@ -120,6 +138,7 @@ const SingleFixture = struct {
 
 const TwoPartyFixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
     t_w: *zzdds.intraprocess.MemoryTransport,
     d_w: *zzdds.intraprocess.DirectDiscovery,
@@ -136,6 +155,10 @@ const TwoPartyFixture = struct {
     topic_r: DDS.Topic,
 
     fn init(a: std.mem.Allocator) !TwoPartyFixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(a);
         errdefer delivery.deinit();
 
@@ -174,6 +197,7 @@ const TwoPartyFixture = struct {
         const topic_r = dp_r.create_topic("WVTopic", "WVType", .{}, null, 0);
 
         return .{
+            .mr = mr,
             .alloc = a,
             .delivery = delivery,
             .t_w = t_w,
@@ -194,6 +218,7 @@ const TwoPartyFixture = struct {
     fn deinit(self: *TwoPartyFixture) void {
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_w.deinit();
         self.factory_r.deinit();
         self.d_w.deinit();
@@ -201,19 +226,32 @@ const TwoPartyFixture = struct {
         self.t_w.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *TwoPartyFixture) void {
+        self.mr.settle();
     }
 
     fn makeWriter(self: *TwoPartyFixture, qos: DDS.DataWriterQos) DDS.DataWriter {
-        return self.pub_.create_datawriter(self.topic_w, qos, null, 0);
+        const entity = self.pub_.create_datawriter(self.topic_w, qos, null, 0);
+        // Matching runs on the runtime too.
+        self.mr.settle();
+        return entity;
     }
 
     fn makeReader(self: *TwoPartyFixture, qos: DDS.DataReaderQos) DDS.DataReader {
-        return self.sub_.create_datareader(
+        const entity = self.sub_.create_datareader(
             topicDesc(self.topic_r),
             qos,
             null,
             0,
         );
+        // Matching runs on the runtime too.
+        self.mr.settle();
+        return entity;
     }
 };
 
@@ -424,6 +462,7 @@ test "a match fires on_publication_matched and leaves status_changes clear" {
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
     @as(*DataWriterImpl, @ptrCast(@alignCast(dw.ptr))).recordPublicationMatched(42, true);
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), counts.pub_matched);
     // Listener clears the change on fire; status_changes should be clear too.
     try testing.expectEqual(@as(DDS.StatusMask, 0), dw.vtable.get_status_changes(dw.ptr));
@@ -459,6 +498,7 @@ test "notifyIncompatibleQos: fires listener and clears status" {
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
     DataWriterImpl.notifyIncompatibleQos(dw.ptr, 11);
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), counts.incompat);
     try testing.expectEqual(@as(DDS.StatusMask, 0), dw.vtable.get_status_changes(dw.ptr));
 }
@@ -492,6 +532,7 @@ test "notifyDeadlineMissed: fires listener and clears status" {
 
     const impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
     impl.notifyDeadlineMissed();
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), counts.deadline);
     try testing.expectEqual(@as(DDS.StatusMask, 0), dw.vtable.get_status_changes(dw.ptr));
 }
@@ -524,6 +565,7 @@ test "notifyLivelinessLost: fires listener and clears status" {
 
     const impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
     impl.notifyLivelinessLost();
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), counts.liveliness_lost);
     try testing.expectEqual(@as(DDS.StatusMask, 0), dw.vtable.get_status_changes(dw.ptr));
 }

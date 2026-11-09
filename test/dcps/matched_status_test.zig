@@ -3,10 +3,12 @@
 //! Covers the polling path (get_publication/subscription_matched_status) and the
 //! listener path (on_publication/subscription_matched callbacks).  Uses
 //! IntraProcessDelivery + DirectDiscovery, which fires discovery callbacks
-//! synchronously so every assertion is deterministic.
+//! synchronously, on a ManualRuntime that tests settle so the listeners it
+//! raises have run: every assertion is deterministic.
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 const ZZDDS = zzdds.ZZDDS;
@@ -30,6 +32,7 @@ const testing = std.testing;
 
 const Fixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
 
     t_w: *zzdds.intraprocess.MemoryTransport,
@@ -47,6 +50,10 @@ const Fixture = struct {
     topic_r: DDS.Topic,
 
     fn init(alloc: std.mem.Allocator) !Fixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
         const t_w = try delivery.newTransport();
@@ -70,6 +77,7 @@ const Fixture = struct {
         const topic_r = dp_r.create_topic("MatchTopic", "MatchType", .{}, null, 0);
 
         return .{
+            .mr = mr,
             .alloc = alloc,
             .delivery = delivery,
             .t_w = t_w,
@@ -90,6 +98,7 @@ const Fixture = struct {
     fn deinit(self: *Fixture) void {
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_w.deinit();
         self.factory_r.deinit();
         self.d_w.deinit();
@@ -97,6 +106,13 @@ const Fixture = struct {
         self.t_w.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *Fixture) void {
+        self.mr.settle();
     }
 };
 
@@ -125,6 +141,7 @@ test "pub_matched: status populated when reader is created after writer" {
 
     // Create the writer first; no readers yet.
     const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    fx.settle();
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_raw);
 
     // No match yet.
@@ -135,6 +152,7 @@ test "pub_matched: status populated when reader is created after writer" {
 
     // Create a matching reader — DirectDiscovery fires synchronously.
     const dr_raw = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    fx.settle();
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr_raw);
 
     _ = dw_raw.vtable.get_publication_matched_status(dw_raw.ptr, &s);
@@ -150,6 +168,7 @@ test "sub_matched: status populated when writer is created after reader" {
 
     // Create the reader first.
     const dr_raw = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    fx.settle();
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr_raw);
 
     var s = DDS.SubscriptionMatchedStatus{};
@@ -158,6 +177,7 @@ test "sub_matched: status populated when writer is created after reader" {
 
     // Now create the writer.
     const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    fx.settle();
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_raw);
 
     _ = dr_raw.vtable.get_subscription_matched_status(dr_raw.ptr, &s);
@@ -172,10 +192,12 @@ test "pub_matched: total_count accumulates; change resets after read" {
     defer fx.deinit();
 
     const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    fx.settle();
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_raw);
 
     // First reader matches.
     const dr1_raw = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    fx.settle();
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr1_raw);
 
     var s = DDS.PublicationMatchedStatus{};
@@ -194,6 +216,7 @@ test "pub_matched: total_count accumulates; change resets after read" {
 
     // Second reader matches: total goes to 2.
     const dr2_raw = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    fx.settle();
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr2_raw);
 
     _ = dw_raw.vtable.get_publication_matched_status(dw_raw.ptr, &s);
@@ -209,9 +232,11 @@ test "pub_matched: current_count decrements when reader is deleted" {
     defer fx.deinit();
 
     const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    fx.settle();
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_raw);
 
     const dr_raw = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    fx.settle();
 
     // Confirm match.
     var s = DDS.PublicationMatchedStatus{};
@@ -220,6 +245,7 @@ test "pub_matched: current_count decrements when reader is deleted" {
 
     // Delete the reader — retracts from discovery, fires onReaderLost.
     _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr_raw);
+    fx.settle();
 
     _ = dw_raw.vtable.get_publication_matched_status(dw_raw.ptr, &s);
     try testing.expectEqual(@as(i32, 1), s.total_count); // total never decrements
@@ -233,15 +259,18 @@ test "sub_matched: current_count decrements when writer is deleted" {
     defer fx.deinit();
 
     const dr_raw = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    fx.settle();
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr_raw);
 
     const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    fx.settle();
 
     var s = DDS.SubscriptionMatchedStatus{};
     _ = dr_raw.vtable.get_subscription_matched_status(dr_raw.ptr, &s);
     try testing.expectEqual(@as(i32, 1), s.current_count);
 
     _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_raw);
+    fx.settle();
 
     _ = dr_raw.vtable.get_subscription_matched_status(dr_raw.ptr, &s);
     try testing.expectEqual(@as(i32, 1), s.total_count);
@@ -264,15 +293,17 @@ test "pub_matched: listener fires with correct status on match" {
         listener,
         DDS.PUBLICATION_MATCHED_STATUS,
     );
+    fx.settle();
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_raw);
 
     // Listener not yet fired (no reader exists).
     try testing.expectEqual(@as(i32, 0), captured.total_count);
 
     const dr_raw = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    fx.settle();
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr_raw);
 
-    // Listener fired synchronously by DirectDiscovery.
+    // Listener fired for the match DirectDiscovery made.
     try testing.expectEqual(@as(i32, 1), captured.total_count);
     try testing.expectEqual(@as(i32, 1), captured.total_count_change);
     try testing.expectEqual(@as(i32, 1), captured.current_count);
@@ -293,14 +324,17 @@ test "pub_matched: listener fires on unmatch when reader deleted" {
         listener,
         DDS.PUBLICATION_MATCHED_STATUS,
     );
+    fx.settle();
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_raw);
 
     const dr_raw = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), captured.total_count);
 
     // Reset the capture, then delete the reader.
     captured = .{};
     _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr_raw);
+    fx.settle();
 
     // Listener fires with current_count = 0, change = -1.
     try testing.expectEqual(@as(i32, 0), captured.total_count_change); // no new matches
@@ -321,11 +355,13 @@ test "sub_matched: listener fires with correct status on match" {
         listener,
         DDS.SUBSCRIPTION_MATCHED_STATUS,
     );
+    fx.settle();
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr_raw);
 
     try testing.expectEqual(@as(i32, 0), captured.total_count);
 
     const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    fx.settle();
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_raw);
 
     try testing.expectEqual(@as(i32, 1), captured.total_count);
@@ -348,13 +384,16 @@ test "sub_matched: listener fires on unmatch when writer deleted" {
         listener,
         DDS.SUBSCRIPTION_MATCHED_STATUS,
     );
+    fx.settle();
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr_raw);
 
     const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), captured.total_count);
 
     captured = .{};
     _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_raw);
+    fx.settle();
 
     try testing.expectEqual(@as(i32, 0), captured.total_count_change);
     try testing.expectEqual(@as(i32, 0), captured.current_count);
@@ -367,8 +406,10 @@ test "pub_matched: last_subscription_handle matches get_matched_subscriptions ha
     defer fx.deinit();
 
     const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    fx.settle();
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_raw);
     const dr_raw = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    fx.settle();
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr_raw);
 
     var s = DDS.PublicationMatchedStatus{};
@@ -388,7 +429,8 @@ test "pub_matched: last_subscription_handle matches get_matched_subscriptions ha
 //
 // DirectDiscovery matches synchronously, so an endpoint created after its
 // remote counterpart is already known matches *inside* create_datawriter /
-// create_datareader. A listener installed afterwards (set_listener /
+// create_datareader (on the shared runtime, its listener is raised once
+// settled). A listener installed afterwards (set_listener /
 // set_listener_ex) misses that status change: DDS does not report earlier
 // status changes to a newly attached listener. These tests pin both halves:
 // the race, and that a listener passed at creation (standard or extended)
@@ -456,19 +498,23 @@ test "pub_matched: a listener attached after create_datawriter misses a match ma
     defer fx.deinit();
 
     const dr_raw = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    fx.settle();
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr_raw);
 
     // Late listener: the match already happened inside create_datawriter.
     var late = DDS.PublicationMatchedStatus{};
     const dw_late = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    fx.settle();
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_late);
     _ = dw_late.set_listener(dwMatchedListener(&late), DDS.PUBLICATION_MATCHED_STATUS);
+    fx.settle();
     try testing.expectEqual(@as(usize, 1), try matchedSubscriptionCount(dw_late));
     try testing.expectEqual(@as(i32, 0), late.total_count);
 
     // Listener passed at creation: sees it.
     var early = DDS.PublicationMatchedStatus{};
     const dw_early = fx.pub_w.create_datawriter(fx.topic_w, .{}, dwMatchedListener(&early), DDS.PUBLICATION_MATCHED_STATUS);
+    fx.settle();
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_early);
     try testing.expectEqual(@as(usize, 1), try matchedSubscriptionCount(dw_early));
     try testing.expectEqual(@as(i32, 1), early.current_count);
@@ -481,6 +527,7 @@ test "create_datawriter_ex: extended listener sees the match and readiness from 
 
     // BEST_EFFORT reader: on_reliable_reader_ready fires at match (no handshake).
     const dr_raw = fx.sub_r.create_datareader(topicDesc(fx.topic_r), bestEffortReaderQos(), null, 0);
+    fx.settle();
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr_raw);
 
     const zpub = zzdds.asZzddsPublisher(fx.pub_w) orelse return error.TestUnexpectedResult;
@@ -490,6 +537,7 @@ test "create_datawriter_ex: extended listener sees the match and readiness from 
         .on_publication_matched = exOnPubMatched,
         .on_reliable_reader_ready = exOnReaderReady,
     }, DDS.PUBLICATION_MATCHED_STATUS);
+    fx.settle();
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw);
 
     try testing.expect(dw.ptr != zzdds.dcps.NIL_PTR);
@@ -508,6 +556,7 @@ test "create_datareader_ex: extended listener sees the match and readiness from 
 
     // BEST_EFFORT writer: on_reliable_writer_ready fires at match (no handshake).
     const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, bestEffortWriterQos(), null, 0);
+    fx.settle();
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_raw);
 
     const zsub = zzdds.asZzddsSubscriber(fx.sub_r) orelse return error.TestUnexpectedResult;
@@ -517,6 +566,7 @@ test "create_datareader_ex: extended listener sees the match and readiness from 
         .on_subscription_matched = exOnSubMatched,
         .on_reliable_writer_ready = exOnWriterReady,
     }, DDS.SUBSCRIPTION_MATCHED_STATUS);
+    fx.settle();
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr);
 
     try testing.expect(dr.ptr != zzdds.dcps.NIL_PTR);
@@ -537,6 +587,7 @@ test "asZzddsPublisher/asZzddsSubscriber reject foreign handles; null listener i
 
     const zpub = zzdds.asZzddsPublisher(fx.pub_w).?;
     const dw = zpub.create_datawriter_ex(fx.topic_w, .{}, null, 0);
+    fx.settle();
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw);
     try testing.expect(dw.ptr != zzdds.dcps.NIL_PTR);
     try testing.expectEqual(fx.pub_w.ptr, zpub.as_Publisher().ptr);
@@ -556,10 +607,13 @@ test "pub_matched: a writer created after a known reader counts it once, and unm
     defer fx.deinit();
 
     const dr_raw = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    fx.settle();
     const dw_a = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    fx.settle();
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_a);
     // A second writer's announcement re-delivers the reader to this participant.
     const dw_b = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    fx.settle();
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_b);
 
     for ([_]DDS.DataWriter{ dw_a, dw_b }) |dw| {
@@ -570,6 +624,7 @@ test "pub_matched: a writer created after a known reader counts it once, and unm
     }
 
     _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr_raw);
+    fx.settle();
     for ([_]DDS.DataWriter{ dw_a, dw_b }) |dw| {
         var s = DDS.PublicationMatchedStatus{};
         _ = dw.vtable.get_publication_matched_status(dw.ptr, &s);
@@ -584,9 +639,12 @@ test "sub_matched: a reader created after a known writer counts it once, and unm
     defer fx.deinit();
 
     const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    fx.settle();
     const dr_a = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    fx.settle();
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr_a);
     const dr_b = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    fx.settle();
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr_b);
 
     for ([_]DDS.DataReader{ dr_a, dr_b }) |dr| {
@@ -597,6 +655,7 @@ test "sub_matched: a reader created after a known writer counts it once, and unm
     }
 
     _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_raw);
+    fx.settle();
     for ([_]DDS.DataReader{ dr_a, dr_b }) |dr| {
         var s = DDS.SubscriptionMatchedStatus{};
         _ = dr.vtable.get_subscription_matched_status(dr.ptr, &s);
@@ -629,6 +688,7 @@ test "pub_matched: a reader discovered while create_datawriter runs is matched b
     // synchronously, inside create_datareader, before the writer's matched
     // notify is registered: discovery must not match it yet.
     const dr = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    fx.settle();
     try testing.expect(dr.ptr != zzdds.dcps.NIL_PTR);
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr);
     try testing.expectEqual(@as(usize, 0), parts.pw.matchedReaderCount());
@@ -640,6 +700,7 @@ test "pub_matched: a reader discovered while create_datawriter runs is matched b
         .listener_data = &status,
         .on_publication_matched = dwOnPubMatched,
     }, DDS.PUBLICATION_MATCHED_STATUS, parts);
+    fx.settle();
     try testing.expect(dw.ptr != zzdds.dcps.NIL_PTR);
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw);
     try testing.expectEqual(@as(usize, 1), parts.pw.matchedReaderCount());
@@ -694,6 +755,7 @@ test "sub data: a sample delivered when its writer is matched already resolves i
     const dr = fx.sub_r.create_datareader(topicDesc(fx.topic_r), dr_qos, DDS.dataReaderListener(&check, .{
         .on_data_available = guidCheckOnDataAvailable,
     }), DDS.DATA_AVAILABLE_STATUS);
+    fx.settle();
     try testing.expect(dr.ptr != zzdds.dcps.NIL_PTR);
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr);
     check.dr = dr;
@@ -703,6 +765,7 @@ test "sub data: a sample delivered when its writer is matched already resolves i
     // reader, held (as the participant would) for the match.
     const pr = @as(*zzdds.dcps.DataReaderImpl, @ptrCast(@alignCast(dr.ptr))).proto_reader;
     pr.handleIncomingChange(writer_guid, 1, .{ .seconds = 0, .fraction = 0 }, std.mem.zeroes([16]u8), &.{ 0x00, 0x01, 0x00, 0x00 }, .alive, null, null, null, null);
+    fx.settle();
     try testing.expectEqual(@as(usize, 0), check.calls);
     var held = zzdds.rtps.unmatched_cache.UnmatchedCache.init(alloc, .{ .max_bytes = 1 << 20, .max_writers = 8, .max_samples_per_writer = 64, .max_partials_per_writer = 4 });
     defer held.deinit();
@@ -724,6 +787,7 @@ test "sub data: a sample delivered when its writer is matched already resolves i
         .reliability = .reliable,
         .prematch = .{ .cache = &held },
     });
+    fx.settle();
     try testing.expectEqual(@as(usize, 1), check.calls);
     try testing.expectEqual(@as(u32, 1), check.taken);
     try testing.expectEqual(zzdds.dcps.guidToHandle(writer_guid), check.publication_handle);
@@ -764,6 +828,7 @@ test "sample lost: listener may call back into its reader for GAP and Heartbeat 
     const dr = fx.sub_r.create_datareader(topicDesc(fx.topic_r), dr_qos, DDS.dataReaderListener(&check, .{
         .on_sample_lost = lostCheckOnSampleLost,
     }), DDS.SAMPLE_LOST_STATUS);
+    fx.settle();
     try testing.expect(dr.ptr != zzdds.dcps.NIL_PTR);
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr);
     check.dr = dr;
@@ -779,14 +844,17 @@ test "sample lost: listener may call back into its reader for GAP and Heartbeat 
         .multicast_locators = &.{},
         .reliability = .reliable,
     });
+    fx.settle();
 
     // GAP: SNs 1-2 are irreversibly gone.
     pr.handleGap(writer_guid, 1, .{ .base = 3, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) });
+    fx.settle();
     try testing.expectEqual(@as(i32, 2), check.lost_total);
     try testing.expectEqual(@as(usize, 1), check.matched_seen);
 
     // Heartbeat whose firstSN is past SNs 3-4: they are gone too.
     const reader_eid = @as(*zzdds.dcps.DataReaderImpl, @ptrCast(@alignCast(dr.ptr))).guid.entity_id;
     pr.handleHeartbeat(writer_guid, reader_eid, 5, 6, 1, true, false);
+    fx.settle();
     try testing.expectEqual(@as(i32, 4), check.lost_total);
 }

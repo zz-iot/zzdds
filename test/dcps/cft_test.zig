@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -356,6 +357,7 @@ test "eval: null AST always passes" {
 // Fixture for the integration test (identical to other dcps test fixtures).
 const Fixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
 
     t_w: *zzdds.intraprocess.MemoryTransport,
@@ -373,6 +375,10 @@ const Fixture = struct {
     topic_r: DDS.Topic,
 
     fn init(alloc: std.mem.Allocator) !Fixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
         const t_w = try delivery.newTransport();
@@ -396,6 +402,7 @@ const Fixture = struct {
         const topic_r = dp_r.create_topic("CftTopic", "CftType", .{}, null, 0);
 
         return .{
+            .mr = mr,
             .alloc = alloc,
             .delivery = delivery,
             .t_w = t_w,
@@ -416,6 +423,7 @@ const Fixture = struct {
     fn deinit(self: *Fixture) void {
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_w.deinit();
         self.factory_r.deinit();
         self.d_w.deinit();
@@ -423,6 +431,13 @@ const Fixture = struct {
         self.t_w.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *Fixture) void {
+        self.mr.settle();
     }
 };
 
@@ -515,10 +530,12 @@ test "cft: end-to-end sample delivery with post-take filtering" {
     // Write payload with value = 0x42 = 66 (should NOT pass "value > 70").
     const low_payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0x42 }; // 66
     _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &low_payload);
+    fx.settle();
 
     // Write payload with value = 0x80 = 128 (should pass "value > 70").
     const high_payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0x80 }; // 128
     _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &high_payload);
+    fx.settle();
 
     // Drain all samples, apply the CFT filter manually (typed-wrapper style).
     var passing = std.ArrayListUnmanaged(TakenSample).empty;
@@ -687,6 +704,7 @@ test "cft: set_filter_expression switches a live reader's filter and keeps its m
     const high = [_]u8{ 0x00, 0x01, 0x00, 0x00, 128 };
     _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &low);
     _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &high);
+    fx.settle();
     var before = try takeValues(alloc, dr);
     defer before.deinit(alloc);
     try testing.expectEqualSlices(u8, &.{128}, before.items);
@@ -707,6 +725,7 @@ test "cft: set_filter_expression switches a live reader's filter and keeps its m
 
     _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &low);
     _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &high);
+    fx.settle();
     var after = try takeValues(alloc, dr);
     defer after.deinit(alloc);
     try testing.expectEqualSlices(u8, &.{66}, after.items);
@@ -715,6 +734,7 @@ test "cft: set_filter_expression switches a live reader's filter and keeps its m
     try testing.expectEqual(DDS.RETCODE_OK, zcft.vtable.set_filter_expression(zcft.ptr, "", null));
     _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &low);
     _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &high);
+    fx.settle();
     var all = try takeValues(alloc, dr);
     defer all.deinit(alloc);
     try testing.expectEqualSlices(u8, &.{ 66, 128 }, all.items);
@@ -770,4 +790,72 @@ test "cft: set_filter_expression out of memory at any allocation leaves the filt
 
 test "cft: asZzddsContentFilteredTopic rejects a foreign handle" {
     try testing.expect(zzdds.asZzddsContentFilteredTopic(zzdds.dcps.nil_cft) == null);
+}
+
+// Proves that wiring a real TypeSupport.get_field (no codegen involved: a
+// hand-written closure over an intentionally trivial payload) is enough, on
+// its own, for the reader's cft_filter to activate and filter, string fields
+// included.
+test "cft: TypeSupport.get_field wires cft_filter automatically: reader delivers only matching samples" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    const GetField = struct {
+        // A fake wire format for this test only: byte 0 = "x" (int), byte 1 =
+        // "color"'s length, bytes 2.. = "color"'s bytes. get_field's contract
+        // doesn't care how the payload is structured; the string exercises
+        // the scratch path, which exists to keep a string from dangling.
+        fn get(_: *anyopaque, payload: []const u8, field: []const u8, scratch: []u8) ?FilterValue {
+            if (std.mem.eql(u8, field, "x")) {
+                if (payload.len > 0) return .{ .int = payload[0] };
+                return null;
+            }
+            if (std.mem.eql(u8, field, "color")) {
+                if (payload.len < 2) return null;
+                const len = payload[1];
+                if (payload.len < 2 + @as(usize, len) or len > scratch.len) return null;
+                @memcpy(scratch[0..len], payload[2 .. 2 + len]);
+                return .{ .string = scratch[0..len] };
+            }
+            return null;
+        }
+        fn keyHash(_: *anyopaque, _: []const u8) [16]u8 {
+            return std.mem.zeroes([16]u8);
+        }
+    };
+
+    // Only the reader's participant needs it: filtering happens on receipt.
+    try testing.expect(zzdds.registerTypeSupport(fx.dp_r, "CftType", .{
+        .ctx = undefined,
+        .compute_key_hash = GetField.keyHash,
+        .get_field = GetField.get,
+    }));
+
+    const cft = fx.dp_r.create_contentfilteredtopic("CftAuto", fx.topic_r, "x = 5 AND color = 'RED'", null);
+    try testing.expect(cft.ptr != nil.NIL_PTR);
+    defer _ = fx.dp_r.delete_contentfilteredtopic(cft);
+
+    // KEEP_ALL on both sides: the writes share one (zero) key.
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const dw = fx.pub_w.create_datawriter(fx.topic_w, dw_qos, null, 0);
+    const dr = fx.sub_r.create_datareader(cft.vtable.as_TopicDescription(cft.ptr), dr_qos, null, 0);
+    fx.settle();
+
+    const matching = [_]u8{ 5, 3, 'R', 'E', 'D' };
+    const wrong_x = [_]u8{ 6, 3, 'R', 'E', 'D' };
+    const wrong_color = [_]u8{ 5, 3, 'B', 'L', 'U' };
+    try zzdds.writeRaw(dw, .alive, NIL_KEY, &matching);
+    try zzdds.writeRaw(dw, .alive, NIL_KEY, &wrong_x);
+    try zzdds.writeRaw(dw, .alive, NIL_KEY, &wrong_color);
+    fx.settle();
+
+    // Without cft_filter wired up, all three would come through.
+    const first = zzdds.takeRaw(dr) orelse return error.TestUnexpectedResult;
+    defer first.deinit();
+    try testing.expectEqualSlices(u8, &matching, first.data);
+    try testing.expect(zzdds.takeRaw(dr) == null);
 }

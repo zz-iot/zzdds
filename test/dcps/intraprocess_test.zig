@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -46,6 +47,7 @@ const PAYLOAD_C = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0xCC };
 /// synchronous — no pump or sleep required.
 const Fixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
 
     // Writer side
@@ -69,6 +71,10 @@ const Fixture = struct {
         topic_name: [:0]const u8,
         type_name: [:0]const u8,
     ) !Fixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
 
@@ -123,6 +129,7 @@ const Fixture = struct {
         );
 
         return .{
+            .mr = mr,
             .alloc = alloc,
             .delivery = delivery,
             .t_w = t_w,
@@ -143,6 +150,7 @@ const Fixture = struct {
     fn deinit(self: *Fixture) void {
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_w.deinit();
         self.factory_r.deinit();
         self.d_w.deinit();
@@ -150,6 +158,13 @@ const Fixture = struct {
         self.t_w.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *Fixture) void {
+        self.mr.settle();
     }
 
     /// Create a matched writer+reader pair. Endpoint matching happens
@@ -173,6 +188,8 @@ const Fixture = struct {
             null,
             0,
         );
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return .{
             .dw = @ptrCast(@alignCast(dw.ptr)),
             .dr = @ptrCast(@alignCast(dr.ptr)),
@@ -217,6 +234,7 @@ test "intraprocess: BEST_EFFORT single sample delivered synchronously" {
     const pair = fx.makeWriterReader(dw_qos, dr_qos);
 
     try writeRaw(pair.dw, &PAYLOAD_A);
+    fx.settle();
 
     // No deliverAll(), no sleep — delivery is synchronous.
     const samples = try drainSamples(alloc, pair.dr);
@@ -246,6 +264,7 @@ test "intraprocess: BEST_EFFORT three samples in order" {
     try writeRaw(pair.dw, &PAYLOAD_A);
     try writeRaw(pair.dw, &PAYLOAD_B);
     try writeRaw(pair.dw, &PAYLOAD_C);
+    fx.settle();
 
     const samples = try drainSamples(alloc, pair.dr);
     defer {
@@ -273,6 +292,7 @@ test "intraprocess: incompatible QoS — no delivery, incompat counter increment
     const pair = fx.makeWriterReader(dw_qos, dr_qos);
 
     try writeRaw(pair.dw, &PAYLOAD_A);
+    fx.settle();
 
     // No sample delivered — proxies were never added due to QoS mismatch.
     const samples = try drainSamples(alloc, pair.dr);
@@ -311,9 +331,10 @@ test "intraprocess: writer created before reader — reader gets history via TRA
     const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));
     try writeRaw(dw, &PAYLOAD_A);
     try writeRaw(dw, &PAYLOAD_B);
+    fx.settle();
 
-    // Now create the reader — DirectDiscovery fires on_reader_discovered
-    // synchronously, which triggers history replay via addMatchedReader.
+    // Now create the reader — DirectDiscovery fires on_reader_discovered,
+    // which triggers history replay via addMatchedReader.
     const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(fx.topic_r.ptr))).toTopicDescription();
     const dr_raw = fx.sub_r.create_datareader(
         topic_desc_r,
@@ -322,6 +343,7 @@ test "intraprocess: writer created before reader — reader gets history via TRA
         0,
     );
     const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_raw.ptr));
+    fx.settle();
 
     const samples = try drainSamples(alloc, dr);
     defer {
@@ -369,13 +391,14 @@ test "intraprocess: set_listener fires on_data_available immediately for already
     const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));
     try writeRaw(dw, &PAYLOAD_A);
     try writeRaw(dw, &PAYLOAD_B);
+    fx.settle();
 
     // Create the reader with NO listener -- matching the real application
-    // pattern this regression is about. DirectDiscovery + MemoryTransport
-    // deliver synchronously, so by the time create_datareader() returns,
-    // PAYLOAD_A/B are already sitting in the reader's cache, unnotified.
+    // pattern this regression is about. Once the match and history replay
+    // settle, PAYLOAD_A/B are sitting in the reader's cache, unnotified.
     const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(fx.topic_r.ptr))).toTopicDescription();
     const dr_raw = fx.sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
+    fx.settle();
 
     var fired: i32 = 0;
     const Ctx = struct {
@@ -388,9 +411,11 @@ test "intraprocess: set_listener fires on_data_available immediately for already
         .on_data_available = Ctx.onDataAvailable,
     };
 
-    // The fix under test: this must synchronously fire on_data_available
-    // for the data that arrived before the listener was ever attached.
+    // The fix under test: this must fire on_data_available for the data
+    // that arrived before the listener was ever attached, with no new
+    // arrival (on the shared runtime, once the dispatch it posts has run).
     try testing.expectEqual(DDS.RETCODE_OK, dr_raw.set_listener(listener, DDS.DATA_AVAILABLE_STATUS));
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), fired);
 }
 
@@ -486,12 +511,14 @@ test "intraprocess: zzdds.takeRaw refuses pending data once teardown has begun, 
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
     try writeRaw(dw_impl, &PAYLOAD_A);
+    fx.settle();
 
     // Confirm delivery genuinely happened -- if this were empty, a refusal
     // below wouldn't prove anything (could just be an empty queue).
     const sanity = zzdds.takeRaw(dr) orelse return error.TestUnexpectedResult;
     sanity.deinit();
     try writeRaw(dw_impl, &PAYLOAD_B); // leave one real, pending sample behind
+    fx.settle();
 
     // Simulate a callback that's already "in flight" (acquired quiesce)
     // when teardown begins -- deinit() must not free the struct out from

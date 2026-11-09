@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 const ZZDDS = zzdds.ZZDDS;
@@ -28,6 +29,7 @@ fn topicDesc(t: DDS.Topic) DDS.TopicDescription {
 
 const Fixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
 
     t_w: *zzdds.intraprocess.MemoryTransport,
@@ -45,6 +47,10 @@ const Fixture = struct {
     topic_r: DDS.Topic,
 
     fn init(alloc: std.mem.Allocator) !Fixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
         const t_w = try delivery.newTransport();
@@ -68,6 +74,7 @@ const Fixture = struct {
         const topic_r = dp_r.create_topic("MatchTopic", "MatchType", .{}, null, 0);
 
         return .{
+            .mr = mr,
             .alloc = alloc,
             .delivery = delivery,
             .t_w = t_w,
@@ -88,6 +95,7 @@ const Fixture = struct {
     fn deinit(self: *Fixture) void {
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_w.deinit();
         self.factory_r.deinit();
         self.d_w.deinit();
@@ -95,6 +103,13 @@ const Fixture = struct {
         self.t_w.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *Fixture) void {
+        self.mr.settle();
     }
 };
 
@@ -154,6 +169,7 @@ test "on_data_available may call into its participant, subscriber and reader" {
     const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));
 
     _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD);
+    fx.settle();
     try testing.expect(probe.calls >= 1);
     try testing.expect(probe.participant_ok);
     try testing.expect(probe.subscriber_ok);
@@ -198,6 +214,7 @@ test "incompatible-QoS listeners may call into their participant" {
         .on_offered_incompatible_qos = incompatWriterCb,
     }), DDS.OFFERED_INCOMPATIBLE_QOS_STATUS);
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw);
+    fx.settle();
 
     try testing.expect(r_probe.calls >= 1 and r_probe.participant_ok);
     try testing.expect(w_probe.calls >= 1 and w_probe.participant_ok);
@@ -232,8 +249,10 @@ test "on_publication_matched for a lost reader may call into its participant and
     probe.dw = dw;
 
     const dr = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), probe.last_current);
     _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr);
+    fx.settle();
     try testing.expectEqual(@as(i32, 0), probe.last_current);
     try testing.expect(probe.participant_ok);
     try testing.expectEqual(@as(usize, 0), probe.matched_seen);
@@ -269,6 +288,7 @@ test "listeners raised by notify_datareaders may call into their subscriber" {
     // Data arrives while the listener is masked out, leaving a change for
     // notify_datareaders to claim.
     _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD);
+    fx.settle();
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
     @atomicStore(DDS.StatusMask, &dr_impl.listener_mask, DDS.DATA_AVAILABLE_STATUS, .monotonic);
     try testing.expectEqual(@as(usize, 0), probe.calls);
@@ -308,12 +328,13 @@ test "on_reliable_reader_ready may call into its participant" {
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     // The handshake completes on an ACKNACK, which in-process delivery hands
-    // to the participant synchronously, before create_datawriter_ex returns.
+    // to the participant (on the shared runtime, once settled).
     const dw = zpub.create_datawriter_ex(fx.topic_w, dw_qos, .{
         .listener_data = &probe,
         .on_reliable_reader_ready = readyProbeOnReady,
     }, 0);
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw);
+    fx.settle();
     try testing.expect(probe.ready);
     try testing.expect(probe.participant_ok);
 }
@@ -378,6 +399,7 @@ test "every incompatible reader is notified once, however many there are" {
     dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
     const dw = fx.pub_w.create_datawriter(fx.topic_w, dw_qos, null, 0);
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw);
+    fx.settle();
 
     for (counts) |c| try testing.expectEqual(@as(usize, 1), c.calls);
 }
@@ -385,7 +407,9 @@ test "every incompatible reader is notified once, however many there are" {
 const IncompatPolicies = struct {
     ids: [8]DDS.QosPolicyId_t = undefined,
     n: usize = 0,
+    first_change: i32 = 0,
     fn cb(p: *IncompatPolicies, _: DDS.DataReader, status: DDS.RequestedIncompatibleQosStatus) void {
+        if (p.n == 0) p.first_change = status.total_count_change;
         if (p.n < p.ids.len) p.ids[p.n] = status.last_policy_id;
         p.n += 1;
     }
@@ -418,12 +442,22 @@ test "a reader incompatible with several writers is told each policy" {
         .on_requested_incompatible_qos = IncompatPolicies.cb,
     }), DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS);
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr);
+    fx.settle();
 
-    // The first two come from the check made as the reader is created, one
-    // per writer, each with its own policy. (Nothing after them is checked:
-    // this test's in-process discovery then announces both writers again,
-    // and an already-reported incompatible writer is currently reported
-    // again.)
+    // On the shared runtime the reader has at most one pending notification
+    // per status, so the incompatibilities found as it is created reach the
+    // listener as one call that counts both writers
+    // (docs/design/concurrency/listeners.md#status-ordering-requirements).
+    if (zzdds.runtime.enabled) {
+        try testing.expectEqual(@as(usize, 1), probe.n);
+        try testing.expect(probe.first_change >= 2);
+        return;
+    }
+    // Otherwise the first two calls come from the check made as the reader
+    // is created, one per writer, each with its own policy. (Nothing after
+    // them is checked: this test's in-process discovery then announces both
+    // writers again, and an already-reported incompatible writer is
+    // currently reported again.)
     try testing.expect(probe.n >= 2);
     const first = probe.ids[0..2];
     std.mem.sort(DDS.QosPolicyId_t, first, {}, std.sort.asc(DDS.QosPolicyId_t));

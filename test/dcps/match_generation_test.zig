@@ -5,14 +5,15 @@
 //! installing it wins.
 //!
 //! The participant decides matches under its lock and installs them after
-//! releasing it, raising incompatible-QoS listeners in between. Each test
-//! has an incompatible endpoint whose listener reports the loss (or a newer
-//! announcement) in that window. Discovery events are fired directly (a
+//! releasing it, raising incompatible-QoS notifications in between. Each
+//! test has an incompatible endpoint whose notification reports the loss
+//! (or a newer announcement) in that window. Discovery events are fired directly (a
 //! discovery plugin that only captures its callbacks), DATA is injected as
-//! raw RTPS from a second MockTransport, and time is a ManualClock.
+//! raw RTPS from a second MockTransport, on a ManualRuntime.
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -26,7 +27,6 @@ const DomainParticipantImpl = dcps.DomainParticipantImpl;
 const DataReaderImpl = dcps.DataReaderImpl;
 const DataWriterImpl = dcps.DataWriterImpl;
 const TopicImpl = dcps.TopicImpl;
-const ManualClock = zzdds.util.time.ManualClock;
 
 const Discovery = iface.Discovery;
 const Guid = iface.Guid;
@@ -110,6 +110,7 @@ const Remote = struct {
 };
 
 const Harness = struct {
+    mr: *ManualRuntime,
     net: *MockNetwork,
     transport: *MockTransport,
     injector: *MockTransport,
@@ -120,8 +121,12 @@ const Harness = struct {
     pub_: DDS.Publisher,
     topic: DDS.Topic,
 
-    fn init(h: *Harness, clock: *ManualClock) !void {
+    fn init(h: *Harness) !void {
         const alloc = testing.allocator;
+        h.mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(h.mr);
+        h.mr.init();
+        errdefer h.mr.deinit();
         h.net = try MockNetwork.init(alloc);
         errdefer h.net.deinit();
         h.transport = try MockTransport.init(alloc, h.net, &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7410)});
@@ -132,7 +137,7 @@ const Harness = struct {
         config.participant.timer_clock_name = "manual";
         h.factory = try DomainParticipantFactoryImpl.init(alloc, h.transport.transport(), CapturingDisc.discovery(), noop_security, .spec_random, config);
         errdefer h.factory.deinit();
-        try h.factory.clock_registry.register("manual", clock.clock());
+        try h.factory.clock_registry.register("manual", h.mr.clock());
         h.dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         h.dp_impl = @ptrCast(@alignCast(h.dp.ptr));
         h.sub = h.dp.create_subscriber(.{}, null, 0);
@@ -143,10 +148,18 @@ const Harness = struct {
     fn deinit(h: *Harness) void {
         _ = h.dp.vtable.delete_contained_entities(h.dp.ptr);
         _ = h.factory.toDDSFactory().delete_participant(h.dp);
+        h.mr.settle();
         h.factory.deinit();
         h.injector.deinit();
         h.transport.deinit();
         h.net.deinit();
+        h.mr.deinit();
+        std.heap.page_allocator.destroy(h.mr);
+    }
+
+    /// Runs what was queued so far (a no-op on the default build).
+    fn settle(h: *Harness) void {
+        h.mr.settle();
     }
 
     fn reader(h: *Harness, qos: DDS.DataReaderQos, listener: ?DDS.DataReaderListener) *DataReaderImpl {
@@ -234,6 +247,7 @@ const Harness = struct {
         try rtpsData(&buf, writer_guid.prefix, eid, sn);
         try h.injector.transport().send(&Locator.udp4(.{ 127, 0, 0, 1 }, h.dp_impl.data_listen_port), buf.items);
         h.net.deliverAll();
+        h.settle();
     }
 
     fn held(h: *Harness) usize {
@@ -284,31 +298,51 @@ fn pubMatched(w: *DataWriterImpl) DDS.PublicationMatchedStatus {
 
 // ── An incompatible endpoint's listener, run between decision and install ────
 
-/// Runs `then` once, from the first incompatible-QoS callback.
+/// Runs `then` once, from the first incompatible-QoS notification the
+/// participant raises for the endpoint `reader` or `writer` creates. The
+/// participant raises it as its listener would be: after deciding the
+/// matches and before installing them. It wraps the notification rather
+/// than using the listener, which the shared runtime raises later.
 const Between = struct {
     h: *Harness,
     then: *const fn (*Between) void,
     guid: Guid = undefined,
     fired: bool = false,
+    inner_ctx: *anyopaque = undefined,
+    inner_fn: *const fn (*anyopaque, i32) void = undefined,
 
-    fn readerListener(self: *Between) DDS.DataReaderListener {
-        return .{ .listener_data = self, .on_requested_incompatible_qos = onRequested };
+    const NotifyFn = *const fn (*anyopaque, i32) void;
+    const RegisterFn = *const fn (*anyopaque, DDS.InstanceHandle_t, *anyopaque, NotifyFn) void;
+    var current: *Between = undefined;
+    var original: RegisterFn = undefined;
+
+    fn reader(self: *Between, qos: DDS.DataReaderQos) *DataReaderImpl {
+        const sub_impl: *dcps.SubscriberImpl = @ptrCast(@alignCast(self.h.sub.ptr));
+        current = self;
+        original = sub_impl.cbs.register_incompat_qos;
+        sub_impl.cbs.register_incompat_qos = register;
+        defer sub_impl.cbs.register_incompat_qos = original;
+        return self.h.reader(qos, null);
     }
 
-    fn writerListener(self: *Between) DDS.DataWriterListener {
-        return .{ .listener_data = self, .on_offered_incompatible_qos = onOffered };
+    fn writer(self: *Between, qos: DDS.DataWriterQos) *DataWriterImpl {
+        const pub_impl: *dcps.PublisherImpl = @ptrCast(@alignCast(self.h.pub_.ptr));
+        current = self;
+        original = pub_impl.cbs.register_incompat_qos;
+        pub_impl.cbs.register_incompat_qos = register;
+        defer pub_impl.cbs.register_incompat_qos = original;
+        return self.h.writer(qos, null);
     }
 
-    fn onRequested(_: *anyopaque, _: *const DDS.RequestedIncompatibleQosStatus, ld: ?*anyopaque) callconv(.c) void {
-        run(ld);
+    fn register(ctx: *anyopaque, handle: DDS.InstanceHandle_t, notify_ctx: *anyopaque, notify_fn: NotifyFn) void {
+        current.inner_ctx = notify_ctx;
+        current.inner_fn = notify_fn;
+        original(ctx, handle, current, notify);
     }
 
-    fn onOffered(_: *anyopaque, _: *const DDS.OfferedIncompatibleQosStatus, ld: ?*anyopaque) callconv(.c) void {
-        run(ld);
-    }
-
-    fn run(ld: ?*anyopaque) void {
-        const self: *Between = @ptrCast(@alignCast(ld));
+    fn notify(ctx: *anyopaque, policy_id: i32) void {
+        const self: *Between = @ptrCast(@alignCast(ctx));
+        self.inner_fn(self.inner_ctx, policy_id);
         if (self.fired) return;
         self.fired = true;
         self.then(self);
@@ -326,9 +360,8 @@ fn incompatibleReaderQos() DDS.DataReaderQos {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 test "a writer lost before its match is installed is not matched, and is held for again" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     const w = endpointGuid(0x61, 1, WRITER_KIND);
     var between = Between{ .h = &h, .guid = w, .then = struct {
@@ -336,7 +369,7 @@ test "a writer lost before its match is installed is not matched, and is held fo
             b.h.loseWriter(b.guid);
         }
     }.f };
-    _ = h.reader(incompatibleReaderQos(), between.readerListener());
+    _ = between.reader(incompatibleReaderQos());
     const r = h.reader(.{}, null);
 
     h.announceWriter(w, .{});
@@ -356,9 +389,8 @@ test "a writer lost before its match is installed is not matched, and is held fo
 }
 
 test "an older announcement of a writer does not overwrite a newer one" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     const w = endpointGuid(0x62, 1, WRITER_KIND);
     var between = Between{ .h = &h, .guid = w, .then = struct {
@@ -366,7 +398,7 @@ test "an older announcement of a writer does not overwrite a newer one" {
             b.h.announceWriter(b.guid, .{ .ownership_kind = 1, .ownership_strength = 9 });
         }
     }.f };
-    _ = h.reader(incompatibleReaderQos(), between.readerListener());
+    _ = between.reader(incompatibleReaderQos());
     var qos = DDS.DataReaderQos{};
     qos.ownership.kind = .EXCLUSIVE_OWNERSHIP_QOS;
     const r = h.reader(qos, null);
@@ -381,9 +413,8 @@ test "an older announcement of a writer does not overwrite a newer one" {
 }
 
 test "a reader lost before its match is installed is not matched" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     const rd = endpointGuid(0x63, 1, READER_KIND);
     var between = Between{ .h = &h, .guid = rd, .then = struct {
@@ -394,7 +425,7 @@ test "a reader lost before its match is installed is not matched" {
     // Offers BEST_EFFORT to a reader that requests RELIABLE.
     var best_effort = DDS.DataWriterQos{};
     best_effort.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
-    _ = h.writer(best_effort, between.writerListener());
+    _ = between.writer(best_effort);
     var reliable = DDS.DataWriterQos{};
     reliable.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     const w = h.writer(reliable, null);
@@ -415,9 +446,8 @@ test "a reader created as its writers' participant is lost does not match them" 
     // A new reader matches writers discovered before it (its announcement's
     // own matches), after the participant releases its lock, as discovery's
     // matches are.
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     const good = endpointGuid(0x64, 1, WRITER_KIND);
     const bad = endpointGuid(0x64, 2, WRITER_KIND);
@@ -431,16 +461,15 @@ test "a reader created as its writers' participant is lost does not match them" 
     }.f };
     var qos = DDS.DataReaderQos{};
     qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
-    const r = h.reader(qos, between.readerListener());
+    const r = between.reader(qos);
     try testing.expect(between.fired);
     try testing.expectEqual(@as(usize, 0), r.proto_reader.matchedWriterCount());
     try testing.expectEqual(@as(i32, 0), subMatched(r).total_count);
 }
 
 test "a writer lost after its match is installed is unmatched, with its state" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     var qos = DDS.DataReaderQos{};
     qos.ownership.kind = .EXCLUSIVE_OWNERSHIP_QOS;
@@ -460,9 +489,8 @@ test "a writer lost after its match is installed is unmatched, with its state" {
 }
 
 test "a live writer's loss raises on_liveliness_changed" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     const Seen = struct {
         calls: u32 = 0,
@@ -478,19 +506,20 @@ test "a live writer's loss raises on_liveliness_changed" {
     const w = endpointGuid(0x66, 1, WRITER_KIND);
 
     h.announceWriter(w, .{ .lease_s = 10 });
+    h.settle();
     try testing.expectEqual(@as(u32, 1), seen.calls);
     try testing.expectEqual(@as(i32, 1), seen.last.alive_count);
 
     h.loseWriter(w);
+    h.settle();
     try testing.expectEqual(@as(u32, 2), seen.calls);
     try testing.expectEqual(@as(i32, 0), seen.last.alive_count);
     try testing.expectEqual(@as(i32, -1), seen.last.alive_count_change);
 }
 
 test "a reader discovered while its writer is being created is counted" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     // Discovery can match a writer from the moment the publisher registers
     // its matched notify, before create_datawriter returns: announce a
@@ -535,9 +564,8 @@ test "a reader discovered while its writer is being created is counted" {
 // ── A refresh that no longer matches ──────────────────────────────────────────
 
 test "a writer refreshed with a longer deadline than its reader requests is unmatched, and counted once as incompatible" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     var qos = DDS.DataReaderQos{};
     qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
@@ -557,9 +585,8 @@ test "a writer refreshed with a longer deadline than its reader requests is unma
 }
 
 test "a writer refreshed into a partition its reader is not in is unmatched" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     const r = h.reader(.{}, null);
     const w = endpointGuid(0x71, 1, WRITER_KIND);
@@ -573,9 +600,8 @@ test "a writer refreshed into a partition its reader is not in is unmatched" {
 }
 
 test "a reader refreshed with a shorter deadline than its writer offers is unmatched, and counted once as incompatible" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     var qos = DDS.DataWriterQos{};
     qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
@@ -592,9 +618,8 @@ test "a reader refreshed with a shorter deadline than its writer offers is unmat
 }
 
 test "a reader refreshed into a partition its writer is not in is unmatched" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     var reliable = DDS.DataWriterQos{};
     reliable.reliability.kind = .RELIABLE_RELIABILITY_QOS;

@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const testing = std.testing;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
@@ -57,6 +58,7 @@ const KEY_HASH = std.mem.zeroes([16]u8);
 
 const Fixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
     t_w: *MemoryTransport,
     d_w: *DirectDiscovery,
@@ -79,6 +81,10 @@ const Fixture = struct {
     dr_box: ?*anyopaque = null,
 
     fn init(alloc: std.mem.Allocator) !Fixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
 
@@ -103,6 +109,7 @@ const Fixture = struct {
         const topic_r = dp_r.create_topic("BootTopic", "BootType", .{}, null, 0);
 
         return .{
+            .mr = mr,
             .alloc = alloc,
             .delivery = delivery,
             .t_w = t_w,
@@ -125,6 +132,7 @@ const Fixture = struct {
         if (self.dr_box) |b| zidl_bindings.freeEntityBox(self.alloc, b);
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_w.deinit();
         self.factory_r.deinit();
         self.d_w.deinit();
@@ -132,6 +140,13 @@ const Fixture = struct {
         self.t_w.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *Fixture) void {
+        self.mr.settle();
     }
 
     /// Returns both the native fat-pointer structs (dw/dr -- for calling
@@ -147,6 +162,8 @@ const Fixture = struct {
         const td = @as(*TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
         const dr = self.sub_r.create_datareader(td, .{}, null, 0);
         const dw = self.pub_w.create_datawriter(self.topic_w, .{}, null, 0);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         const dw_box = zidl_bindings.boxEntity(self.alloc, dw.ptr, &DataWriterImpl.views) catch @panic("test OOM boxing DataWriter");
         const dr_box = zidl_bindings.boxEntity(self.alloc, dr.ptr, &DataReaderImpl.views) catch @panic("test OOM boxing DataReader");
         self.dw_box = dw_box;
@@ -633,6 +650,7 @@ test "bootstrap: get_key_value_writer returns CDR payload after alive write" {
     const pair = fx.makeWriterReader();
 
     writeRawViaOp(pair.dw, KEY_HASH, &PAYLOAD);
+    fx.settle();
 
     const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
     var buf: [64]u8 = undefined;
@@ -678,6 +696,7 @@ test "bootstrap: get_key_value_reader returns CDR payload after receive" {
     const pair = fx.makeWriterReader();
 
     writeRawViaOp(pair.dw, KEY_HASH, &PAYLOAD);
+    fx.settle();
 
     const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
     var buf: [64]u8 = undefined;
@@ -710,6 +729,7 @@ test "bootstrap: lookup_instance_reader returns handle for alive instance, 0 whe
     const pair = fx.makeWriterReader();
 
     writeRawViaOp(pair.dw, KEY_HASH, &PAYLOAD);
+    fx.settle();
 
     // Known alive instance returns its handle.
     const ih = bootstrap.zzdds_lookup_instance_reader(pair.dr_boxed, &KEY_HASH);
@@ -893,6 +913,7 @@ test "extensions: DDS_Publisher/Subscriber_as_zzdds_* share the boxed handle and
     try testing.expect(dw.ptr != np);
     defer _ = fx.pub_w.delete_datawriter(dw);
     try testing.expectEqual(fx.pub_w.ptr, dw.get_publisher().ptr);
+    fx.settle();
 
     try testing.expectEqual(@as(i32, 1), state.matched_current);
     try testing.expectEqual(@as(usize, 1), state.ready_calls);
@@ -1037,6 +1058,7 @@ test "extensions: take_serialized via ZZDDS DataReader vtable" {
     const pair = fx.makeWriterReader();
 
     writeRawViaOp(pair.dw, KEY_HASH, &PAYLOAD);
+    fx.settle();
 
     const zdr = zidl_bindings.unboxAsView(ZZDDS.DataReader, extensions.DDS_DataReader_as_zzdds_DataReader(pair.dr.vtable.get_c_abi_handle(pair.dr.ptr)));
     var sample: ZZDDS.SerializedSample = std.mem.zeroes(ZZDDS.SerializedSample);
@@ -1839,9 +1861,9 @@ test "readerSetListenerEx: real C-ABI set_listener_ex delegates to DataReaderImp
 
     // Install the listener on the reader *before* the writer exists --
     // default QoS is BEST_EFFORT, so on_reliable_writer_ready fires
-    // immediately at match (no heartbeat handshake to wait for), and
-    // IntraProcessDelivery matches synchronously inside create_datawriter
-    // itself: deterministic, no polling needed.
+    // immediately at match (no heartbeat handshake to wait for), and the
+    // match is made by the time create_datawriter has settled:
+    // deterministic, no polling needed.
     const td = @as(*TopicImpl, @ptrCast(@alignCast(fx.topic_r.ptr))).toTopicDescription();
     const dr = fx.sub_r.create_datareader(td, .{}, null, 0);
 
@@ -1856,6 +1878,7 @@ test "readerSetListenerEx: real C-ABI set_listener_ex delegates to DataReaderImp
     try testing.expectEqual(DDS.RETCODE_OK, zdr.vtable.set_listener_ex(zdr.ptr, &listener, DDS.STATUS_MASK_ALL));
 
     _ = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    fx.settle();
 
     try testing.expectEqual(@as(usize, 1), state.calls);
     try testing.expect(state.last_ready == true);

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -35,6 +36,7 @@ fn makeKey(b: u8) [16]u8 {
 
 const Fixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
     t_w: *zzdds.intraprocess.MemoryTransport,
     d_w: *zzdds.intraprocess.DirectDiscovery,
@@ -50,6 +52,10 @@ const Fixture = struct {
     topic_r: DDS.Topic,
 
     fn init(alloc: std.mem.Allocator) !Fixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
         const t_w = try delivery.newTransport();
@@ -71,6 +77,7 @@ const Fixture = struct {
         const sub_r = dp_r.create_subscriber(.{}, null, 0);
         const topic_r = dp_r.create_topic("RejTopic", "RejType", .{}, null, 0);
         return .{
+            .mr = mr,
             .alloc = alloc,
             .delivery = delivery,
             .t_w = t_w,
@@ -91,6 +98,7 @@ const Fixture = struct {
     fn deinit(self: *Fixture) void {
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_w.deinit();
         self.factory_r.deinit();
         self.d_w.deinit();
@@ -98,6 +106,13 @@ const Fixture = struct {
         self.t_w.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *Fixture) void {
+        self.mr.settle();
     }
 
     fn topicDesc(self: *Fixture) DDS.TopicDescription {
@@ -106,11 +121,15 @@ const Fixture = struct {
 
     fn makeWriter(self: *Fixture) *DataWriterImpl {
         const dw = self.pub_w.create_datawriter(self.topic_w, .{}, null, 0);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return @ptrCast(@alignCast(dw.ptr));
     }
 
     fn makeReader(self: *Fixture, dr_qos: DDS.DataReaderQos, listener: ?DDS.DataReaderListener, mask: DDS.StatusMask) *DataReaderImpl {
         const dr = self.sub_r.create_datareader(self.topicDesc(), dr_qos, listener, mask);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return @ptrCast(@alignCast(dr.ptr));
     }
 };
@@ -145,6 +164,7 @@ test "sample_rejected: max_samples poll path" {
 
     try write(dw, NIL_KEY); // accepted
     try write(dw, NIL_KEY); // rejected — pending full
+    fx.settle();
 
     var s = DDS.SampleRejectedStatus{};
     _ = dr.toDDSDataReader().vtable.get_sample_rejected_status(dr.toDDSDataReader().ptr, &s);
@@ -167,6 +187,7 @@ test "sample_rejected: change resets after poll" {
 
     try write(dw, NIL_KEY);
     try write(dw, NIL_KEY); // rejected
+    fx.settle();
 
     var s = DDS.SampleRejectedStatus{};
     _ = dr.toDDSDataReader().vtable.get_sample_rejected_status(dr.toDDSDataReader().ptr, &s);
@@ -193,6 +214,7 @@ test "sample_rejected: total_count accumulates across multiple rejections" {
     try write(dw, NIL_KEY); // accepted
     try write(dw, NIL_KEY); // rejected #1
     try write(dw, NIL_KEY); // rejected #2
+    fx.settle();
 
     var s = DDS.SampleRejectedStatus{};
     _ = dr.toDDSDataReader().vtable.get_sample_rejected_status(dr.toDDSDataReader().ptr, &s);
@@ -217,9 +239,11 @@ test "sample_rejected: listener fires on rejection" {
     _ = fx.makeReader(dr_qos, listener, DDS.SAMPLE_REJECTED_STATUS);
 
     try write(dw, NIL_KEY); // accepted — no listener fire
+    fx.settle();
     try testing.expectEqual(DDS.SampleRejectedStatusKind.NOT_REJECTED, captured.last_reason);
 
     try write(dw, NIL_KEY); // rejected — listener fires
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), captured.total_count);
     try testing.expectEqual(@as(i32, 1), captured.total_count_change);
     try testing.expectEqual(DDS.SampleRejectedStatusKind.REJECTED_BY_SAMPLES_LIMIT, captured.last_reason);
@@ -242,8 +266,10 @@ test "sample_rejected: listener change is 1 per event even when poll change woul
 
     try write(dw, NIL_KEY); // accepted
     try write(dw, NIL_KEY); // rejected #1 → listener fires, captured.total_count_change = 1
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), captured.total_count_change);
     try write(dw, NIL_KEY); // rejected #2 → listener fires again, captured.total_count_change = 1
+    fx.settle();
     try testing.expectEqual(@as(i32, 2), captured.total_count);
     try testing.expectEqual(@as(i32, 1), captured.total_count_change);
 }
@@ -263,6 +289,7 @@ test "sample_rejected: max_samples_per_instance limit" {
     // Two writes for the same instance (NIL_KEY → same instance handle).
     try write(dw, NIL_KEY); // accepted
     try write(dw, NIL_KEY); // rejected — per-instance limit
+    fx.settle();
 
     var s = DDS.SampleRejectedStatus{};
     _ = dr.toDDSDataReader().vtable.get_sample_rejected_status(dr.toDDSDataReader().ptr, &s);
@@ -283,8 +310,10 @@ test "sample_rejected: max_instances limit" {
 
     // First instance (key=0x01): accepted.
     try write(dw, makeKey(0x01));
+    fx.settle();
     // Second instance (key=0x02): rejected — instance limit.
     try write(dw, makeKey(0x02));
+    fx.settle();
 
     var s = DDS.SampleRejectedStatus{};
     _ = dr.toDDSDataReader().vtable.get_sample_rejected_status(dr.toDDSDataReader().ptr, &s);
@@ -304,6 +333,7 @@ test "sample_rejected: no rejection when limits are zero (unlimited)" {
     try write(dw, NIL_KEY);
     try write(dw, NIL_KEY);
     try write(dw, NIL_KEY);
+    fx.settle();
 
     var s = DDS.SampleRejectedStatus{};
     _ = dr.toDDSDataReader().vtable.get_sample_rejected_status(dr.toDDSDataReader().ptr, &s);

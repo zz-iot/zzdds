@@ -2,13 +2,14 @@
 //! the "nearest enclosing non-null listener" fallback chain: reader ->
 //! subscriber -> participant, writer -> publisher -> participant.
 //!
-//! Uses IntraProcessDelivery + DirectDiscovery (synchronous, no pump) so
-//! every assertion is deterministic, matching matched_status_test.zig's/
-//! instance_lifecycle_test.zig's existing pattern for real (not stub-
-//! vtable) two-participant entity trees.
+//! Uses IntraProcessDelivery + DirectDiscovery on a ManualRuntime (tests
+//! settle after each step) so every assertion is deterministic, matching
+//! matched_status_test.zig's/instance_lifecycle_test.zig's existing pattern
+//! for real (not stub-vtable) two-participant entity trees.
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -36,6 +37,7 @@ fn topicDesc(t: DDS.Topic) DDS.TopicDescription {
 
 const Fixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
 
     t_w: *zzdds.intraprocess.MemoryTransport,
@@ -53,6 +55,10 @@ const Fixture = struct {
     topic_r: DDS.Topic,
 
     fn init(alloc: std.mem.Allocator) !Fixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
 
@@ -77,6 +83,7 @@ const Fixture = struct {
         const topic_r = dp_r.create_topic("FallbackTopic", "FallbackType", .{}, null, 0);
 
         return .{
+            .mr = mr,
             .alloc = alloc,
             .delivery = delivery,
             .t_w = t_w,
@@ -97,6 +104,7 @@ const Fixture = struct {
     fn deinit(self: *Fixture) void {
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_w.deinit();
         self.factory_r.deinit();
         self.d_w.deinit();
@@ -104,6 +112,13 @@ const Fixture = struct {
         self.t_w.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *Fixture) void {
+        self.mr.settle();
     }
 };
 
@@ -147,6 +162,7 @@ test "listener fallback: reader with no listener falls back to Subscriber's on_d
     const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
     const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));
     _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD);
+    fx.settle();
 
     try testing.expectEqual(FiredOn.subscriber, state.fired_on);
     // The callback that ran is the Subscriber's, but the handle it received
@@ -175,6 +191,7 @@ test "listener fallback: reader and Subscriber both silent falls back to DomainP
     const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
     const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));
     _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD);
+    fx.settle();
 
     try testing.expectEqual(FiredOn.participant, state.fired_on);
     try testing.expectEqual(dr_handle, state.handle.ptr);
@@ -204,6 +221,7 @@ test "listener fallback: reader's own listener wins over Subscriber's (no fallba
     const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
     const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));
     _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD);
+    fx.settle();
 
     try testing.expectEqual(FiredOn.reader, state.fired_on);
     try testing.expectEqual(dr_handle, state.handle.ptr);
@@ -241,9 +259,9 @@ test "listener fallback: writer with no listener falls back to Publisher's on_pu
 
     // Writer created with NO listener -- match must fall back to the Publisher.
     _ = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
-    // Reader on the other participant triggers discovery/match synchronously
-    // (DirectDiscovery, no pump needed).
+    // Reader on the other participant triggers discovery/match.
     _ = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    fx.settle();
 
     try testing.expectEqual(PubFiredOn.publisher, state.fired_on);
 }
