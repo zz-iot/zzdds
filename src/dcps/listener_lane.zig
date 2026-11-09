@@ -261,9 +261,11 @@ pub const Group = struct {
         if (p.member_next) |next| next.member_prev = p.member_prev;
     }
 
-    /// Counts a request about to be submitted, or an explicit traversal.
-    /// False once the group is closed: it must not start.
-    fn begin(self: *Group) bool {
+    /// Counts a request about to be submitted, or an explicit traversal,
+    /// such as a participant's `set_listener` waiting for a listener: the
+    /// participant's deletion then finishes only after `end`. False once
+    /// the group is closed: it must not start.
+    pub fn begin(self: *Group) bool {
         self.mu.lock();
         defer self.mu.unlock();
         if (self.closed.load(.monotonic)) return false;
@@ -273,7 +275,7 @@ pub const Group = struct {
 
     /// Under `mu` throughout: `close` may free the group once it sees the
     /// last end.
-    fn end(self: *Group) void {
+    pub fn end(self: *Group) void {
         self.mu.lock();
         self.inflight -= 1;
         const last = self.inflight == 0 and self.closed.load(.monotonic);

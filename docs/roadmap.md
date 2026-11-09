@@ -1093,8 +1093,10 @@ deleting it from any callback chain does not wait. On either runtime, `set_liste
 `set_listener_ex` from application code return once no callback runs through the
 registration they replaced or an earlier replaced one, and do not wait from a callback
 chain ([replacement completion](design/concurrency/listeners.md#replacement-completion)).
-The threaded runtime does not yet wait for a running listener when deleting a reader or
-writer. Builtin-topic readers' listeners run
+The threaded runtime does not yet wait for a running listener when deleting a reader,
+writer or participant. So a participant deleted from the callback that a
+`set_listener` on it waits for can be freed under that setter; the shared runtime defers
+the teardown until the setter returns. Builtin-topic readers' listeners run
 the same way. One endpoint's listeners run one at a time, and different endpoints' may
 run at once on hosted workers, except that one listener runs one call at a time wherever
 it is installed, including as a parent's listener: the core identifies it by its

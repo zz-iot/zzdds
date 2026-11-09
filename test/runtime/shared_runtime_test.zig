@@ -3054,6 +3054,74 @@ test "a participant deleted from one reader's listener is torn down after anothe
     try testing.expectEqual(@as(u32, 1), ov.calls.load(.seq_cst));
 }
 
+/// A participant listener whose first on_data_available for `reader` waits
+/// for a setter to wait for it, then deletes the participant.
+const DeleteParticipantUnderSetter = struct {
+    io: std.Io,
+    node: *Node = undefined,
+    dp: DDS.DomainParticipant = undefined,
+    reader: *anyopaque = undefined,
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+    entered: std.Io.Event = .unset,
+    setter_timed_out: bool = false,
+
+    fn onData(handle: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
+        const self: *DeleteParticipantUnderSetter = @ptrCast(@alignCast(ld.?));
+        // The builtin readers fall back to this listener too.
+        if (zzdds.zidl_rt.unboxAsView(DDS.DataReader, handle).ptr != self.reader) return;
+        if (self.entered.isSet()) return;
+        self.entered.set(self.io);
+        const deadline = zzdds.util.time.monotonicNs() + 10 * std.time.ns_per_s;
+        while (zzdds.util.listener_box.waitingSetters() == 0) {
+            if (zzdds.util.time.monotonicNs() > deadline) {
+                self.setter_timed_out = true;
+                break;
+            }
+            std.Thread.yield() catch {};
+        }
+        self.rc = Slice.deleteParticipant(self.node, self.dp);
+    }
+
+    fn clear(self: *DeleteParticipantUnderSetter, rc: *DDS.ReturnCode_t) void {
+        rc.* = self.dp.vtable.set_listener(self.dp.ptr, null, 0);
+    }
+};
+
+test "a participant deleted by the listener its setter waits for is torn down after the setter returns" {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    var del: DeleteParticipantUnderSetter = .{ .io = h.io() };
+    var pair: Pair = undefined;
+    try pair.initWith(&h.runtime, PairOptions.bestEffort());
+    h.runtime.releaseOwner();
+    del.node = &pair.r;
+    del.dp = pair.dp_r;
+    del.reader = pair.dr.toDDSDataReader().ptr;
+    // Only the participant has a listener: the reader's status falls back to it.
+    var dp_listener = DDS.DomainParticipantListener{ .listener_data = &del, .on_data_available = DeleteParticipantUnderSetter.onData };
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dp_r.vtable.set_listener(pair.dp_r.ptr, &dp_listener, DDS.DATA_AVAILABLE_STATUS));
+
+    try pair.write(0);
+    try del.entered.waitTimeout(h.io(), ten_seconds);
+    var set_rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR;
+    // Waits for the listener, which deletes the participant: its teardown
+    // follows the setter, which is still using it.
+    const setter = try std.Thread.spawn(.{}, DeleteParticipantUnderSetter.clear, .{ &del, &set_rc });
+    setter.join();
+    try testing.expect(!del.setter_timed_out);
+    try testing.expectEqual(DDS.RETCODE_OK, del.rc);
+    try testing.expectEqual(DDS.RETCODE_OK, set_rc);
+
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dp_w.delete_contained_entities());
+    try pair.w.delete(pair.dp_w);
+    // The workers exit once the runtime stops.
+    h.hosted.join();
+    try testing.expectEqual(rt.State.backend_stopped, h.runtime.getState());
+    pair.freeNodes();
+    h.runtime.deinit();
+    h.threaded.deinit();
+}
+
 test "deleting a participant drops its builtin readers' queued listener turns without driving" {
     var m: Manual = undefined;
     m.init();
