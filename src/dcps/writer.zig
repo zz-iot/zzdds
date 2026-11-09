@@ -104,6 +104,8 @@ pub const DataWriterImpl = struct {
     // (see listenerExFromBase/baseFromListenerEx) so on_reliable_reader_ready
     // and the standard callbacks are always dispatched from one place.
     listener_ex_box: *ListenerBox(ZZDDS.DataWriterListenerEx),
+    /// Replaced registrations whose callbacks may still be running.
+    retired_listeners: listener_box_mod.Retired(ZZDDS.DataWriterListenerEx) = .{},
     /// Guards `listener_ex_box` swaps/acquires only — never held across a
     /// dispatch or any other call (see listener_box.zig).
     listener_mu: Mutex = .{},
@@ -336,7 +338,8 @@ pub const DataWriterImpl = struct {
     fn reallyDeinit(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.listeners.deinit();
-        self.listener_ex_box.releaseRef(self.alloc);
+        self.retired_listeners.deinit(self.alloc);
+        self.listener_ex_box.releaseHold(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.c_abi.free(self.alloc);
         self.qos.deinit(self.alloc);
@@ -761,6 +764,8 @@ pub const DataWriterImpl = struct {
         defer box.releaseRef(self.alloc);
         if (box.listener.on_reliable_reader_ready) |cb| {
             if (!listener_lane.admit(box)) return;
+            listener_box_mod.enterCall();
+            defer listener_box_mod.leaveCall();
             cb(guidToHandle(event.guid), event.ready, box.listener.listener_data);
         }
     }
@@ -786,21 +791,20 @@ pub const DataWriterImpl = struct {
 
     /// Backs `zzdds::DataWriter::set_listener_ex` (see src/c_abi/extensions.zig).
     pub fn setListenerEx(self: *Self, listener_ex: ZZDDS.DataWriterListenerEx, mask: DDS.StatusMask) void {
-        self.swapListenerEx(listener_ex);
-        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
+        self.swapListenerEx(listener_ex, mask);
     }
 
-    /// Installs `new_listener_ex`, releasing whatever it replaces. Safe
-    /// against a concurrently in-flight dispatch acquired via
-    /// `acquireListenerEx` (see listener_box.zig).
-    fn swapListenerEx(self: *Self, new_listener_ex: ZZDDS.DataWriterListenerEx) void {
+    /// Installs `new_listener_ex` and `mask`, retiring the registration it
+    /// replaces (listener_box.zig's `Retired`): a dispatch already using
+    /// that one keeps it alive until it returns.
+    fn swapListenerEx(self: *Self, new_listener_ex: ZZDDS.DataWriterListenerEx, mask: DDS.StatusMask) void {
         const new_box = ListenerBox(ZZDDS.DataWriterListenerEx).create(self.alloc, new_listener_ex) catch
             @panic("zzdds: out of memory boxing listener");
-        self.listener_mu.lock();
-        const old_box = self.listener_ex_box;
-        self.listener_ex_box = new_box;
-        self.listener_mu.unlock();
-        old_box.releaseRef(self.alloc);
+        const upto = self.retired_listeners.install(&self.listener_mu, &self.listener_ex_box, new_box);
+        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
+        // From application code, returns once no callback uses what it
+        // replaced (docs/design/concurrency/listeners.md#replacement-completion).
+        self.retired_listeners.drain(self.alloc, &self.listener_mu, upto, !listener_lane.inCallbackChain());
     }
 
     /// Call with no lock held. Returns a box the caller may safely read/
@@ -1080,8 +1084,7 @@ pub const DataWriterImpl = struct {
 
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.DataWriterListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
-        self.swapListenerEx(listenerExFromBase(if (a_listener) |l| l.* else DDS.noop_DataWriterListener));
-        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
+        self.swapListenerEx(listenerExFromBase(if (a_listener) |l| l.* else DDS.noop_DataWriterListener), mask);
         return DDS.RETCODE_OK;
     }
 

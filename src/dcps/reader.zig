@@ -325,6 +325,8 @@ pub const DataReaderImpl = struct {
     // (see listenerExFromBase/baseFromListenerEx) so on_reliable_writer_ready
     // and the standard callbacks are always dispatched from one place.
     listener_ex_box: *ListenerBox(ZZDDS.DataReaderListenerEx),
+    /// Replaced registrations whose callbacks may still be running.
+    retired_listeners: listener_box_mod.Retired(ZZDDS.DataReaderListenerEx) = .{},
     /// Guards `listener_ex_box` swaps/acquires only — never held across a
     /// dispatch or any other call, so it can never participate in a
     /// deadlock with `mu` or any other lock (see listener_box.zig).
@@ -692,7 +694,8 @@ pub const DataReaderImpl = struct {
     fn reallyDeinit(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.listeners.deinit();
-        self.listener_ex_box.releaseRef(self.alloc);
+        self.retired_listeners.deinit(self.alloc);
+        self.listener_ex_box.releaseHold(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.c_abi.free(self.alloc);
         // Tear down any ReadCondition/QueryCondition the app never explicitly
@@ -3272,8 +3275,7 @@ pub const DataReaderImpl = struct {
 
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.DataReaderListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
-        self.swapListener(if (a_listener) |l| l.* else DDS.noop_DataReaderListener);
-        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
+        self.swapListenerEx(listenerExFromBase(if (a_listener) |l| l.* else DDS.noop_DataReaderListener), mask);
 
         // DDS status conditions/listeners are level-triggered, not
         // edge-triggered: enabling a listener for a status that's *already*
@@ -3310,32 +3312,20 @@ pub const DataReaderImpl = struct {
         return listener_box_mod.handOut(baseFromListenerEx(self.listener_ex_box.listener));
     }
 
-    /// Installs `new_listener` (widened from the base OMG type — the
-    /// extension callback is unset), releasing whatever it replaces. Safe
-    /// against a concurrently in-flight dispatch acquired via
-    /// `acquireListener` (see listener_box.zig) — the entity's own
-    /// "installed" reference is what gets dropped here; an in-flight
-    /// dispatch's own extra reference keeps the old box (and its native
-    /// context) alive until that dispatch finishes and releases it.
-    fn swapListener(self: *Self, new_listener: DDS.DataReaderListener) void {
-        self.swapListenerEx(listenerExFromBase(new_listener));
-    }
-
     /// Backs `zzdds::DataReader::set_listener_ex` (see
     /// src/c_abi/extensions.zig).
     pub fn setListenerEx(self: *Self, listener_ex: ZZDDS.DataReaderListenerEx, mask: DDS.StatusMask) void {
-        self.swapListenerEx(listener_ex);
-        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
+        self.swapListenerEx(listener_ex, mask);
     }
 
-    fn swapListenerEx(self: *Self, new_listener_ex: ZZDDS.DataReaderListenerEx) void {
+    fn swapListenerEx(self: *Self, new_listener_ex: ZZDDS.DataReaderListenerEx, mask: DDS.StatusMask) void {
         const new_box = ListenerBox(ZZDDS.DataReaderListenerEx).create(self.alloc, new_listener_ex) catch
             @panic("zzdds: out of memory boxing listener");
-        self.listener_mu.lock();
-        const old_box = self.listener_ex_box;
-        self.listener_ex_box = new_box;
-        self.listener_mu.unlock();
-        old_box.releaseRef(self.alloc);
+        const upto = self.retired_listeners.install(&self.listener_mu, &self.listener_ex_box, new_box);
+        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
+        // From application code, returns once no callback uses what it
+        // replaced (docs/design/concurrency/listeners.md#replacement-completion).
+        self.retired_listeners.drain(self.alloc, &self.listener_mu, upto, !listener_lane.inCallbackChain());
     }
 
     /// Call with no lock held. Returns a box the caller may safely read/
@@ -3369,6 +3359,8 @@ pub const DataReaderImpl = struct {
         defer box.releaseRef(self.alloc);
         if (box.listener.on_reliable_writer_ready) |cb| {
             if (!listener_lane.admit(box)) return;
+            listener_box_mod.enterCall();
+            defer listener_box_mod.leaveCall();
             cb(writer_mod.guidToHandle(event.guid), event.ready, box.listener.listener_data);
         }
     }
@@ -4259,7 +4251,8 @@ test "coherent access: WaitSet trigger survives multiple queued committed sets (
             while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
         }
         dr.seen_instances.deinit(alloc);
-        dr.listener_ex_box.releaseRef(alloc);
+        dr.retired_listeners.deinit(alloc);
+        dr.listener_ex_box.releaseHold(alloc);
     }
 
     // Two already-complete coherent sets queued, as if two GROUP-scope
@@ -4347,7 +4340,8 @@ test "takeRaw: expired LIFESPAN sample is silently discarded" {
             while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
         }
         dr.seen_instances.deinit(alloc);
-        dr.listener_ex_box.releaseRef(alloc);
+        dr.retired_listeners.deinit(alloc);
+        dr.listener_ex_box.releaseHold(alloc);
     }
 
     const d = try alloc.dupe(u8, &.{0xAA});
@@ -4399,7 +4393,8 @@ fn deinitTestReader(dr: *DataReaderImpl, alloc: std.mem.Allocator) void {
         while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
     }
     dr.seen_instances.deinit(alloc);
-    dr.listener_ex_box.releaseRef(alloc);
+    dr.retired_listeners.deinit(alloc);
+    dr.listener_ex_box.releaseHold(alloc);
 }
 
 test "determineStatesLocked: disposed_generation_count increments only on resurrection from DISPOSED" {

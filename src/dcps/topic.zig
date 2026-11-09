@@ -13,6 +13,7 @@ const waitset = @import("waitset.zig");
 const filter_mod = @import("filter.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const listener_box_mod = @import("../util/listener_box.zig");
+const listener_lane = @import("listener_lane.zig");
 const ListenerBox = listener_box_mod.ListenerBox;
 const Mutex = @import("../util/mutex.zig").Mutex;
 const extensions_mod = @import("../c_abi/extensions.zig");
@@ -51,6 +52,8 @@ pub const TopicImpl = struct {
     enabled: std.atomic.Value(bool) = .init(true),
     qos: DDS.TopicQos,
     listener_box: *ListenerBox(DDS.TopicListener),
+    /// Replaced registrations whose callbacks may still be running.
+    retired_listeners: listener_box_mod.Retired(DDS.TopicListener) = .{},
     /// Guards `listener_box` swaps/acquires only — never held across a
     /// dispatch or any other call (see listener_box.zig).
     listener_mu: Mutex = .{},
@@ -158,7 +161,8 @@ pub const TopicImpl = struct {
     }
 
     fn destroy(self: *Self) void {
-        self.listener_box.releaseRef(self.alloc);
+        self.retired_listeners.deinit(self.alloc);
+        self.listener_box.releaseHold(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.c_abi.free(self.alloc);
         self.td_c_abi.free(self.alloc);
@@ -285,8 +289,7 @@ pub const TopicImpl = struct {
 
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.TopicListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
-        self.swapListener(if (a_listener) |l| l.* else DDS.noop_TopicListener);
-        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
+        self.swapListener(if (a_listener) |l| l.* else DDS.noop_TopicListener, mask);
         return DDS.RETCODE_OK;
     }
 
@@ -297,17 +300,17 @@ pub const TopicImpl = struct {
         return listener_box_mod.handOut(self.listener_box.listener);
     }
 
-    /// Installs `new_listener`, releasing whatever it replaces. Safe against
-    /// a concurrently in-flight dispatch acquired via `acquireListener` (see
-    /// listener_box.zig).
-    fn swapListener(self: *Self, new_listener: DDS.TopicListener) void {
+    /// Installs `new_listener` and `mask`, retiring the registration it
+    /// replaces (listener_box.zig's `Retired`): a dispatch already using
+    /// that one keeps it alive until it returns.
+    fn swapListener(self: *Self, new_listener: DDS.TopicListener, mask: DDS.StatusMask) void {
         const new_box = ListenerBox(DDS.TopicListener).create(self.alloc, new_listener) catch
             @panic("zzdds: out of memory boxing listener");
-        self.listener_mu.lock();
-        const old_box = self.listener_box;
-        self.listener_box = new_box;
-        self.listener_mu.unlock();
-        old_box.releaseRef(self.alloc);
+        const upto = self.retired_listeners.install(&self.listener_mu, &self.listener_box, new_box);
+        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
+        // From application code, returns once no callback uses what it
+        // replaced (docs/design/concurrency/listeners.md#replacement-completion).
+        self.retired_listeners.drain(self.alloc, &self.listener_mu, upto, !listener_lane.inCallbackChain());
     }
 
     fn vtGetInconsistent(ctx: *anyopaque, a_status: *DDS.InconsistentTopicStatus) DDS.ReturnCode_t {

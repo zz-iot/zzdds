@@ -23,6 +23,7 @@ const ListenerCall = @import("listener_lane.zig").Call;
 const ListenerTraversal = @import("listener_lane.zig").Traversal;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const listener_box_mod = @import("../util/listener_box.zig");
+const listener_lane = @import("listener_lane.zig");
 const ListenerBox = listener_box_mod.ListenerBox;
 const listener_fallback = @import("../util/listener_fallback.zig");
 const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
@@ -180,6 +181,8 @@ pub const SubscriberImpl = struct {
     /// governs whether *this Subscriber's* future DataReaders start enabled.
     enabled: std.atomic.Value(bool),
     listener_box: *ListenerBox(DDS.SubscriberListener),
+    /// Replaced registrations whose callbacks may still be running.
+    retired_listeners: listener_box_mod.Retired(DDS.SubscriberListener) = .{},
     /// Guards `listener_box` swaps/acquires only — never held across a
     /// dispatch or any other call (see listener_box.zig).
     listener_mu: Mutex = .{},
@@ -289,7 +292,8 @@ pub const SubscriberImpl = struct {
 
     fn reallyDeinit(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.listener_box.releaseRef(self.alloc);
+        self.retired_listeners.deinit(self.alloc);
+        self.listener_box.releaseHold(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.c_abi.free(self.alloc);
         // Owned DataReaders were torn down synchronously in deinit(); empty here.
@@ -838,8 +842,7 @@ pub const SubscriberImpl = struct {
 
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.SubscriberListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
-        self.swapListener(if (a_listener) |l| l.* else DDS.noop_SubscriberListener);
-        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
+        self.swapListener(if (a_listener) |l| l.* else DDS.noop_SubscriberListener, mask);
         return DDS.RETCODE_OK;
     }
 
@@ -850,17 +853,17 @@ pub const SubscriberImpl = struct {
         return listener_box_mod.handOut(self.listener_box.listener);
     }
 
-    /// Installs `new_listener`, releasing whatever it replaces. Safe against
-    /// a concurrently in-flight dispatch acquired via `acquireListener` (see
-    /// listener_box.zig).
-    fn swapListener(self: *Self, new_listener: DDS.SubscriberListener) void {
+    /// Installs `new_listener` and `mask`, retiring the registration it
+    /// replaces (listener_box.zig's `Retired`): a dispatch already using
+    /// that one keeps it alive until it returns.
+    fn swapListener(self: *Self, new_listener: DDS.SubscriberListener, mask: DDS.StatusMask) void {
         const new_box = ListenerBox(DDS.SubscriberListener).create(self.alloc, new_listener) catch
             @panic("zzdds: out of memory boxing listener");
-        self.listener_mu.lock();
-        const old_box = self.listener_box;
-        self.listener_box = new_box;
-        self.listener_mu.unlock();
-        old_box.releaseRef(self.alloc);
+        const upto = self.retired_listeners.install(&self.listener_mu, &self.listener_box, new_box);
+        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
+        // From application code, returns once no callback uses what it
+        // replaced (docs/design/concurrency/listeners.md#replacement-completion).
+        self.retired_listeners.drain(self.alloc, &self.listener_mu, upto, !listener_lane.inCallbackChain());
     }
 
     /// Call with no lock held. Returns a box the caller may safely read/
@@ -1328,7 +1331,11 @@ pub const SubscriberImpl = struct {
         // top-level defer (a safety net for an early-return path) doesn't
         // double-release.
         for (listener_snaps.items) |snap| {
-            if (snap.resolution.cb) |cb| cb(snap.dr.vtable.get_c_abi_handle(snap.dr.ptr), snap.resolution.listener_data);
+            if (snap.resolution.cb) |cb| {
+                listener_box_mod.enterCall();
+                defer listener_box_mod.leaveCall();
+                cb(snap.dr.vtable.get_c_abi_handle(snap.dr.ptr), snap.resolution.listener_data);
+            }
             snap.resolution.release();
         }
         listener_snaps.clearRetainingCapacity();

@@ -2098,6 +2098,112 @@ test "deleting a publisher's contents from outside a callback waits for a writer
     try expectDeletionWaitsForListener(.writer, true);
 }
 
+fn clearReaderListener(held: *Held, rc: *DDS.ReturnCode_t) void {
+    rc.* = held.dr.set_listener(null, 0);
+    held.deleted.store(true, .release);
+}
+
+fn clearWriterListener(held: *Held, rc: *DDS.ReturnCode_t) void {
+    rc.* = held.dw.set_listener(null, 0);
+    held.deleted.store(true, .release);
+}
+
+/// Clears an endpoint's listener from another application thread while it
+/// runs on a hosted worker: set_listener returns only once it has returned
+/// (docs/design/concurrency/listeners.md#replacement-completion). `deleted`
+/// marks the setter's return.
+fn expectReplacementWaitsForListener(endpoint: Endpoint) !void {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    var held: Held = .{ .io = h.io() };
+    var o = PairOptions.bestEffort();
+    switch (endpoint) {
+        .reader => {
+            o.dr_listener = held.readerListener();
+            o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+        },
+        .writer => {
+            o.dw_listener = held.writerListener();
+            o.dw_mask = DDS.OFFERED_DEADLINE_MISSED_STATUS;
+        },
+    }
+    var pair: Pair = undefined;
+    try pair.initWith(&h.runtime, o);
+    h.runtime.releaseOwner();
+    held.dr = pair.dr.toDDSDataReader();
+    held.dw = pair.dw_h;
+
+    switch (endpoint) {
+        .reader => try pair.write(0),
+        .writer => {
+            var qos: DDS.DataWriterQos = undefined;
+            try testing.expectEqual(DDS.RETCODE_OK, pair.dw_h.get_qos(&qos));
+            qos.deadline.period = Slice.deadline;
+            try testing.expectEqual(DDS.RETCODE_OK, pair.dw_h.set_qos(qos));
+        },
+    }
+    try held.entered.waitTimeout(h.io(), ten_seconds);
+    var rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR;
+    const setter = switch (endpoint) {
+        .reader => try std.Thread.spawn(.{}, clearReaderListener, .{ &held, &rc }),
+        .writer => try std.Thread.spawn(.{}, clearWriterListener, .{ &held, &rc }),
+    };
+    while (zzdds.util.listener_box.waitingSetters() == 0 and !held.deleted.load(.acquire)) std.Thread.yield() catch {};
+    held.release.set(h.io());
+    setter.join();
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expect(!held.release_timed_out);
+    try testing.expect(!held.deleted_before_return);
+    try testing.expect(held.returned.isSet());
+
+    try pair.deinit();
+    try h.deinit();
+}
+
+test "clearing a reader's listener from outside a callback waits for its running listener to return" {
+    try expectReplacementWaitsForListener(.reader);
+}
+
+test "clearing a writer's listener from outside a callback waits for its running listener to return" {
+    try expectReplacementWaitsForListener(.writer);
+}
+
+/// A reader listener that clears itself from its own turn.
+const ClearSelf = struct {
+    io: std.Io,
+    dr: DDS.DataReader = undefined,
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+    returned: std.Io.Event = .unset,
+
+    fn onData(_: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
+        const self: *ClearSelf = @ptrCast(@alignCast(ld.?));
+        if (self.returned.isSet()) return;
+        self.rc = self.dr.set_listener(null, 0);
+        self.returned.set(self.io);
+    }
+};
+
+test "a listener clearing itself from its own turn does not wait for itself" {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    var state: ClearSelf = .{ .io = h.io() };
+    var o = PairOptions.bestEffort();
+    o.dr_listener = .{ .listener_data = &state, .on_data_available = ClearSelf.onData };
+    o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+    var pair: Pair = undefined;
+    try pair.initWith(&h.runtime, o);
+    h.runtime.releaseOwner();
+    state.dr = pair.dr.toDDSDataReader();
+
+    try pair.write(0);
+    // Waiting for itself would never return.
+    try state.returned.waitTimeout(h.io(), ten_seconds);
+    try testing.expectEqual(DDS.RETCODE_OK, state.rc);
+
+    try pair.deinit();
+    try h.deinit();
+}
+
 test "deleting a reader from outside a callback waits for its listener called by notify_datareaders" {
     var threaded: std.Io.Threaded = .init(alloc, .{});
     defer threaded.deinit();

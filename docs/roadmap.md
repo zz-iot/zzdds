@@ -1089,7 +1089,12 @@ and progress that runs internal work only passes them over. Direct discovery sti
 matches synchronously on the caller's thread, but the listeners that follow run on the
 runtime. Deleting a reader or writer from application code waits for a listener
 running through it (as a runtime turn, or inline from `notify_datareaders`) to return;
-deleting it from any callback chain does not wait. Builtin-topic readers' listeners run
+deleting it from any callback chain does not wait. On either runtime, `set_listener` and
+`set_listener_ex` from application code return once no callback runs through the
+registration they replaced or an earlier replaced one, and do not wait from a callback
+chain ([replacement completion](design/concurrency/listeners.md#replacement-completion)).
+The threaded runtime does not yet wait for a running listener when deleting a reader or
+writer. Builtin-topic readers' listeners run
 the same way. One endpoint's listeners run one at a time, and different endpoints' may
 run at once on hosted workers, except that one listener runs one call at a time wherever
 it is installed, including as a parent's listener: the core identifies it by its
