@@ -2942,38 +2942,60 @@ test "vtJoinMulticast and vtLeaveMulticast IPv4 round-trip" {
     t.leaveMulticast(&mc_group);
 }
 
-test "two transports join one multicast group on one port" {
+test "two transports join one multicast group on one port, and both receive from it" {
     // Every participant on a host binds its domain's discovery port; on
     // Darwin all but the first failed to until allowAddrReuse set
-    // SO_REUSEPORT there.
+    // SO_REUSEPORT there. Sharing the port is not enough: each must also get
+    // every multicast datagram, as SPDP needs.
     const alloc = std.testing.allocator;
     const mc_port: u16 = 55402;
     const listen_loc = Locator.udp4(.{ 0, 0, 0, 0 }, mc_port);
     const mc_group = Locator.udp4(.{ 239, 255, 0, 1 }, mc_port);
 
-    var sentinel: u8 = 0;
-    const h = ReceiveHandler{
-        .ctx = &sentinel,
-        .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
-        }.f,
+    // Atomics: the handler runs on each transport's receive thread.
+    const Counter = struct {
+        n: std.atomic.Value(usize) = .init(0),
+        fn f(ctx: *anyopaque, _: []const u8, _: Locator, _: Channel) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.n.fetchAdd(1, .monotonic);
+        }
+        fn handler(self: *@This()) ReceiveHandler {
+            return .{ .ctx = self, .on_receive = f };
+        }
     };
+    var ctr = [2]Counter{ .{}, .{} };
 
     const a = try UdpTransport.init(alloc, .{ .participant_id = 181, .ipv6_enabled = false }, 0, null);
     defer a.deinit();
     const b = try UdpTransport.init(alloc, .{ .participant_id = 182, .ipv6_enabled = false }, 0, null);
     defer b.deinit();
+    const ts = [2]*UdpTransport{ a, b };
 
-    for ([_]*UdpTransport{ a, b }) |udp| {
+    for (ts, &ctr) |udp, *cnt| {
         const t = udp.transport();
-        try t.listen(&listen_loc, h);
+        try t.listen(&listen_loc, cnt.handler());
         try t.joinMulticast(&mc_group);
     }
-    for ([_]*UdpTransport{ a, b }) |udp| {
+    defer for (ts, &ctr) |udp, *cnt| {
         const t = udp.transport();
         t.leaveMulticast(&mc_group);
-        t.unlisten(&listen_loc, h);
+        t.unlisten(&listen_loc, cnt.handler());
+    };
+
+    // Resend until both have one: a datagram can be dropped.
+    var tries: usize = 0;
+    while (tries < 30) : (tries += 1) {
+        if (ctr[0].n.load(.monotonic) > 0 and ctr[1].n.load(.monotonic) > 0) break;
+        try a.transport().send(&mc_group, "spdp");
+        sleepMs(100);
     }
+    const got_a = ctr[0].n.load(.monotonic);
+    const got_b = ctr[1].n.load(.monotonic);
+    // Neither: this host does not loop multicast back at all, which is not
+    // what this test is about. Exactly one is the bug.
+    if (got_a == 0 and got_b == 0) return error.SkipZigTest;
+    try std.testing.expect(got_a > 0);
+    try std.testing.expect(got_b > 0);
 }
 
 // ── sendUdp4 / sendUdp6 direct calls ─────────────────────────────────────────
