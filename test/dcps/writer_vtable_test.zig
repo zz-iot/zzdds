@@ -513,13 +513,17 @@ test "notifyIncompatibleQos: accumulates when no listener; getter clears change"
     try testing.expect(dw.vtable.get_status_changes(dw.ptr) & DDS.OFFERED_INCOMPATIBLE_QOS_STATUS != 0);
 
     var s: DDS.OfferedIncompatibleQosStatus = .{};
+    defer s.policies.deinit(alloc);
     _ = dw.vtable.get_offered_incompatible_qos_status(dw.ptr, &s);
     try testing.expectEqual(@as(i32, 1), s.total_count);
     try testing.expectEqual(@as(i32, 11), s.last_policy_id);
-    // After reading, change is cleared.
+    try testing.expectEqualSlices(DDS.QosPolicyCount, &.{.{ .policy_id = 11, .count = 1 }}, s.policies._buffer.?[0..s.policies._length]);
+    // After reading, change is cleared; the per-policy count is not.
     var s2: DDS.OfferedIncompatibleQosStatus = .{};
+    defer s2.policies.deinit(alloc);
     _ = dw.vtable.get_offered_incompatible_qos_status(dw.ptr, &s2);
     try testing.expectEqual(@as(i32, 0), s2.total_count_change);
+    try testing.expectEqual(@as(u32, 1), s2.policies._length);
 }
 
 test "notifyDeadlineMissed: fires listener and clears status" {

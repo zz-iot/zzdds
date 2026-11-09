@@ -414,9 +414,10 @@ test "DataReader: get_requested_incompatible_qos_status initially zero" {
     defer fx.deinit();
     const dr = fx.makeReader(nil.nil_dr_listener, 0);
     defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr);
-    var status: DDS.RequestedIncompatibleQosStatus = undefined;
+    var status: DDS.RequestedIncompatibleQosStatus = .{};
     try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.get_requested_incompatible_qos_status(dr.ptr, &status));
     try testing.expectEqual(@as(i32, 0), status.total_count);
+    try testing.expectEqual(@as(u32, 0), status.policies._length);
 }
 
 test "DataReader: get_subscription_matched_status initially zero" {
@@ -595,13 +596,19 @@ test "DataReader: get_requested_incompatible_qos_status clears change after read
     const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
 
     DataReaderImpl.notifyIncompatibleQos(dr, 5);
-    var status: DDS.RequestedIncompatibleQosStatus = undefined;
+    var status: DDS.RequestedIncompatibleQosStatus = .{};
+    defer status.policies.deinit(alloc);
     _ = dr_dds.vtable.get_requested_incompatible_qos_status(dr_dds.ptr, &status);
     try testing.expectEqual(@as(i32, 1), status.total_count);
     try testing.expectEqual(@as(i32, 5), status.last_policy_id);
-    // Second read: total_count_change cleared.
+    try testing.expectEqualSlices(DDS.QosPolicyCount, &.{.{ .policy_id = 5, .count = 1 }}, status.policies._buffer.?[0..status.policies._length]);
+    // Second read, reusing the sequence: total_count_change cleared, the
+    // per-policy count kept, in the buffer the first read allocated.
+    const buffer = status.policies._buffer;
     _ = dr_dds.vtable.get_requested_incompatible_qos_status(dr_dds.ptr, &status);
     try testing.expectEqual(@as(i32, 0), status.total_count_change);
+    try testing.expectEqual(buffer, status.policies._buffer);
+    try testing.expectEqual(@as(u32, 1), status.policies._length);
 }
 
 test "DataReader: get_sample_lost_status clears change after read" {

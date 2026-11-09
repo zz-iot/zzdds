@@ -275,18 +275,20 @@ fn subMatched(r: *DataReaderImpl) DDS.SubscriptionMatchedStatus {
     return s;
 }
 
-fn requestedIncompatible(r: *DataReaderImpl) DDS.RequestedIncompatibleQosStatus {
+fn requestedIncompatible(r: *DataReaderImpl) i32 {
     var s: DDS.RequestedIncompatibleQosStatus = .{};
     const dr = r.toDDSDataReader();
     _ = dr.vtable.get_requested_incompatible_qos_status(dr.ptr, &s);
-    return s;
+    s.policies.deinit(testing.allocator);
+    return s.total_count;
 }
 
-fn offeredIncompatible(w: *DataWriterImpl) DDS.OfferedIncompatibleQosStatus {
+fn offeredIncompatible(w: *DataWriterImpl) i32 {
     var s: DDS.OfferedIncompatibleQosStatus = .{};
     const dw = w.toDDSDataWriter();
     _ = dw.vtable.get_offered_incompatible_qos_status(dw.ptr, &s);
-    return s;
+    s.policies.deinit(testing.allocator);
+    return s.total_count;
 }
 
 fn pubMatched(w: *DataWriterImpl) DDS.PublicationMatchedStatus {
@@ -577,11 +579,11 @@ test "a writer refreshed with a longer deadline than its reader requests is unma
     h.announceWriter(w, .{ .deadline_s = 2 });
     try testing.expectEqual(@as(i32, 0), subMatched(r).current_count);
     try testing.expectEqual(@as(usize, 0), r.proto_reader.matchedWriterCount());
-    try testing.expectEqual(@as(i32, 1), requestedIncompatible(r).total_count);
+    try testing.expectEqual(@as(i32, 1), requestedIncompatible(r));
     // Matching again, it is matched again.
     h.announceWriter(w, .{ .deadline_s = 1 });
     try testing.expectEqual(@as(i32, 1), subMatched(r).current_count);
-    try testing.expectEqual(@as(i32, 1), requestedIncompatible(r).total_count);
+    try testing.expectEqual(@as(i32, 1), requestedIncompatible(r));
 }
 
 test "a writer refreshed into a partition its reader is not in is unmatched" {
@@ -596,7 +598,30 @@ test "a writer refreshed into a partition its reader is not in is unmatched" {
     h.announceWriter(w, .{ .partitions = &.{"elsewhere"} });
     try testing.expectEqual(@as(i32, 0), subMatched(r).current_count);
     try testing.expectEqual(@as(usize, 0), r.proto_reader.matchedWriterCount());
-    try testing.expectEqual(@as(i32, 0), requestedIncompatible(r).total_count);
+    try testing.expectEqual(@as(i32, 0), requestedIncompatible(r));
+}
+
+test "a writer created after an incompatible reader was discovered counts it as incompatible" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const rd = endpointGuid(0x74, 1, READER_KIND);
+    h.announceReaderWith(rd, .{ .deadline_s = 1 });
+
+    // Its first announcement is the only check against that reader.
+    var qos = DDS.DataWriterQos{};
+    qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    qos.deadline.period = .{ .sec = 2, .nanosec = 0 };
+    const w = h.writer(qos, null);
+    try testing.expectEqual(@as(i32, 0), pubMatched(w).current_count);
+
+    var s: DDS.OfferedIncompatibleQosStatus = .{};
+    defer s.policies.deinit(testing.allocator);
+    const dw = w.toDDSDataWriter();
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.get_offered_incompatible_qos_status(dw.ptr, &s));
+    try testing.expectEqual(@as(i32, 1), s.total_count);
+    try testing.expectEqual(DDS.DEADLINE_QOS_POLICY_ID, s.last_policy_id);
+    try testing.expectEqualSlices(DDS.QosPolicyCount, &.{.{ .policy_id = DDS.DEADLINE_QOS_POLICY_ID, .count = 1 }}, s.policies._buffer.?[0..s.policies._length]);
 }
 
 test "a reader refreshed with a shorter deadline than its writer offers is unmatched, and counted once as incompatible" {
@@ -614,7 +639,7 @@ test "a reader refreshed with a shorter deadline than its writer offers is unmat
     h.announceReaderWith(rd, .{ .deadline_s = 1 });
     try testing.expectEqual(@as(i32, 0), pubMatched(w).current_count);
     try testing.expectEqual(@as(usize, 0), w.proto_writer.matchedReaderCount());
-    try testing.expectEqual(@as(i32, 1), offeredIncompatible(w).total_count);
+    try testing.expectEqual(@as(i32, 1), offeredIncompatible(w));
 }
 
 test "a reader refreshed into a partition its writer is not in is unmatched" {
@@ -631,5 +656,5 @@ test "a reader refreshed into a partition its writer is not in is unmatched" {
     h.announceReaderWith(rd, .{ .partitions = &.{"elsewhere"} });
     try testing.expectEqual(@as(i32, 0), pubMatched(w).current_count);
     try testing.expectEqual(@as(usize, 0), w.proto_writer.matchedReaderCount());
-    try testing.expectEqual(@as(i32, 0), offeredIncompatible(w).total_count);
+    try testing.expectEqual(@as(i32, 0), offeredIncompatible(w));
 }

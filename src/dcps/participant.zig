@@ -4410,7 +4410,8 @@ pub const DomainParticipantImpl = struct {
                 // Without room, nothing is unmatched (see the roadmap's
                 // "A remote endpoint's discovery is handled best-effort
                 // when out of memory").
-                const can_unmatch = aw.announced and removed.reserve(self.alloc, self.discovered_readers.items.len);
+                const refresh = aw.announced;
+                const can_unmatch = refresh and removed.reserve(self.alloc, self.discovered_readers.items.len);
                 aw.announced = true;
                 // Retroactively match against readers discovered before this
                 // writer existed (or before it announced final partition/
@@ -4440,7 +4441,12 @@ pub const DomainParticipantImpl = struct {
                     if (!std.mem.eql(u8, dr.type_name, aw.type_name)) continue;
                     const result = qm_mod.checkDiscovered(&local_wd, &dr.qos);
                     if (!result.isCompatible()) {
-                        if (can_unmatch and removed.unmatchReaderLocked(aw, dr.guid)) {
+                        // As for a reader (subAnnounceProtoReader): this is
+                        // the only place a reader discovered first is checked
+                        // against this writer. A refresh counts only a match
+                        // it removes: the first announcement counted the rest.
+                        const unmatched = can_unmatch and removed.unmatchReaderLocked(aw, dr.guid);
+                        if (!refresh or unmatched) {
                             aw.incompat_pending.record(result.incompatible);
                             incompat = true;
                         }

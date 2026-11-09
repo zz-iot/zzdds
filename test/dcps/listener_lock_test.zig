@@ -404,14 +404,17 @@ test "every incompatible reader is notified once, however many there are" {
     for (counts) |c| try testing.expectEqual(@as(usize, 1), c.calls);
 }
 
+/// The policies the last call's status counts, in the order it lists them.
 const IncompatPolicies = struct {
     ids: [8]DDS.QosPolicyId_t = undefined,
-    n: usize = 0,
-    first_change: i32 = 0,
+    n_ids: usize = 0,
+    calls: usize = 0,
     fn cb(p: *IncompatPolicies, _: DDS.DataReader, status: DDS.RequestedIncompatibleQosStatus) void {
-        if (p.n == 0) p.first_change = status.total_count_change;
-        if (p.n < p.ids.len) p.ids[p.n] = status.last_policy_id;
-        p.n += 1;
+        p.calls += 1;
+        // Borrowed for the call: keep the ids only.
+        const policies = if (status.policies._buffer) |b| b[0..status.policies._length] else &.{};
+        p.n_ids = @min(policies.len, p.ids.len);
+        for (policies[0..p.n_ids], p.ids[0..p.n_ids]) |pc, *id| id.* = pc.policy_id;
     }
 };
 
@@ -444,22 +447,9 @@ test "a reader incompatible with several writers is told each policy" {
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr);
     fx.settle();
 
-    // On the shared runtime the reader has at most one pending notification
-    // per status, so the incompatibilities found as it is created reach the
-    // listener as one call that counts both writers
-    // (docs/design/concurrency/listeners.md#status-ordering-requirements).
-    if (zzdds.runtime.enabled) {
-        try testing.expectEqual(@as(usize, 1), probe.n);
-        try testing.expect(probe.first_change >= 2);
-        return;
-    }
-    // Otherwise the first two calls come from the check made as the reader
-    // is created, one per writer, each with its own policy. (Nothing after
-    // them is checked: this test's in-process discovery then announces both
-    // writers again, and an already-reported incompatible writer is
-    // currently reported again.)
-    try testing.expect(probe.n >= 2);
-    const first = probe.ids[0..2];
-    std.mem.sort(DDS.QosPolicyId_t, first, {}, std.sort.asc(DDS.QosPolicyId_t));
-    try testing.expectEqualSlices(DDS.QosPolicyId_t, &.{ DDS.DURABILITY_QOS_POLICY_ID, DDS.RELIABILITY_QOS_POLICY_ID }, first);
+    // However the calls fall (on the shared runtime they coalesce into one,
+    // docs/design/concurrency/listeners.md#status-ordering-requirements), the
+    // status counts each policy (DDS 1.4 §2.2.4.1), in policy-id order.
+    try testing.expect(probe.calls >= 1);
+    try testing.expectEqualSlices(DDS.QosPolicyId_t, &.{ DDS.DURABILITY_QOS_POLICY_ID, DDS.RELIABILITY_QOS_POLICY_ID }, probe.ids[0..probe.n_ids]);
 }

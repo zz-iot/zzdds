@@ -14,7 +14,9 @@
 //     bridges once built a separate base wrapper);
 //   - that entity upcasts to zzdds::DataWriterImpl / zzdds::DataReaderImpl;
 //   - a ContentFilteredTopic upcasts to zzdds::ContentFilteredTopicImpl, whose
-//     set_filter_expression changes the filter without unmatching its reader.
+//     set_filter_expression changes the filter without unmatching its reader;
+//   - the incompatible-QoS statuses' per-policy counts come back through the
+//     getters (the core allocates them, the binding copies and frees them).
 #include "zzdds_cpp.hpp"
 
 #include <atomic>
@@ -168,6 +170,26 @@ int main() {
     }
     CHECK(sub->delete_datareader(cft_reader) == ::DDS::RETCODE_OK);
     CHECK(dp_r->delete_contentfilteredtopic(cft) == ::DDS::RETCODE_OK);
+
+    // A BEST_EFFORT writer cannot serve the RELIABLE reader: both sides count
+    // it against RELIABILITY in their statuses' policies.
+    auto be_qos = ::DDS::DataWriterQos::default_value();
+    be_qos.reliability.kind = ::DDS::ReliabilityQosPolicyKind::BEST_EFFORT_RELIABILITY_QOS;
+    auto be_writer = pub->create_datawriter(topic_w, be_qos, nullptr, 0);
+    CHECK(be_writer);
+    auto counts_reliability = [](const ::DDS::QosPolicyCountSeq& policies) {
+        return policies.size() == 1 && policies[0].policy_id == ::DDS::RELIABILITY_QOS_POLICY_ID &&
+               policies[0].count >= 1;
+    };
+    CHECK(wait_until([&] {
+        ::DDS::RequestedIncompatibleQosStatus st{};
+        return dr->get_requested_incompatible_qos_status(st) == ::DDS::RETCODE_OK && counts_reliability(st.policies);
+    }));
+    CHECK(wait_until([&] {
+        ::DDS::OfferedIncompatibleQosStatus st{};
+        return be_writer->get_offered_incompatible_qos_status(st) == ::DDS::RETCODE_OK && counts_reliability(st.policies);
+    }));
+    CHECK(pub->delete_datawriter(be_writer) == ::DDS::RETCODE_OK);
 
     CHECK(pub->delete_datawriter(dw) == ::DDS::RETCODE_OK);
     CHECK(sub->delete_datareader(dr) == ::DDS::RETCODE_OK);

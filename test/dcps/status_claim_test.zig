@@ -246,7 +246,8 @@ test "status claim: REQUESTED_INCOMPATIBLE_QOS changed during the callback stays
 
     try testing.expect(drStatusChanges(dr) & DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS != 0);
     const dds = dr.toDDSDataReader();
-    var st: DDS.RequestedIncompatibleQosStatus = undefined;
+    var st: DDS.RequestedIncompatibleQosStatus = .{};
+    defer st.policies.deinit(testing.allocator);
     _ = dds.vtable.get_requested_incompatible_qos_status(dds.ptr, &st);
     try testing.expectEqual(@as(i32, 2), st.total_count);
     try testing.expectEqual(@as(i32, 1), st.total_count_change);
@@ -432,7 +433,8 @@ test "status claim: OFFERED_INCOMPATIBLE_QOS changed during the callback stays p
 
     try testing.expect(dwStatusChanges(dw) & DDS.OFFERED_INCOMPATIBLE_QOS_STATUS != 0);
     const dds = dw.toDDSDataWriter();
-    var st: DDS.OfferedIncompatibleQosStatus = undefined;
+    var st: DDS.OfferedIncompatibleQosStatus = .{};
+    defer st.policies.deinit(testing.allocator);
     _ = dds.vtable.get_offered_incompatible_qos_status(dds.ptr, &st);
     try testing.expectEqual(@as(i32, 2), st.total_count);
     try testing.expectEqual(@as(i32, 1), st.total_count_change);

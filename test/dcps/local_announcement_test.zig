@@ -439,12 +439,14 @@ fn partitionCount(p: DDS.PartitionQosPolicy) u32 {
 
 fn offeredIncompatibleCount(dw: DDS.DataWriter) !i32 {
     var st: DDS.OfferedIncompatibleQosStatus = .{};
+    defer st.policies.deinit(testing.allocator);
     try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.get_offered_incompatible_qos_status(dw.ptr, &st));
     return st.total_count;
 }
 
 fn requestedIncompatibleCount(dr: DDS.DataReader) !i32 {
     var st: DDS.RequestedIncompatibleQosStatus = .{};
+    defer st.policies.deinit(testing.allocator);
     try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.get_requested_incompatible_qos_status(dr.ptr, &st));
     return st.total_count;
 }
