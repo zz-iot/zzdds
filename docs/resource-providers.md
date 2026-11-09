@@ -200,8 +200,8 @@ the preparation. No XRCE framing, ID assignment or session lifecycle is implied.
 ## Downstream linked-provider builds
 
 With `-Dtypesupport-library=true`, downstream builds can obtain
-`zzdds_dep.module("zidl_typesupport")` alongside `module("zidl_rt")` and
-`artifact("zidl")`. Import those exact module instances when compiling generated
+`zzdds_dep.module("zidl_typesupport")`, `module("zidl_cdr")`,
+`module("zidl_bindings")` and `artifact("zidl")`. Import those exact module instances when compiling generated
 linked providers; creating another runtime/ABI graph can produce incompatible
 Zig types or duplicate module imports. The XRCE agent integration exercises this
 build contract.

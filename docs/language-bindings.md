@@ -20,14 +20,14 @@ registry. Users install this; they never run `--generate-interfaces` themselves.
 Generated source is **not** checked in to the repository. It is produced as
 part of the release/publish pipeline. The packages live in the zzdds repository
 (or a dedicated bindings repo); the zidl repository owns only the CDR companion
-libraries (`zidl-rt`, `zidl-cdr`, `zidl-rs`).
+libraries (`zidl-bindings`, `zidl-cdr`, `zidl-rs`).
 
 **2. CDR companion library** — provides the serialization primitives that
 user-generated TypeSupport code calls into. Which library (if any) depends on
 the language; see `zidl/docs/runtime_libraries.md` §"CDR Runtime Strategy":
 
-- C / C++: link `zidl-cdr` (C99 library; part of the zidl package)
-- Zig: link `zidl-rt` (Zig package)
+- C / C++: link `zidl-cdr` (stable C ABI archive; part of the zidl package)
+- Zig: import `zidl_cdr` for codecs and `zidl_bindings` for generated binding support
 - Java / Python / C#: none — CDR is inlined into the generated file
 - Rust pure: `zidl-rs` crate; the `zzdds` Rust crate re-exports it as
   `zzdds::cdr` so users only need one `cargo add`
@@ -86,7 +86,7 @@ back to the C caller:
 
 ```zig
 pub export fn DDS_Topic_get_name(self: *anyopaque) callconv(.c) [*:0]const u8 {
-    const _self: DDS.Topic = zidl_rt.unboxAsView(DDS.Topic, self);
+    const _self: DDS.Topic = zidl_bindings.unboxAsView(DDS.Topic, self);
     return _self.vtable.get_name(_self.ptr);
 }
 ```
@@ -115,7 +115,7 @@ presents, not one box per view — so a `GuardCondition` handle and the `Conditi
 `WaitSet.wait()` later returns for that same object are the identical, `==`-comparable
 C-ABI address, not just each internally self-consistent. The box's payload for these
 interfaces is a nested `CAbiViews` value (not a bare `Vtable` pointer), unboxed via
-`zidl_rt.unboxAsView` rather than `unboxAs` — pick the right one based on whether the
+`zidl_bindings.unboxAsView` rather than `unboxAs` — pick the right one based on whether the
 interface being unboxed carries the annotation, not on which interface's operation you're
 implementing a wrapper for (a parameter's type and the enclosing operation's interface can
 differ, e.g. `WaitSet.attach_condition`'s `Condition` parameter needs `unboxAsView` even
@@ -232,3 +232,13 @@ after selection; C/C++/Zig language choice alone does not establish that capabil
 See [the access contract](design/concurrency/operations.md#prepared-readtake-selection-claims-and-failure) and
 [binding result mappings](design/concurrency/operations.md#binding-visible-prepared-access-failures) for effect phases and the
 separate case of an output container failing after successful consumption.
+
+## Native CDR development builds
+
+With the shared-native zidl migration, `-Dzidl-source=/absolute/path/to/zidl`
+selects the new generator, native runtime and shared C ABI archive together.
+The SDK and binding smoke tests link that archive; building it requires Zig,
+while installed C/C++ applications keep their normal compiler and link names.
+The dependency is pinned to zidl commit `07358e16ad9ab94194c95e379c7bd70768801b79`
+(merged PR #69). Zig consumers obtain `zidl_cdr` and `zidl_bindings` through
+the zzdds dependency so generated and handwritten code share module identity.

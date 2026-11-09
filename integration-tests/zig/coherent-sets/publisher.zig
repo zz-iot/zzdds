@@ -14,7 +14,7 @@ const std = @import("std");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 const ZZDDS = @import("zzdds_ext_generated").zzdds;
-const zidl_rt = @import("zidl_rt");
+const zidl_bindings = @import("zidl_bindings");
 const pose_group_gen = @import("pose_group_gen");
 
 const GROUP_COUNT: i32 = 20;

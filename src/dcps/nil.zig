@@ -4,8 +4,8 @@
 //! the generated vtable types (DDS.DomainParticipant, DDS.Publisher, etc.)
 //! use non-optional `ptr: *anyopaque`, we provide nil-object vtables that return
 //! RETCODE_ERROR for every method.  The nil entity's `ptr` points to
-//! `zidl_rt.NIL_PTR`, a distinguishable sentinel address shared with
-//! zidl_rt's own C-ABI entity-interface-param null handling (see that
+//! `zidl_bindings.NIL_PTR`, a distinguishable sentinel address shared with
+//! zidl_bindings's own C-ABI entity-interface-param null handling (see that
 //! constant's doc comment) -- so a NULL passed for an optional entity
 //! in-param (e.g. dcps.idl's raw op family's `a_condition`) is recognized as
 //! nil by isNil() below too, not just entities this module itself hands out.
@@ -15,9 +15,9 @@
 const std = @import("std");
 const DDS = @import("zzdds_generated").DDS;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
-const zidl_rt = @import("zidl_rt");
+const zidl_bindings = @import("zidl_bindings");
 
-pub const NIL_PTR: *anyopaque = zidl_rt.NIL_PTR;
+pub const NIL_PTR: *anyopaque = zidl_bindings.NIL_PTR;
 
 /// True if the entity's ptr is the nil sentinel.
 pub fn isNil(entity: anytype) bool {

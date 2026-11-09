@@ -939,7 +939,7 @@ pub const GuardConditionImpl = struct {
         .as_Condition = vtAsConditionGuard,
     };
 
-    /// One `CAbiViews` value for the whole object (see `zidl_rt.unboxAsView`).
+    /// One `CAbiViews` value for the whole object (see `zidl_bindings.unboxAsView`).
     /// Its `base` field nests Condition's own `CAbiViews`, at offset 0 — every
     /// ancestor view's `get_c_abi_handle` below hands the *same* pointer
     /// (`&views`) to the *same* `c_abi` cache, so both views share one box.
@@ -1826,7 +1826,7 @@ test "WaitSet: a second condition's drain() still succeeds and invalidates itsel
 }
 
 test "waitset and guard handles retire while native references defer cleanup" {
-    const rt = @import("zidl_rt");
+    const rt = @import("zidl_bindings");
     const alloc = std.testing.allocator;
     const guard = try GuardConditionImpl.init(alloc);
     var guard_deleted = false;

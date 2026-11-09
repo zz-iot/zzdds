@@ -7,7 +7,7 @@
         // Point at the zzdds repo root (this app lives at
         // stress-tests/zig/lifecycle_churn within it). No direct
         // dependency on zidl -- build.zig gets the zidl executable and
-        // zidl_rt module through zzdds. See examples/zig/hello_world.
+        // zidl_cdr and zidl_bindings modules through zzdds. See examples/zig/hello_world.
         .zzdds = .{
             .path = "../../..",
         },

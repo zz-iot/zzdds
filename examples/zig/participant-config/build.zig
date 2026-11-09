@@ -24,13 +24,10 @@ pub fn build(b: *std.Build) void {
     const zzdds_gen = zzdds_dep.module("zzdds_generated");
     const zzdds_ext_gen = zzdds_dep.module("zzdds_ext_generated");
 
-    // Get zidl's executable and zidl_rt module *through* zzdds (which
-    // re-exposes both) rather than declaring our own separate dependency on
-    // zidl -- see hello_world/presence's build.zig for the full "why"
-    // (avoids a duplicate-module build failure when zidl is a `.path`
-    // dependency during zidl+zzdds co-development).
+    // Use zzdds's generator and canonical runtime modules to share type identity.
     const zidl_exe = zzdds_dep.artifact("zidl");
-    const zidl_rt_mod = zzdds_dep.module("zidl_rt");
+    const zidl_cdr_mod = zzdds_dep.module("zidl_cdr");
+    const zidl_bindings_mod = zzdds_dep.module("zidl_bindings");
 
     // Generate ConfigPing Zig bindings from idl/config_ping.idl.
     const gen_ping = b.addRunArtifact(zidl_exe);
@@ -43,7 +40,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            .{ .name = "zidl_cdr", .module = zidl_cdr_mod },
+            .{ .name = "zidl_bindings", .module = zidl_bindings_mod },
             .{ .name = "zzdds", .module = zzdds_mod },
         },
     });
@@ -53,7 +51,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "zzdds_generated", .module = zzdds_gen },
         .{ .name = "zzdds_ext_generated", .module = zzdds_ext_gen },
         .{ .name = "config_ping_gen", .module = ping_gen_mod },
-        .{ .name = "zidl_rt", .module = zidl_rt_mod },
+        .{ .name = "zidl_cdr", .module = zidl_cdr_mod },
+        .{ .name = "zidl_bindings", .module = zidl_bindings_mod },
     };
 
     const pub_exe = b.addExecutable(.{

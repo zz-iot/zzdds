@@ -18,17 +18,10 @@ pub fn build(b: *std.Build) void {
     const zzdds_gen = zzdds_dep.module("zzdds_generated");
     const zzdds_ext_gen = zzdds_dep.module("zzdds_ext_generated");
 
-    // Get zidl's executable and zidl_rt module *through* zzdds (which
-    // re-exposes both) rather than declaring our own separate dependency on
-    // zidl -- when zidl is a `.path` dependency (as it is during zidl+zzdds
-    // co-development, pre-release), a second independent `.path` dependency
-    // on the same directory doesn't get deduplicated by Zig's package
-    // manager, and the build fails outright the moment one compilation unit
-    // ends up importing both instances of the same file under two module
-    // names ("file exists in modules 'zidl_rt' and 'zidl_rt0'"). See zzdds's
-    // own build.zig for where these are re-exposed.
+    // Use zzdds's generator and canonical runtime modules to share type identity.
     const zidl_exe = zzdds_dep.artifact("zidl");
-    const zidl_rt_mod = zzdds_dep.module("zidl_rt");
+    const zidl_cdr_mod = zzdds_dep.module("zidl_cdr");
+    const zidl_bindings_mod = zzdds_dep.module("zidl_bindings");
 
     // Generate HelloWorld Zig bindings from idl/hello_world.idl.
     const gen_hello = b.addRunArtifact(zidl_exe);
@@ -41,7 +34,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            .{ .name = "zidl_cdr", .module = zidl_cdr_mod },
+            .{ .name = "zidl_bindings", .module = zidl_bindings_mod },
             .{ .name = "zzdds", .module = zzdds_mod },
         },
     });
@@ -51,7 +45,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "zzdds_generated", .module = zzdds_gen },
         .{ .name = "zzdds_ext_generated", .module = zzdds_ext_gen },
         .{ .name = "hello_world_gen", .module = hello_gen_mod },
-        .{ .name = "zidl_rt", .module = zidl_rt_mod },
+        .{ .name = "zidl_cdr", .module = zidl_cdr_mod },
+        .{ .name = "zidl_bindings", .module = zidl_bindings_mod },
     };
 
     const pub_exe = b.addExecutable(.{

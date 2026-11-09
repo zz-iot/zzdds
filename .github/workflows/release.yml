@@ -185,7 +185,7 @@ jobs:
   # Uses the stable binary name (no -Ddds-version) — the versioned name is for
   # official dds-rtps submission, not the CI gate.
   #
-  # NOTE: When ci.yml's INTEROP_RTPS_REF is bumped to a new zenzen branch, bump
+  # NOTE: When ci.yml's INTEROP_RTPS_REF is bumped, bump
   # the ref below to match — this job must stay in sync with ci.yml's
   # self-interop job (same checkout, same symlink wiring) or it will build the
   # current zzdds against a stale dds-rtps harness and fail with API mismatches.
@@ -196,7 +196,7 @@ jobs:
     # the newer Ubuntu that ubuntu-latest now resolves to.
     runs-on: ubuntu-24.04
     env:
-      INTEROP_RTPS_REF: zenzen-44d6146
+      INTEROP_RTPS_REF: 696aebf4a1c9775cc5bf726d1f0c7baebe1fb7b0
 
     steps:
       - name: Check out zzdds
@@ -215,12 +215,8 @@ jobs:
         run: |
           mkdir -p dds-rtps/srcZig/zzdds/packages
           ln -s ../../../../zzdds dds-rtps/srcZig/zzdds/packages/zzdds
-          # zzdds now re-exports zidl's own artifact and zidl_rt module (see
-          # zzdds's build.zig comment on b.modules.put(... "zidl_rt" ...) /
-          # b.installArtifact(zidl_exe)), and dds-rtps's build.zig.zon no
-          # longer declares its own .zidl dependency — zig resolves zidl
-          # transitively through this zzdds path dep, so no separate zidl
-          # checkout/symlink is needed here anymore.
+          # The harness obtains the generator and both runtime modules through
+          # zzdds, sharing one zidl dependency graph.
           #
           # zig-pkg/ is gitignored so actions/checkout does not clean it between
           # runs on the same runner.  Stale URL-fetched packages shadow the path

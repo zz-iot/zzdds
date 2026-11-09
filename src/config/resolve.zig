@@ -9,7 +9,7 @@
 const std = @import("std");
 const ext = @import("zzdds_ext_generated").zzdds;
 const toml = @import("toml.zig");
-const rt = @import("zidl_rt");
+const rt = @import("zidl_bindings");
 const reader = @import("read_options.zig");
 const modern = @import("build_options").config_authoring;
 pub const ReadOptions = reader.Options;

@@ -19,7 +19,7 @@ const std = @import("std");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 const ZZDDS = @import("zzdds_ext_generated").zzdds;
-const zidl_rt = @import("zidl_rt");
+const zidl_cdr = @import("zidl_cdr");
 const loaned_ping_gen = @import("loaned_ping_gen");
 
 const SAMPLE_COUNT: i32 = 5;
@@ -63,22 +63,22 @@ fn onPublicationMatched(state: *State, dw: DDS.DataWriter, status: DDS.Publicati
 
 /// Serialize `value` into a fresh, owned buffer. The caller frees it. This
 /// mirrors what the generated typed `write()` wrapper does internally
-/// (`loaned_ping_gen.LoanedPingDataWriter.write`) -- zidl-rt's `CdrWriter`
+/// (`loaned_ping_gen.LoanedPingDataWriter.write`) -- zidl-cdr's `CdrWriter`
 /// is always `std.ArrayList`-backed (dynamic growth), so there's no way yet
 /// to serialize directly into the fixed buffer `loan_raw()` hands back the
 /// way C's `zidl_cdr_writer_init_fixed` can (see the spec doc's "Zig-specific
-/// caveat" section) -- a real, discovered gap in zidl-rt today, not an
+/// caveat" section) -- a real, discovered gap in zidl-cdr today, not an
 /// oversight in this example. The bytes still end up published via the real
 /// `loan_raw`/`publish_loan_raw` ops below, just via one extra memcpy.
 fn serializeToOwnedBuffer(alloc: std.mem.Allocator, xcdr2: bool, value: loaned_ping_gen.LoanedPing) !std.ArrayList(u8) {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(alloc);
     if (xcdr2) {
-        var w = zidl_rt.CdrWriter(.xcdr2).init(&buf, alloc);
+        var w = zidl_cdr.CdrWriter(.xcdr2).init(&buf, alloc);
         try w.writeEncapHeaderDelimited();
         try loaned_ping_gen.LoanedPing.serialize(&w, value);
     } else {
-        var w = zidl_rt.CdrWriter(.xcdr1).init(&buf, alloc);
+        var w = zidl_cdr.CdrWriter(.xcdr1).init(&buf, alloc);
         try w.writeEncapHeader();
         try loaned_ping_gen.LoanedPing.serialize(&w, value);
     }

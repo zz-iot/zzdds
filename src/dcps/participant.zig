@@ -52,7 +52,7 @@ const writer_mod = @import("writer.zig");
 const runtime_mod = @import("../runtime/core.zig");
 const CloseLatch = @import("../runtime/close_latch.zig").CloseLatch;
 const listener_lane = @import("listener_lane.zig");
-const zidl_rt = @import("zidl_rt");
+const zidl_cdr = @import("zidl_cdr");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const listener_box_mod = @import("../util/listener_box.zig");
 const ListenerBox = listener_box_mod.ListenerBox;
@@ -433,7 +433,7 @@ fn pushBuiltinParticipantCdr(
 ) void {
     var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(alloc);
-    var w = zidl_rt.CdrWriter(.xcdr1).init(&buf, alloc);
+    var w = zidl_cdr.CdrWriter(.xcdr1).init(&buf, alloc);
     w.writeEncapHeader() catch return;
     const v = DDS.ParticipantBuiltinTopicData{
         .key = writer_mod.guidToBuiltinKey(data.guid),
@@ -466,7 +466,7 @@ fn pushBuiltinPublicationCdr(
 ) void {
     var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(alloc);
-    var w = zidl_rt.CdrWriter(.xcdr1).init(&buf, alloc);
+    var w = zidl_cdr.CdrWriter(.xcdr1).init(&buf, alloc);
     w.writeEncapHeader() catch return;
     const v = DDS.PublicationBuiltinTopicData{
         .key = writer_mod.guidToBuiltinKey(data.guid),
@@ -501,7 +501,7 @@ fn pushBuiltinSubscriptionCdr(
 ) void {
     var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(alloc);
-    var w = zidl_rt.CdrWriter(.xcdr1).init(&buf, alloc);
+    var w = zidl_cdr.CdrWriter(.xcdr1).init(&buf, alloc);
     w.writeEncapHeader() catch return;
     const v = DDS.SubscriptionBuiltinTopicData{
         .key = writer_mod.guidToBuiltinKey(data.guid),
@@ -542,7 +542,7 @@ fn pushBuiltinTopicCdr(
 ) void {
     var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(alloc);
-    var w = zidl_rt.CdrWriter(.xcdr1).init(&buf, alloc);
+    var w = zidl_cdr.CdrWriter(.xcdr1).init(&buf, alloc);
     w.writeEncapHeader() catch return;
     DDS.TopicBuiltinTopicData.serialize(&w, v) catch return;
     dr.pushCdr(buf.items);

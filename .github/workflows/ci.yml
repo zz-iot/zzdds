@@ -32,12 +32,12 @@ concurrency:
 # Bump this tag when you want to pick up a new release (may change the vendor list).
 #
 # INTEROP_RTPS_REF: zz-iot/dds-rtps branch/tag checked out for the test harness.
-# Points to the zenzen branch that tracks zzdds C-ABI work.
+# Includes split zidl runtime support in the zzdds harness.
 # Override via the dds_rtps_ref workflow_dispatch input to test a different branch or tag.
 env:
   INTEROP_RELEASE_TAG: v2.1.2026
-  # NOTE: When updating the zenzen branch, bump the fallback below to the new branch name.
-  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-76cd6f4' }}
+  # Keep the fallback below and release.yml on the same harness revision.
+  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || '696aebf4a1c9775cc5bf726d1f0c7baebe1fb7b0' }}
 
 jobs:
   design-validation:
@@ -1220,12 +1220,8 @@ jobs:
         run: |
           mkdir -p dds-rtps/srcZig/zzdds/packages
           ln -s ../../../../zzdds dds-rtps/srcZig/zzdds/packages/zzdds
-          # zzdds now re-exports zidl's own artifact and zidl_rt module (see
-          # zzdds's build.zig comment on b.modules.put(... "zidl_rt" ...) /
-          # b.installArtifact(zidl_exe)), and dds-rtps's build.zig.zon no
-          # longer declares its own .zidl dependency — zig resolves zidl
-          # transitively through this zzdds path dep, so no separate zidl
-          # checkout/symlink is needed here anymore.
+          # The harness obtains the generator and both runtime modules through
+          # zzdds, sharing one zidl dependency graph.
           #
           # zig-pkg/ is gitignored so actions/checkout does not clean it between
           # runs on the same runner.  Stale URL-fetched packages shadow the path

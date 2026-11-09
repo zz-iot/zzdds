@@ -18,7 +18,8 @@ pub fn build(b: *std.Build) void {
     const zzdds_ext_gen = zzdds_dep.module("zzdds_ext_generated");
 
     const zidl_exe = zzdds_dep.artifact("zidl");
-    const zidl_rt_mod = zzdds_dep.module("zidl_rt");
+    const zidl_cdr_mod = zzdds_dep.module("zidl_cdr");
+    const zidl_bindings_mod = zzdds_dep.module("zidl_bindings");
 
     // Generate HistoryEvent Zig bindings from idl/catchup_sample.idl.
     const gen_catchup = b.addRunArtifact(zidl_exe);
@@ -31,7 +32,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            .{ .name = "zidl_cdr", .module = zidl_cdr_mod },
+            .{ .name = "zidl_bindings", .module = zidl_bindings_mod },
             .{ .name = "zzdds", .module = zzdds_mod },
         },
     });
@@ -41,7 +43,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "zzdds_generated", .module = zzdds_gen },
         .{ .name = "zzdds_ext_generated", .module = zzdds_ext_gen },
         .{ .name = "catchup_gen", .module = catchup_gen_mod },
-        .{ .name = "zidl_rt", .module = zidl_rt_mod },
+        .{ .name = "zidl_cdr", .module = zidl_cdr_mod },
+        .{ .name = "zidl_bindings", .module = zidl_bindings_mod },
     };
 
     const pub_exe = b.addExecutable(.{

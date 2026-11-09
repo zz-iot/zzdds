@@ -353,7 +353,7 @@ pub const SubscriberImpl = struct {
         .as_Entity = vtAsEntity,
     };
 
-    /// One `CAbiViews` value for the whole object (see `zidl_rt.unboxAsView`).
+    /// One `CAbiViews` value for the whole object (see `zidl_bindings.unboxAsView`).
     /// One `CAbiViews` value for the whole object, covering Entity,
     /// Subscriber and (via `extensions.zig`'s `subscriber_vtable`)
     /// zzdds::Subscriber. See `DataWriterImpl.views`.

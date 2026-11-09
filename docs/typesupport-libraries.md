@@ -21,7 +21,8 @@ zig build -Dtypesupport-library=true
 ```
 
 The ABI helpers and generator come from the same pinned dependency and share the
-host's `zidl_rt` module. Ordinary builds keep the feature disabled. Optional
+host's `zidl_cdr` and `zidl_bindings` modules. Ordinary builds keep the feature
+disabled. Optional
 `-Dtypesupport-package=/absolute/path/to/zidl/packages/zidl-typesupport` and
 `-Dtypesupport-generator=/absolute/path/to/zidl/zig-out/bin/zidl` overrides remain
 available for cross-project development. This is a native Zig API; no C/Java

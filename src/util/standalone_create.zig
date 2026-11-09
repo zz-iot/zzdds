@@ -18,7 +18,7 @@
 //! repeated logic.
 
 const std = @import("std");
-const zidl_rt = @import("zidl_rt");
+const zidl_bindings = @import("zidl_bindings");
 
 /// `Iface` is a zidl-generated interface fat-pointer type (e.g. `DDS.WaitSet`)
 /// with `.ptr`/`.vtable` fields, where `.vtable.get_c_abi_handle` is present
@@ -30,12 +30,12 @@ const zidl_rt = @import("zidl_rt");
 /// call site and there's no case where a caller wants one without the other.
 pub fn createWithAllocator(
     comptime Iface: type,
-    allocator: ?*const zidl_rt.ZidlAllocator,
+    allocator: ?*const zidl_bindings.ZidlAllocator,
     comptime log_name: []const u8,
     comptime construct: fn (std.mem.Allocator) anyerror!Iface,
     nil_value: Iface,
 ) *anyopaque {
-    const alloc = if (allocator) |a| zidl_rt.toAllocator(a) else std.heap.c_allocator;
+    const alloc = if (allocator) |a| zidl_bindings.toAllocator(a) else std.heap.c_allocator;
     const r = construct(alloc) catch |err| {
         // .warn, not .err: this is an expected, recoverable degrade (fall
         // back to the nil sentinel), not an unexpected internal error --

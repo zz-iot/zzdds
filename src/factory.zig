@@ -7,7 +7,7 @@ const ZZDDS = @import("zzdds_ext_generated").zzdds;
 
 const extensions = @import("c_abi/extensions.zig");
 const nil = @import("dcps/nil.zig");
-const zidl_rt = @import("zidl_rt");
+const zidl_bindings = @import("zidl_bindings");
 const allocator_adapter = @import("c_abi/allocator_adapter.zig");
 
 pub const CreateFactoryError = error{
@@ -39,7 +39,7 @@ pub const DomainParticipantFactory = struct {
 
 pub fn createFactory() CreateFactoryError!DomainParticipantFactory {
     const boxed = extensions.zzdds_create_factory();
-    const handle = zidl_rt.unboxAsView(ZZDDS.DomainParticipantFactory, boxed);
+    const handle = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, boxed);
     if (nil.isNil(handle)) return error.FactoryCreateFailed;
     return .{ .handle = handle };
 }
@@ -61,9 +61,9 @@ pub fn createFactory() CreateFactoryError!DomainParticipantFactory {
 /// (confirmed the hard way: an earlier version of this function built
 /// `c_alloc` as its own local and got exactly that crash on first
 /// `deinit()`).
-pub fn createFactoryWithAllocator(c_alloc: *const zidl_rt.ZidlAllocator) CreateFactoryError!DomainParticipantFactory {
+pub fn createFactoryWithAllocator(c_alloc: *const zidl_bindings.ZidlAllocator) CreateFactoryError!DomainParticipantFactory {
     const boxed = extensions.zzdds_create_factory_with_allocator(c_alloc);
-    const handle = zidl_rt.unboxAsView(ZZDDS.DomainParticipantFactory, boxed);
+    const handle = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, boxed);
     if (nil.isNil(handle)) return error.FactoryCreateFailed;
     return .{ .handle = handle };
 }

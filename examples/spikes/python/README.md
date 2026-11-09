@@ -189,7 +189,7 @@ before the wrapper was collected (plausible — cached elsewhere, logged,
 handed to a second API) and tries to use it after the premature destroy,
 that's a genuine use-after-free — confirmed via a clean, symbolized Zig
 panic (not just a bare segfault): `DDS_GuardCondition_set_trigger_value` →
-`zidl_rt.unboxAs` reads a freed handle's now-garbage vtable pointer
+`zidl_bindings.unboxAs` reads a freed handle's now-garbage vtable pointer
 (`panic: incorrect alignment`), pinpointing the exact mechanism.
 
 This differs from finding 3 in an important way: it is **not** a hazard

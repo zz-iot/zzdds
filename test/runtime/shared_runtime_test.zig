@@ -974,8 +974,8 @@ test "a participant deleted from its own listener retires its wrappers before th
         .builtin_description = description.vtable.get_c_abi_handle(description.ptr),
         .status_condition = cond.vtable.get_c_abi_handle(cond.ptr),
     };
-    try testing.expect(zzdds.zidl_rt.observeHandleRetire(Retired.on, &retired));
-    defer _ = zzdds.zidl_rt.unobserveHandleRetire(Retired.on, &retired);
+    try testing.expect(zzdds.zidl_bindings.observeHandleRetire(Retired.on, &retired));
+    defer _ = zzdds.zidl_bindings.unobserveHandleRetire(Retired.on, &retired);
 
     var sd = SelfDelete{ .node = &r, .dp = dp_r, .retired = &retired };
     const topic_w = dp_w.create_topic("SliceTopic", "SliceType", .{}, null, 0);

@@ -1,5 +1,5 @@
 const std = @import("std");
-pub fn addTests(b: *std.Build, zzdds: *std.Build.Module, dds: *std.Build.Module, rt: *std.Build.Module, ts: *std.Build.Module, generator: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, dynamic_enabled: bool, resources_enabled: bool, abi_package: std.Build.LazyPath, inspector: ?*std.Build.Step.Compile) *std.Build.Step {
+pub fn addTests(b: *std.Build, zzdds: *std.Build.Module, dds: *std.Build.Module, codec: *std.Build.Module, bindings: *std.Build.Module, ts: *std.Build.Module, generator: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, dynamic_enabled: bool, resources_enabled: bool, abi_package: std.Build.LazyPath, inspector: ?*std.Build.Step.Compile) *std.Build.Step {
     const all = b.step("test-typesupport-platform", "Run linked and OS-loaded provider checks");
     const check = b.step("check-typesupport-library", "Compile provider libraries and host checks without running target code");
     const fixtures = if (resources_enabled) b.step("resource-provider-fixtures", "Build example provider artifacts for resource-inspect") else null;
@@ -12,18 +12,25 @@ pub fn addTests(b: *std.Build, zzdds: *std.Build.Module, dds: *std.Build.Module,
     // Zig bundles a second sanitizer runtime into instrumented DSOs, whose
     // initial-exec TLS cannot be allocated by dlopen. Instrument the host; keep
     // the immutable, synchronous generated wire-callback fixtures uninstrumented.
-    const library_rt = if (zzdds.sanitize_thread orelse false) b.createModule(.{
-        .root_source_file = rt.root_source_file,
+    const library_codec = if (zzdds.sanitize_thread orelse false) b.createModule(.{
+        .root_source_file = codec.root_source_file,
         .target = target,
         .optimize = optimize,
         .sanitize_thread = false,
-    }) else rt;
+    }) else codec;
+    const library_bindings = if (zzdds.sanitize_thread orelse false) b.createModule(.{
+        .root_source_file = bindings.root_source_file,
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = false,
+        .imports = &.{.{ .name = "zidl_cdr", .module = library_codec }},
+    }) else bindings;
     const library_abi = if (zzdds.sanitize_thread orelse false) b.createModule(.{
         .root_source_file = ts.root_source_file,
         .target = target,
         .optimize = optimize,
         .sanitize_thread = false,
-        .imports = &.{ .{ .name = "zidl_rt", .module = library_rt }, .{ .name = "zidl_typesupport_c", .module = ts.import_table.get("zidl_typesupport_c").? } },
+        .imports = &.{ .{ .name = "zidl_cdr", .module = library_codec }, .{ .name = "zidl_bindings", .module = library_bindings }, .{ .name = "zidl_typesupport_c", .module = ts.import_table.get("zidl_typesupport_c").? } },
     }) else ts;
     var libraries: [3]?std.Build.LazyPath = .{ null, null, null };
     var linked_provider: ?*std.Build.Module = null;
@@ -33,13 +40,13 @@ pub fn addTests(b: *std.Build, zzdds: *std.Build.Module, dds: *std.Build.Module,
         gen.addArgs(&.{ "-b", "zig", "--experimental-typesupport-library", "-o" });
         const out = gen.addOutputDirectoryArg(stem);
         gen.addFileArg(b.path(b.fmt("test/typesupport/{s}.idl", .{stem})));
-        const types = b.createModule(.{ .root_source_file = out.path(b, b.fmt("{s}.zig", .{stem})), .target = target, .optimize = optimize, .imports = &.{.{ .name = "zidl_rt", .module = rt }} });
+        const types = b.createModule(.{ .root_source_file = out.path(b, b.fmt("{s}.zig", .{stem})), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zidl_cdr", .module = codec }, .{ .name = "zidl_bindings", .module = bindings } } });
         const provider = b.createModule(.{
             .sanitize_thread = zzdds.sanitize_thread,
             .root_source_file = out.path(b, b.fmt("{s}_typesupport.zig", .{stem})),
             .target = target,
             .optimize = optimize,
-            .imports = &.{ .{ .name = "types", .module = types }, .{ .name = "zidl_rt", .module = rt }, .{ .name = "zidl_typesupport", .module = ts } },
+            .imports = &.{ .{ .name = "types", .module = types }, .{ .name = "zidl_cdr", .module = codec }, .{ .name = "zidl_bindings", .module = bindings }, .{ .name = "zidl_typesupport", .module = ts } },
         });
         if (std.mem.eql(u8, stem, "a")) {
             linked_provider = provider;
@@ -61,13 +68,13 @@ pub fn addTests(b: *std.Build, zzdds: *std.Build.Module, dds: *std.Build.Module,
             all.dependOn(&run_static.step);
         }
         if (!dynamic_enabled) continue;
-        const library_types = b.createModule(.{ .root_source_file = out.path(b, b.fmt("{s}.zig", .{stem})), .target = target, .optimize = optimize, .sanitize_thread = false, .imports = &.{.{ .name = "zidl_rt", .module = library_rt }} });
+        const library_types = b.createModule(.{ .root_source_file = out.path(b, b.fmt("{s}.zig", .{stem})), .target = target, .optimize = optimize, .sanitize_thread = false, .imports = &.{ .{ .name = "zidl_cdr", .module = library_codec }, .{ .name = "zidl_bindings", .module = library_bindings } } });
         const library_provider = b.createModule(.{
             .root_source_file = out.path(b, b.fmt("{s}_typesupport.zig", .{stem})),
             .target = target,
             .optimize = optimize,
             .sanitize_thread = false,
-            .imports = &.{ .{ .name = "types", .module = library_types }, .{ .name = "zidl_rt", .module = library_rt }, .{ .name = "zidl_typesupport", .module = library_abi } },
+            .imports = &.{ .{ .name = "types", .module = library_types }, .{ .name = "zidl_cdr", .module = library_codec }, .{ .name = "zidl_bindings", .module = library_bindings }, .{ .name = "zidl_typesupport", .module = library_abi } },
         });
         const lib = b.addLibrary(.{ .name = b.fmt("provider_{s}", .{stem}), .use_llvm = true, .linkage = .dynamic, .root_module = library_provider });
         libraries[i] = lib.getEmittedBin();
@@ -133,7 +140,7 @@ pub fn addTests(b: *std.Build, zzdds: *std.Build.Module, dds: *std.Build.Module,
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{ .{ .name = "zzdds", .module = zzdds }, .{ .name = "zzdds_generated", .module = dds }, .{ .name = "zidl_rt", .module = rt } },
+        .imports = &.{ .{ .name = "zzdds", .module = zzdds }, .{ .name = "zzdds_generated", .module = dds }, .{ .name = "zidl_cdr", .module = codec }, .{ .name = "zidl_bindings", .module = bindings } },
     }) });
     t.root_module.addOptions("library_paths", paths);
     t.root_module.addIncludePath(abi_package.path(b, "include"));

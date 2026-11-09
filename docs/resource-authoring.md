@@ -43,7 +43,7 @@ TOML bytes -> generic located tree -> IDL-generated strict records
 
 `zzdds.toml` is the existing parser, extended once. It knows syntax and locations,
 not DDS fields. zidl's new opt-in `--zig-generate-authoring` flag emits
-`toml_fields`, `tomlSpec` and `decodeToml`; the latter uses `zidl_rt.authoring`.
+`toml_fields`, `tomlSpec` and `decodeToml`; the latter uses `zidl_bindings.authoring`.
 The existing `--zig-generate-toml-config`/`applyToml` remains a separate mutating API with its prior default/ownership
 contract. Existing configuration decoding is not silently made strict.
 
