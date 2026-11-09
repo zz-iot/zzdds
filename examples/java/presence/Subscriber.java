@@ -149,6 +149,13 @@ public class Subscriber {
             Thread.sleep(POLL_PERIOD_MS);
         }
 
+        // Detach the listener before deleting the reader. set_listener returns
+        // only once any callback already running has finished, so none is still
+        // using the reader when delete_datareader runs.
+        if (rawReader.set_listener(null, 0) != 0) {
+            System.err.println("FAIL: set_listener() failed");
+            System.exit(1);
+        }
         sub.delete_datareader(rawReader);
 
         System.out.println("Subscriber: observed full online -> offline -> online cycle.");

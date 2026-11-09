@@ -205,6 +205,13 @@ int main(int argc, char **argv) {
         sleep_ms(POLL_PERIOD_MS);
     }
 
+    /* Detach the listener before deleting the reader. set_listener returns
+     * only once any callback already running has finished, so none is still
+     * using the reader when delete_datareader runs. */
+    if (DDS_DataReader_set_listener(dr, NULL, 0) != DDS_RETCODE_OK) {
+        fprintf(stderr, "FAIL: set_listener() failed\n");
+        return 1;
+    }
     DDS_Subscriber_delete_datareader(sub, dr);
 
     printf("Subscriber: observed full online -> offline -> online cycle.\n");
