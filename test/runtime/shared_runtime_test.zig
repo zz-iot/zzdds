@@ -3122,6 +3122,46 @@ test "a participant deleted by the listener its setter waits for is torn down af
     h.threaded.deinit();
 }
 
+/// A participant listener context whose release hook deletes the participant.
+const DeleteParticipantOnRelease = struct {
+    node: *Node,
+    dp: DDS.DomainParticipant,
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+    released: u32 = 0,
+
+    fn release(ld: ?*anyopaque) callconv(.c) void {
+        const self: *DeleteParticipantOnRelease = @ptrCast(@alignCast(ld.?));
+        self.released += 1;
+        self.rc = Slice.deleteParticipant(self.node, self.dp);
+    }
+};
+
+test "a participant deleted by the release hook of the listener its setter replaces is torn down after the setter returns" {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    var pair: Pair = undefined;
+    try pair.initWith(&h.runtime, PairOptions.bestEffort());
+    h.runtime.releaseOwner();
+    var del: DeleteParticipantOnRelease = .{ .node = &pair.r, .dp = pair.dp_r };
+    var dp_listener = DDS.DomainParticipantListener{ .listener_data = &del, .release_listener_data = DeleteParticipantOnRelease.release };
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dp_r.vtable.set_listener(pair.dp_r.ptr, &dp_listener, 0));
+
+    // No callback uses the listener, so the setter releases it itself: the
+    // deletion from its hook must not wait for the setter.
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dp_r.vtable.set_listener(pair.dp_r.ptr, null, 0));
+    try testing.expectEqual(@as(u32, 1), del.released);
+    try testing.expectEqual(DDS.RETCODE_OK, del.rc);
+
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dp_w.delete_contained_entities());
+    try pair.w.delete(pair.dp_w);
+    // The workers exit once the runtime stops.
+    h.hosted.join();
+    try testing.expectEqual(rt.State.backend_stopped, h.runtime.getState());
+    pair.freeNodes();
+    h.runtime.deinit();
+    h.threaded.deinit();
+}
+
 test "deleting a participant drops its builtin readers' queued listener turns without driving" {
     var m: Manual = undefined;
     m.init();

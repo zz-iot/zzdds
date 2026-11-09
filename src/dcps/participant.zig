@@ -5667,14 +5667,17 @@ pub const DomainParticipantImpl = struct {
         mask: DDS.StatusMask,
     ) DDS.ReturnCode_t {
         const self = cast(ctx);
-        // A callback the setter waits for may delete this participant. On
-        // the shared runtime, counting the setter in the listener group
-        // defers the deletion's teardown until the setter is done with it.
-        // The threaded runtime's deletion waits for no listener yet
-        // (docs/roadmap.md).
+        // A callback the setter waits for, or the replaced listener's release
+        // hook, may delete this participant. On the shared runtime the setter
+        // is a traversal of the listener group, so the deletion's teardown
+        // follows the setter, and a deletion from its own release hook
+        // defers instead of waiting for it. The threaded runtime's deletion
+        // waits for no listener yet (docs/roadmap.md).
         const group = self.listenerGroup();
-        if (group) |g| if (!g.begin()) return DDS.RETCODE_ALREADY_DELETED;
-        defer if (group) |g| g.end();
+        var traversal: listener_lane.Traversal = .{};
+        traversal.begin(group);
+        defer traversal.end();
+        if (group != null and !traversal.counted) return DDS.RETCODE_ALREADY_DELETED;
         self.swapListener(if (a_listener) |l| l.* else DDS.noop_DomainParticipantListener, mask);
         return DDS.RETCODE_OK;
     }

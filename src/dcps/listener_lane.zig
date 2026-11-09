@@ -130,8 +130,9 @@ pub fn admit(source: anytype) bool {
 }
 
 /// An explicit traversal through a participant's members
-/// (`notify_datareaders`), counted in their group from `begin` to `end`: the
-/// participant's deletion from one of its callbacks follows all of it.
+/// (`notify_datareaders`), or a participant's `set_listener`, counted in
+/// their group from `begin` to `end`: the participant's deletion from one of
+/// its callbacks, or from a release hook the setter runs, follows all of it.
 pub const Traversal = struct {
     frame: Frame = undefined,
     counted: bool = false,
@@ -261,11 +262,9 @@ pub const Group = struct {
         if (p.member_next) |next| next.member_prev = p.member_prev;
     }
 
-    /// Counts a request about to be submitted, or an explicit traversal,
-    /// such as a participant's `set_listener` waiting for a listener: the
-    /// participant's deletion then finishes only after `end`. False once
-    /// the group is closed: it must not start.
-    pub fn begin(self: *Group) bool {
+    /// Counts a request about to be submitted, or an explicit traversal.
+    /// False once the group is closed: it must not start.
+    fn begin(self: *Group) bool {
         self.mu.lock();
         defer self.mu.unlock();
         if (self.closed.load(.monotonic)) return false;
@@ -275,7 +274,7 @@ pub const Group = struct {
 
     /// Under `mu` throughout: `close` may free the group once it sees the
     /// last end.
-    pub fn end(self: *Group) void {
+    fn end(self: *Group) void {
         self.mu.lock();
         self.inflight -= 1;
         const last = self.inflight == 0 and self.closed.load(.monotonic);
