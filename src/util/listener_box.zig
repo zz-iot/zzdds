@@ -22,7 +22,6 @@ const listener_lifecycle = @import("listener_lifecycle.zig");
 const listener_identity = @import("listener_identity.zig");
 const Mutex = @import("mutex.zig").Mutex;
 const Condvar = @import("condvar.zig").Condvar;
-const time = @import("time.zig");
 
 /// What a `get_listener` returns for the installed `listener`: the same
 /// registration, retained for the caller when it asks for that
@@ -355,6 +354,11 @@ test "Retired: a busy replaced registration is released by its last use, not the
     slot.releaseHold(testing.allocator);
 }
 
+/// Until a `drain` on another thread waits for a use to end.
+fn awaitWaitingSetter() void {
+    while (waitingSetters() == 0) std.Thread.yield() catch {};
+}
+
 test "Retired: drain waits for a use of a replaced registration to end" {
     var mu: Mutex = .{};
     var released: std.atomic.Value(u32) = .init(0);
@@ -371,8 +375,8 @@ test "Retired: drain waits for a use of a replaced registration to end" {
 
     const Ender = struct {
         fn run(box: *ListenerBox(TestListener), rel: *std.atomic.Value(u32)) void {
-            time.sleepNs(50 * std.time.ns_per_ms);
-            // drain has not returned: the context is not released yet.
+            awaitWaitingSetter();
+            // drain waits: the context is not released yet.
             std.debug.assert(rel.load(.seq_cst) == 0);
             box.releaseRef(testing.allocator);
         }
@@ -410,9 +414,8 @@ test "Retired: drain waits for earlier retirements, not later ones" {
 
     const Ender = struct {
         fn run(x: *ListenerBox(TestListener), y: *ListenerBox(TestListener)) void {
-            time.sleepNs(30 * std.time.ns_per_ms);
+            awaitWaitingSetter();
             x.releaseRef(testing.allocator);
-            time.sleepNs(30 * std.time.ns_per_ms);
             y.releaseRef(testing.allocator);
         }
     };

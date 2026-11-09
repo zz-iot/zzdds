@@ -81,6 +81,11 @@ ALLOWLIST = {
     # API and WaitSet tests intentionally wake waits from another thread.
     "test/dcps/api_test.zig": (1, "threaded WaitSet wakeup"),
     "test/dcps/waitset_test.zig": (1, "threaded WaitSet wakeup"),
+    # set_listener replacement completion: a callback really blocks on the
+    # writer's thread while set_listener on another thread must wait for it,
+    # so the test polls, with a bound, for each thread to reach its step.
+    # One shared helper (awaitTrue).
+    "test/dcps/listener_replacement_test.zig": (1, "threaded set_listener-waits-for-callback polling"),
     # TCP transport tests exercise real listener/connection threads.
     "test/transport/tcp_transport_test.zig": (1, "TCP listener thread startup"),
     # Regression test for deinit() reentrancy from the participant's own
