@@ -182,6 +182,13 @@ int main(int argc, char **argv) {
         sleep_ms(POLL_PERIOD_MS);
     }
 
+    // Detach the listener before deleting the reader. set_listener returns
+    // only once any callback already running has finished, so none is still
+    // using the reader when delete_datareader runs.
+    if (dr->set_listener(nullptr, 0) != ::DDS::RETCODE_OK) {
+        std::fprintf(stderr, "FAIL: set_listener() failed\n");
+        return 1;
+    }
     sub->delete_datareader(dr);
 
     std::printf("Subscriber: observed full online -> offline -> online cycle.\n");

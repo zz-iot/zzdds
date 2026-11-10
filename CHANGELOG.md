@@ -25,6 +25,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   a rejected `set_listener_ex` built. `ReturnCode_t` is annotated `@success_result(RETCODE_OK)`
   for this.
 - Interop CI and releases use the dds-rtps harness tag `zenzen-76cd6f4`.
+- The `presence` example subscribers detach their listener before deleting the reader.
+  Deleting it while `on_data_available` ran made `take()` return `ALREADY_DELETED`, which
+  the C subscriber reported as a failure.
 
 ## 2026-11-05
 

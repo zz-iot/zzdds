@@ -84,7 +84,10 @@ for `, `Publisher: asserting liveliness and resuming`, `Publisher: done.`
    corroborating the liveliness transitions rather than replacing them.
 4. Exit successfully once it has observed, in order: an initial `ONLINE`, a
    subsequent `OFFLINE`, and a final `ONLINE` again — the one thing this
-   example actually asserts programmatically (not just prints).
+   example actually asserts programmatically (not just prints). Before
+   deleting the reader, detach its listener with `set_listener(null, 0)`:
+   `set_listener` returns only once any running callback has finished, so
+   `on_data_available` cannot still be taking from a deleted reader.
 
 Required stdout markers: `Create topic:`, `Create reader for topic:`,
 `ONLINE alive_count=`, `OFFLINE alive_count=`, `Subscriber: observed full

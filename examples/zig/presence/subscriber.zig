@@ -183,6 +183,13 @@ pub fn main(init: std.process.Init) !void {
         sleepNs(io, POLL_PERIOD_NS);
     }
 
+    // Detach the listener before deleting the reader. set_listener returns
+    // only once any callback already running has finished, so none is still
+    // using the reader when delete_datareader runs.
+    if (dr.set_listener(null, 0) != DDS.RETCODE_OK) {
+        std.debug.print("FAIL: set_listener() failed\n", .{});
+        std.process.exit(1);
+    }
     _ = subscriber.delete_datareader(dr);
 
     std.debug.print("Subscriber: observed full online -> offline -> online cycle.\n", .{});

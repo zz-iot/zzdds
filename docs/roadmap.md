@@ -506,6 +506,23 @@ or an optimisation on an already-improved path):
 - **Example: Java listener replacement leaks the old JNI global reference** — a second
   `set_listener`-style call on an entity doesn't release the previous one
   (`examples/java/listener-pubsub`).
+- **Examples: review how each binding uses the generated typed API; zidl's output may need
+  fixes too.** The examples are meant to show the same calls on the generated
+  `{T}DataReader`/`{T}DataWriter` in every binding, but the generated read/take operations
+  differ by binding, and so does what they report for a deleted reader. This surfaced when
+  the `presence` subscriber deleted its reader while `on_data_available` was running
+  (2026-11-09; the examples now detach the listener first):
+  - C and C++: the single-sample `take` returns `ReturnCode_t`, so `ALREADY_DELETED` reaches
+    the caller. The multi-sample variants (`take_n`, `take_instance`, `*_w_condition`)
+    return an `int` and fill caller-supplied arrays instead of `{T}Seq`/`SampleInfoSeq`;
+    check how they report errors, and whether C++ should take sequences.
+  - Java: `take()` returns `null` for `NO_DATA`, `ALREADY_DELETED` and `ERROR` alike. The
+    generated wrapper drops `take_raw`'s return code.
+  - Zig: `take_next_sample` returns `!bool`, and a deleted reader gives `false`, as
+    `NO_DATA` does. Check whether its error set should include `ALREADY_DELETED`.
+
+  Compare each binding's examples with the others, then each backend's typed API with the
+  IDL language mapping and the DDS return codes. Fixes to the generated API belong in zidl.
 
 ### Allocator strategy (`design/allocator-strategy.md` is source of truth)
 
