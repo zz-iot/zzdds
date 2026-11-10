@@ -188,6 +188,13 @@ def run_pair(pub_lang: str, sub_lang: str, zig_out: Path) -> bool:
 # work" with "does the writer guarantee zero data loss for a reader that
 # hasn't matched yet" (a separate, unrelated VOLATILE-durability property).
 #
+# The subscriber keeps all history (-k 0). Every sample is the same BLUE
+# instance, so under the default KEEP_LAST 1 a size-3 sample is replaced by
+# the size-4 one written right after it unless a read falls between the two,
+# which with equal write and read periods depends on their phase. Seen on
+# Windows CI: both size-3 samples after the match were replaced, while the
+# filter itself worked.
+#
 # LiveProcess.stop()'s bounded SIGINT-then-SIGKILL escalation is what
 # makes this safe at all: an earlier bash version of this exact design
 # hung for 40+ minutes because a Java subscriber didn't react to SIGINT
@@ -222,7 +229,7 @@ def run_cft_check(lang: str, zig_out: Path) -> bool:
 
     # Each binding flushes live output; no platform-specific stdbuf wrapper.
     sub = LiveProcess(
-        [*base_cmd(lang, zig_out), "-S", "-d", DOMAIN, "--cft", "shapesize > 2", "-i", "-1", "--read-period", PERIOD_MS],
+        [*base_cmd(lang, zig_out), "-S", "-d", DOMAIN, "--cft", "shapesize > 2", "-k", "0", "-i", "-1", "--read-period", PERIOD_MS],
         env=env,
         log_path=logdir / "sub.log",
     )
