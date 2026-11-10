@@ -59,7 +59,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   `-Dshared-runtime` builds.
 - In CI's stress lanes, the stress apps' own zzdds now allocates through a DebugAllocator
   (`ZZDDS_DEBUG_ALLOCATOR=1`). Before, `-Ddebug-allocator` reached only the root build,
-  so double-frees and uses after free inside zzdds went unchecked there.
+  so double-frees and uses after free inside zzdds went unchecked there. The stress apps
+  build it with the new `-Ddebug-allocator-stack-traces=false`, which keeps every check
+  but records no allocation or free sites. The stress runs now fail on its double-free and
+  mismatched-free reports, which it logs without stopping the process.
+- The `participants` stress scenario announces participants every 100 ms and waits for each
+  endpoint's first match, so participants created apart match too.
 - On macOS, every participant on a host can bind the domain's discovery port. The UDP
   transport now sets `SO_REUSEPORT` there as well as `SO_REUSEADDR`. Without it, only the
   first participant got the port, and the others received no multicast SPDP.

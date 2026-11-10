@@ -24,8 +24,12 @@ import _common  # noqa: E402
 
 SCENARIOS = ["entities", "reentrant", "waitset", "listener", "cft", "participants", "instance"]
 SUMMARY_RE = re.compile(r"^SUMMARY: OK scenario=(\w+) ops=(\d+)", re.M)
+# The last two are -Ddebug-allocator's reports of a double free and of a
+# free whose size or alignment differs from the allocation's. It logs them
+# and carries on, so only the log shows them.
 BAD = ("FAIL:", "panic", "Segmentation fault", "General protection",
-       "ThreadSanitizer", "data race", "leaked")
+       "ThreadSanitizer", "data race", "leaked",
+       "Double free detected", "does not match free")
 
 
 def build(tsan: bool) -> Path:

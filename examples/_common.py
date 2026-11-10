@@ -57,8 +57,15 @@ def debug_allocator_args() -> list[str]:
     ZZDDS_DEBUG_ALLOCATOR=1 (CI's stress lanes) builds that dependency with
     -Ddebug-allocator, so double-frees and uses after free inside zzdds fail
     at the call site. The root build's flag does not reach it.
+
+    Without stack traces: recording one on every allocation and free holds
+    the allocator's lock, which serializes the stress apps' threads enough
+    that discovery cannot keep up. Every check still runs; reproduce a
+    failure locally without this to see where the memory was allocated.
     """
-    return ["-Ddebug-allocator=true"] if os.environ.get("ZZDDS_DEBUG_ALLOCATOR") == "1" else []
+    if os.environ.get("ZZDDS_DEBUG_ALLOCATOR") != "1":
+        return []
+    return ["-Ddebug-allocator=true", "-Ddebug-allocator-stack-traces=false"]
 
 
 def zig_build_cmd() -> list[str]:

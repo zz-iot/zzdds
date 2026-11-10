@@ -934,6 +934,45 @@ const ParticipantsCtx = struct {
     domain: u32,
     deadline_ns: i64,
     idx: u32,
+
+    /// A participant learns of one created before it only from that one's next
+    /// SPDP announcement: on discovering a newcomer, SPDP announces at half
+    /// its period rather than replying at once. At the default 3 s period
+    /// that is longer than a participant here lives, so only participants
+    /// created almost together would ever match.
+    const announcement_period_ms: u32 = 100;
+
+    /// How long a participant waits for its endpoint's first match before
+    /// exchanging samples and being deleted, so it is deleted while matched.
+    /// Generous because discovery is much slower under -Ddebug-allocator:
+    /// every allocation in the process takes one lock and captures a stack
+    /// trace, and on the shared runtime two threads process every
+    /// participant's discovery traffic.
+    const match_wait_ns: i64 = 1 * std.time.ns_per_s;
+
+    /// Until the first match, `match_wait_ns`, or the scenario's deadline.
+    fn waitForMatch(ctx: ParticipantsCtx, matched: anytype) void {
+        const until = @min(monoNs(ctx.io) + match_wait_ns, ctx.deadline_ns);
+        while (!matched.isMatched() and monoNs(ctx.io) < until) sleepMs(ctx.io, 2);
+    }
+};
+
+const WriterMatched = struct {
+    w: DDS.DataWriter,
+    fn isMatched(self: WriterMatched) bool {
+        var status: DDS.PublicationMatchedStatus = .{};
+        _ = self.w.get_publication_matched_status(&status);
+        return status.current_count > 0;
+    }
+};
+
+const ReaderMatched = struct {
+    r: DDS.DataReader,
+    fn isMatched(self: ReaderMatched) bool {
+        var status: DDS.SubscriptionMatchedStatus = .{};
+        _ = self.r.get_subscription_matched_status(&status);
+        return status.current_count > 0;
+    }
 };
 
 fn participantsThread(ctx: ParticipantsCtx) void {
@@ -945,7 +984,13 @@ fn participantsThread(ctx: ParticipantsCtx) void {
             return;
         };
         const dpf = factory.toDDSFactory();
-        const dp = dpf.create_participant(ctx.domain, .{}, null, 0);
+        // See `ParticipantsCtx.announcement_period_ms`. Zeroed, not `.{}`: the
+        // copy this gets is freed with c_allocator (see shape's dds_impl.zig).
+        var cfg: zzdds.ZZDDS.DomainParticipantConfig = std.mem.zeroes(zzdds.ZZDDS.DomainParticipantConfig);
+        _ = factory.toZZDDSFactory().get_default_participant_config(&cfg);
+        cfg.participant.announcement_period_ms = ParticipantsCtx.announcement_period_ms;
+        const dp = factory.toZZDDSFactory().create_participant_ex(ctx.domain, .{}, null, 0, cfg);
+        cfg.deinit(std.heap.c_allocator);
         if (dp.ptr == zzdds.dcps.NIL_PTR) {
             fail("participants: create_participant returned nil under churn");
             factory.deinit();
@@ -985,6 +1030,7 @@ fn participantsThread(ctx: ParticipantsCtx) void {
                 qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
                 const w = p.create_datawriter(topic, qos, DDS.DataWriterListener{ .on_publication_matched = cbPubMatched }, DDS.PUBLICATION_MATCHED_STATUS);
                 if (w.ptr != zzdds.dcps.NIL_PTR) {
+                    ctx.waitForMatch(WriterMatched{ .w = w });
                     const writer = gen.MessageDataWriter.init(w, g_alloc);
                     var msg = gen.Message{ .subject_id = @intCast(ctx.idx + 1), .count = 0 };
                     const handle = writer.register_instance(msg);
@@ -1010,6 +1056,7 @@ fn participantsThread(ctx: ParticipantsCtx) void {
                     .on_data_available = cbDataAvail,
                 }, DDS.SUBSCRIPTION_MATCHED_STATUS | DDS.DATA_AVAILABLE_STATUS);
                 if (r.ptr != zzdds.dcps.NIL_PTR) {
+                    ctx.waitForMatch(ReaderMatched{ .r = r });
                     var reader = gen.MessageDataReader.init(r, g_alloc);
                     var polls: u32 = 0;
                     while (polls < 10) : (polls += 1) {

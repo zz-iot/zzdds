@@ -11,7 +11,8 @@ reported.
 Pass/fail:
   * every process exits 0 within the timeout
   * every process prints exactly one `SUMMARY: OK ...` line
-  * no `FAIL:` / `panic` / `SLOW_TEARDOWN`-over-hard-limit line anywhere
+  * no `FAIL:` / `panic` / `SLOW_TEARDOWN`-over-hard-limit line anywhere,
+    and no double-free or mismatched-free report from -Ddebug-allocator
   * every process's self-reported teardown_ms < --teardown-hard-limit-ms
 
 CI runs this with small counts; the nightly matrix runs it bigger and with
@@ -113,7 +114,10 @@ def main() -> int:
             td = int(m.group(2))
             if td > args.teardown_hard_limit_ms:
                 failures.append(f"{name}: teardown_ms={td} > {args.teardown_hard_limit_ms}")
-        for bad in ("FAIL:", "panic", "Segmentation fault", "leak"):
+        # The last two are -Ddebug-allocator's reports of a double free and
+        # of a mismatched free: it logs them and carries on.
+        for bad in ("FAIL:", "panic", "Segmentation fault", "leak",
+                    "Double free detected", "does not match free"):
             if bad in text:
                 failures.append(f"{name}: log contains {bad!r}")
                 break

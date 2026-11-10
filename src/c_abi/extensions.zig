@@ -1183,7 +1183,13 @@ pub export fn zzdds_cft_match_sample(
 // the actual call site instead of silently corrupting the heap -- this is
 // what the original zig/shape heap-corruption investigation had to fall
 // back to manual DebugAllocator wiring to get, before this flag existed.
-var debug_gpa: std.heap.DebugAllocator(.{}) = .{};
+//
+// -Ddebug-allocator-stack-traces=false keeps every check but records no
+// stack traces, so reports name no allocation or free site. Recording one
+// holds the allocator's lock for the capture, which serializes every thread
+// in the process.
+const debug_gpa_config: std.heap.DebugAllocatorConfig = if (build_options.debug_allocator_stack_traces) .{} else .{ .stack_trace_frames = 0 };
+var debug_gpa: std.heap.DebugAllocator(debug_gpa_config) = .{};
 
 fn createFactory(allocator: ?*const zidl_bindings.ZidlAllocator) !ZZDDS.DomainParticipantFactory {
     const alloc = if (allocator) |a|

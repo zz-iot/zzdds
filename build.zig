@@ -197,6 +197,7 @@ pub fn build(b: *std.Build) void {
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer") orelse false;
     const config_authoring = b.option(bool, "config-authoring", "Use the shared runtime config reader (false selects legacy applyToml)") orelse true;
     const debug_allocator = b.option(bool, "debug-allocator", "Route the default (allocator=NULL) factory allocation path through std.heap.DebugAllocator instead of std.heap.c_allocator, for fast attributable double-free/UAF diagnostics") orelse false;
+    const debug_allocator_stack_traces = b.option(bool, "debug-allocator-stack-traces", "With -Ddebug-allocator, record a stack trace on every allocation and free, so its reports show where memory was allocated and freed. Turning it off keeps every check and is much faster under many threads (default: true)") orelse true;
 
     // ── Dependencies ──────────────────────────────────────────────────────────
 
@@ -444,6 +445,7 @@ pub fn build(b: *std.Build) void {
         opts.addOption(bool, "xtypes", xtypes);
         opts.addOption(bool, "content_subscription_profile", content_subscription_profile);
         opts.addOption(bool, "debug_allocator", debug_allocator);
+        opts.addOption(bool, "debug_allocator_stack_traces", debug_allocator_stack_traces);
     }
     build_options.addOption(bool, "shared_runtime", shared_runtime);
     build_options_shared_runtime.addOption(bool, "shared_runtime", true);
