@@ -147,6 +147,129 @@ bool wait_until(Pred pred) {
     return pred();
 }
 
+// zzdds creates every reader as its zzdds extension class, so without RTTI
+// (this test is also built with -fno-rtti) a static cast reaches that API.
+template <typename To, typename From>
+std::shared_ptr<To> as_zzdds(const std::shared_ptr<From>& p) {
+#if defined(__cpp_rtti) || defined(__GXX_RTTI) || defined(_CPPRTTI)
+    return std::dynamic_pointer_cast<To>(p);
+#else
+    return std::static_pointer_cast<To>(p);
+#endif
+}
+
+// Rejected registrations: a call that registers a listener and fails leaves
+// the registration with the caller, so the binding must release what it built.
+// set_listener and set_listener_ex on a reader whose deletion has begun return
+// ALREADY_DELETED from the core. The shared runtime makes that window
+// deterministic: deleting a reader waits for its running callback before
+// retiring the wrapper, so a call from that callback still reaches the core.
+// The callback retries until the core rejects, then checks the rejected
+// listener was released by the time the call returned.
+std::atomic<int> g_probes_made{0};
+std::atomic<int> g_probes_destroyed{0};
+
+class Probe : public ::DDS::DataReaderListenerBase {
+public:
+    Probe() { g_probes_made++; }
+    ~Probe() override { g_probes_destroyed++; }
+};
+
+class ProbeEx : public ::zzdds::DataReaderListenerExBase {
+public:
+    ProbeEx() { g_probes_made++; }
+    ~ProbeEx() override { g_probes_destroyed++; }
+};
+
+struct Rejection {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool entered = false;
+    bool deleting = false;
+    bool done = false;
+    ::DDS::ReturnCode_t plain_rc = -1;
+    ::DDS::ReturnCode_t ex_rc = -1;
+    bool plain_released = false;
+    bool ex_released = false;
+};
+Rejection g_rej;
+
+// Calls `set` with a new listener until the reader rejects one; returns that
+// result and whether the rejected listener was already destroyed on return.
+template <typename L, typename Set>
+::DDS::ReturnCode_t set_until_rejected(Set set, bool &released) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::weak_ptr<L> weak;
+        ::DDS::ReturnCode_t rc;
+        {
+            auto listener = std::make_shared<L>();
+            weak = listener;
+            rc = set(listener);
+        }
+        if (rc != ::DDS::RETCODE_OK) {
+            released = weak.expired();
+            return rc;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return ::DDS::RETCODE_TIMEOUT;
+}
+
+class RejectingListener : public ::DDS::DataReaderListenerBase {
+public:
+    void on_subscription_matched(std::shared_ptr<::DDS::DataReader> reader, ::DDS::SubscriptionMatchedStatus status) override {
+        if (status.current_count == 0) return;
+        {
+            std::unique_lock<std::mutex> lock(g_rej.mu);
+            if (g_rej.entered) return;
+            g_rej.entered = true;
+            g_rej.cv.notify_all();
+            if (!g_rej.cv.wait_for(lock, std::chrono::seconds(20), [] { return g_rej.deleting; })) return;
+        }
+        bool plain_released = false;
+        bool ex_released = false;
+        const auto plain_rc = set_until_rejected<Probe>(
+            [&](std::shared_ptr<Probe> l) { return reader->set_listener(l, ::DDS::SUBSCRIPTION_MATCHED_STATUS); },
+            plain_released);
+        auto zreader = as_zzdds<::zzdds::DataReaderImpl>(reader);
+        const auto ex_rc = set_until_rejected<ProbeEx>(
+            [&](std::shared_ptr<ProbeEx> l) { return zreader->set_listener_ex(l, ::DDS::SUBSCRIPTION_MATCHED_STATUS); },
+            ex_released);
+        std::lock_guard<std::mutex> lock(g_rej.mu);
+        g_rej.plain_rc = plain_rc;
+        g_rej.ex_rc = ex_rc;
+        g_rej.plain_released = plain_released;
+        g_rej.ex_released = ex_released;
+        g_rej.done = true;
+        g_rej.cv.notify_all();
+    }
+};
+
+void check_rejected_registrations(const std::shared_ptr<::DDS::Subscriber> &sub,
+                                  const std::shared_ptr<::DDS::TopicDescription> &topic) {
+    auto dr = sub->create_datareader(topic, ::DDS::DataReaderQos::default_value(),
+                                     std::make_shared<RejectingListener>(), ::DDS::SUBSCRIPTION_MATCHED_STATUS);
+    CHECK(dr);
+    {
+        std::unique_lock<std::mutex> lock(g_rej.mu);
+        CHECK(g_rej.cv.wait_for(lock, std::chrono::seconds(20), [] { return g_rej.entered; }));
+        g_rej.deleting = true;
+    }
+    g_rej.cv.notify_all();
+    // Returns once the callback has returned.
+    CHECK(sub->delete_datareader(dr) == ::DDS::RETCODE_OK);
+    std::lock_guard<std::mutex> lock(g_rej.mu);
+    CHECK(g_rej.done);
+    CHECK(g_rej.plain_rc == ::DDS::RETCODE_ALREADY_DELETED);
+    CHECK(g_rej.plain_released);
+    CHECK(g_rej.ex_rc == ::DDS::RETCODE_ALREADY_DELETED);
+    CHECK(g_rej.ex_released);
+    // Accepted listeners go with the reader.
+    CHECK(wait_until([] { return g_probes_destroyed.load() == g_probes_made.load(); }));
+    CHECK(g_probes_destroyed.load() == g_probes_made.load());
+}
+
 } // namespace
 
 int main() {
@@ -214,6 +337,13 @@ int main() {
     CHECK(wait_until([] { return g_direct_matches.load() > 0; }));
 
     CHECK(dr->get_listener() == nullptr);
+
+    // Only the shared runtime waits for a running callback when deleting.
+    const char *shared = std::getenv("ZZDDS_SHARED_RUNTIME");
+    if (shared && std::atoi(shared) != 0) {
+        check_rejected_registrations(
+            sub, std::static_pointer_cast<::zzdds::TopicImpl>(topic_r)->as_topic_description());
+    }
 
     // Deletion retires the wrapper before returning, even if native references
     // postpone freeing the handle. Its calls no longer reach the core.

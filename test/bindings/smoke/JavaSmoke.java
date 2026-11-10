@@ -13,6 +13,7 @@
 import io.zzdds.dcps.Dcps;
 import io.zzdds.ext.Zzdds;
 
+import java.lang.ref.WeakReference;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -82,6 +83,105 @@ public class JavaSmoke {
         Dcps.DDS.Subscriber subscriber = a.get_subscriber();
         check(subscriber.delete_datareader(a) == 0, "delete_datareader(a) rc == 0");
         check(subscriber.delete_datareader(b) == 0, "delete_datareader(b) rc == 0");
+    }
+
+    // A call that registers a listener and fails leaves the registration with
+    // the caller, so the binding must drop the reference it took on the
+    // listener. set_listener and set_listener_ex on a writer whose deletion has
+    // begun return ALREADY_DELETED from the core. On the shared runtime,
+    // deleting a writer waits for its running callback before retiring the
+    // wrapper, so a call from that callback still reaches the core. The
+    // callback retries until the core rejects; each rejected listener must
+    // then be collectable. (A writer, since Java reaches set_listener_ex only
+    // through ZzddsRuntime.asZzddsDataWriter; the C++ test covers a reader.)
+    static class Probe implements Dcps.DDS.DataWriterListener {
+        public void on_offered_deadline_missed(Dcps.DDS.DataWriter w, Dcps.DDS.OfferedDeadlineMissedStatus s) {}
+        public void on_offered_incompatible_qos(Dcps.DDS.DataWriter w, Dcps.DDS.OfferedIncompatibleQosStatus s) {}
+        public void on_liveliness_lost(Dcps.DDS.DataWriter w, Dcps.DDS.LivelinessLostStatus s) {}
+        public void on_publication_matched(Dcps.DDS.DataWriter w, Dcps.DDS.PublicationMatchedStatus s) {}
+    }
+
+    static class ProbeEx extends Probe implements Zzdds.zzdds.DataWriterListenerEx {
+        public void on_reliable_reader_ready(int readerHandle, boolean isReady) {}
+    }
+
+    static final class Rejection {
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch deleting = new CountDownLatch(1);
+        final CountDownLatch done = new CountDownLatch(1);
+        final AtomicBoolean first = new AtomicBoolean(true);
+        volatile Zzdds.zzdds.DataWriter writer;
+        volatile int plainRc = -1;
+        volatile int exRc = -1;
+        final WeakReference<?>[] plainRejected = new WeakReference<?>[1];
+        final WeakReference<?>[] exRejected = new WeakReference<?>[1];
+    }
+
+    // The probe is reachable only through `rejected` and the binding once this returns.
+    static int setProbe(Zzdds.zzdds.DataWriter w, boolean ex, WeakReference<?>[] rejected) {
+        int mask = Dcps.DDS.PUBLICATION_MATCHED_STATUS.value;
+        if (ex) {
+            ProbeEx p = new ProbeEx();
+            rejected[0] = new WeakReference<>(p);
+            return w.set_listener_ex(p, mask);
+        }
+        Probe p = new Probe();
+        rejected[0] = new WeakReference<>(p);
+        return w.set_listener(p, mask);
+    }
+
+    static int setUntilRejected(Zzdds.zzdds.DataWriter w, boolean ex, WeakReference<?>[] rejected) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+        while (System.nanoTime() < deadline) {
+            int rc = setProbe(w, ex, rejected);
+            if (rc != 0) return rc;
+            Thread.sleep(1);
+        }
+        return -1;
+    }
+
+    static boolean collected(WeakReference<?> ref) throws InterruptedException {
+        for (int i = 0; i < 100 && ref.get() != null; i++) {
+            System.gc();
+            Thread.sleep(50);
+        }
+        return ref.get() == null;
+    }
+
+    static void checkRejectedRegistrations(Zzdds.zzdds.Publisher zdPublisher, Dcps.DDS.Topic topic,
+                                           Dcps.DDS.DataWriterQos qos) throws Exception {
+        final Rejection rej = new Rejection();
+        ProbeEx gate = new ProbeEx() {
+            @Override
+            public void on_publication_matched(Dcps.DDS.DataWriter w, Dcps.DDS.PublicationMatchedStatus s) {
+                if (s.get_current_count() == 0 || !rej.first.getAndSet(false)) return;
+                rej.entered.countDown();
+                try {
+                    if (!rej.deleting.await(20, TimeUnit.SECONDS)) return;
+                    rej.plainRc = setUntilRejected(rej.writer, false, rej.plainRejected);
+                    rej.exRc = setUntilRejected(rej.writer, true, rej.exRejected);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    rej.done.countDown();
+                }
+            }
+        };
+        Dcps.DDS.DataWriter raw = zdPublisher.create_datawriter_ex(topic, qos, gate, Dcps.DDS.PUBLICATION_MATCHED_STATUS.value);
+        check(raw != null, "create_datawriter_ex() of the rejecting writer returned non-null");
+        rej.writer = (Zzdds.zzdds.DataWriter) io.zzdds.runtime.ZzddsRuntime.asZzddsDataWriter(raw);
+        check(rej.writer != null, "asZzddsDataWriter() of the rejecting writer returned non-null");
+        gate = null;
+        check(rej.entered.await(20, TimeUnit.SECONDS), "the rejecting writer matched within 20s");
+        rej.deleting.countDown();
+        // Returns once the callback has returned.
+        check(raw.get_publisher().delete_datawriter(raw) == 0, "delete_datawriter() of the rejecting writer rc == 0");
+        check(rej.done.await(10, TimeUnit.SECONDS), "the rejecting callback finished");
+        int deleted = Dcps.DDS.RETCODE_ALREADY_DELETED.value;
+        check(rej.plainRc == deleted, "set_listener() on a writer being deleted returns ALREADY_DELETED, got " + rej.plainRc);
+        check(rej.exRc == deleted, "set_listener_ex() on a writer being deleted returns ALREADY_DELETED, got " + rej.exRc);
+        check(collected(rej.plainRejected[0]), "a listener set_listener() rejected is released");
+        check(collected(rej.exRejected[0]), "a listener set_listener_ex() rejected is released");
     }
 
     public static void main(String[] args) throws Exception {
@@ -276,6 +376,8 @@ public class JavaSmoke {
         if (Boolean.getBoolean("zzdds.sharedRuntime")) {
             checkOneIdentity(zdSubscriber, topicReader, readerQos, writer, sample);
             System.out.println("  one listener object runs one callback at a time across readers: OK");
+            checkRejectedRegistrations(zdPublisher, topicWriter, writerQos);
+            System.out.println("  rejected listener registrations are released: OK");
         }
 
         int deleteRc = publisher.delete_datawriter(rawWriter);

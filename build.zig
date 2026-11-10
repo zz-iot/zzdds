@@ -1074,6 +1074,8 @@ pub fn build(b: *std.Build) void {
                 const cpp_lifetime_run = b.addRunArtifact(cpp_lifetime);
                 // Own domain, as above: 7400 + 250*101 = 32650, still below 32768.
                 cpp_lifetime_run.setEnvironmentVariable("ZZDDS_TEST_DOMAIN_BASE", "101");
+                // Rejected registrations are checked only on the shared runtime.
+                cpp_lifetime_run.setEnvironmentVariable("ZZDDS_SHARED_RUNTIME", if (shared_runtime) "1" else "0");
                 if (prev_lifetime_run) |prev| cpp_lifetime_run.step.dependOn(prev);
                 prev_lifetime_run = &cpp_lifetime_run.step;
                 binding_smoke_step.dependOn(&cpp_lifetime_run.step);
