@@ -157,8 +157,9 @@ fn cdrLibrary(b: *std.Build, source: ZidlSource, codec: *std.Build.Module, targe
     mod.addCSourceFile(.{ .file = source.path("packages/zidl-cdr/src/zidl_cdr.c"), .flags = &.{"-std=c99"} });
     mod.addIncludePath(source.path("packages/zidl-cdr/include"));
     const lib = b.addLibrary(.{ .name = "zidl_cdr", .linkage = .static, .root_module = mod, .use_llvm = if (sanitize_thread) true else null });
+    // As zidl's own c_api_build.zig: no UBSan runtime, which nothing references
+    // with sanitize_c off and whose directives MSVC warns about (LNK4229).
     lib.bundle_compiler_rt = true;
-    lib.bundle_ubsan_rt = true;
     return lib;
 }
 
@@ -703,6 +704,15 @@ pub fn build(b: *std.Build) void {
             repack.addArtifactArg(zidl_cdr_obj);
             const install_fixed_a = b.addInstallFileWithDir(fixed_a, .lib, "libzidl_cdr.a");
             b.getInstallStep().dependOn(&install_fixed_a.step);
+        } else if (target.result.os.tag == .windows and target.result.abi != .msvc) {
+            // C/C++ applications on Windows link the installed archive with
+            // MSVC, which only accepts one built for an MSVC-ABI target (an
+            // archive for Zig's default GNU ABI fails with LNK1143). zzdds.dll
+            // and the Zig-linked tests keep the archive for `target`.
+            const msvc_target = b.resolveTargetQuery(.{ .cpu_arch = target.result.cpu.arch, .os_tag = .windows, .abi = .msvc });
+            const msvc_dep = b.dependency("zidl", .{ .target = msvc_target, .optimize = optimize });
+            const msvc_runtime = runtimeModules(b, zidl_dep, msvc_dep, msvc_target, optimize, false);
+            b.installArtifact(cdrLibrary(b, zidl_dep, msvc_runtime.codec, msvc_target, optimize, false));
         } else {
             b.installArtifact(zidl_cdr_lib);
         }
