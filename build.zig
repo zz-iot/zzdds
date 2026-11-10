@@ -109,7 +109,7 @@ const cpp_impl_override_args = [_][]const u8{
     "--handle-retire-query", "zzdds_handle_retire_is_retired",
 };
 
-fn typesupportModule(b: *std.Build, package: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, rt: *std.Build.Module) *std.Build.Module {
+fn typesupportModule(b: *std.Build, package: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, codec: *std.Build.Module) *std.Build.Module {
     const header = b.addTranslateC(.{
         .root_source_file = package.path(b, "include/zidl_typesupport.h"),
         .target = target,
@@ -120,7 +120,7 @@ fn typesupportModule(b: *std.Build, package: std.Build.LazyPath, target: std.Bui
         .root_source_file = package.path(b, "src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "zidl_rt", .module = rt }, .{ .name = "zidl_typesupport_c", .module = header.createModule() } },
+        .imports = &.{ .{ .name = "zidl_cdr", .module = codec }, .{ .name = "zidl_typesupport_c", .module = header.createModule() } },
     });
 }
 
@@ -134,6 +134,40 @@ const ZidlSource = struct {
         return self.dependency.path(sub);
     }
 };
+const Runtime = struct { codec: *std.Build.Module, bindings: *std.Build.Module };
+
+fn runtimeModules(b: *std.Build, source: ZidlSource, dependency: *std.Build.Dependency, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, sanitize_thread: bool) Runtime {
+    if (source.source == null) return .{ .codec = dependency.module("zidl_cdr"), .bindings = dependency.module("zidl_bindings") };
+    const codec = b.createModule(.{ .root_source_file = source.path("packages/zidl-cdr/src/root.zig"), .target = target, .optimize = optimize, .sanitize_thread = sanitize_thread });
+    const bindings = b.createModule(.{ .root_source_file = source.path("packages/zidl-bindings/src/root.zig"), .target = target, .optimize = optimize, .sanitize_thread = sanitize_thread, .imports = &.{.{ .name = "zidl_cdr", .module = codec }} });
+    return .{ .codec = codec, .bindings = bindings };
+}
+
+fn cdrLibrary(b: *std.Build, source: ZidlSource, codec: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, sanitize_thread: bool) *std.Build.Step.Compile {
+    const mod = b.createModule(.{
+        .root_source_file = source.path("packages/zidl-cdr/src/shared_primitives.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .link_libc = true,
+        .sanitize_c = .off,
+        .stack_protector = false,
+        .imports = &.{.{ .name = "zidl_cdr", .module = codec }},
+    });
+    mod.addCSourceFile(.{ .file = source.path("packages/zidl-cdr/src/zidl_cdr.c"), .flags = &.{"-std=c99"} });
+    mod.addIncludePath(source.path("packages/zidl-cdr/include"));
+    const lib = b.addLibrary(.{ .name = "zidl_cdr", .linkage = .static, .root_module = mod, .use_llvm = if (sanitize_thread) true else null });
+    // As zidl's own c_api_build.zig: no UBSan runtime, which nothing references
+    // with sanitize_c off and whose directives MSVC warns about (LNK4229).
+    lib.bundle_compiler_rt = true;
+    return lib;
+}
+
+fn linkCdr(module: *std.Build.Module, library: *std.Build.Step.Compile) void {
+    module.sanitize_thread = library.root_module.sanitize_thread;
+    module.linkLibrary(library);
+}
+
 fn localZidl(b: *std.Build, source: ZidlSource, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
     const xtypes = b.createModule(.{ .root_source_file = source.path("packages/zidl-xtypes/src/root.zig"), .target = b.graph.host, .optimize = optimize });
     const compiler = b.createModule(.{ .root_source_file = source.path("src/root.zig"), .target = b.graph.host, .optimize = optimize, .imports = &.{.{ .name = "zidl_xtypes", .module = xtypes }} });
@@ -181,30 +215,11 @@ pub fn build(b: *std.Build) void {
         .@"sanitize-thread" = sanitize_thread,
     });
     const zidl_exe = if (zidl_source != null) localZidl(b, zidl_dep, optimize) else zidl_tool_dep.artifact("zidl");
-    const zidl_rt_mod = if (zidl_source != null) b.createModule(.{
-        .root_source_file = zidl_dep.path("packages/zidl-rt/src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .sanitize_thread = sanitize_thread,
-    }) else zidl_dep.dependency.module("zidl_rt");
+    const runtime = runtimeModules(b, zidl_dep, zidl_dep.dependency, target, optimize, sanitize_thread);
 
-    // Re-expose zidl's own executable and `zidl_rt` module as zzdds's own, so
-    // a downstream Zig consumer (e.g. a zzdds-examples zig/* example) can get
-    // both *through* zzdds (`zzdds_dep.artifact("zidl")` /
-    // `zzdds_dep.module("zidl_rt")`) instead of declaring its own separate
-    // top-level dependency on zidl. That matters specifically when zidl is a
-    // `.path` dependency (as it is while developing zidl and zzdds together,
-    // pre-release): Zig's package manager doesn't deduplicate two independent
-    // `.path` dependencies on the same directory declared by two different
-    // build.zig files, even though they resolve to the identical files —
-    // each gets instantiated as its own module, and the build then fails
-    // outright ("file exists in modules 'zidl_rt' and 'zidl_rt0'") the moment
-    // any single compilation unit ends up importing both. Unconditional
-    // (not gated behind `need_c_abi` like the artifact install below used to
-    // be) because a pure-Zig consumer needing only `zidl_rt` + the `zidl`
-    // binary for its own IDL codegen shouldn't have to opt into the C/C++/Java
-    // binding pipeline just to get them.
-    b.modules.put(b.graph.arena, b.dupe("zidl_rt"), zidl_rt_mod) catch @panic("OOM");
+    // Re-export the same modules so downstream code shares types and registries.
+    b.modules.put(b.graph.arena, b.dupe("zidl_cdr"), runtime.codec) catch @panic("OOM");
+    b.modules.put(b.graph.arena, b.dupe("zidl_bindings"), runtime.bindings) catch @panic("OOM");
     b.installArtifact(zidl_exe);
 
     // ── Language binding flags ────────────────────────────────────────────────
@@ -225,6 +240,7 @@ pub fn build(b: *std.Build) void {
     // C ABI layer is a shared prerequisite for C, C++, Java, Python, .NET, Rust zig-ffi
     // — Java's JNI bridge links against libzzdds/dcps.h the same way C/C++ do.
     const need_c_abi = c_binding or cpp_binding or java_binding;
+    const cdr_lib = if (need_c_abi) cdrLibrary(b, zidl_dep, runtime.codec, target, optimize, sanitize_thread) else null;
 
     // Hoisted out of the `if (need_c_abi)` block below so the Java binding
     // section (which needs `need_c_abi` too, but is declared later in this
@@ -256,7 +272,7 @@ pub fn build(b: *std.Build) void {
     //
     // --zig-generate-c-api-cdr-allocator: opt-in companion flag (default off
     // in zidl, since plain --zig-generate-c-api must stay dependency-free for
-    // consumers that only link zidl_rt — see zidl PR #45's Greptile finding).
+    // consumers that only link zidl_bindings — see zidl PR #45's Greptile finding).
     // zzdds always passes it alongside --zig-generate-c-api because it
     // already links libzidl_cdr unconditionally in this same need_c_abi
     // block (see zidl_cdr_lib below) for C/C++ CDR decode, so there's no
@@ -277,7 +293,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .sanitize_thread = sanitize_thread,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            .{ .name = "zidl_cdr", .module = runtime.codec },
+            .{ .name = "zidl_bindings", .module = runtime.bindings },
         },
     });
 
@@ -360,7 +377,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .sanitize_thread = sanitize_thread,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            .{ .name = "zidl_cdr", .module = runtime.codec },
+            .{ .name = "zidl_bindings", .module = runtime.bindings },
             .{ .name = "zzdds_generated", .module = generated_dcps_mod },
         },
     });
@@ -390,7 +408,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .sanitize_thread = sanitize_thread,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            .{ .name = "zidl_cdr", .module = runtime.codec },
+            .{ .name = "zidl_bindings", .module = runtime.bindings },
         },
     });
 
@@ -410,9 +429,12 @@ pub fn build(b: *std.Build) void {
 
     // `build_options_shared_runtime` is the same set with the switch on, for
     // the shared-runtime tests, which run in every build while it exists.
+    // `build_options_lib` is `build_options` for libzzdds itself, which alone
+    // may compile the codec's C ABI in (see cdr_exports_in_library below).
     const build_options = b.addOptions();
     const build_options_shared_runtime = b.addOptions();
-    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime }) |opts| {
+    const build_options_lib = b.addOptions();
+    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime, build_options_lib }) |opts| {
         opts.addOption(bool, "config_authoring", config_authoring);
         opts.addOption(bool, "ipv4", ipv4);
         opts.addOption(bool, "ipv6", ipv6);
@@ -425,6 +447,16 @@ pub fn build(b: *std.Build) void {
     }
     build_options.addOption(bool, "shared_runtime", shared_runtime);
     build_options_shared_runtime.addOption(bool, "shared_runtime", true);
+    build_options_lib.addOption(bool, "shared_runtime", shared_runtime);
+    // A ThreadSanitizer build is position-independent *executable* code, so
+    // Zig gives the codec archive's thread-locals local-exec TLS, which a
+    // shared library cannot link ("relocation R_X86_64_TPOFF32 ... cannot be
+    // used with -shared"). libzzdds then compiles the codec's C ABI in itself
+    // instead of linking the archive; executables still link the archive.
+    const cdr_exports_in_library = sanitize_thread;
+    build_options.addOption(bool, "cdr_exports_in_library", false);
+    build_options_shared_runtime.addOption(bool, "cdr_exports_in_library", false);
+    build_options_lib.addOption(bool, "cdr_exports_in_library", cdr_exports_in_library);
     // Pass ZZDDS_XTYPES preprocessor define to zidl so dcps.idl gates XTypes
     // content (DataRepresentationQosPolicy and its uses) at code-generation time.
     if (xtypes) gen_dcps.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
@@ -439,18 +471,18 @@ pub fn build(b: *std.Build) void {
         if (!std.fs.path.isAbsolute(path)) @panic("-Dtypesupport-package must be absolute");
         break :blk .{ .cwd_relative = path };
     } else zidl_dep.path("packages/zidl-typesupport");
-    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime }) |opts| opts.addOption(bool, "typesupport_library", typesupport_enabled);
+    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime, build_options_lib }) |opts| opts.addOption(bool, "typesupport_library", typesupport_enabled);
     const resource_authoring = b.option(bool, "resource-authoring", "Enable experimental strict TOML resources") orelse false;
     const resources_enabled = b.option(bool, "resource-construction", "Enable experimental programmatic DDS resource construction") orelse resource_authoring;
     if (resource_authoring and !resources_enabled) @panic("resource authoring requires resource construction");
-    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime }) |opts| {
+    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime, build_options_lib }) |opts| {
         opts.addOption(bool, "resource_authoring", resource_authoring);
         opts.addOption(bool, "resource_construction", resources_enabled);
     }
     const typesupport_dynamic = b.option(bool, "typesupport-dynamic", "Include OS dynamic loading (disable for static providers only)") orelse true;
-    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime }) |opts| opts.addOption(bool, "typesupport_dynamic", typesupport_dynamic);
+    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime, build_options_lib }) |opts| opts.addOption(bool, "typesupport_dynamic", typesupport_dynamic);
     const typesupport_mod = if (typesupport_enabled)
-        typesupportModule(b, typesupport_package, target, optimize, zidl_rt_mod)
+        typesupportModule(b, typesupport_package, target, optimize, runtime.codec)
     else
         null;
 
@@ -460,7 +492,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            .{ .name = "zidl_cdr", .module = runtime.codec },
+            .{ .name = "zidl_bindings", .module = runtime.bindings },
             .{ .name = "zzdds_generated", .module = generated_dcps_mod },
             .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod },
             .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod },
@@ -485,16 +518,13 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
-            .imports = &.{.{ .name = "zidl_rt", .module = zidl_rt_mod }},
+            .imports = &.{ .{ .name = "zidl_cdr", .module = runtime.codec }, .{ .name = "zidl_bindings", .module = runtime.bindings } },
         });
         zzdds_mod.addImport("resource_authoring_generated", schema);
     }
 
     if (need_c_abi) {
-        zzdds_mod.addCSourceFile(.{
-            .file = zidl_dep.path("packages/zidl-cdr/src/zidl_cdr.c"),
-            .flags = &.{"-std=c99"},
-        });
+        linkCdr(zzdds_mod, cdr_lib.?);
         zzdds_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
     }
     if (target.result.os.tag == .windows) {
@@ -530,7 +560,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            .{ .name = "zidl_cdr", .module = runtime.codec },
+            .{ .name = "zidl_bindings", .module = runtime.bindings },
             .{ .name = "zzdds", .module = dds_adapter_mod },
         },
     });
@@ -540,7 +571,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .Debug,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            .{ .name = "zidl_cdr", .module = runtime.codec },
+            .{ .name = "zidl_bindings", .module = runtime.bindings },
             .{ .name = "zzdds", .module = dds_adapter_mod },
             .{ .name = "binding_smoke", .module = generated_smoke_mod },
         },
@@ -646,57 +678,9 @@ pub fn build(b: *std.Build) void {
         // zidl_exe is now installed unconditionally near the top of this
         // function (see the comment there) — no longer gated on need_c_abi.
 
-        // Build and install the CDR runtime as a pre-compiled static library.
-        // C/C++ users link against libzidl_cdr.a rather than compiling zidl_cdr.c
-        // from source; the header-only interface (zidl_cdr.h) is already installed above.
-        const zidl_cdr_mod = b.createModule(.{
-            .root_source_file = null,
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .sanitize_thread = sanitize_thread,
-            // This module is installed as a standalone static library for
-            // direct third-party C/C++ linking (see installArtifact below),
-            // not just embedded into libzzdds's own final link — so it must
-            // not depend on runtime hooks only Zig's own linker step would
-            // satisfy. Left at Zig's default (unset), Debug/ReleaseSafe
-            // optimize modes instrument zidl_cdr.c's C source with
-            // -fsanitize-c (emitting calls to __ubsan_handle_*) and
-            // -fstack-protector (__stack_chk_fail/__stack_chk_guard).
-            // Those get resolved for free when this module is linked into
-            // libzzdds.so/.dll (Zig statically links its own compiler-rt at
-            // that final link step) and, on Linux, __stack_chk_fail/_guard
-            // happen to also be satisfied by glibc regardless -- but an
-            // external MSVC-linked consumer of the exported zidl_cdr.lib has
-            // no such runtime available for any of these symbols, and fails
-            // with LNK2019 unresolved externals (found building the Windows
-            // examples lane, which is the first place anything linked
-            // zidl_cdr.lib directly via a non-Zig toolchain). zidl_cdr.c is
-            // vendored, narrow, mechanical CDR encode/decode logic from the
-            // zidl dependency, not zzdds's own Zig code -- disabling these
-            // C-source-specific checks here doesn't touch Zig's own native
-            // safety checks (bounds/overflow/etc.) anywhere else in the
-            // project, which are a separate, unaffected mechanism.
-            .sanitize_c = .off,
-            .stack_protector = false,
-        });
-        zidl_cdr_mod.addCSourceFile(.{
-            .file = zidl_dep.path("packages/zidl-cdr/src/zidl_cdr.c"),
-            .flags = &.{"-std=c99"},
-        });
-        zidl_cdr_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
-        const zidl_cdr_lib = b.addLibrary(.{
-            .name = "zidl_cdr",
-            .linkage = .static,
-            .root_module = zidl_cdr_mod,
-            // -Dsanitize-thread=true silently no-ops on Zig 0.16's default
-            // self-hosted x86_64 backend for Debug builds -- it accepts
-            // -fsanitize-thread but doesn't actually instrument anything.
-            // Real TSan requires the LLVM backend. Confirmed empirically: a
-            // deliberate unsynchronized two-thread race went undetected
-            // without this, and was caught immediately with it.
-            .use_llvm = if (sanitize_thread) true else null,
-        });
+        // Share the codec archive across SDK exports and binding consumers.
+        const zidl_cdr_lib = cdr_lib.?;
+        const zidl_cdr_mod = zidl_cdr_lib.root_module;
 
         // Install libzidl_cdr.a. On macOS the archive that `Step.Compile`'s
         // own (GNU-format) archiver writes has member offsets Apple's ld64
@@ -713,11 +697,22 @@ pub fn build(b: *std.Build) void {
                 .root_module = zidl_cdr_mod,
                 .use_llvm = if (sanitize_thread) true else null,
             });
+            zidl_cdr_obj.bundle_compiler_rt = true;
+            zidl_cdr_obj.bundle_ubsan_rt = true;
             const repack = b.addSystemCommand(&.{ b.graph.zig_exe, "ar", "-rcs", "--format=darwin" });
             const fixed_a = repack.addOutputFileArg("libzidl_cdr.a");
             repack.addArtifactArg(zidl_cdr_obj);
             const install_fixed_a = b.addInstallFileWithDir(fixed_a, .lib, "libzidl_cdr.a");
             b.getInstallStep().dependOn(&install_fixed_a.step);
+        } else if (target.result.os.tag == .windows and target.result.abi != .msvc) {
+            // C/C++ applications on Windows link the installed archive with
+            // MSVC, which only accepts one built for an MSVC-ABI target (an
+            // archive for Zig's default GNU ABI fails with LNK1143). zzdds.dll
+            // and the Zig-linked tests keep the archive for `target`.
+            const msvc_target = b.resolveTargetQuery(.{ .cpu_arch = target.result.cpu.arch, .os_tag = .windows, .abi = .msvc });
+            const msvc_dep = b.dependency("zidl", .{ .target = msvc_target, .optimize = optimize });
+            const msvc_runtime = runtimeModules(b, zidl_dep, msvc_dep, msvc_target, optimize, false);
+            b.installArtifact(cdrLibrary(b, zidl_dep, msvc_runtime.codec, msvc_target, optimize, false));
         } else {
             b.installArtifact(zidl_cdr_lib);
         }
@@ -732,7 +727,8 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .sanitize_thread = sanitize_thread,
                 .imports = &.{
-                    .{ .name = "zidl_rt", .module = zidl_rt_mod },
+                    .{ .name = "zidl_cdr", .module = runtime.codec },
+                    .{ .name = "zidl_bindings", .module = runtime.bindings },
                     .{ .name = "zzdds_generated", .module = generated_dcps_mod },
                     .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod },
                     .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod },
@@ -742,7 +738,7 @@ pub fn build(b: *std.Build) void {
             // needs the LLVM backend forced to actually instrument anything.
             .use_llvm = if (sanitize_thread) true else null,
         });
-        zzdds_lib.root_module.addOptions("build_options", build_options);
+        zzdds_lib.root_module.addOptions("build_options", build_options_lib);
         zzdds_lib.root_module.link_libc = true;
         // Without this, only Zig's own `export fn` C-ABI surface
         // (--zig-generate-c-api) ends up in zzdds.dll's export table on
@@ -787,7 +783,24 @@ pub fn build(b: *std.Build) void {
         zzdds_lib.root_module.addIncludePath(gen_zzdds_c_lib_dir);
         zzdds_lib.root_module.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
         zzdds_lib.root_module.addIncludePath(b.path("include"));
-        zzdds_lib.root_module.linkLibrary(zidl_cdr_lib);
+        if (cdr_exports_in_library) {
+            // See cdr_exports_in_library: the archive's own sources, compiled
+            // as part of this shared library (src/root.zig imports the Zig half).
+            zzdds_lib.root_module.addImport("zidl_cdr_exports", b.createModule(.{
+                .root_source_file = zidl_dep.path("packages/zidl-cdr/src/shared_primitives.zig"),
+                .target = target,
+                .optimize = optimize,
+                .sanitize_thread = sanitize_thread,
+                .link_libc = true,
+                .imports = &.{.{ .name = "zidl_cdr", .module = runtime.codec }},
+            }));
+            zzdds_lib.root_module.addCSourceFile(.{
+                .file = zidl_dep.path("packages/zidl-cdr/src/zidl_cdr.c"),
+                .flags = &.{"-std=c99"},
+            });
+        } else {
+            linkCdr(zzdds_lib.root_module, zidl_cdr_lib);
+        }
 
         // dll_export_fns (above) only covers Zig's own `export fn` surface,
         // not the plain C functions just compiled in from dcps_cdr.c/
@@ -862,10 +875,7 @@ pub fn build(b: *std.Build) void {
             .file = gen_smoke_c_dir.path(b, "binding_smoke_cdr.c"),
             .flags = &.{ "-std=c99", "-Wall" },
         });
-        c_smoke_mod.addCSourceFile(.{
-            .file = zidl_dep.path("packages/zidl-cdr/src/zidl_cdr.c"),
-            .flags = &.{ "-std=c99", "-Wall" },
-        });
+        linkCdr(c_smoke_mod, cdr_lib.?);
         c_smoke_mod.addIncludePath(gen_smoke_c_dir);
         c_smoke_mod.addIncludePath(gen_c_dir);
         c_smoke_mod.addIncludePath(gen_zzdds_c_dir);
@@ -920,10 +930,7 @@ pub fn build(b: *std.Build) void {
                 .file = gen_smoke_cpp_dir.path(b, "binding_smoke_cdr.cpp"),
                 .flags = &.{ "-std=c++17", "-Wall" },
             });
-            cpp_smoke_mod.addCSourceFile(.{
-                .file = zidl_dep.path("packages/zidl-cdr/src/zidl_cdr.c"),
-                .flags = &.{ "-std=c99", "-Wall" },
-            });
+            linkCdr(cpp_smoke_mod, cdr_lib.?);
 
             // Binding smoke test for zzdds_cpp.hpp's allocator-injection surfaces
             // (factory bootstrap + C++ wrapper-object PMR allocation), including
@@ -1107,6 +1114,8 @@ pub fn build(b: *std.Build) void {
                 const cpp_lifetime_run = b.addRunArtifact(cpp_lifetime);
                 // Own domain, as above: 7400 + 250*101 = 32650, still below 32768.
                 cpp_lifetime_run.setEnvironmentVariable("ZZDDS_TEST_DOMAIN_BASE", "101");
+                // Rejected registrations are checked only on the shared runtime.
+                cpp_lifetime_run.setEnvironmentVariable("ZZDDS_SHARED_RUNTIME", if (shared_runtime) "1" else "0");
                 if (prev_lifetime_run) |prev| cpp_lifetime_run.step.dependOn(prev);
                 prev_lifetime_run = &cpp_lifetime_run.step;
                 binding_smoke_step.dependOn(&cpp_lifetime_run.step);
@@ -1626,12 +1635,12 @@ pub fn build(b: *std.Build) void {
         } else zidl_exe.getEmittedBin();
         const library_test_step = b.step("test-typesupport-library", "Check immutable provider registration and generation retirement");
         if (typesupport_dynamic) {
-            @import("examples/zig/typesupport-library/build.zig").addExample(b, zzdds_mod, generated_dcps_mod, generated_zzdds_mod, zidl_rt_mod, ts, generator, target, optimize);
+            @import("examples/zig/typesupport-library/build.zig").addExample(b, zzdds_mod, generated_dcps_mod, generated_zzdds_mod, runtime.codec, runtime.bindings, ts, generator, target, optimize);
         } else {
             const fail = b.addFail("typesupport-example requires -Dtypesupport-dynamic=true");
             b.step("typesupport-example", "Build the dynamic typesupport example").dependOn(&fail.step);
         }
-        const integration = @import("test/typesupport/build.zig").addTests(b, zzdds_mod, generated_dcps_mod, zidl_rt_mod, ts, generator, target, optimize, typesupport_dynamic, resources_enabled, typesupport_package, inspector);
+        const integration = @import("test/typesupport/build.zig").addTests(b, zzdds_mod, generated_dcps_mod, runtime.codec, runtime.bindings, ts, generator, target, optimize, typesupport_dynamic, resources_enabled, typesupport_package, inspector);
         library_test_step.dependOn(integration);
         test_step.dependOn(integration);
     }
@@ -1657,9 +1666,10 @@ pub fn build(b: *std.Build) void {
                     .root_source_file = gen_broker_dir.path(b, "broker-control-draft.zig"),
                     .target = target,
                     .optimize = optimize,
-                    .imports = &.{.{ .name = "zidl_rt", .module = zidl_rt_mod }},
+                    .imports = &.{ .{ .name = "zidl_cdr", .module = runtime.codec }, .{ .name = "zidl_bindings", .module = runtime.bindings } },
                 }) },
-                .{ .name = "zidl_rt", .module = zidl_rt_mod },
+                .{ .name = "zidl_cdr", .module = runtime.codec },
+                .{ .name = "zidl_bindings", .module = runtime.bindings },
             },
         }),
     });
@@ -1781,7 +1791,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            .{ .name = "zidl_cdr", .module = runtime.codec },
+            .{ .name = "zidl_bindings", .module = runtime.bindings },
             .{ .name = "zzdds_generated", .module = generated_dcps_mod },
             .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod },
             .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod },
@@ -1792,10 +1803,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = source,
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "zidl_rt", .module = zidl_rt_mod }},
+        .imports = &.{ .{ .name = "zidl_cdr", .module = runtime.codec }, .{ .name = "zidl_bindings", .module = runtime.bindings } },
     }));
-    if (typesupport_enabled) zzdds_mod_shared_runtime.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target, optimize, zidl_rt_mod));
+    if (typesupport_enabled) zzdds_mod_shared_runtime.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target, optimize, runtime.codec));
     zzdds_mod_shared_runtime.link_libc = true;
+    if (need_c_abi) linkCdr(zzdds_mod_shared_runtime, cdr_lib.?);
     const shared_runtime_test_files = [_][]const u8{
         "test/runtime/shared_runtime_test.zig",
         "test/runtime/readiness_test.zig",
@@ -1931,7 +1943,8 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "zzdds", .module = zzdds_mod },
                     .{ .name = "zzdds_generated", .module = generated_dcps_mod },
-                    .{ .name = "zidl_rt", .module = zidl_rt_mod },
+                    .{ .name = "zidl_cdr", .module = runtime.codec },
+                    .{ .name = "zidl_bindings", .module = runtime.bindings },
                     .{ .name = "test_domain", .module = test_domain_mod },
                     .{ .name = "sample_sequence", .module = sample_sequence_mod },
                     .{ .name = "mock_dcps_fixture", .module = mock_dcps_fixture_mod },
@@ -1964,7 +1977,8 @@ pub fn build(b: *std.Build) void {
             .sanitize_thread = sanitize_thread,
             .imports = &.{
                 .{ .name = "zzdds", .module = zzdds_mod },
-                .{ .name = "zidl_rt", .module = zidl_rt_mod },
+                .{ .name = "zidl_cdr", .module = runtime.codec },
+                .{ .name = "zidl_bindings", .module = runtime.bindings },
             },
         });
         resource_probe_mod = probe_mod;
@@ -2057,7 +2071,7 @@ pub fn build(b: *std.Build) void {
     // conservative about which CPU features it targets even for "native".
     // A parallel module graph (mirroring zzdds_mod_tsan et al. below, same
     // reason: a module's target can't be swapped after construction) rebuilds
-    // zidl_rt/generated code/zzdds itself against this safer target -- the
+    // zidl_bindings/generated code/zzdds itself against this safer target -- the
     // *codegen outputs* (gen_output_dir, generated_zzdds_root,
     // gen_rtps_disc_dir) are reused unchanged; only recompilation differs.
     const target_llvm_safe = b.resolveTargetQuery(.{ .cpu_model = .baseline });
@@ -2066,17 +2080,15 @@ pub fn build(b: *std.Build) void {
         .target = target_llvm_safe,
         .optimize = optimize,
     });
-    const zidl_rt_mod_llvm_safe = if (zidl_source != null) b.createModule(.{
-        .root_source_file = zidl_dep.path("packages/zidl-rt/src/root.zig"),
-        .target = target_llvm_safe,
-        .optimize = optimize,
-    }) else zidl_dep_llvm_safe.module("zidl_rt");
+    const runtime_llvm_safe = runtimeModules(b, zidl_dep, zidl_dep_llvm_safe, target_llvm_safe, optimize, false);
+    const cdr_lib_llvm_safe = if (need_c_abi) cdrLibrary(b, zidl_dep, runtime_llvm_safe.codec, target_llvm_safe, optimize, false) else null;
 
     const generated_dcps_mod_llvm_safe = b.createModule(.{
         .root_source_file = gen_output_dir.path(b, "dcps.zig"),
         .target = target_llvm_safe,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe },
+            .{ .name = "zidl_cdr", .module = runtime_llvm_safe.codec },
+            .{ .name = "zidl_bindings", .module = runtime_llvm_safe.bindings },
         },
     });
 
@@ -2084,7 +2096,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = generated_zzdds_root,
         .target = target_llvm_safe,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe },
+            .{ .name = "zidl_cdr", .module = runtime_llvm_safe.codec },
+            .{ .name = "zidl_bindings", .module = runtime_llvm_safe.bindings },
             .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
         },
     });
@@ -2093,7 +2106,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = gen_rtps_disc_dir.path(b, "rtps_discovery.zig"),
         .target = target_llvm_safe,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe },
+            .{ .name = "zidl_cdr", .module = runtime_llvm_safe.codec },
+            .{ .name = "zidl_bindings", .module = runtime_llvm_safe.bindings },
         },
     });
 
@@ -2102,7 +2116,8 @@ pub fn build(b: *std.Build) void {
         .target = target_llvm_safe,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe },
+            .{ .name = "zidl_cdr", .module = runtime_llvm_safe.codec },
+            .{ .name = "zidl_bindings", .module = runtime_llvm_safe.bindings },
             .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
             .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod_llvm_safe },
             .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod_llvm_safe },
@@ -2113,10 +2128,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = source,
         .target = target_llvm_safe,
         .optimize = optimize,
-        .imports = &.{.{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe }},
+        .imports = &.{ .{ .name = "zidl_cdr", .module = runtime_llvm_safe.codec }, .{ .name = "zidl_bindings", .module = runtime_llvm_safe.bindings } },
     }));
-    if (typesupport_enabled) zzdds_mod_llvm_safe.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target_llvm_safe, optimize, zidl_rt_mod_llvm_safe));
+    if (typesupport_enabled) zzdds_mod_llvm_safe.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target_llvm_safe, optimize, runtime_llvm_safe.codec));
     zzdds_mod_llvm_safe.link_libc = true;
+    if (need_c_abi) linkCdr(zzdds_mod_llvm_safe, cdr_lib_llvm_safe.?);
     if (target_llvm_safe.result.os.tag == .windows) {
         zzdds_mod_llvm_safe.linkSystemLibrary("ws2_32", .{});
         zzdds_mod_llvm_safe.linkSystemLibrary("bcryptprimitives", .{});
@@ -2146,7 +2162,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = source,
             .target = target_llvm_safe,
             .optimize = optimize,
-            .imports = &.{ .{ .name = "zzdds", .module = zzdds_mod_llvm_safe }, .{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe } },
+            .imports = &.{ .{ .name = "zzdds", .module = zzdds_mod_llvm_safe }, .{ .name = "zidl_cdr", .module = runtime_llvm_safe.codec }, .{ .name = "zidl_bindings", .module = runtime_llvm_safe.bindings } },
         });
         inline for (.{ "resource_construction_test", "resource_authoring_test" }) |name| {
             if (!std.mem.eql(u8, name, "resource_authoring_test") or resource_authoring) {
@@ -2267,7 +2283,8 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "zzdds", .module = zzdds_mod_llvm_safe },
                     .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
-                    .{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe },
+                    .{ .name = "zidl_cdr", .module = runtime_llvm_safe.codec },
+                    .{ .name = "zidl_bindings", .module = runtime_llvm_safe.bindings },
                     .{ .name = "test_domain", .module = test_domain_mod },
                     .{ .name = "sample_sequence", .module = sample_sequence_mod },
                     .{ .name = "mock_dcps_fixture", .module = mock_dcps_fixture_mod_llvm_safe },
@@ -2306,7 +2323,8 @@ pub fn build(b: *std.Build) void {
         .target = target_llvm_safe,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe },
+            .{ .name = "zidl_cdr", .module = runtime_llvm_safe.codec },
+            .{ .name = "zidl_bindings", .module = runtime_llvm_safe.bindings },
             .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
             .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod_llvm_safe },
             .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod_llvm_safe },
@@ -2317,10 +2335,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = source,
         .target = target_llvm_safe,
         .optimize = optimize,
-        .imports = &.{.{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe }},
+        .imports = &.{ .{ .name = "zidl_cdr", .module = runtime_llvm_safe.codec }, .{ .name = "zidl_bindings", .module = runtime_llvm_safe.bindings } },
     }));
-    if (typesupport_enabled) zzdds_mod_llvm_safe_shared_runtime.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target_llvm_safe, optimize, zidl_rt_mod_llvm_safe));
+    if (typesupport_enabled) zzdds_mod_llvm_safe_shared_runtime.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target_llvm_safe, optimize, runtime_llvm_safe.codec));
     zzdds_mod_llvm_safe_shared_runtime.link_libc = true;
+    if (need_c_abi) linkCdr(zzdds_mod_llvm_safe_shared_runtime, cdr_lib_llvm_safe.?);
     for (shared_runtime_test_files) |src| {
         const t = b.addTest(.{
             .name = std.fs.path.stem(src),
@@ -2352,19 +2371,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .@"sanitize-thread" = true,
     });
-    const zidl_rt_mod_tsan = if (zidl_source != null) b.createModule(.{
-        .root_source_file = zidl_dep.path("packages/zidl-rt/src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .sanitize_thread = true,
-    }) else zidl_dep_tsan.module("zidl_rt");
+    const runtime_tsan = runtimeModules(b, zidl_dep, zidl_dep_tsan, target, optimize, true);
+    const cdr_lib_tsan = if (need_c_abi) cdrLibrary(b, zidl_dep, runtime_tsan.codec, target, optimize, true) else null;
 
     const generated_dcps_mod_tsan = b.createModule(.{
         .root_source_file = gen_output_dir.path(b, "dcps.zig"),
         .target = target,
         .sanitize_thread = true,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod_tsan },
+            .{ .name = "zidl_cdr", .module = runtime_tsan.codec },
+            .{ .name = "zidl_bindings", .module = runtime_tsan.bindings },
         },
     });
 
@@ -2373,7 +2389,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .sanitize_thread = true,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod_tsan },
+            .{ .name = "zidl_cdr", .module = runtime_tsan.codec },
+            .{ .name = "zidl_bindings", .module = runtime_tsan.bindings },
             .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
         },
     });
@@ -2383,7 +2400,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .sanitize_thread = true,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod_tsan },
+            .{ .name = "zidl_cdr", .module = runtime_tsan.codec },
+            .{ .name = "zidl_bindings", .module = runtime_tsan.bindings },
         },
     });
 
@@ -2393,7 +2411,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .sanitize_thread = true,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod_tsan },
+            .{ .name = "zidl_cdr", .module = runtime_tsan.codec },
+            .{ .name = "zidl_bindings", .module = runtime_tsan.bindings },
             .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
             .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod_tsan },
             .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod_tsan },
@@ -2405,10 +2424,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .sanitize_thread = true,
-        .imports = &.{.{ .name = "zidl_rt", .module = zidl_rt_mod_tsan }},
+        .imports = &.{ .{ .name = "zidl_cdr", .module = runtime_tsan.codec }, .{ .name = "zidl_bindings", .module = runtime_tsan.bindings } },
     }));
-    if (typesupport_enabled) zzdds_mod_tsan.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target, optimize, zidl_rt_mod_tsan));
+    if (typesupport_enabled) zzdds_mod_tsan.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target, optimize, runtime_tsan.codec));
     zzdds_mod_tsan.link_libc = true;
+    if (need_c_abi) linkCdr(zzdds_mod_tsan, cdr_lib_tsan.?);
 
     // Library self-tests (TSan)
     //
@@ -2457,7 +2477,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .sanitize_thread = true,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod_tsan },
+            .{ .name = "zidl_cdr", .module = runtime_tsan.codec },
+            .{ .name = "zidl_bindings", .module = runtime_tsan.bindings },
             .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
             .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod_tsan },
             .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod_tsan },
@@ -2469,10 +2490,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .sanitize_thread = true,
-        .imports = &.{.{ .name = "zidl_rt", .module = zidl_rt_mod_tsan }},
+        .imports = &.{ .{ .name = "zidl_cdr", .module = runtime_tsan.codec }, .{ .name = "zidl_bindings", .module = runtime_tsan.bindings } },
     }));
-    if (typesupport_enabled) zzdds_mod_tsan_shared_runtime.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target, optimize, zidl_rt_mod_tsan));
+    if (typesupport_enabled) zzdds_mod_tsan_shared_runtime.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target, optimize, runtime_tsan.codec));
     zzdds_mod_tsan_shared_runtime.link_libc = true;
+    if (need_c_abi) linkCdr(zzdds_mod_tsan_shared_runtime, cdr_lib_tsan.?);
     var tsan_dcps_test_domain: u32 = 1;
     for (shared_runtime_test_files) |src| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
@@ -2505,7 +2527,8 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zzdds", .module = zzdds_mod_tsan },
                 .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
-                .{ .name = "zidl_rt", .module = zidl_rt_mod_tsan },
+                .{ .name = "zidl_cdr", .module = runtime_tsan.codec },
+                .{ .name = "zidl_bindings", .module = runtime_tsan.bindings },
                 .{ .name = "test_domain", .module = test_domain_mod },
                 .{ .name = "sample_sequence", .module = sample_sequence_mod },
                 .{ .name = "mock_dcps_fixture", .module = mock_dcps_fixture_mod_tsan },

@@ -354,7 +354,7 @@ pub const PublisherImpl = struct {
         .as_Entity = vtAsEntity,
     };
 
-    /// One `CAbiViews` value for the whole object (see `zidl_rt.unboxAsView`).
+    /// One `CAbiViews` value for the whole object (see `zidl_bindings.unboxAsView`).
     /// One `CAbiViews` value for the whole object, covering Entity,
     /// Publisher and (via `extensions.zig`'s `publisher_vtable`, sharing this
     /// same `c_abi` field) zzdds::Publisher. See `DataWriterImpl.views`.

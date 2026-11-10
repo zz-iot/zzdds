@@ -8,7 +8,10 @@ module DDS {
     // Basic types
 
     // A C++ or Java wrapper whose entity has been deleted returns this
-    // without reaching the core (zidl's --handle-retire-hook).
+    // without reaching the core (zidl's --handle-retire-hook). A call that
+    // registers a listener and returns anything but RETCODE_OK has not taken
+    // the registration, so the wrapper releases it itself.
+    @success_result(RETCODE_OK)
     @retired_result(RETCODE_ALREADY_DELETED)
     typedef long                ReturnCode_t;
     typedef long                QosPolicyId_t;

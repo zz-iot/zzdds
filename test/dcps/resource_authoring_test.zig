@@ -181,7 +181,7 @@ test "TOML writer and reader construct real graphs and exchange generated sample
     try probe.ProbeDataWriter.init(writer_handle, testing.allocator).write(.{ .value = 123 }, 0);
     const sample = try takeSample(try ri.reader("main", "endpoint"));
     defer sample.deinit();
-    var cdr = try zzdds.zidl_rt.CdrReader.init(sample.data);
+    var cdr = try zzdds.zidl_cdr.CdrReader.init(sample.data);
     var value: probe.Probe = .{};
     try probe.Probe.deserializeInto(&value, &cdr, testing.allocator);
     try testing.expectEqual(@as(u32, 123), value.value);

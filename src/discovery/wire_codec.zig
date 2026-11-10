@@ -5,7 +5,7 @@
 //! `docs/design/discovery-codec.md`.
 
 const std = @import("std");
-const zidl_rt = @import("zidl_rt");
+const zidl_cdr = @import("zidl_cdr");
 const tr_iface = @import("../transport/interface.zig");
 const guid_mod = @import("../rtps/guid.zig");
 const Disc = @import("zzdds_disc_generated");
@@ -38,7 +38,7 @@ pub fn guidFromBytes(b: []const u8) Guid {
 pub fn emitPlCdr(comptime T: type, alloc: std.mem.Allocator, value: T) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(alloc);
-    var w = zidl_rt.PlCdrWriter.init(&buf, alloc);
+    var w = zidl_cdr.PlCdrWriter.init(&buf, alloc);
     try w.writeEncapHeader();
     try T.serializePlCdr(&w, value);
     return buf.toOwnedSlice(alloc);

@@ -4756,7 +4756,7 @@ test "late read and query conditions retire while reader storage remains pinned"
     defer ws.deinit();
     for ([_]DDS.Condition{ rc.toCondition(), qc.toCondition() }) |condition| {
         const h = condition.vtable.get_c_abi_handle(condition.ptr);
-        try testing.expect(@import("zidl_rt").isEntityBoxRetired(h));
+        try testing.expect(@import("zidl_bindings").isEntityBoxRetired(h));
         try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, ws.toDDSWaitSet().attach_condition(condition));
     }
     // The remaining reference's deferred release frees both tracked conditions;

@@ -1,5 +1,5 @@
 const std = @import("std");
-const zidl_rt = @import("zidl_rt");
+const zidl_cdr = @import("zidl_cdr");
 const zzdds = @import("zzdds");
 const smoke = @import("binding_smoke");
 
@@ -9,7 +9,7 @@ pub fn main() !void {
     var sample = smoke.BindingSmokeStatus{
         .id = 7,
         .count = 42,
-        .label = try zidl_rt.BoundedArray(u8, 32).fromSlice("zig-smoke"),
+        .label = try zidl_cdr.BoundedArray(u8, 32).fromSlice("zig-smoke"),
     };
 
     const expected_hash = smoke.BindingSmokeStatus.computeKeyHash(&sample);

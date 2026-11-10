@@ -974,8 +974,8 @@ test "a participant deleted from its own listener retires its wrappers before th
         .builtin_description = description.vtable.get_c_abi_handle(description.ptr),
         .status_condition = cond.vtable.get_c_abi_handle(cond.ptr),
     };
-    try testing.expect(zzdds.zidl_rt.observeHandleRetire(Retired.on, &retired));
-    defer _ = zzdds.zidl_rt.unobserveHandleRetire(Retired.on, &retired);
+    try testing.expect(zzdds.zidl_bindings.observeHandleRetire(Retired.on, &retired));
+    defer _ = zzdds.zidl_bindings.unobserveHandleRetire(Retired.on, &retired);
 
     var sd = SelfDelete{ .node = &r, .dp = dp_r, .retired = &retired };
     const topic_w = dp_w.create_topic("SliceTopic", "SliceType", .{}, null, 0);
@@ -3068,7 +3068,7 @@ const DeleteParticipantUnderSetter = struct {
     fn onData(handle: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
         const self: *DeleteParticipantUnderSetter = @ptrCast(@alignCast(ld.?));
         // The builtin readers fall back to this listener too.
-        if (zzdds.zidl_rt.unboxAsView(DDS.DataReader, handle).ptr != self.reader) return;
+        if (zzdds.zidl_bindings.unboxAsView(DDS.DataReader, handle).ptr != self.reader) return;
         if (self.entered.isSet()) return;
         self.entered.set(self.io);
         const deadline = zzdds.util.time.monotonicNs() + 10 * std.time.ns_per_s;

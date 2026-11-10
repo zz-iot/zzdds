@@ -13,14 +13,16 @@
 //!
 //! Usage: gen_windows_def <output.def> <input.c> [input.c ...]
 //!
-//! Parses each input file line by line for zidl's own generated shape --
-//! confirmed by direct inspection, not assumed: every top-level function
-//! it emits is a single physical line, starting in column 0 (never
-//! `static`, never indented), of the form `RETURN NAME(ARGS) {`.
-//! Anything not matching that exact shape (declarations, typedefs,
-//! struct bodies, multi-line signatures) is simply not a match and is
-//! skipped -- this tool only needs to not miss real definitions, not
-//! reject every non-definition line explicitly.
+//! Parses each input file line by line for zidl's own generated shape:
+//! every top-level function it emits is a single physical line, starting
+//! in column 0 (never indented), of the form `RETURN NAME(ARGS) {`.
+//! A `static` definition of that shape (zidl 0.3.28's `*_bounded_impl`
+//! helpers) is internal to its file and is not exported: listing it makes
+//! lld-link fail with an undefined symbol. Anything else not matching
+//! that exact shape (declarations, typedefs, struct bodies, multi-line
+//! signatures) is simply not a match and is skipped -- this tool only
+//! needs to not miss real definitions, not reject every non-definition
+//! line explicitly.
 
 const std = @import("std");
 const Io = std.Io;
@@ -31,12 +33,13 @@ fn extractFunctionName(line: []const u8) ?[]const u8 {
     const before_brace = std.mem.trimEnd(u8, trimmed_end[0 .. trimmed_end.len - 1], " \t");
     if (!std.mem.endsWith(u8, before_brace, ")")) return null;
 
-    // Line must start at column 0 with an identifier char (never `static`,
-    // never indented -- both would mean this isn't a top-level exported
-    // definition zidl generated for public use).
+    // Line must start at column 0 with an identifier char, and not with
+    // `static` -- an indented or static definition isn't a top-level
+    // exported definition zidl generated for public use.
     if (line.len == 0) return null;
     const first = line[0];
     if (!(std.ascii.isAlphabetic(first) or first == '_')) return null;
+    if (std.mem.startsWith(u8, line, "static ") or std.mem.startsWith(u8, line, "static\t")) return null;
 
     const open_paren = std.mem.indexOfScalar(u8, before_brace, '(') orelse return null;
     const name_end = open_paren;
@@ -106,4 +109,13 @@ pub fn main(init: std.process.Init) !void {
         try w.print("    {s}\n", .{name.*});
     }
     try w.flush();
+}
+
+test "a public definition is exported and a static one is not" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("DDS_Duration_t_serialize", extractFunctionName("int DDS_Duration_t_serialize(ZidlCdrWriter *_w, const DDS_Duration_t *_v) {").?);
+    try testing.expectEqualStrings("DDS_Duration_t_default", extractFunctionName("DDS_Duration_t *DDS_Duration_t_default(void) {\r").?);
+    try testing.expectEqual(null, extractFunctionName("static int DDS_Duration_t_deserialize_bounded_impl(ZidlCdrReader *_r, DDS_Duration_t *_v) {"));
+    try testing.expectEqual(null, extractFunctionName("static int DDS_Duration_t_deserialize_bounded_impl(ZidlCdrReader *_r, DDS_Duration_t *_v);"));
+    try testing.expectEqual(null, extractFunctionName("    int _rc = f(&_local, _v); {"));
 }

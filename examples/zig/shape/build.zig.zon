@@ -12,7 +12,7 @@
         // lives at examples/zig/shape within it).
         //
         // No direct dependency on zidl here -- build.zig gets the zidl
-        // executable and zidl_rt module *through* zzdds instead (which
+        // executable and zidl_cdr and zidl_bindings modules *through* zzdds instead (which
         // re-exposes both), so there's only ever one zidl resolution in the
         // whole graph. See build.zig's comment for why a second, independent
         // one breaks the build outright when zidl is a `.path` dependency.

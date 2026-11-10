@@ -1,6 +1,6 @@
 // Bounded codec evidence only; this is not broker admission validation.
 const std = @import("std");
-const rt = @import("zidl_rt");
+const rt = @import("zidl_cdr");
 const wire = @import("wire").BrokerWireDraft;
 const testing = std.testing;
 

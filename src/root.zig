@@ -39,8 +39,9 @@ pub const monitor_polling = @import("transport/monitor/polling.zig");
 pub const discovery = @import("discovery/interface.zig");
 /// zidl-generated PL_CDR codec for SPDP/SEDP discovery data (idl/rtps_discovery.idl).
 pub const disc_wire = @import("zzdds_disc_generated");
-/// zidl runtime (CDR reader/writer, PL_CDR helpers) — re-exported for tests.
-pub const zidl_rt = @import("zidl_rt");
+/// Canonical codec and binding support, shared with generated modules.
+pub const zidl_cdr = @import("zidl_cdr");
+pub const zidl_bindings = @import("zidl_bindings");
 pub const spdp_discovery = @import("discovery/spdp.zig");
 pub const sedp_discovery = @import("discovery/sedp.zig");
 pub const disc_qos_adapter = @import("discovery/qos_adapter.zig");
@@ -71,6 +72,9 @@ comptime {
     _ = c_abi.bootstrap;
     _ = c_abi.extensions;
     _ = c_abi.allocator_adapter;
+    // A ThreadSanitizer libzzdds compiles the codec's C ABI in itself rather
+    // than linking the separately built archive (see build.zig).
+    if (@import("build_options").cdr_exports_in_library) _ = @import("zidl_cdr_exports");
 }
 /// Re-export the generated DDS type definitions so generated code can do
 ///   const _zzdds = @import("zzdds");

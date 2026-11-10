@@ -26,7 +26,7 @@ const tr_iface = @import("../transport/interface.zig");
 const guid_mod = @import("../rtps/guid.zig");
 const pid_mod = @import("../rtps/pid.zig");
 const qm_mod = @import("../dcps/qos_match.zig");
-const zidl_rt = @import("zidl_rt");
+const zidl_cdr = @import("zidl_cdr");
 const Disc = @import("zzdds_disc_generated");
 const writer_sm_mod = @import("../rtps/writer_sm.zig");
 const reader_sm_mod = @import("../rtps/reader_sm.zig");
@@ -120,7 +120,7 @@ pub fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement
     // (no declared member — see idl/rtps_discovery.idl). Only when XTypes is
     // built in AND a blob is available (advertising it without a TypeLookup
     // service stalls OpenDDS endpoint matching).
-    var uparams: [1]zidl_rt.RawParam = undefined;
+    var uparams: [1]zidl_cdr.RawParam = undefined;
     var un: usize = 0;
     if (build_opts.xtypes and ann.type_info_cdr.len > 0) {
         uparams[0] = .{ .pid = 0x0075, .bytes = @constCast(ann.type_info_cdr) };
@@ -200,7 +200,7 @@ const wireLocatorsOwned = wire_codec.wireLocatorsOwned;
 
 fn decodeEndpointT(comptime T: type, alloc: std.mem.Allocator, payload: []const u8) !DecodedEndpoint(T) {
     if (payload.len < 4) return error.TooShort;
-    var r = try zidl_rt.CdrReader.init(payload);
+    var r = try zidl_cdr.CdrReader.init(payload);
     var data: T = .{};
     errdefer data.deinit(alloc);
     // `.lenient`: skip/retain unknowns, tolerate a truncated tail, round a
@@ -227,7 +227,7 @@ fn decodeEndpointT(comptime T: type, alloc: std.mem.Allocator, payload: []const 
 /// is present (and never heap-allocated in that case).
 fn partitionNamesOwned(
     alloc: std.mem.Allocator,
-    unknown: []const zidl_rt.RawParam,
+    unknown: []const zidl_cdr.RawParam,
     declared: anytype,
     little_endian: bool,
 ) error{OutOfMemory}![]const []const u8 {
@@ -275,7 +275,7 @@ fn legacyPartitionSeq(
 }
 
 /// The PID_TYPE_INFORMATION (0x0075) blob out of `unknown_params`, borrowed.
-fn typeInfoBlob(unknown: []const zidl_rt.RawParam) []const u8 {
+fn typeInfoBlob(unknown: []const zidl_cdr.RawParam) []const u8 {
     for (unknown) |rp| {
         if (rp.pid == 0x0075) return rp.bytes;
     }
@@ -1401,7 +1401,7 @@ test "partitionNamesOwned: legacy 0x0035 wins over declared member and is not tr
 
     const v = try emitStringSeqValue(a, &names, true);
     defer a.free(v);
-    const unknown = [_]zidl_rt.RawParam{.{ .pid = PidTable.PARTITION_LEGACY, .bytes = v }};
+    const unknown = [_]zidl_cdr.RawParam{.{ .pid = PidTable.PARTITION_LEGACY, .bytes = v }};
 
     // declared member absent → legacy path (and legacy wins even when present).
     const NoDeclared = @as(@FieldType(Disc.DiscoveredWriterData, "partition"), null);
@@ -1424,7 +1424,7 @@ test "decodeEndpointT: RTI Connext's vendor PID 0x8021 does not alias PID_PRESEN
     const a = testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
-    var w = zidl_rt.PlCdrWriter.init(&buf, a);
+    var w = zidl_cdr.PlCdrWriter.init(&buf, a);
     try w.writeEncapHeader();
     {
         const h = try w.reservePlParam(PidTable.ENDPOINT_GUID);
@@ -1474,7 +1474,7 @@ test "decodeEndpointT: a peer's PID_UNICAST_LOCATOR/PID_MULTICAST_LOCATOR entrie
     const a = testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
-    var w = zidl_rt.PlCdrWriter.init(&buf, a);
+    var w = zidl_cdr.PlCdrWriter.init(&buf, a);
     try w.writeEncapHeader();
     {
         const h = try w.reservePlParam(PidTable.ENDPOINT_GUID);
@@ -1504,7 +1504,7 @@ test "decodeEndpointT / typeInfoBlob: a decoded PID_TYPE_INFORMATION blob round-
     const a = testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
-    var w = zidl_rt.PlCdrWriter.init(&buf, a);
+    var w = zidl_cdr.PlCdrWriter.init(&buf, a);
     try w.writeEncapHeader();
     {
         const h = try w.reservePlParam(PidTable.ENDPOINT_GUID);

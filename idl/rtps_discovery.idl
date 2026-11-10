@@ -24,7 +24,7 @@
 //   deserialize: accumulate each occurrence into the sequence
 //
 // @pl_retain_unknown keeps any parameter the switch does not recognise in
-// `unknown_params: []zidl_rt.RawParam`, replayed verbatim by serializePlCdr
+// `unknown_params: []zidl_cdr.RawParam`, replayed verbatim by serializePlCdr
 // before the sentinel. This is how the discovery codec stays lossless for a
 // broker relay (docs/design/discovery-broker.md) and how the SEDP writer
 // encode path re-injects PID_TYPE_INFORMATION (an opaque blob) in wire order

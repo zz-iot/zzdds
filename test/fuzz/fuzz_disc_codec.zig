@@ -28,14 +28,14 @@ const std = @import("std");
 const zzdds = @import("zzdds");
 
 const Disc = zzdds.disc_wire;
-const zidl_rt = zzdds.zidl_rt;
+const zidl_cdr = zzdds.zidl_cdr;
 
 fn deinitIf(comptime T: type, out: *T, alloc: std.mem.Allocator) void {
     if (comptime @hasDecl(T, "deinit")) out.deinit(alloc);
 }
 
-fn tryDecode(comptime T: type, alloc: std.mem.Allocator, data: []const u8, mode: zidl_rt.PlMode) void {
-    var r = zidl_rt.CdrReader.init(data) catch return;
+fn tryDecode(comptime T: type, alloc: std.mem.Allocator, data: []const u8, mode: zidl_cdr.PlMode) void {
+    var r = zidl_cdr.CdrReader.init(data) catch return;
     var out: T = .{};
     defer deinitIf(T, &out, alloc);
     T.deserializeFromPlCdr(&out, &r, alloc, mode) catch return;
@@ -44,11 +44,11 @@ fn tryDecode(comptime T: type, alloc: std.mem.Allocator, data: []const u8, mode:
     if (mode != .lenient) return;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(alloc);
-    var w = zidl_rt.PlCdrWriter.init(&buf, alloc);
+    var w = zidl_cdr.PlCdrWriter.init(&buf, alloc);
     w.writeEncapHeader() catch return;
     T.serializePlCdr(&w, out) catch return;
 
-    var r2 = zidl_rt.CdrReader.init(buf.items) catch return;
+    var r2 = zidl_cdr.CdrReader.init(buf.items) catch return;
     var out2: T = .{};
     defer deinitIf(T, &out2, alloc);
     T.deserializeFromPlCdr(&out2, &r2, alloc, .lenient) catch return;

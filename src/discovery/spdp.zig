@@ -36,7 +36,7 @@ const header_mod = @import("../rtps/message/header.zig");
 const runtime_mod = @import("../runtime/core.zig");
 const QueuedReceive = @import("../transport/queued_receive.zig").QueuedReceive;
 const IngressBudget = @import("../transport/ingress_budget.zig").IngressBudget;
-const zidl_rt = @import("zidl_rt");
+const zidl_cdr = @import("zidl_cdr");
 const Disc = @import("zzdds_disc_generated");
 
 const Transport = tr_iface.Transport;
@@ -1094,7 +1094,7 @@ pub fn decodeSpdpParticipant(
     vendor_id: header_mod.VendorId,
 ) !KnownParticipant {
     if (payload.len < 4) return error.TooShort;
-    var r = try zidl_rt.CdrReader.init(payload);
+    var r = try zidl_cdr.CdrReader.init(payload);
     var data: Disc.SPDPdiscoveredParticipantData = .{};
     defer data.deinit(alloc);
     try Disc.SPDPdiscoveredParticipantData.deserializeFromPlCdr(&data, &r, alloc, .lenient);

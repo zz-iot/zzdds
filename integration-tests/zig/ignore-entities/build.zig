@@ -18,7 +18,8 @@ pub fn build(b: *std.Build) void {
     const zzdds_gen = zzdds_dep.module("zzdds_generated");
 
     const zidl_exe = zzdds_dep.artifact("zidl");
-    const zidl_rt_mod = zzdds_dep.module("zidl_rt");
+    const zidl_cdr_mod = zzdds_dep.module("zidl_cdr");
+    const zidl_bindings_mod = zzdds_dep.module("zidl_bindings");
 
     const gen_ignore_event = b.addRunArtifact(zidl_exe);
     gen_ignore_event.addArgs(&.{ "-b", "zig", "--split-files", "--generate-zzdds-wrappers", "-o" });
@@ -30,7 +31,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            .{ .name = "zidl_cdr", .module = zidl_cdr_mod },
+            .{ .name = "zidl_bindings", .module = zidl_bindings_mod },
             .{ .name = "zzdds", .module = zzdds_mod },
         },
     });
@@ -39,7 +41,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "zzdds", .module = zzdds_mod },
         .{ .name = "zzdds_generated", .module = zzdds_gen },
         .{ .name = "ignore_event_gen", .module = ignore_event_gen_mod },
-        .{ .name = "zidl_rt", .module = zidl_rt_mod },
+        .{ .name = "zidl_cdr", .module = zidl_cdr_mod },
+        .{ .name = "zidl_bindings", .module = zidl_bindings_mod },
     };
 
     const ignorer_exe = b.addExecutable(.{

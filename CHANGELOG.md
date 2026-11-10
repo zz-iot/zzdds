@@ -8,6 +8,24 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-10
+
+- Update zidl to 0.3.29 and adopt its split runtimes. zzdds exports zidl's codec as the
+  `zidl_cdr` module and its binding support as `zidl_bindings`, also reachable as
+  `zzdds.zidl_cdr` and `zzdds.zidl_bindings`. **Breaking** for Zig consumers: the `zidl_rt`
+  module and `zzdds.zidl_rt` are gone; import `zidl_cdr` or `zidl_bindings` through the zzdds
+  dependency, so generated and handwritten code share one copy of each.
+- The C ABI library and the installed `zidl_cdr` archive use zidl's shared native codec, so
+  building them from source requires Zig. C and C++ applications keep their own compiler,
+  the installed headers and the same link names. On Windows the installed archive is built
+  for the MSVC ABI, which MSVC needs to link it.
+- C++ and Java bindings release a listener that `set_listener` or `set_listener_ex` rejects
+  (any result but `RETCODE_OK`, such as `RETCODE_ALREADY_DELETED` on an entity being
+  deleted). Java previously kept a rejected listener alive, and C++ leaked the registration
+  a rejected `set_listener_ex` built. `ReturnCode_t` is annotated `@success_result(RETCODE_OK)`
+  for this.
+- Interop CI and releases use the dds-rtps harness tag `zenzen-76cd6f4`.
+
 ## 2026-11-05
 
 - `set_listener` and `set_listener_ex` on any entity, called from application code, return

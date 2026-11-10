@@ -9,7 +9,7 @@ const test_domain = @import("test_domain");
 const testing = std.testing;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
-const zidl_rt = @import("zidl_rt");
+const zidl_bindings = @import("zidl_bindings");
 
 const c_abi_ts = zzdds.c_abi.typesupport;
 const DomainParticipantImpl = zzdds.dcps.DomainParticipantImpl;
@@ -105,12 +105,12 @@ const Fixture = struct {
         );
         errdefer factory.deinit();
         const dp = factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
-        const dp_boxed = try zidl_rt.boxEntity(alloc, dp.ptr, &DomainParticipantImpl.views);
+        const dp_boxed = try zidl_bindings.boxEntity(alloc, dp.ptr, &DomainParticipantImpl.views);
         return .{ .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp, .dp_boxed = dp_boxed, .alloc = alloc };
     }
 
     fn deinit(self: *Fixture) void {
-        zidl_rt.freeEntityBox(self.alloc, self.dp_boxed);
+        zidl_bindings.freeEntityBox(self.alloc, self.dp_boxed);
         _ = self.factory.toDDSFactory().delete_participant(self.dp);
         self.factory.deinit();
         self.d.deinit();
@@ -215,7 +215,7 @@ test "c_abi TypeSupport: NULL compute_key_hash_key_only_fn falls back to zero ha
 }
 
 test "c_abi TypeSupport: NULL participant handle returns error instead of crashing" {
-    // Regression test: zidl_rt.unboxAs dereferences its argument
+    // Regression test: zidl_bindings.unboxAs dereferences its argument
     // unconditionally, so a literal NULL passed by a C caller (a normal,
     // expected "no object" value in C, not UB) must be caught before
     // unboxing, not after -- @ptrFromInt(0) constructs the same bit pattern

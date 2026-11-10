@@ -20,7 +20,7 @@
 const std = @import("std");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
-const zidl_rt = @import("zidl_rt");
+const zidl_cdr = @import("zidl_cdr");
 const loaned_ping_gen = @import("loaned_ping_gen");
 
 const SAMPLE_COUNT: i32 = 5;
@@ -67,7 +67,7 @@ fn onDataAvailable(state: *State, dr: DDS.DataReader) void {
         const desc = payloads._buffer.?[0];
         const info = infos._buffer.?[0];
         if (info.valid_data) {
-            var reader = zidl_rt.CdrReader.init(desc._buffer.?[0..desc._length]) catch {
+            var reader = zidl_cdr.CdrReader.init(desc._buffer.?[0..desc._length]) catch {
                 std.debug.print("FAIL: CdrReader.init() on loaned payload failed\n", .{});
                 std.process.exit(1);
             };

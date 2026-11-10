@@ -186,7 +186,7 @@ const MatchAction = struct {
         const action: *MatchAction = @ptrCast(@alignCast(ctx.?));
         if (action.fired) return;
         action.fired = true;
-        const writer = zzdds.zidl_rt.unboxAsView(DDS.DataWriter, handle);
+        const writer = zzdds.zidl_bindings.unboxAsView(DDS.DataWriter, handle);
         action.deleted = writer.get_publisher().delete_datawriter(writer) == DDS.RETCODE_OK;
         action.owner.destroy() catch |err| {
             action.cancelled = err == error.ConstructionInProgress;
@@ -196,7 +196,7 @@ const MatchAction = struct {
         const action: *MatchAction = @ptrCast(@alignCast(ctx.?));
         if (action.fired) return;
         action.fired = true;
-        const reader = zzdds.zidl_rt.unboxAsView(DDS.DataReader, handle);
+        const reader = zzdds.zidl_bindings.unboxAsView(DDS.DataReader, handle);
         action.deleted = reader.get_subscriber().delete_datareader(reader) == DDS.RETCODE_OK;
         action.owner.destroy() catch |err| {
             action.cancelled = err == error.ConstructionInProgress;

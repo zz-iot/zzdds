@@ -1,7 +1,7 @@
 const std = @import("std");
 const dds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
-const rt = @import("zidl_rt");
+const rt = @import("zidl_bindings");
 const testing = std.testing;
 const alloc = testing.allocator;
 

@@ -5,7 +5,7 @@ const build_options = @import("build_options");
 
 const DDS = @import("zzdds_generated").DDS;
 const ZZDDS = @import("zzdds_ext_generated").zzdds;
-const zidl_rt = @import("zidl_rt");
+const zidl_bindings = @import("zidl_bindings");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 
 const config_generated = @import("../config/generated.zig");
@@ -18,7 +18,7 @@ const config_mod = @import("../config/schema.zig");
 // retaining the box until native references drain. Bindings retire wrappers
 // before delete returns, including cascading deletes (util/c_abi_handle.zig).
 comptime {
-    zidl_rt.exportHandleRetireHook("zzdds_handle_retire");
+    zidl_bindings.exportHandleRetireHook("zzdds_handle_retire");
 }
 const process_config = @import("../config/process.zig");
 const DomainParticipantFactoryImpl = @import("../dcps/factory.zig").DomainParticipantFactoryImpl;
@@ -663,7 +663,7 @@ pub export fn zzdds_create_factory() callconv(.c) *anyopaque {
 /// needs its own separate configuration surface. Pass NULL for the default.
 /// `allocator` must outlive the factory returned here and everything created
 /// through it — see ZidlAllocator's contract in zidl_allocator.h.
-pub export fn zzdds_create_factory_with_allocator(allocator: ?*const zidl_rt.ZidlAllocator) callconv(.c) *anyopaque {
+pub export fn zzdds_create_factory_with_allocator(allocator: ?*const zidl_bindings.ZidlAllocator) callconv(.c) *anyopaque {
     const r: ZZDDS.DomainParticipantFactory = createFactory(allocator) catch |err| {
         std.log.err("zzdds_create_factory_with_allocator: {}", .{err});
         return factoryGetCAbiHandleZzdds(nil.NIL_PTR);
@@ -672,12 +672,12 @@ pub export fn zzdds_create_factory_with_allocator(allocator: ?*const zidl_rt.Zid
 }
 
 pub export fn zzdds_factory_is_nil(factory: *anyopaque) callconv(.c) bool {
-    const f = zidl_rt.unboxAsView(ZZDDS.DomainParticipantFactory, factory);
+    const f = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, factory);
     return f.ptr == nil.NIL_PTR;
 }
 
 pub export fn zzdds_destroy_factory(factory: *anyopaque) callconv(.c) void {
-    const f = zidl_rt.unboxAsView(ZZDDS.DomainParticipantFactory, factory);
+    const f = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, factory);
     if (f.ptr == nil.NIL_PTR) return;
     f.vtable.deinit(f.ptr);
 }
@@ -703,7 +703,7 @@ fn waitSetCtor(alloc: std.mem.Allocator) !DDS.WaitSet {
 /// the default std.heap.c_allocator. Pass NULL for the default. `allocator`
 /// must outlive the WaitSet returned here — see ZidlAllocator's contract in
 /// zidl_allocator.h.
-pub export fn zzdds_create_waitset_with_allocator(allocator: ?*const zidl_rt.ZidlAllocator) callconv(.c) *anyopaque {
+pub export fn zzdds_create_waitset_with_allocator(allocator: ?*const zidl_bindings.ZidlAllocator) callconv(.c) *anyopaque {
     return standalone_create.createWithAllocator(
         DDS.WaitSet,
         allocator,
@@ -726,7 +726,7 @@ fn guardConditionCtor(alloc: std.mem.Allocator) !DDS.GuardCondition {
 /// allocated through `allocator` instead of the default std.heap.c_allocator.
 /// Pass NULL for the default. `allocator` must outlive the GuardCondition
 /// returned here — see ZidlAllocator's contract in zidl_allocator.h.
-pub export fn zzdds_create_guardcondition_with_allocator(allocator: ?*const zidl_rt.ZidlAllocator) callconv(.c) *anyopaque {
+pub export fn zzdds_create_guardcondition_with_allocator(allocator: ?*const zidl_bindings.ZidlAllocator) callconv(.c) *anyopaque {
     return standalone_create.createWithAllocator(
         DDS.GuardCondition,
         allocator,
@@ -742,25 +742,25 @@ pub export fn zzdds_create_guardcondition_with_allocator(allocator: ?*const zidl
 /// apart from the boxed nil sentinel zzdds_create_waitset[_with_allocator]
 /// returns on allocation failure.
 pub export fn zzdds_waitset_is_nil(waitset: *anyopaque) callconv(.c) bool {
-    const w = zidl_rt.unboxAs(DDS.WaitSet, waitset);
+    const w = zidl_bindings.unboxAs(DDS.WaitSet, waitset);
     return w.ptr == nil.NIL_PTR;
 }
 
 pub export fn zzdds_guardcondition_is_nil(guardcondition: *anyopaque) callconv(.c) bool {
-    const g = zidl_rt.unboxAsView(DDS.GuardCondition, guardcondition);
+    const g = zidl_bindings.unboxAsView(DDS.GuardCondition, guardcondition);
     return g.ptr == nil.NIL_PTR;
 }
 
 /// WaitSet/GuardCondition have no owning factory to delete them through
 /// (see zzdds_create_waitset's doc comment) — mirrors zzdds_destroy_factory.
 pub export fn zzdds_destroy_waitset(waitset: *anyopaque) callconv(.c) void {
-    const w = zidl_rt.unboxAs(DDS.WaitSet, waitset);
+    const w = zidl_bindings.unboxAs(DDS.WaitSet, waitset);
     if (w.ptr == nil.NIL_PTR) return;
     w.vtable.deinit(w.ptr);
 }
 
 pub export fn zzdds_destroy_guardcondition(guardcondition: *anyopaque) callconv(.c) void {
-    const g = zidl_rt.unboxAsView(DDS.GuardCondition, guardcondition);
+    const g = zidl_bindings.unboxAsView(DDS.GuardCondition, guardcondition);
     if (g.ptr == nil.NIL_PTR) return;
     g.vtable.deinit(g.ptr);
 }
@@ -796,9 +796,9 @@ pub export fn zzdds_waitset_attach_condition_with_release(
     release_fn: ?*const fn (?*anyopaque) callconv(.c) void,
     out_accepted: ?*bool,
 ) callconv(.c) DDS.ReturnCode_t {
-    const w = zidl_rt.unboxAs(DDS.WaitSet, waitset);
+    const w = zidl_bindings.unboxAs(DDS.WaitSet, waitset);
     if (w.ptr == nil.NIL_PTR) return DDS.RETCODE_ERROR;
-    const c = zidl_rt.unboxAsView(DDS.Condition, condition);
+    const c = zidl_bindings.unboxAsView(DDS.Condition, condition);
     const impl: *WaitSetImpl = @ptrCast(@alignCast(w.ptr));
     return impl.attachConditionWithRelease(c, release_ctx, release_fn, out_accepted);
 }
@@ -847,9 +847,9 @@ pub export fn zzdds_process_configure(config: *const ZZDDS.ProcessConfig) callco
 /// know if it didn't work).
 pub export fn zzdds_process_configure_from_file(
     path: [*:0]const u8,
-    allocator: ?*const zidl_rt.ZidlAllocator,
+    allocator: ?*const zidl_bindings.ZidlAllocator,
 ) callconv(.c) DDS.ReturnCode_t {
-    const alloc = if (allocator) |a| zidl_rt.toAllocator(a) else std.heap.c_allocator;
+    const alloc = if (allocator) |a| zidl_bindings.toAllocator(a) else std.heap.c_allocator;
     process_config.configureFromFile(alloc, std.mem.span(path)) catch |err| {
         std.log.err("zzdds_process_configure_from_file: {}", .{err});
         return switch (err) {
@@ -884,7 +884,7 @@ pub export fn DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(fac
     // factory_vtable methods cast ctx to *FactoryOwner, so this conversion is
     // only valid for handles that were originally issued by zzdds_create_factory
     // (which sets vtable = &dds_factory_vtable via the generated as_DomainParticipantFactory export).
-    const f = zidl_rt.unboxAsView(DDS.DomainParticipantFactory, factory);
+    const f = zidl_bindings.unboxAsView(DDS.DomainParticipantFactory, factory);
     if (f.vtable != &dds_factory_vtable) return factoryGetCAbiHandleZzdds(nil.NIL_PTR);
     const r: ZZDDS.DomainParticipantFactory = .{ .ptr = f.ptr, .vtable = &factory_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -894,7 +894,7 @@ pub export fn DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(fac
 /// zzdds_create_factory → create_participant_ex). Returns a nil handle for any
 /// handle not issued by this implementation.
 pub export fn DDS_DomainParticipant_as_zzdds_DomainParticipant(participant: *anyopaque) callconv(.c) *anyopaque {
-    const p = zidl_rt.unboxAsView(DDS.DomainParticipant, participant);
+    const p = zidl_bindings.unboxAsView(DDS.DomainParticipant, participant);
     if (p.vtable != &DomainParticipantImpl.vtable) return participantGetCAbiHandleZzdds(nil.NIL_PTR);
     const r: ZZDDS.DomainParticipant = .{ .ptr = p.ptr, .vtable = &participant_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -903,7 +903,7 @@ pub export fn DDS_DomainParticipant_as_zzdds_DomainParticipant(participant: *any
 /// Only valid for topics created through a FactoryOwner-owned participant.
 /// Returns a nil handle for any handle not issued by this implementation.
 pub export fn DDS_Topic_as_zzdds_Topic(topic: *anyopaque) callconv(.c) *anyopaque {
-    const t = zidl_rt.unboxAsView(DDS.Topic, topic);
+    const t = zidl_bindings.unboxAsView(DDS.Topic, topic);
     if (t.vtable != &TopicImpl.topic_vtable) return topicGetCAbiHandleZzdds(nil.NIL_PTR);
     const r: ZZDDS.Topic = .{ .ptr = t.ptr, .vtable = &topic_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -913,7 +913,7 @@ pub export fn DDS_Topic_as_zzdds_Topic(topic: *anyopaque) callconv(.c) *anyopaqu
 /// participant. Returns a nil handle for any handle not issued by this
 /// implementation.
 pub export fn DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic(cft: *anyopaque) callconv(.c) *anyopaque {
-    const c = zidl_rt.unboxAsView(DDS.ContentFilteredTopic, cft);
+    const c = zidl_bindings.unboxAsView(DDS.ContentFilteredTopic, cft);
     if (c.vtable != &ContentFilteredTopicImpl.cft_vtable) return cftGetCAbiHandleZzdds(nil.NIL_PTR);
     const r: ZZDDS.ContentFilteredTopic = .{ .ptr = c.ptr, .vtable = &cft_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -922,7 +922,7 @@ pub export fn DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic(cft: *anyop
 /// Only valid for writers created through a FactoryOwner-owned participant.
 /// Returns a nil handle for any handle not issued by this implementation.
 pub export fn DDS_DataWriter_as_zzdds_DataWriter(writer: *anyopaque) callconv(.c) *anyopaque {
-    const w = zidl_rt.unboxAsView(DDS.DataWriter, writer);
+    const w = zidl_bindings.unboxAsView(DDS.DataWriter, writer);
     if (w.vtable != &DataWriterImpl.vtable) return writerGetCAbiHandleZzdds(nil.NIL_PTR);
     const r: ZZDDS.DataWriter = .{ .ptr = w.ptr, .vtable = &writer_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -931,7 +931,7 @@ pub export fn DDS_DataWriter_as_zzdds_DataWriter(writer: *anyopaque) callconv(.c
 /// Only valid for readers created through a FactoryOwner-owned participant.
 /// Returns a nil handle for any handle not issued by this implementation.
 pub export fn DDS_DataReader_as_zzdds_DataReader(reader: *anyopaque) callconv(.c) *anyopaque {
-    const rd = zidl_rt.unboxAsView(DDS.DataReader, reader);
+    const rd = zidl_bindings.unboxAsView(DDS.DataReader, reader);
     if (rd.vtable != &DataReaderImpl.vtable) return readerGetCAbiHandleZzdds(nil.NIL_PTR);
     const r: ZZDDS.DataReader = .{ .ptr = rd.ptr, .vtable = &reader_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -940,7 +940,7 @@ pub export fn DDS_DataReader_as_zzdds_DataReader(reader: *anyopaque) callconv(.c
 /// Only valid for publishers owned by a FactoryOwner-owned participant.
 /// Returns a nil handle for any handle not issued by this implementation.
 pub export fn DDS_Publisher_as_zzdds_Publisher(publisher: *anyopaque) callconv(.c) *anyopaque {
-    const p = zidl_rt.unboxAsView(DDS.Publisher, publisher);
+    const p = zidl_bindings.unboxAsView(DDS.Publisher, publisher);
     if (p.vtable != &PublisherImpl.vtable) return publisherGetCAbiHandleZzdds(nil.NIL_PTR);
     const r: ZZDDS.Publisher = .{ .ptr = p.ptr, .vtable = &publisher_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -949,7 +949,7 @@ pub export fn DDS_Publisher_as_zzdds_Publisher(publisher: *anyopaque) callconv(.
 /// Only valid for subscribers owned by a FactoryOwner-owned participant.
 /// Returns a nil handle for any handle not issued by this implementation.
 pub export fn DDS_Subscriber_as_zzdds_Subscriber(subscriber: *anyopaque) callconv(.c) *anyopaque {
-    const s = zidl_rt.unboxAsView(DDS.Subscriber, subscriber);
+    const s = zidl_bindings.unboxAsView(DDS.Subscriber, subscriber);
     if (s.vtable != &SubscriberImpl.vtable) return subscriberGetCAbiHandleZzdds(nil.NIL_PTR);
     const r: ZZDDS.Subscriber = .{ .ptr = s.ptr, .vtable = &subscriber_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -971,21 +971,21 @@ pub export fn DDS_Subscriber_as_zzdds_Subscriber(subscriber: *anyopaque) callcon
 // internally. Condition is the only interface in zzdds with multiple
 // concrete sibling implementors, so it's the only hierarchy that needs this.
 pub export fn DDS_Condition_as_DDS_GuardCondition(base: *anyopaque) callconv(.c) ?*anyopaque {
-    const c = zidl_rt.unboxAsView(DDS.Condition, base);
+    const c = zidl_bindings.unboxAsView(DDS.Condition, base);
     if (c.vtable != &GuardConditionImpl.cond_vtable) return null;
     const r: DDS.GuardCondition = .{ .ptr = c.ptr, .vtable = &GuardConditionImpl.vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
 }
 
 pub export fn DDS_Condition_as_DDS_StatusCondition(base: *anyopaque) callconv(.c) ?*anyopaque {
-    const c = zidl_rt.unboxAsView(DDS.Condition, base);
+    const c = zidl_bindings.unboxAsView(DDS.Condition, base);
     if (c.vtable != &StatusConditionImpl.cond_vtable) return null;
     const r: DDS.StatusCondition = .{ .ptr = c.ptr, .vtable = &StatusConditionImpl.vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
 }
 
 pub export fn DDS_Condition_as_DDS_ReadCondition(base: *anyopaque) callconv(.c) ?*anyopaque {
-    const c = zidl_rt.unboxAsView(DDS.Condition, base);
+    const c = zidl_bindings.unboxAsView(DDS.Condition, base);
     if (c.vtable != &ReadConditionImpl.cond_vtable) return null;
     const r: DDS.ReadCondition = .{ .ptr = c.ptr, .vtable = &ReadConditionImpl.vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -993,7 +993,7 @@ pub export fn DDS_Condition_as_DDS_ReadCondition(base: *anyopaque) callconv(.c) 
 
 /// Implemented (2026-08-12, binding-design-review Phase 2 follow-up) using the
 /// real distinguishing signal the Phase 1 `owner_qc` redirect created: a
-/// QueryCondition's ReadCondition-view box unboxes (via `zidl_rt.unboxAsView`)
+/// QueryCondition's ReadCondition-view box unboxes (via `zidl_bindings.unboxAsView`)
 /// to `&QueryConditionImpl.rc_thunk_vtable`, never `&ReadConditionImpl.vtable`
 /// — the two are genuinely distinguishable at the C-ABI level even though
 /// QueryConditionImpl embeds (rather than separately allocates) its
@@ -1008,7 +1008,7 @@ pub export fn DDS_Condition_as_DDS_ReadCondition(base: *anyopaque) callconv(.c) 
 /// above (which all return the input `.ptr` unchanged, since none of them
 /// have an embedding wrinkle to correct for).
 pub export fn DDS_ReadCondition_as_DDS_QueryCondition(base: *anyopaque) callconv(.c) ?*anyopaque {
-    const c = zidl_rt.unboxAsView(DDS.ReadCondition, base);
+    const c = zidl_bindings.unboxAsView(DDS.ReadCondition, base);
     if (c.vtable != &QueryConditionImpl.rc_thunk_vtable) return null;
     const r: DDS.QueryCondition = .{ .ptr = c.ptr, .vtable = &QueryConditionImpl.vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -1031,42 +1031,42 @@ pub export fn DDS_ReadCondition_as_DDS_QueryCondition(base: *anyopaque) callconv
 // not a compile-time error, since the C-ABI declaration alone was enough to
 // satisfy the generated caller's own compilation.
 pub export fn DDS_Entity_as_DDS_DomainParticipant(base: *anyopaque) callconv(.c) ?*anyopaque {
-    const e = zidl_rt.unboxAsView(DDS.Entity, base);
+    const e = zidl_bindings.unboxAsView(DDS.Entity, base);
     if (e.vtable != &DomainParticipantImpl.entity_vtable) return null;
     const r: DDS.DomainParticipant = .{ .ptr = e.ptr, .vtable = &DomainParticipantImpl.vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
 }
 
 pub export fn DDS_Entity_as_DDS_Topic(base: *anyopaque) callconv(.c) ?*anyopaque {
-    const e = zidl_rt.unboxAsView(DDS.Entity, base);
+    const e = zidl_bindings.unboxAsView(DDS.Entity, base);
     if (e.vtable != &TopicImpl.entity_vtable) return null;
     const r: DDS.Topic = .{ .ptr = e.ptr, .vtable = &TopicImpl.topic_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
 }
 
 pub export fn DDS_Entity_as_DDS_Publisher(base: *anyopaque) callconv(.c) ?*anyopaque {
-    const e = zidl_rt.unboxAsView(DDS.Entity, base);
+    const e = zidl_bindings.unboxAsView(DDS.Entity, base);
     if (e.vtable != &PublisherImpl.entity_vtable) return null;
     const r: DDS.Publisher = .{ .ptr = e.ptr, .vtable = &PublisherImpl.vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
 }
 
 pub export fn DDS_Entity_as_DDS_Subscriber(base: *anyopaque) callconv(.c) ?*anyopaque {
-    const e = zidl_rt.unboxAsView(DDS.Entity, base);
+    const e = zidl_bindings.unboxAsView(DDS.Entity, base);
     if (e.vtable != &SubscriberImpl.entity_vtable) return null;
     const r: DDS.Subscriber = .{ .ptr = e.ptr, .vtable = &SubscriberImpl.vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
 }
 
 pub export fn DDS_Entity_as_DDS_DataWriter(base: *anyopaque) callconv(.c) ?*anyopaque {
-    const e = zidl_rt.unboxAsView(DDS.Entity, base);
+    const e = zidl_bindings.unboxAsView(DDS.Entity, base);
     if (e.vtable != &DataWriterImpl.entity_vtable) return null;
     const r: DDS.DataWriter = .{ .ptr = e.ptr, .vtable = &DataWriterImpl.vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
 }
 
 pub export fn DDS_Entity_as_DDS_DataReader(base: *anyopaque) callconv(.c) ?*anyopaque {
-    const e = zidl_rt.unboxAsView(DDS.Entity, base);
+    const e = zidl_bindings.unboxAsView(DDS.Entity, base);
     if (e.vtable != &DataReaderImpl.entity_vtable) return null;
     const r: DDS.DataReader = .{ .ptr = e.ptr, .vtable = &DataReaderImpl.vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -1081,14 +1081,14 @@ pub export fn DDS_Entity_as_DDS_DataReader(base: *anyopaque) callconv(.c) ?*anyo
 // always returns null rather than comparing against a vtable nothing real ever
 // installs.
 pub export fn DDS_TopicDescription_as_DDS_Topic(base: *anyopaque) callconv(.c) ?*anyopaque {
-    const td = zidl_rt.unboxAsView(DDS.TopicDescription, base);
+    const td = zidl_bindings.unboxAsView(DDS.TopicDescription, base);
     if (td.vtable != &TopicImpl.td_vtable) return null;
     const r: DDS.Topic = .{ .ptr = td.ptr, .vtable = &TopicImpl.topic_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
 }
 
 pub export fn DDS_TopicDescription_as_DDS_ContentFilteredTopic(base: *anyopaque) callconv(.c) ?*anyopaque {
-    const td = zidl_rt.unboxAsView(DDS.TopicDescription, base);
+    const td = zidl_bindings.unboxAsView(DDS.TopicDescription, base);
     if (td.vtable != &ContentFilteredTopicImpl.td_vtable) return null;
     const r: DDS.ContentFilteredTopic = .{ .ptr = td.ptr, .vtable = &ContentFilteredTopicImpl.cft_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -1149,7 +1149,7 @@ pub export fn zzdds_cft_match_sample(
     get: ZzddsFieldGetFn,
 ) callconv(.c) bool {
     if (@intFromPtr(cft) == 0) return true;
-    const c = zidl_rt.unboxAsView(DDS.ContentFilteredTopic, cft);
+    const c = zidl_bindings.unboxAsView(DDS.ContentFilteredTopic, cft);
     if (nil.isNil(c)) return true;
     if (c.vtable != &ContentFilteredTopicImpl.cft_vtable) return true;
     const impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(c.ptr));
@@ -1185,9 +1185,9 @@ pub export fn zzdds_cft_match_sample(
 // back to manual DebugAllocator wiring to get, before this flag existed.
 var debug_gpa: std.heap.DebugAllocator(.{}) = .{};
 
-fn createFactory(allocator: ?*const zidl_rt.ZidlAllocator) !ZZDDS.DomainParticipantFactory {
+fn createFactory(allocator: ?*const zidl_bindings.ZidlAllocator) !ZZDDS.DomainParticipantFactory {
     const alloc = if (allocator) |a|
-        zidl_rt.toAllocator(a)
+        zidl_bindings.toAllocator(a)
     else if (build_options.debug_allocator)
         debug_gpa.allocator()
     else
@@ -1553,7 +1553,7 @@ test "zzdds extension factory creates participant with generated default config"
     const dp = factory.create_participant_ex(203, qos, null, 0, cfg);
     try std.testing.expect(!nil.isNil(dp));
 
-    const ext_dp = zidl_rt.unboxAsView(ZZDDS.DomainParticipant, DDS_DomainParticipant_as_zzdds_DomainParticipant(dp.vtable.get_c_abi_handle(dp.ptr)));
+    const ext_dp = zidl_bindings.unboxAsView(ZZDDS.DomainParticipant, DDS_DomainParticipant_as_zzdds_DomainParticipant(dp.vtable.get_c_abi_handle(dp.ptr)));
     try std.testing.expectEqual(DDS.RETCODE_OK, ext_dp.register_type_support("KeylessSmoke"));
 
     const dds_factory = factory.vtable.as_DomainParticipantFactory(factory.ptr);

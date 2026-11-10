@@ -1,6 +1,6 @@
 //! Strict authored resource records -> concrete shared builder plans.
 const std = @import("std");
-const rt = @import("zidl_rt");
+const rt = @import("zidl_bindings");
 comptime {
     if (!@hasDecl(rt, "authoring")) @compileError("resource authoring requires zidl v0.3.23 or newer");
 }

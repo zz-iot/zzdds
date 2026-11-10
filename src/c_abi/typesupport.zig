@@ -26,7 +26,7 @@ const TypeSupport = participant_mod.TypeSupport;
 const DomainParticipantImpl = participant_mod.DomainParticipantImpl;
 const filter_mod = @import("../dcps/filter.zig");
 const nil = @import("../dcps/nil.zig");
-const zidl_rt = @import("zidl_rt");
+const zidl_bindings = @import("zidl_bindings");
 const extensions = @import("extensions.zig");
 
 /// Discriminated field value shared with `zzdds_cft_match_sample`'s
@@ -150,13 +150,13 @@ pub export fn zzdds_register_type_support(
     compute_key_hash_key_only_fn: ?ZzddsComputeKeyHashFn,
     get_field_fn: ?ZzddsGetFieldFromCdrFn,
 ) callconv(.c) c_int {
-    // zidl_rt.unboxAs dereferences its argument unconditionally -- a literal
+    // zidl_bindings.unboxAs dereferences its argument unconditionally -- a literal
     // NULL passed by a C caller (a normal, expected "no object" value in C,
     // not UB) must be caught before unboxing, not after; nil.isNil only
     // catches an *already-unboxed* entity's ptr == NIL_PTR sentinel, which a
     // raw NULL C pointer would never reach without crashing first.
     if (@intFromPtr(participant) == 0) return -1;
-    const p = zidl_rt.unboxAsView(DDS.DomainParticipant, participant);
+    const p = zidl_bindings.unboxAsView(DDS.DomainParticipant, participant);
     if (nil.isNil(p)) return -1;
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(p.ptr));
     const name = std.mem.span(type_name);
@@ -296,7 +296,7 @@ pub export fn zzdds_register_type_support_ctx(
     ctx_deinit: ?*const fn (?*anyopaque) callconv(.c) void,
 ) callconv(.c) c_int {
     if (@intFromPtr(participant) == 0) return -1;
-    const p = zidl_rt.unboxAsView(DDS.DomainParticipant, participant);
+    const p = zidl_bindings.unboxAsView(DDS.DomainParticipant, participant);
     if (nil.isNil(p)) return -1;
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(p.ptr));
     const name = std.mem.span(type_name);

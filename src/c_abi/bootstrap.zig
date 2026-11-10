@@ -20,12 +20,12 @@ const DataWriterImpl = @import("../dcps/writer.zig").DataWriterImpl;
 const DataReaderImpl = @import("../dcps/reader.zig").DataReaderImpl;
 const TopicImpl = @import("../dcps/topic.zig").TopicImpl;
 const nil = @import("../dcps/nil.zig");
-const zidl_rt = @import("zidl_rt");
+const zidl_bindings = @import("zidl_bindings");
 
 // Every exported function below takes entity parameters (writer/reader/topic)
 // as `*anyopaque` -- the boxed C-ABI handle matching zzdds_c.h's opaque
 // pointer typedefs (DDS_DataWriter, DDS_DataReader, DDS_Topic) -- and unboxes
-// via zidl_rt.unboxAs to recover the native {ptr, vtable} fat pointer before
+// via zidl_bindings.unboxAs to recover the native {ptr, vtable} fat pointer before
 // touching `.ptr`. Passing the native fat-pointer struct as the parameter
 // type directly (as this file previously did throughout) is a real C-ABI
 // layout mismatch: the struct is 16 bytes (two pointer fields) where the
@@ -37,7 +37,7 @@ const zidl_rt = @import("zidl_rt");
 
 /// True if a raw C-ABI handle is a literal NULL pointer -- distinct from
 /// `nil.isNil`, which checks an *already-unboxed* entity's `.ptr == NIL_PTR`
-/// sentinel. `zidl_rt.unboxAs` dereferences its argument unconditionally, so
+/// sentinel. `zidl_bindings.unboxAs` dereferences its argument unconditionally, so
 /// a literal NULL passed by a C caller (a normal, expected "no object" value
 /// in C, not UB) must be caught here, before unboxing, not after -- every
 /// call site below checks this first.
@@ -63,7 +63,7 @@ fn isNullHandle(handle: *anyopaque) bool {
 /// uncompilable in a Zig-only build.
 pub export fn zzdds_topic_as_description(topic: *anyopaque) callconv(.c) *anyopaque {
     if (isNullHandle(topic)) return nil.nil_topic_description.vtable.get_c_abi_handle(nil.nil_topic_description.ptr);
-    const t = zidl_rt.unboxAsView(DDS.Topic, topic);
+    const t = zidl_bindings.unboxAsView(DDS.Topic, topic);
     const r = t.vtable.as_TopicDescription(t.ptr);
     return r.vtable.get_c_abi_handle(r.ptr);
 }
@@ -91,7 +91,7 @@ pub export fn zzdds_get_key_value_writer(
     len_out: *usize,
 ) callconv(.c) c_int {
     if (isNullHandle(writer)) return -1;
-    const w = zidl_rt.unboxAsView(DDS.DataWriter, writer);
+    const w = zidl_bindings.unboxAsView(DDS.DataWriter, writer);
     if (nil.isNil(w)) return -1;
     const impl: *DataWriterImpl = @ptrCast(@alignCast(w.ptr));
     const kv = impl.getKeyValueRaw(handle) orelse return -1;
@@ -120,7 +120,7 @@ pub export fn zzdds_get_key_value_reader(
     len_out: *usize,
 ) callconv(.c) c_int {
     if (isNullHandle(reader)) return -1;
-    const r = zidl_rt.unboxAsView(DDS.DataReader, reader);
+    const r = zidl_bindings.unboxAsView(DDS.DataReader, reader);
     if (nil.isNil(r)) return -1;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
     const kv = impl.getKeyValueRaw(handle) orelse return -1;
@@ -137,7 +137,7 @@ pub export fn zzdds_lookup_instance_reader(
     key_hash: *const [16]u8,
 ) callconv(.c) DDS.InstanceHandle_t {
     if (isNullHandle(reader)) return 0;
-    const r = zidl_rt.unboxAsView(DDS.DataReader, reader);
+    const r = zidl_bindings.unboxAsView(DDS.DataReader, reader);
     if (nil.isNil(r)) return 0;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
     // Compute handle from key hash and check if it's known alive.

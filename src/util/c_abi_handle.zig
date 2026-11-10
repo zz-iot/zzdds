@@ -17,7 +17,7 @@
 //! boxed value even though `ptr` is the same.
 
 const std = @import("std");
-const zidl_rt = @import("zidl_rt");
+const zidl_bindings = @import("zidl_bindings");
 
 pub const CachedCAbiHandle = struct {
     handle: std.atomic.Value(?*anyopaque) = std.atomic.Value(?*anyopaque).init(null),
@@ -36,9 +36,9 @@ pub const CachedCAbiHandle = struct {
         // failure (no error union, no optional) — the box is small, so
         // treat OOM here the same as any other unrecoverable allocation
         // failure in zzdds.
-        const h = zidl_rt.boxEntity(alloc, ptr, vtable) catch @panic("zzdds: out of memory boxing C-ABI entity handle");
+        const h = zidl_bindings.boxEntity(alloc, ptr, vtable) catch @panic("zzdds: out of memory boxing C-ABI entity handle");
         if (self.handle.cmpxchgStrong(null, h, .acq_rel, .acquire)) |existing| {
-            zidl_rt.freeEntityBox(alloc, h);
+            zidl_bindings.freeEntityBox(alloc, h);
             return self.exportHandle(existing.?);
         }
         return self.exportHandle(h);
@@ -49,7 +49,7 @@ pub const CachedCAbiHandle = struct {
         // Export such a box already retired, so bindings refuse to wrap it.
         // This also closes the race where retire observed an empty cache
         // immediately before get installed the box.
-        if (self.retired.load(.acquire)) zidl_rt.retireEntityBox(h);
+        if (self.retired.load(.acquire)) zidl_bindings.retireEntityBox(h);
         return h;
     }
 
@@ -59,14 +59,14 @@ pub const CachedCAbiHandle = struct {
     /// native storage until they finish exporting and using its handle.
     pub fn retire(self: *CachedCAbiHandle) void {
         if (self.retired.swap(true, .acq_rel)) return;
-        if (self.handle.load(.acquire)) |h| zidl_rt.retireEntityBox(h);
+        if (self.handle.load(.acquire)) |h| zidl_bindings.retireEntityBox(h);
     }
 
     /// Free storage once no native references remain. Retirement may already
     /// have happened on the deleting thread; report each handle only once.
     pub fn free(self: *CachedCAbiHandle, alloc: std.mem.Allocator) void {
         self.retire();
-        if (self.handle.swap(null, .acq_rel)) |h| zidl_rt.freeEntityBox(alloc, h);
+        if (self.handle.swap(null, .acq_rel)) |h| zidl_bindings.freeEntityBox(alloc, h);
     }
 };
 
@@ -76,22 +76,22 @@ test "cached and first-time exports after deletion stay retired until free" {
         calls: usize = 0,
         fn on(ctx: ?*anyopaque, h: *anyopaque) callconv(.c) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            if (zidl_rt.unboxEntity(h).ptr == self.ptr) self.calls += 1;
+            if (zidl_bindings.unboxEntity(h).ptr == self.ptr) self.calls += 1;
         }
     };
     for ([_]bool{ false, true }) |boxed_before_delete| {
         var value: u8 = 0;
         var observed: Observer = .{ .ptr = &value };
-        try std.testing.expect(zidl_rt.observeHandleRetire(Observer.on, &observed));
-        defer _ = zidl_rt.unobserveHandleRetire(Observer.on, &observed);
+        try std.testing.expect(zidl_bindings.observeHandleRetire(Observer.on, &observed));
+        defer _ = zidl_bindings.unobserveHandleRetire(Observer.on, &observed);
         var cache: CachedCAbiHandle = .{};
         if (boxed_before_delete) {
             const h = cache.get(std.testing.allocator, &value, &value);
-            try std.testing.expect(!zidl_rt.isEntityBoxRetired(h));
+            try std.testing.expect(!zidl_bindings.isEntityBoxRetired(h));
         }
         cache.retire();
         const h = cache.get(std.testing.allocator, &value, &value);
-        try std.testing.expect(zidl_rt.isEntityBoxRetired(h));
+        try std.testing.expect(zidl_bindings.isEntityBoxRetired(h));
         try std.testing.expectEqual(h, cache.get(std.testing.allocator, &value, &value));
         try std.testing.expectEqual(@as(usize, 1), observed.calls);
         cache.free(std.testing.allocator);

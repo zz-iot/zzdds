@@ -1,25 +1,25 @@
 //! Bridges a caller-supplied `std.mem.Allocator` into the `ZidlAllocator`
-//! C-ABI vtable — the reverse direction of `zidl_rt`'s own `toAllocator`
+//! C-ABI vtable — the reverse direction of `zidl_bindings`'s own `toAllocator`
 //! (`ZidlAllocator` -> `std.mem.Allocator`). Needed wherever zzdds-internal
 //! Zig code wants to hand a real `std.mem.Allocator` (e.g. a
 //! `std.heap.DebugAllocator` instance, or `std.testing.allocator`) into a
 //! C-ABI entry point that only accepts a `*const ZidlAllocator` (e.g.
 //! `zzdds_create_factory_with_allocator`).
 //!
-//! Kept zzdds-local rather than upstreamed into `zidl_rt` itself: `zidl` is
+//! Kept zzdds-local rather than upstreamed into `zidl_bindings` itself: `zidl` is
 //! a pinned/versioned dependency, and upstreaming this would require a
 //! release cycle before zzdds could consume it. Revisit later if other
 //! zidl-based projects want the same adapter.
 //!
-//! Mirrors `zidl_rt.toAllocator`'s zero-allocation contract: `fromAllocator`
+//! Mirrors `zidl_bindings.toAllocator`'s zero-allocation contract: `fromAllocator`
 //! allocates nothing and returns a value whose `ctx` points directly at the
 //! caller-owned `*const std.mem.Allocator` passed in — that pointer must
 //! outlive the returned `ZidlAllocator`.
 
 const std = @import("std");
-const zidl_rt = @import("zidl_rt");
+const zidl_bindings = @import("zidl_bindings");
 
-pub const ZidlAllocator = zidl_rt.ZidlAllocator;
+pub const ZidlAllocator = zidl_bindings.ZidlAllocator;
 
 fn asAllocator(ctx: ?*anyopaque) *const std.mem.Allocator {
     return @ptrCast(@alignCast(ctx.?));
@@ -68,10 +68,10 @@ test "fromAllocator: alloc/resize/free round-trip through the ZidlAllocator vtab
     try testing.expect(c_alloc.resize(c_alloc.ctx, via_c, 32, 32, 1));
 }
 
-test "fromAllocator: round-trips through zidl_rt.toAllocator back to a working std.mem.Allocator" {
+test "fromAllocator: round-trips through zidl_bindings.toAllocator back to a working std.mem.Allocator" {
     const alloc = testing.allocator;
     const c_alloc = fromAllocator(&alloc);
-    const roundtripped = zidl_rt.toAllocator(&c_alloc);
+    const roundtripped = zidl_bindings.toAllocator(&c_alloc);
 
     const mem = try roundtripped.alloc(u8, 64);
     defer roundtripped.free(mem);
