@@ -72,6 +72,9 @@ comptime {
     _ = c_abi.bootstrap;
     _ = c_abi.extensions;
     _ = c_abi.allocator_adapter;
+    // A ThreadSanitizer libzzdds compiles the codec's C ABI in itself rather
+    // than linking the separately built archive (see build.zig).
+    if (@import("build_options").cdr_exports_in_library) _ = @import("zidl_cdr_exports");
 }
 /// Re-export the generated DDS type definitions so generated code can do
 ///   const _zzdds = @import("zzdds");

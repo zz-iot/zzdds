@@ -428,9 +428,12 @@ pub fn build(b: *std.Build) void {
 
     // `build_options_shared_runtime` is the same set with the switch on, for
     // the shared-runtime tests, which run in every build while it exists.
+    // `build_options_lib` is `build_options` for libzzdds itself, which alone
+    // may compile the codec's C ABI in (see cdr_exports_in_library below).
     const build_options = b.addOptions();
     const build_options_shared_runtime = b.addOptions();
-    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime }) |opts| {
+    const build_options_lib = b.addOptions();
+    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime, build_options_lib }) |opts| {
         opts.addOption(bool, "config_authoring", config_authoring);
         opts.addOption(bool, "ipv4", ipv4);
         opts.addOption(bool, "ipv6", ipv6);
@@ -443,6 +446,16 @@ pub fn build(b: *std.Build) void {
     }
     build_options.addOption(bool, "shared_runtime", shared_runtime);
     build_options_shared_runtime.addOption(bool, "shared_runtime", true);
+    build_options_lib.addOption(bool, "shared_runtime", shared_runtime);
+    // A ThreadSanitizer build is position-independent *executable* code, so
+    // Zig gives the codec archive's thread-locals local-exec TLS, which a
+    // shared library cannot link ("relocation R_X86_64_TPOFF32 ... cannot be
+    // used with -shared"). libzzdds then compiles the codec's C ABI in itself
+    // instead of linking the archive; executables still link the archive.
+    const cdr_exports_in_library = sanitize_thread;
+    build_options.addOption(bool, "cdr_exports_in_library", false);
+    build_options_shared_runtime.addOption(bool, "cdr_exports_in_library", false);
+    build_options_lib.addOption(bool, "cdr_exports_in_library", cdr_exports_in_library);
     // Pass ZZDDS_XTYPES preprocessor define to zidl so dcps.idl gates XTypes
     // content (DataRepresentationQosPolicy and its uses) at code-generation time.
     if (xtypes) gen_dcps.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
@@ -457,16 +470,16 @@ pub fn build(b: *std.Build) void {
         if (!std.fs.path.isAbsolute(path)) @panic("-Dtypesupport-package must be absolute");
         break :blk .{ .cwd_relative = path };
     } else zidl_dep.path("packages/zidl-typesupport");
-    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime }) |opts| opts.addOption(bool, "typesupport_library", typesupport_enabled);
+    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime, build_options_lib }) |opts| opts.addOption(bool, "typesupport_library", typesupport_enabled);
     const resource_authoring = b.option(bool, "resource-authoring", "Enable experimental strict TOML resources") orelse false;
     const resources_enabled = b.option(bool, "resource-construction", "Enable experimental programmatic DDS resource construction") orelse resource_authoring;
     if (resource_authoring and !resources_enabled) @panic("resource authoring requires resource construction");
-    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime }) |opts| {
+    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime, build_options_lib }) |opts| {
         opts.addOption(bool, "resource_authoring", resource_authoring);
         opts.addOption(bool, "resource_construction", resources_enabled);
     }
     const typesupport_dynamic = b.option(bool, "typesupport-dynamic", "Include OS dynamic loading (disable for static providers only)") orelse true;
-    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime }) |opts| opts.addOption(bool, "typesupport_dynamic", typesupport_dynamic);
+    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime, build_options_lib }) |opts| opts.addOption(bool, "typesupport_dynamic", typesupport_dynamic);
     const typesupport_mod = if (typesupport_enabled)
         typesupportModule(b, typesupport_package, target, optimize, runtime.codec)
     else
@@ -715,7 +728,7 @@ pub fn build(b: *std.Build) void {
             // needs the LLVM backend forced to actually instrument anything.
             .use_llvm = if (sanitize_thread) true else null,
         });
-        zzdds_lib.root_module.addOptions("build_options", build_options);
+        zzdds_lib.root_module.addOptions("build_options", build_options_lib);
         zzdds_lib.root_module.link_libc = true;
         // Without this, only Zig's own `export fn` C-ABI surface
         // (--zig-generate-c-api) ends up in zzdds.dll's export table on
@@ -760,7 +773,24 @@ pub fn build(b: *std.Build) void {
         zzdds_lib.root_module.addIncludePath(gen_zzdds_c_lib_dir);
         zzdds_lib.root_module.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
         zzdds_lib.root_module.addIncludePath(b.path("include"));
-        linkCdr(zzdds_lib.root_module, zidl_cdr_lib);
+        if (cdr_exports_in_library) {
+            // See cdr_exports_in_library: the archive's own sources, compiled
+            // as part of this shared library (src/root.zig imports the Zig half).
+            zzdds_lib.root_module.addImport("zidl_cdr_exports", b.createModule(.{
+                .root_source_file = zidl_dep.path("packages/zidl-cdr/src/shared_primitives.zig"),
+                .target = target,
+                .optimize = optimize,
+                .sanitize_thread = sanitize_thread,
+                .link_libc = true,
+                .imports = &.{.{ .name = "zidl_cdr", .module = runtime.codec }},
+            }));
+            zzdds_lib.root_module.addCSourceFile(.{
+                .file = zidl_dep.path("packages/zidl-cdr/src/zidl_cdr.c"),
+                .flags = &.{"-std=c99"},
+            });
+        } else {
+            linkCdr(zzdds_lib.root_module, zidl_cdr_lib);
+        }
 
         // dll_export_fns (above) only covers Zig's own `export fn` surface,
         // not the plain C functions just compiled in from dcps_cdr.c/
