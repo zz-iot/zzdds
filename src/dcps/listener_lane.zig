@@ -44,6 +44,7 @@ const proto = @import("../protocol/interface.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const Condvar = @import("../util/condvar.zig").Condvar;
 const listener_identity = @import("../util/listener_identity.zig");
+const listener_box = @import("../util/listener_box.zig");
 const runtime = @import("../runtime/core.zig");
 
 const Guid = proto.Guid;
@@ -101,9 +102,10 @@ fn holds(id: *Identity) bool {
 }
 
 /// Whether this thread is inside a callback chain: a tracked listener
-/// invocation or any runtime turn, which runs no application code otherwise.
+/// invocation, any runtime turn, which runs no application code otherwise,
+/// or a listener called inline (the threaded runtime).
 pub fn inCallbackChain() bool {
-    return invoking > 0 or runtime.inTurn();
+    return invoking > 0 or runtime.inTurn() or listener_box.inCall();
 }
 
 /// For a listener resolved to run on this thread: whether it may run now.
@@ -128,8 +130,9 @@ pub fn admit(source: anytype) bool {
 }
 
 /// An explicit traversal through a participant's members
-/// (`notify_datareaders`), counted in their group from `begin` to `end`: the
-/// participant's deletion from one of its callbacks follows all of it.
+/// (`notify_datareaders`), or a participant's `set_listener`, counted in
+/// their group from `begin` to `end`: the participant's deletion from one of
+/// its callbacks, or from a release hook the setter runs, follows all of it.
 pub const Traversal = struct {
     frame: Frame = undefined,
     counted: bool = false,

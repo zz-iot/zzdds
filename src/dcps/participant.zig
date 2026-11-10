@@ -941,6 +941,8 @@ pub const DomainParticipantImpl = struct {
     /// helper, written once from the application thread that calls enable().
     enabled: std.atomic.Value(bool),
     listener_box: *ListenerBox(DDS.DomainParticipantListener),
+    /// Replaced registrations whose callbacks may still be running.
+    retired_listeners: listener_box_mod.Retired(DDS.DomainParticipantListener) = .{},
     /// Guards `listener_box` swaps/acquires only — never held across a
     /// dispatch or any other call (see listener_box.zig).
     listener_mu: Mutex = .{},
@@ -1785,7 +1787,8 @@ pub const DomainParticipantImpl = struct {
         // still-running receive-thread dispatch could acquire this exact box
         // concurrently with this thread freeing it -- a cross-thread
         // double-free/use-after-free with no lock to serialize the two.
-        self.listener_box.releaseRef(self.alloc);
+        self.retired_listeners.deinit(self.alloc);
+        self.listener_box.releaseHold(self.alloc);
 
         self.type_info_registry.deinit(self.alloc);
 
@@ -5664,8 +5667,18 @@ pub const DomainParticipantImpl = struct {
         mask: DDS.StatusMask,
     ) DDS.ReturnCode_t {
         const self = cast(ctx);
-        self.swapListener(if (a_listener) |l| l.* else DDS.noop_DomainParticipantListener);
-        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
+        // A callback the setter waits for, or the replaced listener's release
+        // hook, may delete this participant. On the shared runtime the setter
+        // is a traversal of the listener group, so the deletion's teardown
+        // follows the setter, and a deletion from its own release hook
+        // defers instead of waiting for it. The threaded runtime's deletion
+        // waits for no listener yet (docs/roadmap.md).
+        const group = self.listenerGroup();
+        var traversal: listener_lane.Traversal = .{};
+        traversal.begin(group);
+        defer traversal.end();
+        if (group != null and !traversal.counted) return DDS.RETCODE_ALREADY_DELETED;
+        self.swapListener(if (a_listener) |l| l.* else DDS.noop_DomainParticipantListener, mask);
         return DDS.RETCODE_OK;
     }
 
@@ -5676,17 +5689,17 @@ pub const DomainParticipantImpl = struct {
         return listener_box_mod.handOut(self.listener_box.listener);
     }
 
-    /// Installs `new_listener`, releasing whatever it replaces. Safe against
-    /// a concurrently in-flight dispatch acquired via `acquireListener`
-    /// (see listener_box.zig).
-    fn swapListener(self: *Self, new_listener: DDS.DomainParticipantListener) void {
+    /// Installs `new_listener` and `mask`, retiring the registration it
+    /// replaces (listener_box.zig's `Retired`): a dispatch already using
+    /// that one keeps it alive until it returns.
+    fn swapListener(self: *Self, new_listener: DDS.DomainParticipantListener, mask: DDS.StatusMask) void {
         const new_box = ListenerBox(DDS.DomainParticipantListener).create(self.alloc, new_listener) catch
             @panic("zzdds: out of memory boxing listener");
-        self.listener_mu.lock();
-        const old_box = self.listener_box;
-        self.listener_box = new_box;
-        self.listener_mu.unlock();
-        old_box.releaseRef(self.alloc);
+        const upto = self.retired_listeners.install(&self.listener_mu, &self.listener_box, new_box);
+        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
+        // From application code, returns once no callback uses what it
+        // replaced (docs/design/concurrency/listeners.md#replacement-completion).
+        self.retired_listeners.drain(self.alloc, &self.listener_mu, upto, !listener_lane.inCallbackChain());
     }
 
     /// Call with no lock held. Returns a box the caller may safely read/

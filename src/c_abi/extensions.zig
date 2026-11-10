@@ -1403,8 +1403,7 @@ fn writerSetListenerEx(
 ) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataWriterImpl = @ptrCast(@alignCast(ctx));
-    impl.setListenerEx(if (a_listener) |l| l.* else ZZDDS.noop_DataWriterListenerEx, mask);
-    return DDS.RETCODE_OK;
+    return impl.setListenerEx(if (a_listener) |l| l.* else ZZDDS.noop_DataWriterListenerEx, mask);
 }
 
 fn readerSetListenerEx(
@@ -1414,8 +1413,7 @@ fn readerSetListenerEx(
 ) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));
-    impl.setListenerEx(if (a_listener) |l| l.* else ZZDDS.noop_DataReaderListenerEx, mask);
-    return DDS.RETCODE_OK;
+    return impl.setListenerEx(if (a_listener) |l| l.* else ZZDDS.noop_DataReaderListenerEx, mask);
 }
 
 /// NOTE: concurrent readers on the same DataReader must be externally

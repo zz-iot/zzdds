@@ -16,6 +16,7 @@
 //! DomainParticipantListener : ... SubscriberListener, ...).
 const std = @import("std");
 const Identity = @import("listener_identity.zig").Identity;
+const listener_box = @import("listener_box.zig");
 
 /// If `mask & bit != 0` and `listener`'s `field` is a non-null callback,
 /// invokes it as `cb(handle, args..., listener.listener_data)` — matching
@@ -35,6 +36,8 @@ pub fn tryDispatch(
 ) bool {
     if (mask & bit == 0) return false;
     if (@field(listener, field)) |cb| {
+        listener_box.enterCall();
+        defer listener_box.leaveCall();
         @call(.auto, cb, .{handle} ++ args ++ .{listener.listener_data});
         return true;
     }
@@ -85,6 +88,8 @@ pub fn Resolved(comptime Cb: type) type {
         /// Invokes the callback as `cb(handle, args..., listener_data)`, as
         /// `tryDispatch` does.
         pub fn invoke(self: Self, handle: anytype, args: anytype) void {
+            listener_box.enterCall();
+            defer listener_box.leaveCall();
             @call(.auto, self.cb, .{handle} ++ args ++ .{self.listener_data});
         }
 
@@ -218,7 +223,7 @@ test "peek: mirrors tryDispatch's gating without invoking" {
 }
 
 test "resolveBox: keeps the box reference until release, drops it when unresolved" {
-    const ListenerBox = @import("listener_box.zig").ListenerBox;
+    const ListenerBox = listener_box.ListenerBox;
     const Listener = struct {
         on_x: ?*const fn (i32, ?*anyopaque) callconv(.c) void = null,
         listener_data: ?*anyopaque = null,
@@ -233,15 +238,15 @@ test "resolveBox: keeps the box reference until release, drops it when unresolve
     const Cb = Callback(Listener, "on_x");
 
     const box = try ListenerBox(Listener).create(testing.allocator, .{ .on_x = Static.cb });
-    defer box.releaseRef(testing.allocator);
+    defer box.releaseHold(testing.allocator);
 
     try testing.expect(resolveBox(Cb, "on_x", @as(u32, 0), @as(u32, 1), box.acquireLocked(), testing.allocator) == null);
-    try testing.expectEqual(@as(usize, 1), box.refcount.load(.monotonic));
+    try testing.expect(box.idle());
 
     const r = resolveBox(Cb, "on_x", @as(u32, 1), @as(u32, 1), box.acquireLocked(), testing.allocator).?;
-    try testing.expectEqual(@as(usize, 2), box.refcount.load(.monotonic));
+    try testing.expect(!box.idle());
     r.invoke(@as(i32, 42), .{});
     try testing.expectEqual(@as(i32, 42), Static.seen);
     r.release();
-    try testing.expectEqual(@as(usize, 1), box.refcount.load(.monotonic));
+    try testing.expect(box.idle());
 }

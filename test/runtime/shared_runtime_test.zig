@@ -1607,7 +1607,7 @@ test "a reliable-ready event reaches the reader's extension listener as a listen
     try pair.init(&m.runtime, .RELIABLE_RELIABILITY_QOS, null);
     m.runtime.releaseOwner();
     var rr: Recorder = .{ .lane = &pair.dr.listeners.ctx };
-    pair.dr.setListenerEx(.{ .listener_data = &rr, .on_reliable_writer_ready = Recorder.onWriterReady }, 0);
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dr.setListenerEx(.{ .listener_data = &rr, .on_reliable_writer_ready = Recorder.onWriterReady }, 0));
 
     var drives: usize = 0;
     while (!rr.writer_ready and drives < 20) : (drives += 1) {
@@ -2096,6 +2096,112 @@ test "deleting a subscriber's contents from outside a callback waits for a reade
 
 test "deleting a publisher's contents from outside a callback waits for a writer's running listener" {
     try expectDeletionWaitsForListener(.writer, true);
+}
+
+fn clearReaderListener(held: *Held, rc: *DDS.ReturnCode_t) void {
+    rc.* = held.dr.set_listener(null, 0);
+    held.deleted.store(true, .release);
+}
+
+fn clearWriterListener(held: *Held, rc: *DDS.ReturnCode_t) void {
+    rc.* = held.dw.set_listener(null, 0);
+    held.deleted.store(true, .release);
+}
+
+/// Clears an endpoint's listener from another application thread while it
+/// runs on a hosted worker: set_listener returns only once it has returned
+/// (docs/design/concurrency/listeners.md#replacement-completion). `deleted`
+/// marks the setter's return.
+fn expectReplacementWaitsForListener(endpoint: Endpoint) !void {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    var held: Held = .{ .io = h.io() };
+    var o = PairOptions.bestEffort();
+    switch (endpoint) {
+        .reader => {
+            o.dr_listener = held.readerListener();
+            o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+        },
+        .writer => {
+            o.dw_listener = held.writerListener();
+            o.dw_mask = DDS.OFFERED_DEADLINE_MISSED_STATUS;
+        },
+    }
+    var pair: Pair = undefined;
+    try pair.initWith(&h.runtime, o);
+    h.runtime.releaseOwner();
+    held.dr = pair.dr.toDDSDataReader();
+    held.dw = pair.dw_h;
+
+    switch (endpoint) {
+        .reader => try pair.write(0),
+        .writer => {
+            var qos: DDS.DataWriterQos = undefined;
+            try testing.expectEqual(DDS.RETCODE_OK, pair.dw_h.get_qos(&qos));
+            qos.deadline.period = Slice.deadline;
+            try testing.expectEqual(DDS.RETCODE_OK, pair.dw_h.set_qos(qos));
+        },
+    }
+    try held.entered.waitTimeout(h.io(), ten_seconds);
+    var rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR;
+    const setter = switch (endpoint) {
+        .reader => try std.Thread.spawn(.{}, clearReaderListener, .{ &held, &rc }),
+        .writer => try std.Thread.spawn(.{}, clearWriterListener, .{ &held, &rc }),
+    };
+    while (zzdds.util.listener_box.waitingSetters() == 0 and !held.deleted.load(.acquire)) std.Thread.yield() catch {};
+    held.release.set(h.io());
+    setter.join();
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expect(!held.release_timed_out);
+    try testing.expect(!held.deleted_before_return);
+    try testing.expect(held.returned.isSet());
+
+    try pair.deinit();
+    try h.deinit();
+}
+
+test "clearing a reader's listener from outside a callback waits for its running listener to return" {
+    try expectReplacementWaitsForListener(.reader);
+}
+
+test "clearing a writer's listener from outside a callback waits for its running listener to return" {
+    try expectReplacementWaitsForListener(.writer);
+}
+
+/// A reader listener that clears itself from its own turn.
+const ClearSelf = struct {
+    io: std.Io,
+    dr: DDS.DataReader = undefined,
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+    returned: std.Io.Event = .unset,
+
+    fn onData(_: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
+        const self: *ClearSelf = @ptrCast(@alignCast(ld.?));
+        if (self.returned.isSet()) return;
+        self.rc = self.dr.set_listener(null, 0);
+        self.returned.set(self.io);
+    }
+};
+
+test "a listener clearing itself from its own turn does not wait for itself" {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    var state: ClearSelf = .{ .io = h.io() };
+    var o = PairOptions.bestEffort();
+    o.dr_listener = .{ .listener_data = &state, .on_data_available = ClearSelf.onData };
+    o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+    var pair: Pair = undefined;
+    try pair.initWith(&h.runtime, o);
+    h.runtime.releaseOwner();
+    state.dr = pair.dr.toDDSDataReader();
+
+    try pair.write(0);
+    // Waiting for itself would never return.
+    try state.returned.waitTimeout(h.io(), ten_seconds);
+    try testing.expectEqual(DDS.RETCODE_OK, state.rc);
+
+    try pair.deinit();
+    try h.deinit();
 }
 
 test "deleting a reader from outside a callback waits for its listener called by notify_datareaders" {
@@ -2946,6 +3052,114 @@ test "a participant deleted from one reader's listener is torn down after anothe
     h.threaded.deinit();
     try testing.expect(!ov.release_timed_out);
     try testing.expectEqual(@as(u32, 1), ov.calls.load(.seq_cst));
+}
+
+/// A participant listener whose first on_data_available for `reader` waits
+/// for a setter to wait for it, then deletes the participant.
+const DeleteParticipantUnderSetter = struct {
+    io: std.Io,
+    node: *Node = undefined,
+    dp: DDS.DomainParticipant = undefined,
+    reader: *anyopaque = undefined,
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+    entered: std.Io.Event = .unset,
+    setter_timed_out: bool = false,
+
+    fn onData(handle: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
+        const self: *DeleteParticipantUnderSetter = @ptrCast(@alignCast(ld.?));
+        // The builtin readers fall back to this listener too.
+        if (zzdds.zidl_rt.unboxAsView(DDS.DataReader, handle).ptr != self.reader) return;
+        if (self.entered.isSet()) return;
+        self.entered.set(self.io);
+        const deadline = zzdds.util.time.monotonicNs() + 10 * std.time.ns_per_s;
+        while (zzdds.util.listener_box.waitingSetters() == 0) {
+            if (zzdds.util.time.monotonicNs() > deadline) {
+                self.setter_timed_out = true;
+                break;
+            }
+            std.Thread.yield() catch {};
+        }
+        self.rc = Slice.deleteParticipant(self.node, self.dp);
+    }
+
+    fn clear(self: *DeleteParticipantUnderSetter, rc: *DDS.ReturnCode_t) void {
+        rc.* = self.dp.vtable.set_listener(self.dp.ptr, null, 0);
+    }
+};
+
+test "a participant deleted by the listener its setter waits for is torn down after the setter returns" {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    var del: DeleteParticipantUnderSetter = .{ .io = h.io() };
+    var pair: Pair = undefined;
+    try pair.initWith(&h.runtime, PairOptions.bestEffort());
+    h.runtime.releaseOwner();
+    del.node = &pair.r;
+    del.dp = pair.dp_r;
+    del.reader = pair.dr.toDDSDataReader().ptr;
+    // Only the participant has a listener: the reader's status falls back to it.
+    var dp_listener = DDS.DomainParticipantListener{ .listener_data = &del, .on_data_available = DeleteParticipantUnderSetter.onData };
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dp_r.vtable.set_listener(pair.dp_r.ptr, &dp_listener, DDS.DATA_AVAILABLE_STATUS));
+
+    try pair.write(0);
+    try del.entered.waitTimeout(h.io(), ten_seconds);
+    var set_rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR;
+    // Waits for the listener, which deletes the participant: its teardown
+    // follows the setter, which is still using it.
+    const setter = try std.Thread.spawn(.{}, DeleteParticipantUnderSetter.clear, .{ &del, &set_rc });
+    setter.join();
+    try testing.expect(!del.setter_timed_out);
+    try testing.expectEqual(DDS.RETCODE_OK, del.rc);
+    try testing.expectEqual(DDS.RETCODE_OK, set_rc);
+
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dp_w.delete_contained_entities());
+    try pair.w.delete(pair.dp_w);
+    // The workers exit once the runtime stops.
+    h.hosted.join();
+    try testing.expectEqual(rt.State.backend_stopped, h.runtime.getState());
+    pair.freeNodes();
+    h.runtime.deinit();
+    h.threaded.deinit();
+}
+
+/// A participant listener context whose release hook deletes the participant.
+const DeleteParticipantOnRelease = struct {
+    node: *Node,
+    dp: DDS.DomainParticipant,
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+    released: u32 = 0,
+
+    fn release(ld: ?*anyopaque) callconv(.c) void {
+        const self: *DeleteParticipantOnRelease = @ptrCast(@alignCast(ld.?));
+        self.released += 1;
+        self.rc = Slice.deleteParticipant(self.node, self.dp);
+    }
+};
+
+test "a participant deleted by the release hook of the listener its setter replaces is torn down after the setter returns" {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    var pair: Pair = undefined;
+    try pair.initWith(&h.runtime, PairOptions.bestEffort());
+    h.runtime.releaseOwner();
+    var del: DeleteParticipantOnRelease = .{ .node = &pair.r, .dp = pair.dp_r };
+    var dp_listener = DDS.DomainParticipantListener{ .listener_data = &del, .release_listener_data = DeleteParticipantOnRelease.release };
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dp_r.vtable.set_listener(pair.dp_r.ptr, &dp_listener, 0));
+
+    // No callback uses the listener, so the setter releases it itself: the
+    // deletion from its hook must not wait for the setter.
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dp_r.vtable.set_listener(pair.dp_r.ptr, null, 0));
+    try testing.expectEqual(@as(u32, 1), del.released);
+    try testing.expectEqual(DDS.RETCODE_OK, del.rc);
+
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dp_w.delete_contained_entities());
+    try pair.w.delete(pair.dp_w);
+    // The workers exit once the runtime stops.
+    h.hosted.join();
+    try testing.expectEqual(rt.State.backend_stopped, h.runtime.getState());
+    pair.freeNodes();
+    h.runtime.deinit();
+    h.threaded.deinit();
 }
 
 test "deleting a participant drops its builtin readers' queued listener turns without driving" {

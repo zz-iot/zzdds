@@ -5,15 +5,17 @@
 // whichever listener interfaces it implements (DDS::Listener is a virtual
 // base), while each registration has its own listener_data.
 //
-// Lifetime: a listener replaced while one of its callbacks is running stays
-// alive until that callback returns. The application hands the reader its only reference to the listener. Its
-// on_subscription_matched blocks until the main thread has replaced the
-// listener, then checks the listener's destructor has not run. The core keeps
-// the old registration until an in-flight dispatch finishes and then calls its
-// release_listener_data; the binding must hold the listener until then rather
-// than drop it when set_listener overwrites the entity wrapper's reference.
+// Lifetime: set_listener from application code returns only once the
+// callback of the listener it replaced has returned, and a replaced listener
+// stays alive until then. The application hands the reader its only reference
+// to the listener. Its on_subscription_matched blocks while another thread
+// clears the reader's listener; that set_listener must not return, and the
+// listener must not be destroyed, until the callback is released and returns.
+// The core then calls release_listener_data, so the listener is destroyed by
+// the time set_listener returns; the binding must not drop it earlier, when
+// set_listener overwrites the entity wrapper's reference.
 //
-// All synchronization state is global: with the bug, the listener is freed
+// All synchronization state is global: with a bug, the listener is freed
 // while its callback runs, so the callback must not touch `this` after waking.
 //
 // Also: a listener implementing DDS::DataReaderListener directly (not through
@@ -44,9 +46,11 @@ namespace {
 std::mutex g_mu;
 std::condition_variable g_cv;
 bool g_entered = false;
-bool g_replaced = false;
+bool g_released = false;
 std::atomic<bool> g_destroyed{false};
-std::atomic<int> g_alive_after_replace{-1}; // -1 not checked, 0 freed, 1 alive, 2 never replaced
+std::atomic<bool> g_set_returned{false};
+// -1 not checked, 0 freed or set_listener returned while it ran, 1 alive, 2 never released
+std::atomic<int> g_alive_while_replaced{-1};
 
 class BlockingListener : public ::DDS::DataReaderListenerBase {
 public:
@@ -60,11 +64,11 @@ public:
         g_cv.notify_all();
         // A wait that times out never saw the replacement, so it proves
         // nothing about the listener's lifetime: record that as a failure.
-        if (!g_cv.wait_for(lock, std::chrono::seconds(10), [] { return g_replaced; })) {
-            g_alive_after_replace = 2;
+        if (!g_cv.wait_for(lock, std::chrono::seconds(20), [] { return g_released; })) {
+            g_alive_while_replaced = 2;
             return;
         }
-        g_alive_after_replace = g_destroyed.load() ? 0 : 1;
+        g_alive_while_replaced = (g_destroyed.load() || g_set_returned.load()) ? 0 : 1;
     }
 };
 
@@ -188,18 +192,25 @@ int main() {
         std::unique_lock<std::mutex> lock(g_mu);
         CHECK(g_cv.wait_for(lock, std::chrono::seconds(20), [] { return g_entered; }));
     }
-    // Replace the listener while its callback is blocked inside it.
-    CHECK(dr->set_listener(nullptr, 0) == ::DDS::RETCODE_OK);
+    // Clear the listener from another thread while its callback is blocked
+    // inside it: set_listener waits for the callback.
+    ::DDS::ReturnCode_t set_rc = ::DDS::RETCODE_ERROR;
+    std::thread setter([&] {
+        set_rc = dr->set_listener(nullptr, 0);
+        g_set_returned = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(!g_set_returned.load());
     {
         std::lock_guard<std::mutex> lock(g_mu);
-        g_replaced = true;
+        g_released = true;
     }
     g_cv.notify_all();
-
-    CHECK(wait_until([] { return g_alive_after_replace.load() != -1; }));
-    CHECK(g_alive_after_replace.load() == 1);
-    // Released once the callback returned, not leaked.
-    CHECK(wait_until([] { return g_destroyed.load(); }));
+    setter.join();
+    CHECK(set_rc == ::DDS::RETCODE_OK);
+    CHECK(g_alive_while_replaced.load() == 1);
+    // Released once the callback returned, before set_listener did.
+    CHECK(g_destroyed.load());
     CHECK(wait_until([] { return g_direct_matches.load() > 0; }));
 
     CHECK(dr->get_listener() == nullptr);

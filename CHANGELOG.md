@@ -10,6 +10,13 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-05
 
+- `set_listener` and `set_listener_ex` on any entity, called from application code, return
+  only once no callback is still running through the listener they replaced, or through one
+  replaced before it. A listener may still replace or clear itself from a callback, which
+  does not wait. Clearing a reader's own listener before deleting the reader therefore leaves
+  no callback running through that listener. It does not wait for a callback about the reader
+  running through its subscriber's or participant's listener; clear those too if they use
+  the reader.
 - CI runs the ThreadSanitizer examples (waitset, shape and custom-allocator) on a
   `-Dshared-runtime` build too.
 - Update zidl to 0.3.27 and enable its retirement query for C++ and Java bindings.
