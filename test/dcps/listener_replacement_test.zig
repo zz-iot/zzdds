@@ -111,7 +111,7 @@ const Gate = struct {
 
     fn onData(handle: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
         const self: *Gate = @ptrCast(@alignCast(ld.?));
-        if (zzdds.zidl_rt.unboxAsView(DDS.DataReader, handle).ptr != self.reader.?) return;
+        if (zzdds.zidl_bindings.unboxAsView(DDS.DataReader, handle).ptr != self.reader.?) return;
         if (self.calls.fetchAdd(1, .seq_cst) > 0) return;
         self.entered.store(true, .seq_cst);
         self.release_timed_out = !awaitTrue(isSet, .{&self.release});

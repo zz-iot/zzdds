@@ -239,6 +239,7 @@ With the shared-native zidl migration, `-Dzidl-source=/absolute/path/to/zidl`
 selects the new generator, native runtime and shared C ABI archive together.
 The SDK and binding smoke tests link that archive; building it requires Zig,
 while installed C/C++ applications keep their normal compiler and link names.
-The dependency is pinned to zidl commit `07358e16ad9ab94194c95e379c7bd70768801b79`
-(merged PR #69). Zig consumers obtain `zidl_cdr` and `zidl_bindings` through
-the zzdds dependency so generated and handwritten code share module identity.
+The dependency is pinned to zidl release `v0.3.28-zig.0.17.0`, which includes
+the shared-native runtime migration. Zig consumers obtain `zidl_cdr` and
+`zidl_bindings` through the zzdds dependency so generated and handwritten code
+share module identity.

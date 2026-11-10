@@ -3068,7 +3068,7 @@ const DeleteParticipantUnderSetter = struct {
     fn onData(handle: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
         const self: *DeleteParticipantUnderSetter = @ptrCast(@alignCast(ld.?));
         // The builtin readers fall back to this listener too.
-        if (zzdds.zidl_rt.unboxAsView(DDS.DataReader, handle).ptr != self.reader) return;
+        if (zzdds.zidl_bindings.unboxAsView(DDS.DataReader, handle).ptr != self.reader) return;
         if (self.entered.isSet()) return;
         self.entered.set(self.io);
         const deadline = zzdds.util.time.monotonicNs() + 10 * std.time.ns_per_s;
