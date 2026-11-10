@@ -1,12 +1,14 @@
 //! set_listener from application code returns only once no callback still
 //! uses the listener it replaced; from a callback it does not wait
-//! (docs/design/concurrency/listeners.md#replacement-completion). Threaded
-//! runtime: an in-process write delivers on the writer's thread, so a
-//! listener blocked there stays in flight until released.
-//! test/runtime/shared_runtime_test.zig covers the shared runtime.
+//! (docs/design/concurrency/listeners.md#replacement-completion). A test
+//! thread writes and settles, so the callback runs on that thread (inside the
+//! write on the default build, inside the manual runtime's turn on the shared
+//! runtime) and a listener blocked there stays in flight until released.
+//! test/runtime/shared_runtime_test.zig covers the runtime's own threads.
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -29,6 +31,7 @@ fn topicDesc(t: DDS.Topic) DDS.TopicDescription {
 }
 
 const Fixture = struct {
+    mr: ManualRuntime,
     delivery: IntraProcessDelivery,
     t_w: *zzdds.intraprocess.MemoryTransport,
     d_w: *zzdds.intraprocess.DirectDiscovery,
@@ -44,6 +47,7 @@ const Fixture = struct {
     topic_r: DDS.Topic,
 
     fn init(self: *Fixture, alloc: std.mem.Allocator) !void {
+        self.mr.init();
         self.delivery = try IntraProcessDelivery.init(alloc);
         self.t_w = try self.delivery.newTransport();
         self.d_w = try self.delivery.newDiscovery();
@@ -62,6 +66,7 @@ const Fixture = struct {
     fn deinit(self: *Fixture) void {
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_w.deinit();
         self.factory_r.deinit();
         self.d_w.deinit();
@@ -69,11 +74,21 @@ const Fixture = struct {
         self.t_w.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
     }
 
+    /// Creates a writer, matched with the reader once this returns.
     fn writer(self: *Fixture) *DataWriterImpl {
         const dw = self.pub_w.create_datawriter(self.topic_w, .{}, null, 0);
+        self.mr.settle();
         return @ptrCast(@alignCast(dw.ptr));
+    }
+
+    /// Writes one sample and delivers it (a no-op settle on the default
+    /// build, which delivers inside the write).
+    fn write(self: *Fixture, dw: *DataWriterImpl) void {
+        _ = dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD) catch {};
+        self.mr.settle();
     }
 };
 
@@ -118,10 +133,6 @@ const Gate = struct {
         self.set_returned_before_callback = self.set_returned.load(.seq_cst);
     }
 
-    fn write(dw: *DataWriterImpl) void {
-        _ = dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD) catch {};
-    }
-
     fn clearReader(self: *Gate, dr: DDS.DataReader) void {
         self.set_rc = dr.set_listener(null, 0);
         self.set_returned.store(true, .seq_cst);
@@ -135,8 +146,8 @@ const Gate = struct {
     /// With the first callback blocked on the writer's thread, runs
     /// `clear` on another thread and releases the callback only once
     /// `clear` waits for it.
-    fn expectSetterWaits(self: *Gate, dw: *DataWriterImpl, comptime clear: anytype, target: anytype) !void {
-        const writer_thread = try std.Thread.spawn(.{}, write, .{dw});
+    fn expectSetterWaits(self: *Gate, fx: *Fixture, dw: *DataWriterImpl, comptime clear: anytype, target: anytype) !void {
+        const writer_thread = try std.Thread.spawn(.{}, Fixture.write, .{ fx, dw });
         try testing.expect(awaitTrue(isSet, .{&self.entered}));
         const setter = try std.Thread.spawn(.{}, clear, .{ self, target });
         try testing.expect(awaitTrue(setterWaiting, .{}));
@@ -163,7 +174,7 @@ test "clearing a reader's listener from outside a callback waits for its running
     defer _ = fx.sub_r.delete_datareader(dr);
     gate.reader = dr.ptr;
     const dw = fx.writer();
-    try gate.expectSetterWaits(dw, Gate.clearReader, dr);
+    try gate.expectSetterWaits(&fx, dw, Gate.clearReader, dr);
 }
 
 test "clearing a participant's listener waits for its callback dispatched for a reader" {
@@ -179,7 +190,7 @@ test "clearing a participant's listener waits for its callback dispatched for a 
     var dp_listener = DDS.DomainParticipantListener{ .listener_data = &gate, .on_data_available = Gate.onData };
     try testing.expectEqual(DDS.RETCODE_OK, fx.dp_r.vtable.set_listener(fx.dp_r.ptr, &dp_listener, DDS.DATA_AVAILABLE_STATUS));
     const dw = fx.writer();
-    try gate.expectSetterWaits(dw, Gate.clearParticipant, fx.dp_r);
+    try gate.expectSetterWaits(&fx, dw, Gate.clearParticipant, fx.dp_r);
 }
 
 /// A listener that clears itself from its own callback.
@@ -195,8 +206,8 @@ const SelfClear = struct {
         self.rc = self.dr.set_listener(null, 0);
     }
 
-    fn write(self: *SelfClear, dw: *DataWriterImpl) void {
-        Gate.write(dw);
+    fn write(self: *SelfClear, fx: *Fixture, dw: *DataWriterImpl) void {
+        fx.write(dw);
         self.done.store(true, .seq_cst);
     }
 };
@@ -214,13 +225,13 @@ test "a listener clearing itself from its own callback does not wait for itself"
     defer _ = fx.sub_r.delete_datareader(dr);
     state.dr = dr;
     const dw = fx.writer();
-    const writer_thread = try std.Thread.spawn(.{}, SelfClear.write, .{ &state, dw });
+    const writer_thread = try std.Thread.spawn(.{}, SelfClear.write, .{ &state, &fx, dw });
     // Waiting for itself would never return.
     if (!awaitTrue(isSet, .{&state.done})) @panic("set_listener from its own callback waited for itself");
     writer_thread.join();
     try testing.expectEqual(@as(u32, 1), state.calls);
     try testing.expectEqual(DDS.RETCODE_OK, state.rc);
     // A second write finds no listener.
-    Gate.write(dw);
+    fx.write(dw);
     try testing.expectEqual(@as(u32, 1), state.calls);
 }
