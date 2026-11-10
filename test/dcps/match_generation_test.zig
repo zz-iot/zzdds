@@ -624,6 +624,71 @@ test "a writer created after an incompatible reader was discovered counts it as 
     try testing.expectEqualSlices(DDS.QosPolicyCount, &.{.{ .policy_id = DDS.DEADLINE_QOS_POLICY_ID, .count = 1 }}, s.policies._buffer.?[0..s.policies._length]);
 }
 
+test "an incompatible reader discovered between a writer's enabling and its announcement is counted once" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    // create_datawriter prepares the writer twice: before enabling it, and
+    // again after, just before announcing it. Announce the reader at the
+    // second.
+    const Window = struct {
+        const Cbs = @FieldType(dcps.PublisherImpl, "cbs");
+        var harness: *Harness = undefined;
+        var original: @FieldType(Cbs, "prepare_writers") = undefined;
+        var calls: u32 = 0;
+
+        fn prepareWriters(ctx: *anyopaque, handles: []const DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void {
+            try original(ctx, handles, publisher_handle, partition_names, presentation);
+            calls += 1;
+            if (calls == 2) harness.announceReaderWith(endpointGuid(0x75, 1, READER_KIND), .{ .deadline_s = 1 });
+        }
+    };
+    const pub_impl: *dcps.PublisherImpl = @ptrCast(@alignCast(h.pub_.ptr));
+    Window.harness = &h;
+    Window.original = pub_impl.cbs.prepare_writers;
+    pub_impl.cbs.prepare_writers = Window.prepareWriters;
+    var qos = DDS.DataWriterQos{};
+    qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    qos.deadline.period = .{ .sec = 2, .nanosec = 0 };
+    const w = h.writer(qos, null);
+    pub_impl.cbs.prepare_writers = Window.original;
+
+    try testing.expectEqual(@as(u32, 2), Window.calls);
+    try testing.expectEqual(@as(i32, 0), pubMatched(w).current_count);
+    try testing.expectEqual(@as(i32, 1), offeredIncompatible(w));
+}
+
+test "an incompatible writer discovered between a reader's enabling and its announcement is counted once" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    // As for a writer: announce the writer at the reader's second preparing.
+    const Window = struct {
+        const Cbs = @FieldType(dcps.SubscriberImpl, "cbs");
+        var harness: *Harness = undefined;
+        var original: @FieldType(Cbs, "prepare_readers") = undefined;
+        var calls: u32 = 0;
+
+        fn prepareReaders(ctx: *anyopaque, handles: []const DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void {
+            try original(ctx, handles, partition_names, presentation);
+            calls += 1;
+            if (calls == 2) harness.announceWriter(endpointGuid(0x76, 1, WRITER_KIND), .{ .deadline_s = 2 });
+        }
+    };
+    const sub_impl: *dcps.SubscriberImpl = @ptrCast(@alignCast(h.sub.ptr));
+    Window.harness = &h;
+    Window.original = sub_impl.cbs.prepare_readers;
+    sub_impl.cbs.prepare_readers = Window.prepareReaders;
+    var qos = DDS.DataReaderQos{};
+    qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
+    const r = h.reader(qos, null);
+    sub_impl.cbs.prepare_readers = Window.original;
+
+    try testing.expectEqual(@as(u32, 2), Window.calls);
+    try testing.expectEqual(@as(i32, 0), subMatched(r).current_count);
+    try testing.expectEqual(@as(i32, 1), requestedIncompatible(r));
+}
+
 test "a reader refreshed with a shorter deadline than its writer offers is unmatched, and counted once as incompatible" {
     var h: Harness = undefined;
     try h.init();

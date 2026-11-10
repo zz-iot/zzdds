@@ -3375,7 +3375,9 @@ pub const DomainParticipantImpl = struct {
             const local_rd = disc_adapter.readerDiscoveredData(ar.qos, ar.presentation);
             const result = qm_mod.checkDiscovered(data.qos, &local_rd);
             if (!result.isCompatible()) {
-                ar.incompat_pending.record(result.incompatible);
+                // Not yet announced, its first announcement counts this
+                // writer: it checks every writer discovered by then.
+                if (ar.announced) ar.incompat_pending.record(result.incompatible);
                 if (can_unmatch) unmatchWriterLocked(ar, data.guid, &removed);
                 continue;
             }
@@ -3683,7 +3685,9 @@ pub const DomainParticipantImpl = struct {
             const local_wd = disc_adapter.writerDiscoveredData(aw.qos, aw.presentation);
             const result = qm_mod.checkDiscovered(&local_wd, data.qos);
             if (!result.isCompatible()) {
-                aw.incompat_pending.record(result.incompatible);
+                // Not yet announced, its first announcement counts this
+                // reader: it checks every reader discovered by then.
+                if (aw.announced) aw.incompat_pending.record(result.incompatible);
                 if (can_unmatch) unmatchReaderLocked(aw, data.guid, &removed);
                 continue;
             }
