@@ -37,7 +37,7 @@ concurrency:
 env:
   INTEROP_RELEASE_TAG: v2.1.2026
   # Keep the fallback below and release.yml on the same harness revision.
-  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || '696aebf4a1c9775cc5bf726d1f0c7baebe1fb7b0' }}
+  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-76cd6f4' }}
 
 jobs:
   design-validation:

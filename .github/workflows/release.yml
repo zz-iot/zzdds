@@ -196,7 +196,7 @@ jobs:
     # the newer Ubuntu that ubuntu-latest now resolves to.
     runs-on: ubuntu-24.04
     env:
-      INTEROP_RTPS_REF: 696aebf4a1c9775cc5bf726d1f0c7baebe1fb7b0
+      INTEROP_RTPS_REF: zenzen-76cd6f4
 
     steps:
       - name: Check out zzdds
