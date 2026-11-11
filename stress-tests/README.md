@@ -129,6 +129,10 @@ timer-driven listener"). `--scenario`:
   mid-match drives events onto a graph whose participant is also tearing down. (audit:
   *"many-participant SPDP/SEDP fan-in/fan-out"* + *"participant-churning listener
   fallback"* — covers both)
+  Each participant announces itself every 100 ms instead of every 3 s and waits up to 1 s
+  for its endpoint's first match before exchanging samples. At the default period a
+  participant lives too briefly to learn of the ones created before it, so only those
+  created almost together matched.
 - **`instance`** — each thread owns a Publisher + DataWriter; all churn
   `register_instance` / `write` / `dispose` / `unregister_instance` / `get_key_value` /
   `lookup_instance` across a small keyspace while one shared reader + drainer fans in.
@@ -148,6 +152,16 @@ lane (`reentrant`, `listener` and `cft` each pin a data-race fix, see Findings).
 The job also runs all of that on a `-Dshared-runtime` build. To do the same locally, set
 `ZZDDS_SHARED_RUNTIME=1`, which makes each `run.py` build its app with that option. Set
 `ZZDDS_TEST_LOG_STUCK_STACKS=1` to log the stacks of a process that outlives its timeout.
+
+`ZZDDS_DEBUG_ALLOCATOR=1`, which CI sets, makes each `run.py` build its app's zzdds with
+`-Ddebug-allocator -Ddebug-allocator-stack-traces=false`. The allocator still catches every
+double free and mismatched free, and `run.py` fails on its report, but the report names no
+allocation or free site: rebuild with stack traces to see them. Recording a trace on every
+allocation holds the allocator's lock, which slows discovery enough that the
+`participants` scenario fails on the shared runtime.
+
+Job `stress-other` runs the same `run_all.py --strict` suite on Linux ARM64 and macOS ARM64,
+on both builds, without the ThreadSanitizer steps.
 
 ## Findings
 

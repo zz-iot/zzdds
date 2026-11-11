@@ -17,10 +17,9 @@
 //! line the harness asserts on.
 //!
 //! Any failure path prints a line starting "FAIL:" and exits nonzero.
-//! Linux-only (uses getpid for the process label); the stress harness runs
-//! on Linux CI.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 const gen = @import("messenger_gen");
@@ -229,8 +228,14 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn pid() i32 {
-    return std.os.linux.getpid();
+/// The raw Linux syscall only on Linux: on macOS its number is an invalid
+/// syscall, and the process dies of SIGSYS.
+fn pid() i64 {
+    return switch (builtin.os.tag) {
+        .linux => std.os.linux.getpid(),
+        .windows => std.os.windows.GetCurrentProcessId(),
+        else => std.c.getpid(),
+    };
 }
 
 fn runPub(io: std.Io, alloc: std.mem.Allocator, cfg: Config) !void {

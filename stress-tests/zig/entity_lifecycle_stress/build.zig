@@ -13,12 +13,16 @@ pub fn build(b: *std.Build) void {
     // this (confirmed upstream in zzdds's build.zig).
     const use_llvm: ?bool = if (sanitize_thread) true else null;
     const shared_runtime = b.option(bool, "shared-runtime", "Build zzdds with -Dshared-runtime (contributors only; default: false)") orelse false;
+    const debug_allocator = b.option(bool, "debug-allocator", "Build zzdds with -Ddebug-allocator, so the factory's own allocations go through a DebugAllocator (default: false)") orelse false;
+    const debug_allocator_stack_traces = b.option(bool, "debug-allocator-stack-traces", "Build zzdds with -Ddebug-allocator-stack-traces (default: true)") orelse true;
 
     const zzdds_dep = b.dependency("zzdds", .{
         .target = target,
         .optimize = optimize,
         .@"sanitize-thread" = sanitize_thread,
         .@"shared-runtime" = shared_runtime,
+        .@"debug-allocator" = debug_allocator,
+        .@"debug-allocator-stack-traces" = debug_allocator_stack_traces,
     });
     const zzdds_mod = zzdds_dep.module("zzdds");
     const zzdds_gen = zzdds_dep.module("zzdds_generated");

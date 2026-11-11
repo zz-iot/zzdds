@@ -830,6 +830,9 @@ jobs:
       # The stress apps build their own zzdds, so run.py passes them
       # -Dshared-runtime too (examples/_common.py's shared_runtime_args).
       ZZDDS_SHARED_RUNTIME: ${{ matrix.runtime == 'shared' && '1' || '0' }}
+      # Likewise -Ddebug-allocator, so zzdds's own allocations in the stress
+      # apps go through a DebugAllocator (debug_allocator_args).
+      ZZDDS_DEBUG_ALLOCATOR: "1"
       # A process that outlives its timeout logs its stacks before it is killed
       # (examples/_common.py's dump_stacks).
       ZZDDS_TEST_LOG_STUCK_STACKS: "1"
@@ -919,6 +922,73 @@ jobs:
           path: |
             /tmp/elc-stress*/**
             /tmp/churn-stress*/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ── Stress tests: ARM64 platforms ─────────────────────────────────────────
+  #
+  # The same strict suite as `stress`, on Linux ARM64 and macOS ARM64, on both
+  # builds. ARM64's weaker memory ordering and macOS's scheduler can expose
+  # races x86_64 Linux hides. No TSan lane: TSan on macOS crashes on startup
+  # (see test-other), and Linux ARM64 TSan is a separate spike.
+  stress-other:
+    name: stress / ${{ matrix.name }}${{ matrix.runtime == 'shared' && ' (shared runtime)' || '' }}
+    needs: test-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux ARM64, os: ubuntu-24.04-arm, runtime: threaded }
+          - { name: Linux ARM64, os: ubuntu-24.04-arm, runtime: shared }
+          - { name: macOS ARM64, os: macos-latest, runtime: threaded }
+          - { name: macOS ARM64, os: macos-latest, runtime: shared }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      ZZDDS_SHARED_RUNTIME: ${{ matrix.runtime == 'shared' && '1' || '0' }}
+      ZZDDS_DEBUG_ALLOCATOR: "1"
+      ZZDDS_TEST_LOG_STUCK_STACKS: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: "0.17.0"
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build zzdds (native, DebugAllocator)
+        run: zig build -Ddebug-allocator=true -Dshared-runtime=${{ matrix.runtime == 'shared' }} install
+
+      # gdb (Linux) or lldb (macOS) for stuck-process stack dumps; see
+      # `stress`. Best-effort: never fails the job.
+      - name: Prepare failure diagnostics
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            command -v gdb >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends gdb || true; }
+            echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope || true
+          else
+            sudo DevToolsSecurity -enable || true
+          fi
+          # macOS's tempfile directory is not /tmp, so give every platform
+          # one log root for the upload below.
+          mkdir -p "$RUNNER_TEMP/stress-logs"
+          echo "TMPDIR=$RUNNER_TEMP/stress-logs" >> "$GITHUB_ENV"
+
+      - name: Run stress suite (strict)
+        run: stress-tests/run_all.py --strict
+
+      - name: Upload stress logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-logs-${{ matrix.os }}-${{ matrix.runtime }}
+          path: ${{ runner.temp }}/stress-logs
           if-no-files-found: ignore
           retention-days: 7
 
