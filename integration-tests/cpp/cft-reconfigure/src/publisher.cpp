@@ -162,11 +162,13 @@ int main(int argc, char **argv) {
 
     // -- Wait for both of the subscriber's readers (witness + filtered) to
     // match before writing anything, so phase1 is guaranteed to actually
-    // reach both. --
-    for (int waited_ms = 0; state.matched_current_count.load() < 2; waited_ms += POLL_PERIOD_MS) {
+    // reach both. The writer's status is polled, not the count the listener
+    // last saw: on the threaded runtime two matches' callbacks can arrive in
+    // the opposite order, leaving the listener's count at 1. --
+    for (int waited_ms = 0; writer_matched(dw) < 2; waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= MATCH_TIMEOUT_MS) {
             std::fprintf(stderr, "  matched: writer listener=%d status=%d GoTopic_reader=%d\n", state.matched_current_count.load(), writer_matched(dw), reader_matched(go_dr));
-            std::fprintf(stderr, "FAIL: fewer than 2 readers matched within %ds (got %d)\n", MATCH_TIMEOUT_MS / 1000, state.matched_current_count.load());
+            std::fprintf(stderr, "FAIL: fewer than 2 readers matched within %ds (got %d)\n", MATCH_TIMEOUT_MS / 1000, writer_matched(dw));
             return 1;
         }
         usleep(POLL_PERIOD_MS * 1000);

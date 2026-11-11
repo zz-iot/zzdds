@@ -24,6 +24,10 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   `trace.TraceConfig` are replaced by `setTraceSink`, which replaces the configured sink
   with the application's own while the config's scope and filter still apply. The
   `-Dguid-filter` build option is removed: filtering is configuration.
+- The `cft-reconfigure` integration test's publishers wait for both of the subscriber's
+  readers by polling the writer's matched status, not the count their listener last saw.
+  On the threaded runtime one endpoint's listener callbacks can run at once and arrive out
+  of order, which left the listener at 1 of 2 matches. docs/roadmap.md records the gap.
 
 ## 2026-11-10
 
