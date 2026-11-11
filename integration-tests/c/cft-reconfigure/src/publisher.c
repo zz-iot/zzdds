@@ -234,7 +234,9 @@ int main(int argc, char **argv) {
         fflush(stdout);
     }
 
-    for (int waited_ms = 0; atomic_load(&state.matched_current_count) != 0; waited_ms += POLL_PERIOD_MS) {
+    /* Polls the status too: polling it above consumed changes the listener
+     * would otherwise have reported, so the listener's count can be stale. */
+    for (int waited_ms = 0; writer_matched(dw) != 0; waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= DRAIN_TIMEOUT_MS) {
             fprintf(stderr, "  matched: writer listener=%d status=%d\n", atomic_load(&state.matched_current_count), writer_matched(dw));
             fprintf(stderr, "FAIL: subscriber did not disconnect within %ds\n", DRAIN_TIMEOUT_MS / 1000);

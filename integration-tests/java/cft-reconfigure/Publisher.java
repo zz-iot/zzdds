@@ -193,7 +193,9 @@ public class Publisher {
         }
 
         deadline = System.currentTimeMillis() + DRAIN_TIMEOUT_MS;
-        while (state.matchedCurrentCount.get() != 0) {
+        // Polls the status too: polling it above consumed changes the
+        // listener would otherwise have reported, so its count can be stale.
+        while (writerMatched(dw) != 0) {
             if (System.currentTimeMillis() > deadline) {
                 System.err.println("  matched: writer listener=" + state.matchedCurrentCount.get() + " status=" + writerMatched(dw));
                 System.err.println("FAIL: subscriber did not disconnect within " + (DRAIN_TIMEOUT_MS / 1000) + "s");
