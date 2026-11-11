@@ -13,6 +13,7 @@
 //! second MemoryTransport stand in for those writers' traffic.
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const testing = std.testing;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
@@ -157,6 +158,7 @@ const MAX_TOPICS = 2;
 /// sends crafted traffic as if from those writers.
 const Fixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
     t_w: *MemoryTransport,
     d_w: *zzdds.intraprocess.DirectDiscovery,
@@ -181,6 +183,10 @@ const Fixture = struct {
         dr_qos: DDS.DataReaderQos,
         reliable: bool,
     ) !void {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         const t_w = try delivery.newTransport();
         const d_w = try delivery.newDiscovery();
@@ -201,6 +207,7 @@ const Fixture = struct {
         const sub_r = dp_r.create_subscriber(sub_qos, null, 0);
 
         self.* = .{
+            .mr = mr,
             .alloc = alloc,
             .delivery = delivery,
             .t_w = t_w,
@@ -235,12 +242,15 @@ const Fixture = struct {
             const dr = sub_r.create_datareader(td, qos, null, 0);
             self.readers[i] = @ptrCast(@alignCast(dr.ptr));
         }
+        // Matching runs on the runtime too.
+        self.settle();
     }
 
     fn deinit(self: *Fixture) void {
         self.injector.deinit();
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_w.deinit();
         self.factory_r.deinit();
         self.d_w.deinit();
@@ -248,6 +258,13 @@ const Fixture = struct {
         self.t_w.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *Fixture) void {
+        self.mr.settle();
     }
 
     /// Send one RTPS message, as if from the writer participant.
@@ -257,6 +274,7 @@ const Fixture = struct {
         try msg.header(self.alloc, self.prefix);
         try build.add(self.alloc, &msg, self.writer_eids);
         try self.injector.transport().send(&self.dest, msg.buf.items);
+        self.settle();
     }
 
     /// begin_access, then the number of samples each reader exposes.
@@ -528,12 +546,14 @@ test "group coherent set: a part that arrived before its writer matched joins it
     var held_ctx: u8 = 0;
     r0.proto_reader.setWriterMatchCallback(.{ .ctx = &held_ctx, .on_writer_matched = Held.matched, .on_writer_unmatched = Held.unmatched });
     _ = try r0.proto_reader.addMatchedWriter(&info);
+    fx.settle();
     try testing.expectEqual([_]usize{ 0, 0 }, try fx.access(2));
 
     // Once the match completes, the part joins its publisher's set, which
     // waits for writer 1's part.
     r0.proto_reader.setWriterMatchCallback(real_cb);
     real_cb.on_writer_matching.?(real_cb.ctx, &info, false);
+    fx.settle();
     try testing.expectEqual([_]usize{ 0, 0 }, try fx.access(2));
 
     try fx.inject(struct {

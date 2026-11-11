@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -155,6 +156,7 @@ const Recorder = struct {
 /// IntraProcessDelivery (synchronous delivery). `a`'s Publisher and
 /// Subscriber create their endpoints disabled.
 const Fixture = struct {
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
     rec: *Recorder,
     t_a: *zzdds.intraprocess.MemoryTransport,
@@ -173,6 +175,10 @@ const Fixture = struct {
     topic_b: DDS.Topic,
 
     fn init(alloc: std.mem.Allocator, rec: *Recorder) !Fixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
         const config = zzdds.config.Config{};
@@ -205,6 +211,7 @@ const Fixture = struct {
         const topic_b = dp_b.create_topic(TOPIC, "AnnounceType", .{}, null, 0);
 
         return .{
+            .mr = mr,
             .delivery = delivery,
             .rec = rec,
             .t_a = t_a,
@@ -227,6 +234,7 @@ const Fixture = struct {
     fn deinit(self: *Fixture) void {
         _ = self.factory_a.toDDSFactory().delete_participant(self.dp_a);
         _ = self.factory_b.toDDSFactory().delete_participant(self.dp_b);
+        self.mr.settle();
         self.factory_a.deinit();
         self.factory_b.deinit();
         self.d_a.deinit();
@@ -234,6 +242,13 @@ const Fixture = struct {
         self.t_a.deinit();
         self.t_b.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *Fixture) void {
+        self.mr.settle();
     }
 };
 
@@ -326,6 +341,7 @@ test "a writer is in its Publisher when its announcement's matches are reported"
     Probe.publisher = pub_;
     Probe.calls = 0;
     _ = pub_.create_datawriter(fx.topic_a, .{}, .{ .on_publication_matched = Probe.onMatched }, DDS.PUBLICATION_MATCHED_STATUS);
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), Probe.calls);
     try testing.expect(Probe.found);
 }
@@ -348,8 +364,12 @@ test "a writer its announcement's match callback deletes is not returned by crea
     Probe.publisher = pub_;
     Probe.rc = DDS.RETCODE_ERROR;
     const dw = pub_.create_datawriter(fx.topic_a, .{}, .{ .on_publication_matched = Probe.onMatched }, DDS.PUBLICATION_MATCHED_STATUS);
+    fx.settle();
     try testing.expectEqual(DDS.RETCODE_OK, Probe.rc);
-    try testing.expect(dw.ptr == zzdds.dcps.NIL_PTR);
+    try testing.expect(pub_.lookup_datawriter(TOPIC).ptr == zzdds.dcps.NIL_PTR);
+    // On the shared runtime the match is reported after creation returns,
+    // so only the threaded path can hand back a writer already deleted.
+    if (!zzdds.runtime.enabled) try testing.expect(dw.ptr == zzdds.dcps.NIL_PTR);
 }
 
 test "a reader its announcement's match callback deletes is not returned by create_datareader" {
@@ -370,8 +390,11 @@ test "a reader its announcement's match callback deletes is not returned by crea
     Probe.subscriber = sub;
     Probe.rc = DDS.RETCODE_ERROR;
     const dr = sub.create_datareader(topicDesc(fx.topic_a), .{}, .{ .on_subscription_matched = Probe.onMatched }, DDS.SUBSCRIPTION_MATCHED_STATUS);
+    fx.settle();
     try testing.expectEqual(DDS.RETCODE_OK, Probe.rc);
-    try testing.expect(dr.ptr == zzdds.dcps.NIL_PTR);
+    try testing.expect(sub.lookup_datareader(TOPIC).ptr == zzdds.dcps.NIL_PTR);
+    // As for the writer: only the threaded path can return it deleted.
+    if (!zzdds.runtime.enabled) try testing.expect(dr.ptr == zzdds.dcps.NIL_PTR);
 }
 
 test "a writer whose announcement cannot be reserved is not created" {
@@ -416,12 +439,14 @@ fn partitionCount(p: DDS.PartitionQosPolicy) u32 {
 
 fn offeredIncompatibleCount(dw: DDS.DataWriter) !i32 {
     var st: DDS.OfferedIncompatibleQosStatus = .{};
+    defer st.policies.deinit(testing.allocator);
     try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.get_offered_incompatible_qos_status(dw.ptr, &st));
     return st.total_count;
 }
 
 fn requestedIncompatibleCount(dr: DDS.DataReader) !i32 {
     var st: DDS.RequestedIncompatibleQosStatus = .{};
+    defer st.policies.deinit(testing.allocator);
     try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.get_requested_incompatible_qos_status(dr.ptr, &st));
     return st.total_count;
 }
@@ -578,6 +603,7 @@ test "a match decided before a Publisher's partition change is not made after it
     // Its discovery decides a match with each writer; the first one made
     // moves both writers out of its partition before the second is made.
     const dr_b = fx.sub_b.create_datareader(topicDesc(fx.topic_b), .{}, null, 0);
+    fx.settle();
     try testing.expect(Probe.changed);
     try testing.expectEqual(DDS.RETCODE_OK, Probe.rc);
     try testing.expectEqual(@as(i32, 0), try publicationMatchedCount(dw_1));

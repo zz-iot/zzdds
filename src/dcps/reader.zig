@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const DDS = @import("zzdds_generated").DDS;
+const incompat_policies = @import("incompat_policies.zig");
 const ZZDDS = @import("zzdds_ext_generated").zzdds;
 const nil = @import("nil.zig");
 const qos_change = @import("qos_change.zig");
@@ -363,6 +364,8 @@ pub const DataReaderImpl = struct {
     incompat_total: std.atomic.Value(i32) = .init(0),
     incompat_total_change: i32 = 0,
     incompat_last_policy: i32 = 0,
+    /// The status's per-policy counts; guarded by `mu`.
+    incompat_policies: incompat_policies.Counts = .{},
 
     /// SubscriptionMatched status counters. Guarded by `mu`.
     sub_matched_total: i32 = 0,
@@ -2675,6 +2678,7 @@ pub const DataReaderImpl = struct {
         self.mu.lock();
         self.incompat_total_change += 1;
         self.incompat_last_policy = policy_id;
+        self.incompat_policies.record(policy_id);
         self.status_changes |= DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS;
         // Release ordering: publishes the plain-field writes above (program
         // order on this thread) to any thread that observes this value via
@@ -2698,6 +2702,9 @@ pub const DataReaderImpl = struct {
         status.total_count = self.incompat_total.load(.monotonic);
         status.total_count_change = self.incompat_total_change;
         status.last_policy_id = self.incompat_last_policy;
+        // Borrowed for the callback: listeners copy what they keep.
+        var policies: [incompat_policies.id_limit]DDS.QosPolicyCount = undefined;
+        status.policies = self.incompat_policies.borrowed(&policies);
         const claimed = self.claimStatusLocked(DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS, target != null);
         if (claimed) self.incompat_total_change = 0;
         self.mu.unlock();
@@ -3545,11 +3552,11 @@ pub const DataReaderImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
         defer self.mu.unlock();
-        status.* = .{
-            .total_count = self.incompat_total.load(.monotonic),
-            .total_count_change = self.incompat_total_change,
-            .last_policy_id = self.incompat_last_policy,
-        };
+        // Filled first: when it cannot be, nothing is consumed.
+        self.incompat_policies.fill(self.alloc, &status.policies) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        status.total_count = self.incompat_total.load(.monotonic);
+        status.total_count_change = self.incompat_total_change;
+        status.last_policy_id = self.incompat_last_policy;
         self.incompat_total_change = 0;
         self.status_changes &= ~DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS;
         return DDS.RETCODE_OK;

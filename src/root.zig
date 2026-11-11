@@ -182,6 +182,7 @@ test {
     _ = @import("util/entity_quiesce.zig");
     _ = @import("util/drain_queue.zig");
     _ = @import("dcps/qos_match.zig");
+    _ = @import("dcps/incompat_policies.zig");
     _ = @import("dcps/nil.zig");
     _ = @import("dcps/topic.zig");
     _ = @import("dcps/waitset.zig");

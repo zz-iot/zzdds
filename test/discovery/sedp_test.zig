@@ -1117,6 +1117,76 @@ test "SEDP: a writer prepared while the plugin is stopped is announced once the 
     try testing.expectEqual(history_kind.not_alive_disposed, plugin.sedp.pub_writer.?.cache.changes.items[0].kind);
 }
 
+/// A transport that, at each `listen`, records whether `plugin`'s WLP
+/// endpoints exist: WLP receives through SEDP's listener, so a datagram for
+/// it may be handled as soon as SEDP listens. Every other call goes straight
+/// to `inner`, with its own context.
+const WlpReadyAtListen = struct {
+    inner: mock_tr.Transport,
+    vtable: mock_tr.Transport.Vtable,
+    plugin: ?*zzdds.combined_discovery.SpdpSedpDiscovery = null,
+    listens: u32 = 0,
+    before_wlp: u32 = 0,
+
+    /// The one in use: `listen` gets `inner`'s context, not this.
+    var current: ?*WlpReadyAtListen = null;
+
+    fn init(self: *WlpReadyAtListen, inner: mock_tr.Transport) void {
+        self.* = .{ .inner = inner, .vtable = inner.vtable.* };
+        self.vtable.listen = listen;
+        current = self;
+    }
+
+    fn deinit(_: *WlpReadyAtListen) void {
+        current = null;
+    }
+
+    fn transport(self: *WlpReadyAtListen) mock_tr.Transport {
+        return .{ .ctx = self.inner.ctx, .vtable = &self.vtable };
+    }
+
+    fn listen(ctx: *anyopaque, locator: *const Locator, handler: mock_tr.ReceiveHandler) anyerror!void {
+        const self = current.?;
+        self.listens += 1;
+        const pair = &self.plugin.?.wlp.pair;
+        if (pair.writer == null or pair.reader == null) self.before_wlp += 1;
+        return self.inner.vtable.listen(ctx, locator, handler);
+    }
+};
+
+test "SEDP: discovery starts WLP before it listens, so WLP's traffic never finds its endpoints missing" {
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+    const meta_locs = [_]Locator{Locator.udp4(.{ 127, 0, 0, 0x33 }, metaPort(0x33))};
+    const mock = try MockTransport.init(testing.allocator, net, &meta_locs);
+    defer mock.deinit();
+    var wrapped: WlpReadyAtListen = undefined;
+    wrapped.init(mock.transport());
+    defer wrapped.deinit();
+    const plugin = try zzdds.combined_discovery.SpdpSedpDiscovery.init(testing.allocator, wrapped.transport(), 0, 1_000);
+    defer plugin.deinit();
+    wrapped.plugin = plugin;
+    const d = plugin.toDiscovery();
+    var rec: Recorder = .{ .alloc = testing.allocator };
+    defer rec.deinit();
+    const cbs = rec.callbacks();
+    const ann: ParticipantAnnouncement = .{
+        .guid = makeGuid(0x33, 0x01),
+        .domain_id = 0,
+        .name = "",
+        .metatraffic_unicast_locators = &meta_locs,
+        .metatraffic_multicast_locators = &.{},
+        .default_unicast_locators = &.{},
+        .default_multicast_locators = &.{},
+        .lease_duration_ms = 10_000,
+        .builtin_endpoint_set = ALL_SEDP_ENDPOINTS,
+    };
+    try d.start(&ann, &cbs);
+    defer d.stop();
+    try testing.expect(wrapped.listens > 0);
+    try testing.expectEqual(@as(u32, 0), wrapped.before_wlp);
+}
+
 test "SEDP: a writer prepared again is announced with the replacement only once adopted, with no memory left" {
     var r: Reserving = undefined;
     try r.init();

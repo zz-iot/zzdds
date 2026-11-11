@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -63,6 +64,7 @@ fn drainSamples(alloc: std.mem.Allocator, dr: *DataReaderImpl) ![][]u8 {
 
 const Fixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
 
     t_w: *zzdds.intraprocess.MemoryTransport,
@@ -80,6 +82,10 @@ const Fixture = struct {
     topic_r: DDS.Topic,
 
     fn init(alloc: std.mem.Allocator) !Fixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
 
@@ -120,6 +126,7 @@ const Fixture = struct {
         const topic_r = dp_r.create_topic("QosTopic", "QosType", .{}, null, 0);
 
         return .{
+            .mr = mr,
             .alloc = alloc,
             .delivery = delivery,
             .t_w = t_w,
@@ -140,6 +147,7 @@ const Fixture = struct {
     fn deinit(self: *Fixture) void {
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_w.deinit();
         self.factory_r.deinit();
         self.d_w.deinit();
@@ -147,6 +155,13 @@ const Fixture = struct {
         self.t_w.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *Fixture) void {
+        self.mr.settle();
     }
 
     fn makeWriterReader(
@@ -157,6 +172,8 @@ const Fixture = struct {
         const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
         const dr_raw = self.sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
         const dw_raw = self.pub_w.create_datawriter(self.topic_w, dw_qos, null, 0);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return .{
             .dw = @ptrCast(@alignCast(dw_raw.ptr)),
             .dr = @ptrCast(@alignCast(dr_raw.ptr)),
@@ -184,6 +201,7 @@ test "resource_limits: writer BEST_EFFORT — returns OutOfResources when cache 
     // First two writes succeed.
     try writeRaw(pair.dw, &PAYLOAD_A);
     try writeRaw(pair.dw, &PAYLOAD_B);
+    fx.settle();
 
     // Third write hits the limit (cache still holds A and B for BEST_EFFORT).
     const err = pair.dw.writeRaw(
@@ -193,6 +211,7 @@ test "resource_limits: writer BEST_EFFORT — returns OutOfResources when cache 
         std.mem.zeroes([16]u8),
         &PAYLOAD_C,
     );
+    fx.settle();
     try testing.expectError(error.OutOfResources, err);
 }
 
@@ -212,7 +231,10 @@ test "resource_limits: writer RELIABLE VOLATILE — acknowledged samples free sp
     dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
 
     const pair = fx.makeWriterReader(dw_qos, dr_qos);
-    for (0..5) |_| try writeRaw(pair.dw, &PAYLOAD_A);
+    for (0..5) |_| {
+        try writeRaw(pair.dw, &PAYLOAD_A);
+        fx.settle();
+    }
     try testing.expectEqual(@as(usize, 0), pair.dw.proto_writer.cacheLen());
 
     const samples = try drainSamples(alloc, pair.dr);
@@ -241,6 +263,7 @@ test "resource_limits: writer RELIABLE TRANSIENT_LOCAL — acknowledged samples 
     const pair = fx.makeWriterReader(dw_qos, dr_qos);
     try writeRaw(pair.dw, &PAYLOAD_A);
     try writeRaw(pair.dw, &PAYLOAD_B);
+    fx.settle();
     // Kept for late joiners: the write blocks for max_blocking_time, then fails.
     try testing.expectError(error.Timeout, pair.dw.writeRaw(
         .alive,
@@ -249,6 +272,7 @@ test "resource_limits: writer RELIABLE TRANSIENT_LOCAL — acknowledged samples 
         std.mem.zeroes([16]u8),
         &PAYLOAD_C,
     ));
+    fx.settle();
     try testing.expectEqual(@as(usize, 2), pair.dw.proto_writer.cacheLen());
 }
 
@@ -283,6 +307,7 @@ test "resource_limits: writer KEEP_LAST — limit never hit because cache depth 
     try writeRaw(pair.dw, &PAYLOAD_A);
     try writeRaw(pair.dw, &PAYLOAD_B);
     try writeRaw(pair.dw, &PAYLOAD_C);
+    fx.settle();
 }
 
 test "resource_limits: reader — samples dropped when pending queue full" {
@@ -303,6 +328,7 @@ test "resource_limits: reader — samples dropped when pending queue full" {
     try writeRaw(pair.dw, &PAYLOAD_A);
     try writeRaw(pair.dw, &PAYLOAD_B);
     try writeRaw(pair.dw, &PAYLOAD_C); // reader drops this one
+    fx.settle();
 
     const samples = try drainSamples(alloc, pair.dr);
     defer {
@@ -333,6 +359,7 @@ test "resource_limits: reader limit 0 (unlimited) — all samples accepted" {
     try writeRaw(pair.dw, &PAYLOAD_A);
     try writeRaw(pair.dw, &PAYLOAD_B);
     try writeRaw(pair.dw, &PAYLOAD_C);
+    fx.settle();
 
     const samples = try drainSamples(alloc, pair.dr);
     defer {
@@ -353,6 +380,7 @@ test "resource_limits: reader limit 0 (unlimited) — all samples accepted" {
 
 const OwnershipFixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
 
     // Writer A (high strength)
@@ -380,6 +408,10 @@ const OwnershipFixture = struct {
     topic_r: DDS.Topic,
 
     fn init(alloc: std.mem.Allocator) !OwnershipFixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
 
@@ -435,6 +467,7 @@ const OwnershipFixture = struct {
         const topic_r = dp_r.create_topic("OwnTopic", "OwnType", .{}, null, 0);
 
         return .{
+            .mr = mr,
             .alloc = alloc,
             .delivery = delivery,
             .t_a = t_a,
@@ -462,6 +495,7 @@ const OwnershipFixture = struct {
         _ = self.factory_a.toDDSFactory().delete_participant(self.dp_a);
         _ = self.factory_b.toDDSFactory().delete_participant(self.dp_b);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_a.deinit();
         self.d_a.deinit();
         self.t_a.deinit();
@@ -472,21 +506,34 @@ const OwnershipFixture = struct {
         self.d_r.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *OwnershipFixture) void {
+        self.mr.settle();
     }
 
     fn makeReader(self: *OwnershipFixture, dr_qos: DDS.DataReaderQos) *DataReaderImpl {
         const topic_desc = @as(*TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
         const dr_raw = self.sub_r.create_datareader(topic_desc, dr_qos, null, 0);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return @ptrCast(@alignCast(dr_raw.ptr));
     }
 
     fn makeWriterA(self: *OwnershipFixture, dw_qos: DDS.DataWriterQos) *DataWriterImpl {
         const dw_raw = self.pub_a.create_datawriter(self.topic_a, dw_qos, null, 0);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return @ptrCast(@alignCast(dw_raw.ptr));
     }
 
     fn makeWriterB(self: *OwnershipFixture, dw_qos: DDS.DataWriterQos) *DataWriterImpl {
         const dw_raw = self.pub_b.create_datawriter(self.topic_b, dw_qos, null, 0);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return @ptrCast(@alignCast(dw_raw.ptr));
     }
 };
@@ -512,6 +559,7 @@ test "ownership: SHARED — both writers deliver to reader" {
 
     try writeRaw(dw_a, &PAYLOAD_A);
     try writeRaw(dw_b, &PAYLOAD_B);
+    fx.settle();
 
     const samples = try drainSamples(alloc, dr);
     defer {
@@ -552,6 +600,7 @@ test "ownership: EXCLUSIVE — only the highest-strength writer delivers" {
 
     try writeRaw(dw_a, &PAYLOAD_A); // from owner (strength 10) → delivered
     try writeRaw(dw_b, &PAYLOAD_B); // from non-owner (strength 5) → dropped
+    fx.settle();
 
     const samples = try drainSamples(alloc, dr);
     defer {
@@ -599,6 +648,7 @@ test "ownership: EXCLUSIVE — an owner that claimed before its strength was kno
         try testing.expect(dr.writer_strengths.remove(dw_a.guid));
     }
     try writeRaw(dw_a, &PAYLOAD_A); // claims the instance
+    fx.settle();
     {
         dr.mu.lock();
         defer dr.mu.unlock();
@@ -607,6 +657,7 @@ test "ownership: EXCLUSIVE — an owner that claimed before its strength was kno
 
     try writeRaw(dw_b, &PAYLOAD_B); // weaker than the owner → dropped
     try writeRaw(dw_a, &PAYLOAD_A);
+    fx.settle();
 
     const samples = try drainSamples(alloc, dr);
     defer {
@@ -636,6 +687,7 @@ test "ownership: EXCLUSIVE — sole writer becomes owner by default" {
     const pair = fx.makeWriterReader(dw_qos, dr_qos);
 
     try writeRaw(pair.dw, &PAYLOAD_A);
+    fx.settle();
 
     const samples = try drainSamples(alloc, pair.dr);
     defer {
@@ -677,11 +729,13 @@ test "ownership: EXCLUSIVE — owner transfer when current owner is removed" {
     const dw_a: *DataWriterImpl = @ptrCast(@alignCast(dw_a_raw.ptr));
     try writeRaw(dw_a, &PAYLOAD_A); // delivered
     try writeRaw(dw_b, &PAYLOAD_B); // dropped
+    fx.settle();
 
     // Remove writer A.  B should now become the owner.
     _ = fx.pub_a.vtable.delete_datawriter(fx.pub_a.ptr, dw_a_raw);
 
     try writeRaw(dw_b, &PAYLOAD_C); // now delivered (B is the new owner)
+    fx.settle();
 
     const samples = try drainSamples(alloc, dr);
     defer {
@@ -722,6 +776,7 @@ test "keep_last: reader depth=1 silently replaces oldest for same instance (no r
     try writeRawKeyed(pair.dw, &PAYLOAD_A, 0x01);
     try writeRawKeyed(pair.dw, &PAYLOAD_B, 0x01);
     try writeRawKeyed(pair.dw, &PAYLOAD_C, 0x01);
+    fx.settle();
 
     // Only one sample in pending; no rejection should have been triggered.
     try testing.expectEqual(@as(usize, 1), pendingCount(pair.dr));
@@ -759,6 +814,7 @@ test "keep_last: reader depth=1 per-instance — two instances are independent" 
     try writeRawKeyed(pair.dw, &PAYLOAD_A, 0x01);
     try writeRawKeyed(pair.dw, &PAYLOAD_B, 0x02);
     try writeRawKeyed(pair.dw, &PAYLOAD_C, 0x01); // replaces A for instance 0x01
+    fx.settle();
 
     // Two samples total: latest for each instance.
     try testing.expectEqual(@as(usize, 2), pendingCount(pair.dr));
@@ -803,6 +859,7 @@ test "time_based_filter: zero separation (default) — all samples pass" {
     try writeRawAt(pair.dw, &PAYLOAD_A, 0);
     try writeRawAt(pair.dw, &PAYLOAD_B, 0);
     try writeRawAt(pair.dw, &PAYLOAD_C, 0);
+    fx.settle();
 
     const samples = try drainSamples(alloc, pair.dr);
     defer {
@@ -831,6 +888,7 @@ test "time_based_filter: samples within minimum_separation are suppressed" {
     // First sample always delivers; second is at same timestamp (< 1 s apart → drop).
     try writeRawAt(pair.dw, &PAYLOAD_A, 10);
     try writeRawAt(pair.dw, &PAYLOAD_B, 10);
+    fx.settle();
 
     const samples = try drainSamples(alloc, pair.dr);
     defer {
@@ -860,6 +918,7 @@ test "time_based_filter: sample after minimum_separation is delivered" {
     // t=10: delivers; t=11: exactly 1 s later → also delivers.
     try writeRawAt(pair.dw, &PAYLOAD_A, 10);
     try writeRawAt(pair.dw, &PAYLOAD_B, 11);
+    fx.settle();
 
     const samples = try drainSamples(alloc, pair.dr);
     defer {
@@ -892,6 +951,7 @@ test "time_based_filter: multiple suppressions then delivery after window" {
     try writeRawAt(pair.dw, &PAYLOAD_B, 1); // 1s < 2s → drop
     try writeRawAt(pair.dw, &PAYLOAD_C, 1); // 1s < 2s → drop
     try writeRawAt(pair.dw, &PAYLOAD_A, 3); // 3s ≥ 2s → delivers
+    fx.settle();
 
     const samples = try drainSamples(alloc, pair.dr);
     defer {
@@ -923,14 +983,17 @@ test "time_based_filter: per-instance — instances have independent TBF windows
     // t=0 instance B: passes (first for B — independent window).
     try writeRawAtKeyed(pair.dw, &PAYLOAD_A, 0, 0x01);
     try writeRawAtKeyed(pair.dw, &PAYLOAD_B, 0, 0x02);
+    fx.settle();
     // t=3 instance A: within A's 5s window → dropped.
     // t=3 instance B: within B's 5s window → dropped.
     try writeRawAtKeyed(pair.dw, &PAYLOAD_C, 3, 0x01);
     try writeRawAtKeyed(pair.dw, &PAYLOAD_C, 3, 0x02);
+    fx.settle();
     // t=6 instance A: outside A's 5s window → passes.
     // t=6 instance B: outside B's 5s window → passes.
     try writeRawAtKeyed(pair.dw, &PAYLOAD_A, 6, 0x01);
     try writeRawAtKeyed(pair.dw, &PAYLOAD_B, 6, 0x02);
+    fx.settle();
 
     const samples = try drainSamples(alloc, pair.dr);
     defer {
@@ -973,6 +1036,7 @@ fn drListenerDeadline(ctx: *i32) DDS.DataReaderListener {
 
 const TimerFixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
     t: *zzdds.intraprocess.MemoryTransport,
     d: *zzdds.intraprocess.DirectDiscovery,
@@ -983,7 +1047,13 @@ const TimerFixture = struct {
     sub_: DDS.Subscriber,
     topic: DDS.Topic,
 
-    fn init(alloc: std.mem.Allocator, clock: zzdds.util.time.Clock) !TimerFixture {
+    /// Timers run on the manual runtime's clock (the participant's timer
+    /// clock on the default build), which tests move with `mr.manualClock()`.
+    fn init(alloc: std.mem.Allocator) !TimerFixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
         const t = try delivery.newTransport();
@@ -1001,7 +1071,7 @@ const TimerFixture = struct {
             config,
         );
         errdefer factory.deinit();
-        try factory.clock_registry.register("manual", clock);
+        try factory.clock_registry.register("manual", mr.clock());
         const dpf = factory.toDDSFactory();
         const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
         const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -1009,6 +1079,7 @@ const TimerFixture = struct {
         const sub_ = dp.create_subscriber(.{}, null, 0);
         const topic = dp.create_topic("TimerTopic", "TimerType", .{}, null, 0);
         return .{
+            .mr = mr,
             .alloc = alloc,
             .delivery = delivery,
             .t = t,
@@ -1024,10 +1095,18 @@ const TimerFixture = struct {
 
     fn deinit(self: *TimerFixture) void {
         _ = self.factory.toDDSFactory().delete_participant(self.dp);
+        self.mr.settle();
         self.factory.deinit();
         self.d.deinit();
         self.t.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *TimerFixture) void {
+        self.mr.settle();
     }
 
     fn makeWriter(
@@ -1037,6 +1116,8 @@ const TimerFixture = struct {
         mask: DDS.StatusMask,
     ) *DataWriterImpl {
         const dw = self.pub_.create_datawriter(self.topic, qos, listener, mask);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return @ptrCast(@alignCast(dw.ptr));
     }
 
@@ -1048,6 +1129,8 @@ const TimerFixture = struct {
     ) *DataReaderImpl {
         const td = @as(*TopicImpl, @ptrCast(@alignCast(self.topic.ptr))).toTopicDescription();
         const dr = self.sub_.create_datareader(td, qos, listener, mask);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return @ptrCast(@alignCast(dr.ptr));
     }
 };
@@ -1056,8 +1139,8 @@ const TimerFixture = struct {
 
 test "deadline: writer — fires on_offered_deadline_missed when period elapses" {
     const alloc = testing.allocator;
-    var mc = ManualClock.init(0);
-    var fx = try TimerFixture.init(alloc, mc.clock());
+    var fx = try TimerFixture.init(alloc);
+    const mc = fx.mr.manualClock();
     defer fx.deinit();
 
     var count: i32 = 0;
@@ -1068,23 +1151,26 @@ test "deadline: writer — fires on_offered_deadline_missed when period elapses"
     // Period not yet elapsed — no notification.
     mc.advance(999_999_999); // 1 ns short of 1 s
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 0), count);
 
     // Advance past the 1 s deadline — should fire once.
     mc.advance(1); // now at exactly 1 s
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), count);
 
     // Another full period without a write — fires again.
     mc.advance(std.time.ns_per_s);
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 2), count);
 }
 
 test "deadline: writer — write() resets the deadline window" {
     const alloc = testing.allocator;
-    var mc = ManualClock.init(0);
-    var fx = try TimerFixture.init(alloc, mc.clock());
+    var fx = try TimerFixture.init(alloc);
+    const mc = fx.mr.manualClock();
     defer fx.deinit();
 
     var count: i32 = 0;
@@ -1095,22 +1181,25 @@ test "deadline: writer — write() resets the deadline window" {
     // Write at T=0.5 s — resets last_write_ns to 500 ms.
     mc.advance(std.time.ns_per_s / 2);
     try writeRaw(dw, &PAYLOAD_A);
+    fx.settle();
 
     // T=1.0 s: only 0.5 s since last write — not yet missed.
     mc.advance(std.time.ns_per_s / 2);
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 0), count);
 
     // T=1.5 s: 1 s since last write — deadline missed.
     mc.advance(std.time.ns_per_s / 2);
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), count);
 }
 
 test "deadline: reader — fires on_requested_deadline_missed when period elapses" {
     const alloc = testing.allocator;
-    var mc = ManualClock.init(0);
-    var fx = try TimerFixture.init(alloc, mc.clock());
+    var fx = try TimerFixture.init(alloc);
+    const mc = fx.mr.manualClock();
     defer fx.deinit();
 
     var count: i32 = 0;
@@ -1121,18 +1210,20 @@ test "deadline: reader — fires on_requested_deadline_missed when period elapse
     // Period not yet elapsed.
     mc.advance(999_999_999);
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 0), count);
 
     // Exactly 1 s — fires.
     mc.advance(1);
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), count);
 }
 
 test "deadline: reader — receiving data resets the deadline window" {
     const alloc = testing.allocator;
-    var mc = ManualClock.init(0);
-    var fx = try TimerFixture.init(alloc, mc.clock());
+    var fx = try TimerFixture.init(alloc);
+    const mc = fx.mr.manualClock();
     defer fx.deinit();
 
     var count: i32 = 0;
@@ -1147,18 +1238,20 @@ test "deadline: reader — receiving data resets the deadline window" {
     // T=1.0 s: only 0.5 s since last sample — not yet missed.
     mc.advance(std.time.ns_per_s / 2);
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 0), count);
 
     // T=1.5 s: 1 s since last sample — deadline missed.
     mc.advance(std.time.ns_per_s / 2);
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), count);
 }
 
 test "deadline: inactive (period = 0) — never fires" {
     const alloc = testing.allocator;
-    var mc = ManualClock.init(0);
-    var fx = try TimerFixture.init(alloc, mc.clock());
+    var fx = try TimerFixture.init(alloc);
+    const mc = fx.mr.manualClock();
     defer fx.deinit();
 
     var count: i32 = 0;
@@ -1167,6 +1260,7 @@ test "deadline: inactive (period = 0) — never fires" {
 
     mc.advance(100 * std.time.ns_per_s); // advance 100 seconds
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 0), count);
 }
 
@@ -1174,8 +1268,8 @@ test "deadline: inactive (period = 0) — never fires" {
 
 test "liveliness: AUTOMATIC — fires on_liveliness_lost after lease elapses without write" {
     const alloc = testing.allocator;
-    var mc = ManualClock.init(0);
-    var fx = try TimerFixture.init(alloc, mc.clock());
+    var fx = try TimerFixture.init(alloc);
+    const mc = fx.mr.manualClock();
     defer fx.deinit();
 
     var count: i32 = 0;
@@ -1187,18 +1281,20 @@ test "liveliness: AUTOMATIC — fires on_liveliness_lost after lease elapses wit
     // Lease not yet expired.
     mc.advance(999_999_999);
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 0), count);
 
     // Exactly 1 s — lease expired.
     mc.advance(1);
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), count);
 }
 
 test "liveliness: AUTOMATIC — write() resets the liveliness lease" {
     const alloc = testing.allocator;
-    var mc = ManualClock.init(0);
-    var fx = try TimerFixture.init(alloc, mc.clock());
+    var fx = try TimerFixture.init(alloc);
+    const mc = fx.mr.manualClock();
     defer fx.deinit();
 
     var count: i32 = 0;
@@ -1210,22 +1306,25 @@ test "liveliness: AUTOMATIC — write() resets the liveliness lease" {
     // Write at T=0.5 s — resets liveliness_last_ns.
     mc.advance(std.time.ns_per_s / 2);
     try writeRaw(dw, &PAYLOAD_A);
+    fx.settle();
 
     // T=1.0 s: only 0.5 s since last write — lease still valid.
     mc.advance(std.time.ns_per_s / 2);
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 0), count);
 
     // T=1.5 s: 1 s since last write — lease expired.
     mc.advance(std.time.ns_per_s / 2);
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), count);
 }
 
 test "liveliness: MANUAL_BY_TOPIC — fires when assert_liveliness() not called in time" {
     const alloc = testing.allocator;
-    var mc = ManualClock.init(0);
-    var fx = try TimerFixture.init(alloc, mc.clock());
+    var fx = try TimerFixture.init(alloc);
+    const mc = fx.mr.manualClock();
     defer fx.deinit();
 
     var count: i32 = 0;
@@ -1237,17 +1336,19 @@ test "liveliness: MANUAL_BY_TOPIC — fires when assert_liveliness() not called 
     // write() does NOT reset liveliness for MANUAL_BY_TOPIC.
     mc.advance(std.time.ns_per_s / 2);
     try writeRaw(dw, &PAYLOAD_A);
+    fx.settle();
 
     // Still 1 s from creation — lease expires at T=1 s.
     mc.advance(std.time.ns_per_s / 2);
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), count);
 }
 
 test "liveliness: MANUAL_BY_TOPIC — assert_liveliness() on writer resets the lease" {
     const alloc = testing.allocator;
-    var mc = ManualClock.init(0);
-    var fx = try TimerFixture.init(alloc, mc.clock());
+    var fx = try TimerFixture.init(alloc);
+    const mc = fx.mr.manualClock();
     defer fx.deinit();
 
     var count: i32 = 0;
@@ -1264,18 +1365,20 @@ test "liveliness: MANUAL_BY_TOPIC — assert_liveliness() on writer resets the l
     // T=1.0 s: only 0.5 s since assertion — lease still valid.
     mc.advance(std.time.ns_per_s / 2);
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 0), count);
 
     // T=1.5 s: 1 s since last assertion — lease expired.
     mc.advance(std.time.ns_per_s / 2);
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), count);
 }
 
 test "liveliness: MANUAL_BY_PARTICIPANT — participant.assert_liveliness() resets the lease" {
     const alloc = testing.allocator;
-    var mc = ManualClock.init(0);
-    var fx = try TimerFixture.init(alloc, mc.clock());
+    var fx = try TimerFixture.init(alloc);
+    const mc = fx.mr.manualClock();
     defer fx.deinit();
 
     var count: i32 = 0;
@@ -1291,18 +1394,20 @@ test "liveliness: MANUAL_BY_PARTICIPANT — participant.assert_liveliness() rese
     // T=1.0 s: only 0.5 s since participant assertion — lease still valid.
     mc.advance(std.time.ns_per_s / 2);
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 0), count);
 
     // T=1.5 s: 1 s since last assertion — lease expired.
     mc.advance(std.time.ns_per_s / 2);
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), count);
 }
 
 test "liveliness: MANUAL_BY_PARTICIPANT — write() does not reset the lease" {
     const alloc = testing.allocator;
-    var mc = ManualClock.init(0);
-    var fx = try TimerFixture.init(alloc, mc.clock());
+    var fx = try TimerFixture.init(alloc);
+    const mc = fx.mr.manualClock();
     defer fx.deinit();
 
     var count: i32 = 0;
@@ -1314,10 +1419,12 @@ test "liveliness: MANUAL_BY_PARTICIPANT — write() does not reset the lease" {
     // write() must NOT reset liveliness for MANUAL_BY_PARTICIPANT.
     mc.advance(std.time.ns_per_s / 2);
     try writeRaw(dw, &PAYLOAD_A);
+    fx.settle();
 
     // T=1.0 s: lease expires despite the write.
     mc.advance(std.time.ns_per_s / 2);
     fx.dp_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 1), count);
 }
 
@@ -1356,6 +1463,7 @@ test "query_condition: readRaw with SQL filter returns only matching samples" {
     // PAYLOAD_A: value = 0xAA = 170; PAYLOAD_B: value = 0xBB = 187.
     try writeRaw(pair.dw, &PAYLOAD_A);
     try writeRaw(pair.dw, &PAYLOAD_B);
+    fx.settle();
 
     // QueryCondition: only value = 170 (0xAA).
     const dr_dds = pair.dr.toDDSDataReader();
@@ -1401,6 +1509,7 @@ test "query_condition: takeFiltered with SQL filter removes only matching sample
     try writeRaw(pair.dw, &PAYLOAD_A); // value = 0xAA = 170
     try writeRaw(pair.dw, &PAYLOAD_B); // value = 0xBB = 187
     try writeRaw(pair.dw, &PAYLOAD_C); // value = 0xCC = 204
+    fx.settle();
 
     // Take only samples where value <> 187 (excludes PAYLOAD_B).
     const dr_dds = pair.dr.toDDSDataReader();
@@ -1444,6 +1553,7 @@ test "query_condition: parameter substitution with %0" {
 
     try writeRaw(pair.dw, &PAYLOAD_A); // value = 170
     try writeRaw(pair.dw, &PAYLOAD_B); // value = 187
+    fx.settle();
 
     // Create QC with parameterised expression, bound to "170".
     var param_strs: [1][*:0]const u8 = .{"170"};
@@ -1512,9 +1622,11 @@ fn drListenerLiveliness(ctx: *DDS.LivelinessChangedStatus) DDS.DataReaderListene
 }
 
 // Two-participant fixture sharing a ManualClock — both factories register the
-// same manual clock so reader timer_clock and writer timer_clock advance in sync.
+// manual runtime's clock so reader timer_clock and writer timer_clock advance in
+// sync (on the runtime it is both participants' clock anyway).
 const TwoPartyTimerFixture = struct {
     alloc: std.mem.Allocator,
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
 
     t_w: *zzdds.intraprocess.MemoryTransport,
@@ -1532,7 +1644,11 @@ const TwoPartyTimerFixture = struct {
     topic_w: DDS.Topic,
     topic_r: DDS.Topic,
 
-    fn init(alloc: std.mem.Allocator, clock: zzdds.util.time.Clock) !TwoPartyTimerFixture {
+    fn init(alloc: std.mem.Allocator) !TwoPartyTimerFixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
 
@@ -1545,7 +1661,7 @@ const TwoPartyTimerFixture = struct {
         errdefer d_w.deinit();
         const factory_w = try DomainParticipantFactoryImpl.init(alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .spec_random, config);
         errdefer factory_w.deinit();
-        try factory_w.clock_registry.register("manual", clock);
+        try factory_w.clock_registry.register("manual", mr.clock());
         const dp_w = factory_w.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const pub_ = dp_w.create_publisher(.{}, null, 0);
         const topic_w = dp_w.create_topic("LiveTopic", "LiveType", .{}, null, 0);
@@ -1556,13 +1672,14 @@ const TwoPartyTimerFixture = struct {
         errdefer d_r.deinit();
         const factory_r = try DomainParticipantFactoryImpl.init(alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .spec_random, config);
         errdefer factory_r.deinit();
-        try factory_r.clock_registry.register("manual", clock);
+        try factory_r.clock_registry.register("manual", mr.clock());
         const dp_r = factory_r.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const dp_r_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp_r.ptr));
         const sub_ = dp_r.create_subscriber(.{}, null, 0);
         const topic_r = dp_r.create_topic("LiveTopic", "LiveType", .{}, null, 0);
 
         return .{
+            .mr = mr,
             .alloc = alloc,
             .delivery = delivery,
             .t_w = t_w,
@@ -1584,6 +1701,7 @@ const TwoPartyTimerFixture = struct {
     fn deinit(self: *TwoPartyTimerFixture) void {
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_w.deinit();
         self.factory_r.deinit();
         self.d_w.deinit();
@@ -1591,24 +1709,35 @@ const TwoPartyTimerFixture = struct {
         self.t_w.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *TwoPartyTimerFixture) void {
+        self.mr.settle();
     }
 
     fn makeWriter(self: *TwoPartyTimerFixture, qos: DDS.DataWriterQos) *DataWriterImpl {
         const dw = self.pub_.create_datawriter(self.topic_w, qos, null, 0);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return @ptrCast(@alignCast(dw.ptr));
     }
 
     fn makeReader(self: *TwoPartyTimerFixture, listener: ?DDS.DataReaderListener, mask: DDS.StatusMask) *DataReaderImpl {
         const td = @as(*TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
         const dr = self.sub_.create_datareader(td, .{}, listener, mask);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return @ptrCast(@alignCast(dr.ptr));
     }
 };
 
 test "liveliness: reader — on_liveliness_changed fires when writer lease expires" {
     const alloc = testing.allocator;
-    var mc = ManualClock.init(0);
-    var fx = try TwoPartyTimerFixture.init(alloc, mc.clock());
+    var fx = try TwoPartyTimerFixture.init(alloc);
+    const mc = fx.mr.manualClock();
     defer fx.deinit();
 
     var captured = DDS.LivelinessChangedStatus{};
@@ -1621,11 +1750,13 @@ test "liveliness: reader — on_liveliness_changed fires when writer lease expir
     // Lease not yet expired.
     mc.advance(999_999_999);
     fx.dp_r_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 0), captured.not_alive_count);
 
     // Advance past the 1 s lease — listener fires.
     mc.advance(1);
     fx.dp_r_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 0), captured.alive_count);
     try testing.expectEqual(@as(i32, 1), captured.not_alive_count);
 }
@@ -1644,8 +1775,7 @@ test "liveliness: reader — on_liveliness_changed fires on initial writer match
     // never actually invoked, no notifyWakeup either. This test asserts the
     // listener itself fires, not just the polled status.
     const alloc = testing.allocator;
-    var mc = ManualClock.init(0);
-    var fx = try TwoPartyTimerFixture.init(alloc, mc.clock());
+    var fx = try TwoPartyTimerFixture.init(alloc);
     defer fx.deinit();
 
     var captured = DDS.LivelinessChangedStatus{ .alive_count = -1 }; // sentinel: never touched
@@ -1679,8 +1809,8 @@ test "liveliness: reader — MANUAL_BY_PARTICIPANT assertion from one writer ref
     // lease elapses from *that*, even though the participant is genuinely
     // still alive (asserting through A).
     const alloc = testing.allocator;
-    var mc = ManualClock.init(0);
-    var fx = try TwoPartyTimerFixture.init(alloc, mc.clock());
+    var fx = try TwoPartyTimerFixture.init(alloc);
+    const mc = fx.mr.manualClock();
     defer fx.deinit();
 
     var captured = DDS.LivelinessChangedStatus{};
@@ -1699,6 +1829,7 @@ test "liveliness: reader — MANUAL_BY_PARTICIPANT assertion from one writer ref
     // valid evidence). With the fix, this also refreshes B.
     mc.advance(std.time.ns_per_s / 10 * 8);
     try writeRaw(dw_a, &PAYLOAD_A);
+    fx.settle();
 
     // T=1.5s: 0.7s since A's write (and, with the fix, since B's refresh
     // too) -- both still within the 1s lease. Without the fix, B's
@@ -1706,14 +1837,15 @@ test "liveliness: reader — MANUAL_BY_PARTICIPANT assertion from one writer ref
     // lease and it incorrectly expires here.
     mc.advance(std.time.ns_per_s / 10 * 7);
     fx.dp_r_impl.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(i32, 2), captured.alive_count);
     try testing.expectEqual(@as(i32, 0), captured.not_alive_count);
 }
 
 test "liveliness: reader — get_liveliness_changed_status reflects writer match and expiry" {
     const alloc = testing.allocator;
-    var mc = ManualClock.init(0);
-    var fx = try TwoPartyTimerFixture.init(alloc, mc.clock());
+    var fx = try TwoPartyTimerFixture.init(alloc);
+    const mc = fx.mr.manualClock();
     defer fx.deinit();
 
     var dw_qos = DDS.DataWriterQos{};
@@ -1732,6 +1864,7 @@ test "liveliness: reader — get_liveliness_changed_status reflects writer match
     // Expire the lease.
     mc.advance(2 * std.time.ns_per_s);
     fx.dp_r_impl.checkTimers();
+    fx.settle();
 
     _ = dr_dds.vtable.get_liveliness_changed_status(dr_dds.ptr, &status);
     try testing.expectEqual(@as(i32, 0), status.alive_count);

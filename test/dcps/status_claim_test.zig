@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -21,7 +22,6 @@ const DataWriterImpl = zzdds.dcps.DataWriterImpl;
 const DataReaderImpl = zzdds.dcps.DataReaderImpl;
 const TopicImpl = zzdds.dcps.TopicImpl;
 const RtpsTimestamp = zzdds.util.time.RtpsTimestamp;
-const ManualClock = zzdds.util.time.ManualClock;
 const history_mod = zzdds.rtps.history;
 const noop_security = zzdds.noop_security.noop_security_plugins;
 
@@ -72,11 +72,12 @@ fn writerOf(inj: *Injector) *DataWriterImpl {
 
 // ── Fixture ───────────────────────────────────────────────────────────────────
 
-/// Writer and reader participants over IntraProcessDelivery (synchronous
-/// delivery), sharing a ManualClock, with no Publisher, Subscriber or
+/// Writer and reader participants over IntraProcessDelivery, on a
+/// ManualRuntime whose clock they share, with no Publisher, Subscriber or
 /// participant listeners: a hidden endpoint listener leaves nothing to
 /// claim an injected update.
 const Fixture = struct {
+    mr: *ManualRuntime,
     delivery: IntraProcessDelivery,
     t_w: *zzdds.intraprocess.MemoryTransport,
     d_w: *zzdds.intraprocess.DirectDiscovery,
@@ -91,7 +92,11 @@ const Fixture = struct {
     sub_: DDS.Subscriber,
     topic_r: DDS.Topic,
 
-    fn init(alloc: std.mem.Allocator, clock: zzdds.util.time.Clock) !Fixture {
+    fn init(alloc: std.mem.Allocator) !Fixture {
+        const mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(mr);
+        mr.init();
+        errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
         var config = zzdds.config.Config{};
@@ -103,7 +108,7 @@ const Fixture = struct {
         errdefer d_w.deinit();
         const factory_w = try DomainParticipantFactoryImpl.init(alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .spec_random, config);
         errdefer factory_w.deinit();
-        try factory_w.clock_registry.register("manual", clock);
+        try factory_w.clock_registry.register("manual", mr.clock());
         const dp_w = factory_w.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const pub_ = dp_w.create_publisher(.{}, null, 0);
         const topic_w = dp_w.create_topic("ClaimTopic", "ClaimType", .{}, null, 0);
@@ -114,12 +119,13 @@ const Fixture = struct {
         errdefer d_r.deinit();
         const factory_r = try DomainParticipantFactoryImpl.init(alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .spec_random, config);
         errdefer factory_r.deinit();
-        try factory_r.clock_registry.register("manual", clock);
+        try factory_r.clock_registry.register("manual", mr.clock());
         const dp_r = factory_r.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const sub_ = dp_r.create_subscriber(.{}, null, 0);
         const topic_r = dp_r.create_topic("ClaimTopic", "ClaimType", .{}, null, 0);
 
         return .{
+            .mr = mr,
             .delivery = delivery,
             .t_w = t_w,
             .d_w = d_w,
@@ -139,6 +145,7 @@ const Fixture = struct {
     fn deinit(self: *Fixture) void {
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.mr.settle();
         self.factory_w.deinit();
         self.factory_r.deinit();
         self.d_w.deinit();
@@ -146,16 +153,27 @@ const Fixture = struct {
         self.t_w.deinit();
         self.t_r.deinit();
         self.delivery.deinit();
+        self.mr.deinit();
+        std.heap.page_allocator.destroy(self.mr);
+    }
+
+    /// Delivers what was sent so far (a no-op on the default build).
+    fn settle(self: *Fixture) void {
+        self.mr.settle();
     }
 
     fn makeWriter(self: *Fixture, qos: DDS.DataWriterQos, listener: ?DDS.DataWriterListener, mask: DDS.StatusMask) *DataWriterImpl {
         const dw = self.pub_.create_datawriter(self.topic_w, qos, listener, mask);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return @ptrCast(@alignCast(dw.ptr));
     }
 
     fn makeReader(self: *Fixture, qos: DDS.DataReaderQos, listener: ?DDS.DataReaderListener, mask: DDS.StatusMask) *DataReaderImpl {
         const td = @as(*TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
         const dr = self.sub_.create_datareader(td, qos, listener, mask);
+        // Matching runs on the runtime too.
+        self.mr.settle();
         return @ptrCast(@alignCast(dr.ptr));
     }
 };
@@ -173,8 +191,7 @@ fn dwStatusChanges(dw: *DataWriterImpl) DDS.StatusMask {
 // ── DataReader ────────────────────────────────────────────────────────────────
 
 test "status claim: SUBSCRIPTION_MATCHED changed during the callback stays pending, zero net included" {
-    var mc = ManualClock.init(0);
-    var fx = try Fixture.init(testing.allocator, mc.clock());
+    var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
     var inj = Injector{
@@ -194,6 +211,7 @@ test "status claim: SUBSCRIPTION_MATCHED changed during the callback stays pendi
     inj.target = dr;
 
     dr.recordSubscriptionMatched(0x100, true);
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), inj.calls);
     try testing.expectEqual(@as(i32, 1), inj.first_change);
 
@@ -209,8 +227,7 @@ test "status claim: SUBSCRIPTION_MATCHED changed during the callback stays pendi
 }
 
 test "status claim: REQUESTED_INCOMPATIBLE_QOS changed during the callback stays pending" {
-    var mc = ManualClock.init(0);
-    var fx = try Fixture.init(testing.allocator, mc.clock());
+    var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
     var inj = Injector{ .mask = undefined, .target = undefined, .inject = struct {
@@ -223,12 +240,14 @@ test "status claim: REQUESTED_INCOMPATIBLE_QOS changed during the callback stays
     inj.target = dr;
 
     DataReaderImpl.notifyIncompatibleQos(dr, 7);
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), inj.calls);
     try testing.expectEqual(@as(i32, 1), inj.first_change);
 
     try testing.expect(drStatusChanges(dr) & DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS != 0);
     const dds = dr.toDDSDataReader();
-    var st: DDS.RequestedIncompatibleQosStatus = undefined;
+    var st: DDS.RequestedIncompatibleQosStatus = .{};
+    defer st.policies.deinit(testing.allocator);
     _ = dds.vtable.get_requested_incompatible_qos_status(dds.ptr, &st);
     try testing.expectEqual(@as(i32, 2), st.total_count);
     try testing.expectEqual(@as(i32, 1), st.total_count_change);
@@ -236,8 +255,7 @@ test "status claim: REQUESTED_INCOMPATIBLE_QOS changed during the callback stays
 }
 
 test "status claim: SAMPLE_LOST changed during the callback stays pending" {
-    var mc = ManualClock.init(0);
-    var fx = try Fixture.init(testing.allocator, mc.clock());
+    var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
     var inj = Injector{ .mask = undefined, .target = undefined, .inject = struct {
@@ -250,6 +268,7 @@ test "status claim: SAMPLE_LOST changed during the callback stays pending" {
     inj.target = dr;
 
     dr.notifySampleLost(3);
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), inj.calls);
     try testing.expectEqual(@as(i32, 3), inj.first_change);
 
@@ -262,8 +281,7 @@ test "status claim: SAMPLE_LOST changed during the callback stays pending" {
 }
 
 test "status claim: REQUESTED_DEADLINE_MISSED changed during the callback stays pending" {
-    var mc = ManualClock.init(0);
-    var fx = try Fixture.init(testing.allocator, mc.clock());
+    var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
     var inj = Injector{ .mask = undefined, .target = undefined, .inject = struct {
@@ -276,6 +294,7 @@ test "status claim: REQUESTED_DEADLINE_MISSED changed during the callback stays 
     inj.target = dr;
 
     dr.notifyDeadlineMissed();
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), inj.calls);
     try testing.expectEqual(@as(i32, 1), inj.first_change);
 
@@ -288,8 +307,7 @@ test "status claim: REQUESTED_DEADLINE_MISSED changed during the callback stays 
 }
 
 test "status claim: SAMPLE_REJECTED changed during the callback stays pending" {
-    var mc = ManualClock.init(0);
-    var fx = try Fixture.init(testing.allocator, mc.clock());
+    var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
     // The injected update is another rejected sample, which is counted
@@ -310,6 +328,7 @@ test "status claim: SAMPLE_REJECTED changed during the callback stays pending" {
 
     try write(dw); // accepted
     try write(dw); // rejected: the callback runs and rejects another
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), inj.calls);
     try testing.expectEqual(@as(i32, 1), inj.first_change);
 
@@ -322,9 +341,9 @@ test "status claim: SAMPLE_REJECTED changed during the callback stays pending" {
 }
 
 test "status claim: LIVELINESS_CHANGED changed during the callback stays pending" {
-    var mc = ManualClock.init(0);
-    var fx = try Fixture.init(testing.allocator, mc.clock());
+    var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
+    const mc = fx.mr.manualClock();
 
     // The outer update is the writer's lease expiring; the injected one is
     // the writer coming back alive by writing.
@@ -351,6 +370,7 @@ test "status claim: LIVELINESS_CHANGED changed during the callback stays pending
     mc.advance(1_000_000_000);
     const dp_r: *DomainParticipantImpl = @ptrCast(@alignCast(fx.dp_r.ptr));
     dp_r.checkTimers();
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), inj.calls);
     try testing.expectEqual(@as(i32, 1), inj.first_change);
 
@@ -365,8 +385,7 @@ test "status claim: LIVELINESS_CHANGED changed during the callback stays pending
 // ── DataWriter ────────────────────────────────────────────────────────────────
 
 test "status claim: PUBLICATION_MATCHED changed during the callback stays pending, zero net included" {
-    var mc = ManualClock.init(0);
-    var fx = try Fixture.init(testing.allocator, mc.clock());
+    var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
     var inj = Injector{ .mask = undefined, .target = undefined, .inject = struct {
@@ -380,6 +399,7 @@ test "status claim: PUBLICATION_MATCHED changed during the callback stays pendin
     inj.target = dw;
 
     dw.recordPublicationMatched(0x100, true);
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), inj.calls);
     try testing.expectEqual(@as(i32, 1), inj.first_change);
 
@@ -394,8 +414,7 @@ test "status claim: PUBLICATION_MATCHED changed during the callback stays pendin
 }
 
 test "status claim: OFFERED_INCOMPATIBLE_QOS changed during the callback stays pending" {
-    var mc = ManualClock.init(0);
-    var fx = try Fixture.init(testing.allocator, mc.clock());
+    var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
     var inj = Injector{ .mask = undefined, .target = undefined, .inject = struct {
@@ -408,12 +427,14 @@ test "status claim: OFFERED_INCOMPATIBLE_QOS changed during the callback stays p
     inj.target = dw;
 
     DataWriterImpl.notifyIncompatibleQos(dw, 7);
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), inj.calls);
     try testing.expectEqual(@as(i32, 1), inj.first_change);
 
     try testing.expect(dwStatusChanges(dw) & DDS.OFFERED_INCOMPATIBLE_QOS_STATUS != 0);
     const dds = dw.toDDSDataWriter();
-    var st: DDS.OfferedIncompatibleQosStatus = undefined;
+    var st: DDS.OfferedIncompatibleQosStatus = .{};
+    defer st.policies.deinit(testing.allocator);
     _ = dds.vtable.get_offered_incompatible_qos_status(dds.ptr, &st);
     try testing.expectEqual(@as(i32, 2), st.total_count);
     try testing.expectEqual(@as(i32, 1), st.total_count_change);
@@ -421,8 +442,7 @@ test "status claim: OFFERED_INCOMPATIBLE_QOS changed during the callback stays p
 }
 
 test "status claim: OFFERED_DEADLINE_MISSED changed during the callback stays pending" {
-    var mc = ManualClock.init(0);
-    var fx = try Fixture.init(testing.allocator, mc.clock());
+    var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
     var inj = Injector{ .mask = undefined, .target = undefined, .inject = struct {
@@ -435,6 +455,7 @@ test "status claim: OFFERED_DEADLINE_MISSED changed during the callback stays pe
     inj.target = dw;
 
     dw.notifyDeadlineMissed();
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), inj.calls);
     try testing.expectEqual(@as(i32, 1), inj.first_change);
 
@@ -447,8 +468,7 @@ test "status claim: OFFERED_DEADLINE_MISSED changed during the callback stays pe
 }
 
 test "status claim: LIVELINESS_LOST changed during the callback stays pending" {
-    var mc = ManualClock.init(0);
-    var fx = try Fixture.init(testing.allocator, mc.clock());
+    var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
     var inj = Injector{ .mask = undefined, .target = undefined, .inject = struct {
@@ -461,6 +481,7 @@ test "status claim: LIVELINESS_LOST changed during the callback stays pending" {
     inj.target = dw;
 
     dw.notifyLivelinessLost();
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), inj.calls);
     try testing.expectEqual(@as(i32, 1), inj.first_change);
 
@@ -479,19 +500,20 @@ fn dwCountMatched(_: *anyopaque, _: *const DDS.PublicationMatchedStatus, ld: ?*a
 }
 
 test "status claim: a status a listener received is consumed, a later one is not" {
-    var mc = ManualClock.init(0);
-    var fx = try Fixture.init(testing.allocator, mc.clock());
+    var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
     var calls: u32 = 0;
     const dw = fx.makeWriter(.{}, .{ .listener_data = &calls, .on_publication_matched = dwCountMatched }, DDS.PUBLICATION_MATCHED_STATUS);
     dw.recordPublicationMatched(0x100, true);
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), calls);
     try testing.expect(dwStatusChanges(dw) & DDS.PUBLICATION_MATCHED_STATUS == 0);
 
     // With the listener masked out the change stays for the getter.
     @atomicStore(DDS.StatusMask, &dw.listener_mask, 0, .monotonic);
     dw.recordPublicationMatched(0x200, true);
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), calls);
     try testing.expect(dwStatusChanges(dw) & DDS.PUBLICATION_MATCHED_STATUS != 0);
     const dds = dw.toDDSDataWriter();
@@ -527,14 +549,14 @@ fn countDataAvailable(_: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
 }
 
 test "DATA_AVAILABLE: a read resets it, though the samples stay" {
-    var mc = ManualClock.init(0);
-    var fx = try Fixture.init(testing.allocator, mc.clock());
+    var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
     const dw = fx.makeWriter(.{}, null, 0);
     const dr = fx.makeReader(keepAllReaderQos(), null, 0);
     try write(dw);
     try write(dw);
+    fx.settle();
     try testing.expect(drStatusChanges(dr) & DDS.DATA_AVAILABLE_STATUS != 0);
 
     var out: std.ArrayListUnmanaged(zzdds.dcps.TakenSample) = .empty;
@@ -546,18 +568,19 @@ test "DATA_AVAILABLE: a read resets it, though the samples stay" {
 
     // A new sample sets it again.
     try write(dw);
+    fx.settle();
     try testing.expect(drStatusChanges(dr) & DDS.DATA_AVAILABLE_STATUS != 0);
 }
 
 test "DATA_AVAILABLE: a take resets it while samples remain" {
-    var mc = ManualClock.init(0);
-    var fx = try Fixture.init(testing.allocator, mc.clock());
+    var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
     const dw = fx.makeWriter(.{}, null, 0);
     const dr = fx.makeReader(keepAllReaderQos(), null, 0);
     try write(dw);
     try write(dw);
+    fx.settle();
 
     const taken = dr.takeRaw() orelse return error.TestExpectedNonNull;
     dr.alloc.free(taken.data);
@@ -567,8 +590,7 @@ test "DATA_AVAILABLE: a take resets it while samples remain" {
 }
 
 test "DATA_AVAILABLE: on_data_available resets it, and data arriving during the callback stays pending" {
-    var mc = ManualClock.init(0);
-    var fx = try Fixture.init(testing.allocator, mc.clock());
+    var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
     const Probe = struct {
@@ -591,14 +613,14 @@ test "DATA_AVAILABLE: on_data_available resets it, and data arriving during the 
     Probe.dr = fx.makeReader(.{}, .{ .on_data_available = Probe.cb }, DDS.DATA_AVAILABLE_STATUS);
 
     try write(Probe.dw);
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), Probe.calls);
     try testing.expect(!Probe.set_in_callback);
     try testing.expect(drStatusChanges(Probe.dr) & DDS.DATA_AVAILABLE_STATUS != 0);
 }
 
 test "DATA_AVAILABLE: a listener whose change was consumed does not run" {
-    var mc = ManualClock.init(0);
-    var fx = try Fixture.init(testing.allocator, mc.clock());
+    var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
     var calls: u32 = 0;
@@ -609,8 +631,10 @@ test "DATA_AVAILABLE: a listener whose change was consumed does not run" {
     // The arrival's callback claims the change, leaving nothing for
     // notify_datareaders.
     try write(dw);
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), calls);
     _ = fx.sub_.notify_datareaders();
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), calls);
 
     // Two more arrive unclaimed; a take consumes the change first, so
@@ -619,18 +643,19 @@ test "DATA_AVAILABLE: a listener whose change was consumed does not run" {
     @atomicStore(DDS.StatusMask, &dr.listener_mask, 0, .monotonic);
     try write(dw);
     try write(dw);
+    fx.settle();
     const taken = dr.takeRaw() orelse return error.TestExpectedNonNull;
     dr.alloc.free(taken.data);
     @atomicStore(DDS.StatusMask, &dr.listener_mask, DDS.DATA_AVAILABLE_STATUS, .monotonic);
     _ = fx.sub_.notify_datareaders();
     const dds = dr.toDDSDataReader();
     _ = dds.vtable.set_listener(dds.ptr, &listener, DDS.DATA_AVAILABLE_STATUS);
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), calls);
 }
 
 test "DATA_AVAILABLE: begin_access that cannot queue on_data_available leaves it changed" {
-    var mc = ManualClock.init(0);
-    var fx = try Fixture.init(testing.allocator, mc.clock());
+    var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
     // PRESENTATION must be offered as requested for the pair to match.
@@ -648,6 +673,7 @@ test "DATA_AVAILABLE: begin_access that cannot queue on_data_available leaves it
     const dds_dr = sub.create_datareader(td, keepAllReaderQos(), listener, 0);
     const dr: *DataReaderImpl = @ptrCast(@alignCast(dds_dr.ptr));
     try write(dw);
+    fx.settle();
     try testing.expectEqual(@as(u32, 0), calls);
     @atomicStore(DDS.StatusMask, &dr.listener_mask, DDS.DATA_AVAILABLE_STATUS, .monotonic);
 
@@ -657,11 +683,20 @@ test "DATA_AVAILABLE: begin_access that cannot queue on_data_available leaves it
     impl.alloc = testing.failing_allocator;
     _ = sub.begin_access();
     impl.alloc = saved;
+    fx.settle();
+    if (zzdds.runtime.enabled) {
+        // On the shared runtime it is posted to the reader's own listener
+        // queue, which needs no allocation, so it is raised regardless.
+        try testing.expectEqual(@as(u32, 1), calls);
+        _ = sub.end_access();
+        return;
+    }
     try testing.expectEqual(@as(u32, 0), calls);
     try testing.expect(drStatusChanges(dr) & DDS.DATA_AVAILABLE_STATUS != 0);
 
     // So a later notification still runs it.
     _ = sub.notify_datareaders();
+    fx.settle();
     try testing.expectEqual(@as(u32, 1), calls);
     _ = sub.end_access();
 }

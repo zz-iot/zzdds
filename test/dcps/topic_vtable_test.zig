@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -16,6 +17,8 @@ const testing = std.testing;
 
 const Fixture = struct {
     alloc: std.mem.Allocator,
+    /// Set when the participant runs on a manual runtime the test drives.
+    mr: ?*ManualRuntime = null,
     delivery: IntraProcessDelivery,
     t: *zzdds.intraprocess.MemoryTransport,
     d: *zzdds.intraprocess.DirectDiscovery,
@@ -27,6 +30,21 @@ const Fixture = struct {
     }
 
     fn initWithFactoryQos(alloc: std.mem.Allocator, factory_qos: DDS.DomainParticipantFactoryQos) !Fixture {
+        return initOn(alloc, factory_qos, false);
+    }
+
+    /// With `manual`, on a ManualRuntime installed for the participant to take.
+    fn initOn(alloc: std.mem.Allocator, factory_qos: DDS.DomainParticipantFactoryQos, manual: bool) !Fixture {
+        var mr: ?*ManualRuntime = null;
+        if (manual) {
+            const m = try std.heap.page_allocator.create(ManualRuntime);
+            m.init();
+            mr = m;
+        }
+        errdefer if (mr) |m| {
+            m.deinit();
+            std.heap.page_allocator.destroy(m);
+        };
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
         const t = try delivery.newTransport();
@@ -37,15 +55,22 @@ const Fixture = struct {
         errdefer factory.deinit();
         try testing.expectEqual(DDS.RETCODE_OK, factory.toDDSFactory().set_qos(factory_qos));
         const dp = factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
-        return .{ .alloc = alloc, .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp };
+        return .{ .alloc = alloc, .mr = mr, .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp };
     }
 
     fn deinit(self: *Fixture) void {
+        // What the test left queued runs while the participant still exists.
+        if (self.mr) |m| m.settle();
         _ = self.factory.toDDSFactory().delete_participant(self.dp);
+        if (self.mr) |m| m.settle();
         self.factory.deinit();
         self.d.deinit();
         self.t.deinit();
         self.delivery.deinit();
+        if (self.mr) |m| {
+            m.deinit();
+            std.heap.page_allocator.destroy(m);
+        }
     }
 };
 
@@ -560,13 +585,13 @@ test "create_datawriter: an announcement that cannot be prepared leaves the Topi
 /// is left without the deletes a disabled participant refuses.
 /// `fa` is what entities created under it keep allocating through, so it must
 /// outlive them; declare it before this, and reset it before `fx.deinit()`.
-/// Skips on a runtime: its worker delivers what creating a Topic pushes to the
-/// builtin reader, reading the participant's allocator as a test swaps it.
+/// On a runtime, a manual one, driven only at teardown: a hosted worker would
+/// deliver what creating a Topic pushes to the builtin reader, reading the
+/// participant's allocator as a test swaps it.
 fn initForFailingAllocations(alloc: std.mem.Allocator) !Fixture {
-    var fx = try Fixture.initWithFactoryQos(alloc, .{ .entity_factory = .{ .autoenable_created_entities = false } });
+    var fx = try Fixture.initOn(alloc, .{ .entity_factory = .{ .autoenable_created_entities = false } }, true);
     errdefer fx.deinit();
     const dp_impl: *zzdds.dcps.DomainParticipantImpl = @ptrCast(@alignCast(fx.dp.ptr));
-    if (dp_impl.runtime != null) return error.SkipZigTest;
     try testing.expect(!dp_impl.enabled.load(.acquire));
     return fx;
 }

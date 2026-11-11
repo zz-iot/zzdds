@@ -28,6 +28,12 @@ const IP_R: [4]u8 = .{ 127, 0, 0, 21 };
 const PORT_META_W: u16 = 7410;
 const PORT_META_R: u16 = 7412;
 
+/// Only bounds a wait that ends as soon as its condition holds. Generous
+/// because under Valgrind each delivery round takes hundreds of
+/// milliseconds, and on the shared runtime a round's replies can miss the
+/// next one, so matching there takes several seconds.
+const settle_timeout_ns: i128 = 20 * std.time.ns_per_s;
+
 fn reliableVolatileKeepLastQos() struct { dw: DDS.DataWriterQos, dr: DDS.DataReaderQos } {
     var dw_qos = DDS.DataWriterQos{};
     var dr_qos = DDS.DataReaderQos{};
@@ -77,7 +83,7 @@ test "discovery_race: write after both sides confirm match is always delivered (
 
     // Drive full discovery on both sides until the writer itself confirms
     // the match -- the strongest local signal available.
-    const match_deadline = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
+    const match_deadline = time_mod.nanoTimestamp() + settle_timeout_ns;
     while (writer.dw_impl.matchedReaderCount() == 0 and time_mod.nanoTimestamp() < match_deadline) {
         net.deliverAll();
         time_mod.sleepNs(20 * std.time.ns_per_ms);
@@ -96,7 +102,7 @@ test "discovery_race: write after both sides confirm match is always delivered (
 
     var received: std.ArrayList(u32) = .empty;
     defer received.deinit(alloc);
-    const deliver_deadline = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
+    const deliver_deadline = time_mod.nanoTimestamp() + settle_timeout_ns;
     while (received.items.len < 1 and time_mod.nanoTimestamp() < deliver_deadline) {
         net.deliverAll();
         try drainInto(alloc, reader.dr_impl, &received);
@@ -156,7 +162,7 @@ test "discovery_race: a genuinely late VOLATILE joiner does not receive earlier 
     );
     defer reader.deinit();
 
-    const match_deadline = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
+    const match_deadline = time_mod.nanoTimestamp() + settle_timeout_ns;
     while (writer.dw_impl.matchedReaderCount() == 0 and time_mod.nanoTimestamp() < match_deadline) {
         net.deliverAll();
         time_mod.sleepNs(20 * std.time.ns_per_ms);
@@ -177,7 +183,7 @@ test "discovery_race: a genuinely late VOLATILE joiner does not receive earlier 
 
     var received: std.ArrayList(u32) = .empty;
     defer received.deinit(alloc);
-    const deliver_deadline = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
+    const deliver_deadline = time_mod.nanoTimestamp() + settle_timeout_ns;
     while (received.items.len < 1 and time_mod.nanoTimestamp() < deliver_deadline) {
         net.deliverAll();
         try drainInto(alloc, reader.dr_impl, &received);

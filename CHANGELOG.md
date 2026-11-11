@@ -38,6 +38,20 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   no callback running through that listener. It does not wait for a callback about the reader
   running through its subscriber's or participant's listener; clear those too if they use
   the reader.
+- On the shared runtime, a received datagram queued for a participant or for discovery is
+  freed before its context can close. Before, a runtime worker could free it after
+  `delete_participant` returned, with an allocator the application might already have
+  torn down.
+- On the shared runtime, discovery creates the WLP endpoints before SEDP starts listening.
+  WLP receives through SEDP's listener, so a runtime worker could hand WLP traffic to
+  endpoints still being created.
+- RequestedIncompatibleQosStatus and OfferedIncompatibleQosStatus fill `policies` with a
+  count for each policy found incompatible. A writer created after an incompatible reader
+  was discovered now reports that incompatibility; before, only a later QoS change that
+  removed a match counted it.
+- CI runs every unit test on a `-Dshared-runtime` build. Tests that check delivery at points
+  they choose drive a manual runtime on their own thread, and `build.zig`'s
+  `not_yet_on_shared_runtime` list is gone.
 - CI runs the ThreadSanitizer examples (waitset, shape and custom-allocator) on a
   `-Dshared-runtime` build too.
 - Update zidl to 0.3.27 and enable its retirement query for C++ and Java bindings.

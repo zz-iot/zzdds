@@ -5,10 +5,11 @@
 //!
 //! Discovery events are fired directly (a discovery plugin that only
 //! captures its callbacks), DATA is injected as raw RTPS from a second
-//! MockTransport, and time is a ManualClock.
+//! MockTransport, on a ManualRuntime whose clock is the participant's.
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -21,7 +22,6 @@ const DomainParticipantFactoryImpl = dcps.DomainParticipantFactoryImpl;
 const DomainParticipantImpl = dcps.DomainParticipantImpl;
 const DataReaderImpl = dcps.DataReaderImpl;
 const TopicImpl = dcps.TopicImpl;
-const ManualClock = zzdds.util.time.ManualClock;
 
 const Discovery = iface.Discovery;
 const Callbacks = iface.Callbacks;
@@ -104,6 +104,7 @@ const ANY_READER = [4]u8{ 0, 0, 0, 0 };
 // ── Harness ───────────────────────────────────────────────────────────────────
 
 const Harness = struct {
+    mr: *ManualRuntime,
     net: *MockNetwork,
     transport: *MockTransport,
     injector: *MockTransport,
@@ -112,8 +113,12 @@ const Harness = struct {
     dp_impl: *DomainParticipantImpl,
     sub: DDS.Subscriber,
 
-    fn init(h: *Harness, clock: *ManualClock) !void {
+    fn init(h: *Harness) !void {
         const alloc = testing.allocator;
+        h.mr = try std.heap.page_allocator.create(ManualRuntime);
+        errdefer std.heap.page_allocator.destroy(h.mr);
+        h.mr.init();
+        errdefer h.mr.deinit();
         h.net = try MockNetwork.init(alloc);
         errdefer h.net.deinit();
         h.transport = try MockTransport.init(alloc, h.net, &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7410)});
@@ -124,7 +129,7 @@ const Harness = struct {
         config.participant.timer_clock_name = "manual";
         h.factory = try DomainParticipantFactoryImpl.init(alloc, h.transport.transport(), CapturingDisc.discovery(), noop_security, .spec_random, config);
         errdefer h.factory.deinit();
-        try h.factory.clock_registry.register("manual", clock.clock());
+        try h.factory.clock_registry.register("manual", h.mr.clock());
         h.dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         h.dp_impl = @ptrCast(@alignCast(h.dp.ptr));
         h.sub = h.dp.create_subscriber(.{}, null, 0);
@@ -133,10 +138,18 @@ const Harness = struct {
     fn deinit(h: *Harness) void {
         _ = h.dp.vtable.delete_contained_entities(h.dp.ptr);
         _ = h.factory.toDDSFactory().delete_participant(h.dp);
+        h.mr.settle();
         h.factory.deinit();
         h.injector.deinit();
         h.transport.deinit();
         h.net.deinit();
+        h.mr.deinit();
+        std.heap.page_allocator.destroy(h.mr);
+    }
+
+    /// Runs what was queued so far (a no-op on the default build).
+    fn settle(h: *Harness) void {
+        h.mr.settle();
     }
 
     fn reader(h: *Harness, topic_name: [:0]const u8, kind: DDS.ReliabilityQosPolicyKind) *DataReaderImpl {
@@ -163,6 +176,7 @@ const Harness = struct {
         try rtpsData(&buf, writer.prefix, reader_eid, eidBytes(writer.entity_id), sns);
         try h.injector.transport().send(&Locator.udp4(.{ 127, 0, 0, 1 }, h.dp_impl.data_listen_port), buf.items);
         h.net.deliverAll();
+        h.settle();
     }
 
     fn announceParticipant(h: *Harness, prefix: GuidPrefix) void {
@@ -225,9 +239,8 @@ fn writerGuid(seed: u8, key: u8) Guid {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 test "data from an unannounced writer is held once, taken by each reader that matches it, and dropped once matched" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     const be = h.reader("Held", .BEST_EFFORT_RELIABILITY_QOS);
     const rel = h.reader("Held", .RELIABLE_RELIABILITY_QOS);
@@ -252,9 +265,8 @@ test "data from an unannounced writer is held once, taken by each reader that ma
 }
 
 test "data held for a reader whose match a change to it superseded is taken by the match made in its place" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     const Probe = struct {
         var readers: [2]DDS.DataReader = undefined;
@@ -265,9 +277,27 @@ test "data held for a reader whose match a change to it superseded is taken by t
             _ = dr.vtable.get_subscription_matched_status(dr.ptr, &st);
             return st.current_count;
         }
+        const NotifyFn = *const fn (*anyopaque, DDS.InstanceHandle_t, bool) void;
+        const RegisterFn = *const fn (*anyopaque, DDS.InstanceHandle_t, *anyopaque, NotifyFn) void;
+        var original: RegisterFn = undefined;
+        var inner: NotifyFn = undefined;
+
+        /// Wraps each reader's matched notification, which the participant
+        /// makes as it installs each match (as the listener would be raised,
+        /// except on the shared runtime, which raises it later).
+        fn register(ctx: *anyopaque, handle: DDS.InstanceHandle_t, notify_ctx: *anyopaque, notify_fn: NotifyFn) void {
+            inner = notify_fn;
+            original(ctx, handle, notify_ctx, notifyMatched);
+        }
+
+        fn notifyMatched(ctx: *anyopaque, remote: DDS.InstanceHandle_t, added: bool) void {
+            inner(ctx, remote, added);
+            if (added) onMatched();
+        }
+
         /// On the first match, makes the reader not matched yet request a
         /// deadline the writer does not offer, before its match is made.
-        fn onMatched(_: *anyopaque, _: *const DDS.SubscriptionMatchedStatus, _: ?*anyopaque) callconv(.c) void {
+        fn onMatched() void {
             if (changed != null) return;
             const other = for (readers) |dr| {
                 if (matchedCount(dr) == 0) break dr;
@@ -284,9 +314,13 @@ test "data held for a reader whose match a change to it superseded is taken by t
     const desc = @as(*TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
     var qos = DDS.DataReaderQos{};
     qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const sub_impl: *dcps.SubscriberImpl = @ptrCast(@alignCast(h.sub.ptr));
+    Probe.original = sub_impl.cbs.register_matched_notify;
+    sub_impl.cbs.register_matched_notify = Probe.register;
     for (&Probe.readers) |*dr| {
-        dr.* = h.sub.create_datareader(desc, qos, .{ .on_subscription_matched = Probe.onMatched }, DDS.SUBSCRIPTION_MATCHED_STATUS);
+        dr.* = h.sub.create_datareader(desc, qos, null, 0);
     }
+    sub_impl.cbs.register_matched_notify = Probe.original;
     Probe.changed = null;
     Probe.rc = DDS.RETCODE_ERROR;
 
@@ -310,9 +344,8 @@ test "data held for a reader whose match a change to it superseded is taken by t
 }
 
 test "a historical-data wait satisfied by history held before the match finds it in the reader" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     const r = h.readerWith("Held", .RELIABLE_RELIABILITY_QOS, .TRANSIENT_LOCAL_DURABILITY_QOS);
     const dr = r.toDDSDataReader();
@@ -333,9 +366,8 @@ test "a historical-data wait satisfied by history held before the match finds it
 }
 
 test "nothing is held from a writer once discovery has matched it, whether or not a reader did" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     _ = h.reader("Held", .BEST_EFFORT_RELIABILITY_QOS);
 
@@ -346,9 +378,8 @@ test "nothing is held from a writer once discovery has matched it, whether or no
 }
 
 test "data sent to one reader is taken only by that reader" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     const a = h.reader("Held", .BEST_EFFORT_RELIABILITY_QOS);
     const b = h.reader("Held", .BEST_EFFORT_RELIABILITY_QOS);
@@ -362,9 +393,8 @@ test "data sent to one reader is taken only by that reader" {
 }
 
 test "held data is dropped when its writer or its participant is lost" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     _ = h.reader("Held", .BEST_EFFORT_RELIABILITY_QOS);
 
@@ -383,9 +413,8 @@ test "held data is dropped when its writer or its participant is lost" {
 }
 
 test "a writer lost after it was matched is held for again if it comes back" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     const r = h.reader("Held", .BEST_EFFORT_RELIABILITY_QOS);
 
@@ -399,11 +428,11 @@ test "a writer lost after it was matched is held for again if it comes back" {
 }
 
 test "held data expires one lease after it arrived: the sender's, or this participant's until the sender is discovered" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     _ = h.reader("Held", .BEST_EFFORT_RELIABILITY_QOS);
+    const clock = h.mr.manualClock();
 
     // An undiscovered participant's writer: this participant's lease.
     const unknown = writerGuid(0x57, 1);
@@ -416,23 +445,26 @@ test "held data expires one lease after it arrived: the sender's, or this partic
 
     clock.set(@as(i64, REMOTE_LEASE_MS) * std.time.ns_per_ms - 1);
     h.dp_impl.checkTimers();
+    h.settle();
     try testing.expectEqual(2 * PAYLOAD.len, h.held());
     clock.set(@as(i64, REMOTE_LEASE_MS) * std.time.ns_per_ms);
     h.dp_impl.checkTimers();
+    h.settle();
     try testing.expectEqual(PAYLOAD.len, h.held());
 
     clock.set(OWN_LEASE_NS - 1);
     h.dp_impl.checkTimers();
+    h.settle();
     try testing.expectEqual(PAYLOAD.len, h.held());
     clock.set(OWN_LEASE_NS);
     h.dp_impl.checkTimers();
+    h.settle();
     try testing.expectEqual(@as(usize, 0), h.held());
 }
 
 test "nothing is held from an ignored participant" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     _ = h.reader("Held", .BEST_EFFORT_RELIABILITY_QOS);
 
@@ -449,9 +481,8 @@ test "nothing is held from an ignored participant" {
 }
 
 test "nothing is held from a built-in or vendor-specific writer" {
-    var clock = ManualClock.init(0);
     var h: Harness = undefined;
-    try h.init(&clock);
+    try h.init();
     defer h.deinit();
     _ = h.reader("Held", .BEST_EFFORT_RELIABILITY_QOS);
 

@@ -1148,8 +1148,8 @@ The first vertical slice runs one reliable reader/writer pair through the same t
 under a manual and a hosted driver: match, delivery, the acknowledgment and data waits, a
 missed deadline, and retirement begun from listeners, with the runtime's last owner
 deleted inside its own listener. CI runs the unit tests on the runtime too, plain and under
-ThreadSanitizer, except the files in `build.zig`'s `not_yet_on_shared_runtime`, whose fixtures
-expect delivery on the calling thread. It runs the stress tests, rmw_zzdds and the interop
+ThreadSanitizer; tests that check delivery and listeners deterministically install a manual
+runtime they drive themselves (`test/support/manual_runtime.zig`). It runs the stress tests, rmw_zzdds and the interop
 suites on the runtime as well: interop against every vendor, and self-interop under
 ThreadSanitizer. Remaining work is implementation: those tests, the gaps above, then
 broader endpoint migration, thread consolidation onto the shared runtime timers,

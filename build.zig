@@ -17,41 +17,6 @@ const zzdds_version = @import("build.zig.zon").version;
 /// below 102: their ports (`7400 + 250*domain` up) then stay below the OS
 /// ephemeral ranges (Linux from 32768, Windows and macOS from 49152), where
 /// any socket on the machine can take one first. See `test/support/domain.zig`.
-/// Test files a -Dshared-runtime build compiles but does not run yet. Their
-/// fixtures expect delivery and listeners on the calling thread, which the
-/// runtime does not do. Remove a file once it passes there; the list is empty
-/// before the option is deleted
-/// (docs/design/concurrency/runtime.md#coexistence-during-migration).
-const not_yet_on_shared_runtime = [_][]const u8{
-    "test/c_abi/bootstrap_test.zig",
-    "test/dcps/cft_test.zig",
-    "test/dcps/coherent_sets_test.zig",
-    "test/dcps/entity_routing_test.zig",
-    "test/dcps/instance_lifecycle_test.zig",
-    "test/dcps/intraprocess_test.zig",
-    "test/dcps/listener_fallback_test.zig",
-    "test/dcps/listener_lock_test.zig",
-    "test/dcps/listener_replacement_test.zig",
-    "test/dcps/local_announcement_test.zig",
-    "test/dcps/match_generation_test.zig",
-    "test/dcps/matched_status_test.zig",
-    "test/dcps/qos_runtime_test.zig",
-    "test/dcps/read_take_test.zig",
-    "test/dcps/reader_vtable_test.zig",
-    "test/dcps/sample_rejected_test.zig",
-    "test/dcps/status_claim_test.zig",
-    "test/dcps/type_support_test.zig",
-    "test/dcps/unmatched_hold_test.zig",
-    "test/dcps/writer_vtable_test.zig",
-};
-
-/// Whether this build runs `src`.
-fn runsTestFile(shared_runtime: bool, src: []const u8) bool {
-    if (!shared_runtime) return true;
-    for (not_yet_on_shared_runtime) |name| if (std.mem.eql(u8, name, src)) return false;
-    return true;
-}
-
 fn addTestRun(b: *std.Build, t: *std.Build.Step.Compile, next: *u32) *std.Build.Step.Run {
     if (next.* > 101) @panic("addTestRun: out of test domains below 102");
     const r = b.addRunArtifact(t);
@@ -1598,6 +1563,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zzdds_generated", .module = generated_dcps_mod },
         },
     });
+    const manual_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("test/support/manual_runtime.zig"),
+        .imports = &.{.{ .name = "zzdds", .module = zzdds_mod }},
+    });
 
     const test_step = b.step("test", "Run Zenzen DDS tests");
     const inspect_step = b.step("resource-inspect", "Build offline plan validation and explicit multi-library inspection example");
@@ -1950,12 +1919,13 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "test_domain", .module = test_domain_mod },
                     .{ .name = "sample_sequence", .module = sample_sequence_mod },
                     .{ .name = "mock_dcps_fixture", .module = mock_dcps_fixture_mod },
+                    .{ .name = "manual_runtime", .module = manual_runtime_mod },
                 },
             }),
         });
         t.root_module.link_libc = true;
         const run = addTestRun(b, t, &dcps_test_domain);
-        test_step.dependOn(if (runsTestFile(shared_runtime, src)) &run.step else &t.step);
+        test_step.dependOn(&run.step);
         if (std.mem.eql(u8, src, "test/dcps/handle_retirement_test.zig")) {
             b.step("test-handle-retirement", "Check logical handle retirement and deferred entity cleanup").dependOn(&run.step);
         }
@@ -2274,6 +2244,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
         },
     });
+    const manual_runtime_mod_llvm_safe = b.createModule(.{
+        .root_source_file = b.path("test/support/manual_runtime.zig"),
+        .imports = &.{.{ .name = "zzdds", .module = zzdds_mod_llvm_safe }},
+    });
 
     for (dcps_test_files) |src| {
         const t = b.addTest(.{
@@ -2290,6 +2264,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "test_domain", .module = test_domain_mod },
                     .{ .name = "sample_sequence", .module = sample_sequence_mod },
                     .{ .name = "mock_dcps_fixture", .module = mock_dcps_fixture_mod_llvm_safe },
+                    .{ .name = "manual_runtime", .module = manual_runtime_mod_llvm_safe },
                 },
             }),
         });
@@ -2521,6 +2496,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
         },
     });
+    const manual_runtime_mod_tsan = b.createModule(.{
+        .root_source_file = b.path("test/support/manual_runtime.zig"),
+        .imports = &.{.{ .name = "zzdds", .module = zzdds_mod_tsan }},
+    });
     for (dcps_test_files) |src| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(src),
@@ -2534,11 +2513,12 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "test_domain", .module = test_domain_mod },
                 .{ .name = "sample_sequence", .module = sample_sequence_mod },
                 .{ .name = "mock_dcps_fixture", .module = mock_dcps_fixture_mod_tsan },
+                .{ .name = "manual_runtime", .module = manual_runtime_mod_tsan },
             },
         }), .use_llvm = true });
         t.root_module.link_libc = true;
         const run = addTestRun(b, t, &tsan_dcps_test_domain);
-        tsan_step.dependOn(if (runsTestFile(shared_runtime, src)) &run.step else &t.step);
+        tsan_step.dependOn(&run.step);
         if (std.mem.eql(u8, src, "test/dcps/handle_retirement_test.zig")) {
             b.step("test-handle-retirement-tsan", "Check deferred handle retirement with ThreadSanitizer").dependOn(&run.step);
         }
