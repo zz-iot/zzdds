@@ -38,10 +38,27 @@ def port_is_bound(port: int) -> bool:
     return False
 
 
+def wait_for_sample(sub: LiveProcess, timeout: float) -> bool:
+    """Poll the subscriber's log until it prints a received sample line, the
+    subscriber exits, or `timeout` passes."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if RECEIVED_RE.search(sub.log_text()):
+            return True
+        if sub.poll() is not None:
+            break
+        time.sleep(0.1)
+    return RECEIVED_RE.search(sub.log_text()) is not None
+
+
 def run_main_pubsub(zig_out: Path, env: dict) -> bool:
     print("Starting subscriber...")
+    # -i -1: the subscriber reads until it is stopped. -i counts read
+    # iterations, so a fixed count ends it a few read periods after it
+    # starts, which on a slow runner is before the publisher's JVM has
+    # started, matched and written anything.
     sub = LiveProcess(
-        java_cmd(zig_out, CLASSES_DIR, "ShapeMain", "-S", "-i", "10", "--read-period", "200"),
+        java_cmd(zig_out, CLASSES_DIR, "ShapeMain", "-S", "-i", "-1", "--read-period", "200"),
         env=env,
         log_path=SCRIPT_DIR / "build" / "sub.log",
     )
@@ -53,22 +70,31 @@ def run_main_pubsub(zig_out: Path, env: dict) -> bool:
         env=env,
     )
 
+    received = wait_for_sample(sub, PROC_TIMEOUT_S)
     pub.wait(PROC_TIMEOUT_S)
     pub_rc = pub.stop()
-    sub.wait(PROC_TIMEOUT_S)
-    sub_rc = sub.stop()
+    # The subscriber runs until stopped, so having exited by now is a
+    # failure. Its exit code after stop() is not checked: on Windows stop()
+    # terminates the process, which exits nonzero.
+    sub_rc = sub.poll()
+    if not received and sub_rc is None:
+        sub.mark_overdue()
+    sub.stop()
 
     sub_log = sub.log_text()
     print(sub_log)
 
-    if pub_rc != 0 or sub_rc != 0:
-        print(f"FAIL: publisher rc={pub_rc} subscriber rc={sub_rc}", file=sys.stderr)
+    if pub_rc != 0:
+        print(f"FAIL: publisher rc={pub_rc}", file=sys.stderr)
+        return False
+    if sub_rc is not None:
+        print(f"FAIL: subscriber exited before it was stopped (rc={sub_rc})", file=sys.stderr)
         return False
 
-    # Real end-to-end proof, not just "both processes exited 0" -- at least
-    # one actual sample line (e.g. "Square     BLUE       123 045 [20]")
-    # must have reached the subscriber.
-    if not RECEIVED_RE.search(sub_log):
+    # Real end-to-end proof, not just "both processes ran" -- at least one
+    # actual sample line (e.g. "Square     BLUE       123 045 [20]") must
+    # have reached the subscriber.
+    if not received:
         print("FAIL: subscriber never printed a received sample line", file=sys.stderr)
         return False
 

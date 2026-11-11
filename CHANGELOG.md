@@ -24,6 +24,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   `trace.TraceConfig` are replaced by `setTraceSink`, which replaces the configured sink
   with the application's own while the config's scope and filter still apply. The
   `-Dguid-filter` build option is removed: filtering is configuration.
+- The Java `shape` example's run script keeps its subscriber reading until it is stopped.
+  It used to stop after 10 read periods (about 2s), which on a slow runner ended before the
+  publisher's JVM had matched and written a sample.
 
 ## 2026-11-10
 
