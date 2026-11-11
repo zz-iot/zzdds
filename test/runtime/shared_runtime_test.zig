@@ -3199,6 +3199,12 @@ const Slice = struct {
     /// Set from the reader's listener once its participant is deleted.
     io: ?std.Io = null,
     done: std.Io.Event = .unset,
+    /// Set once the application's `set_qos` has returned. On a hosted
+    /// runtime the deadline it sets can be missed, and the writer's listener
+    /// run, before it returns (it still announces the writer), so the
+    /// listener waits for this before deleting the participant: the
+    /// application must not delete what another of its threads still uses.
+    qos_set: std.Io.Event = .unset,
 
     // Recorded by the application thread.
     publication_matched: i32 = 0,
@@ -3211,6 +3217,7 @@ const Slice = struct {
     deadline_calls: u32 = 0,
     deadline_total: i32 = 0,
     writer_in_lane: bool = false,
+    writer_waited: bool = true,
     writer_delete_rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
     reader_matched: [4]i32 = undefined,
     reader_calls: usize = 0,
@@ -3274,7 +3281,9 @@ const Slice = struct {
         var qos: DDS.DataWriterQos = undefined;
         try testing.expectEqual(DDS.RETCODE_OK, self.pair.dw_h.get_qos(&qos));
         qos.deadline.period = deadline;
-        try testing.expectEqual(DDS.RETCODE_OK, self.pair.dw_h.set_qos(qos));
+        const set_rc = self.pair.dw_h.set_qos(qos);
+        if (self.io) |io| self.qos_set.set(io);
+        try testing.expectEqual(DDS.RETCODE_OK, set_rc);
     }
 
     fn onDeadlineMissed(_: *anyopaque, st: *const DDS.OfferedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
@@ -3283,6 +3292,12 @@ const Slice = struct {
         if (self.deadline_calls > 1) return;
         self.deadline_total = st.total_count;
         self.writer_in_lane = self.pair.dw.listeners.ctx.isRunningHere();
+        if (self.io) |io| {
+            self.qos_set.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } }) catch {
+                self.writer_waited = false;
+                return;
+            };
+        }
         self.writer_delete_rc = deleteParticipant(&self.pair.w, self.pair.dp_w);
     }
 
@@ -3310,6 +3325,7 @@ const Slice = struct {
         try testing.expectEqual(@as(u32, 1), self.deadline_calls);
         try testing.expect(self.deadline_total >= 1);
         try testing.expect(self.writer_in_lane);
+        try testing.expect(self.writer_waited);
         try testing.expectEqual(DDS.RETCODE_OK, self.writer_delete_rc);
         try testing.expectEqualSlices(i32, &.{ 1, 0 }, self.reader_matched[0..self.reader_calls]);
         try testing.expect(self.reader_in_lane);
