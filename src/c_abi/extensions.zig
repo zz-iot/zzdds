@@ -70,7 +70,7 @@ const FactoryOwner = struct {
     /// internal per-`ParticipantStack` delegate with its own, independent,
     /// single-view box.
     fac_c_abi: c_abi_handle.CachedCAbiHandle = .{},
-    /// Allocates from `debug_gpa`: see `debugGpaRelease`.
+    /// Allocates from `debug_gpa`: see `FactoryLeakCheck`.
     on_debug_gpa: bool = false,
 
     fn deinit(self: *@This()) void {
@@ -81,7 +81,7 @@ const FactoryOwner = struct {
         self.default_config.deinit(self.alloc);
         const on_debug_gpa = self.on_debug_gpa;
         self.alloc.destroy(self);
-        if (on_debug_gpa) debugGpaRelease();
+        if (build_options.debug_allocator and on_debug_gpa) debugGpaRelease();
     }
 
     fn createParticipant(
@@ -1195,42 +1195,55 @@ pub export fn zzdds_cft_match_sample(
 const debug_gpa_config: std.heap.DebugAllocatorConfig = if (build_options.debug_allocator_stack_traces) .{} else .{ .stack_trace_frames = 0 };
 var debug_gpa: std.heap.DebugAllocator(debug_gpa_config) = .{};
 
-// Factories on `debug_gpa`, counting one from before it allocates anything.
-// Guarded by `debug_gpa_mu`.
-var debug_gpa_factories: u32 = 0;
-var debug_gpa_mu: Mutex = .{};
+// Counts the factories on one allocator, each from before it allocates
+// anything, and checks the allocator for leaks once the last is destroyed.
+// A factory's allocator must outlive it and everything created through it,
+// so by then nothing it allocated may still be live: what is, leaked or is
+// freed late. The lock keeps a factory being created meanwhile from
+// allocating during the check.
+const FactoryLeakCheck = struct {
+    factories: u32 = 0,
+    mu: Mutex = .{},
+
+    fn retain(self: *FactoryLeakCheck) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.factories += 1;
+    }
+
+    // Returns how many allocations are still live if this released the last
+    // factory, else 0. `gpa` is a DebugAllocator, which also logs each one
+    // (with where it was made, given stack traces).
+    fn release(self: *FactoryLeakCheck, gpa: anytype) usize {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.factories -= 1;
+        if (self.factories > 0) return 0;
+        return gpa.detectLeaks();
+    }
+};
+
+var debug_gpa_leak_check: FactoryLeakCheck = .{};
 
 fn debugGpaRetain() void {
-    debug_gpa_mu.lock();
-    defer debug_gpa_mu.unlock();
-    debug_gpa_factories += 1;
+    debug_gpa_leak_check.retain();
 }
 
-// A factory's allocator must outlive it and everything created through it,
-// so once the last factory on `debug_gpa` is destroyed nothing it allocated
-// may still be live: what is, leaked or is freed late. The allocator logs
-// each such allocation (with where it was made, given stack traces), and
-// this then fails the process. The lock keeps a factory being created
-// meanwhile from allocating during the check.
 fn debugGpaRelease() void {
-    debug_gpa_mu.lock();
-    defer debug_gpa_mu.unlock();
-    debug_gpa_factories -= 1;
-    if (debug_gpa_factories > 0) return;
-    const leaks = debug_gpa.detectLeaks();
+    const leaks = debug_gpa_leak_check.release(&debug_gpa);
     if (leaks > 0) std.debug.panic("-Ddebug-allocator: {d} allocation(s) still live after the last factory was destroyed", .{leaks});
 }
 
 fn createFactory(allocator: ?*const zidl_bindings.ZidlAllocator) !ZZDDS.DomainParticipantFactory {
-    const on_debug_gpa = allocator == null and build_options.debug_allocator;
+    const on_debug_gpa = build_options.debug_allocator and allocator == null;
     const alloc = if (allocator) |a|
         zidl_bindings.toAllocator(a)
     else if (on_debug_gpa)
         debug_gpa.allocator()
     else
         std.heap.c_allocator;
-    if (on_debug_gpa) debugGpaRetain();
-    errdefer if (on_debug_gpa) debugGpaRelease();
+    if (build_options.debug_allocator and on_debug_gpa) debugGpaRetain();
+    errdefer if (build_options.debug_allocator and on_debug_gpa) debugGpaRelease();
     const owner = try alloc.create(FactoryOwner);
     errdefer alloc.destroy(owner);
     // Lazily resolves+commits the process-wide config on the very first factory
@@ -1581,6 +1594,45 @@ fn octets(seq: ?*const ZZDDS.OctetSeq) ?[]const u8 {
     const s = seq orelse return null;
     const buf = s._buffer orelse return if (s._length == 0) &.{} else null;
     return buf[0..s._length];
+}
+
+// Stands in for a DebugAllocator with `live` allocations, which would log
+// each one as an error and so fail the test.
+const FakeLeakDetector = struct {
+    live: usize,
+    checks: u32 = 0,
+
+    fn detectLeaks(self: *FakeLeakDetector) usize {
+        self.checks += 1;
+        return self.live;
+    }
+};
+
+test "FactoryLeakCheck checks for leaks only when the last factory is released" {
+    var check: FactoryLeakCheck = .{};
+    var gpa: FakeLeakDetector = .{ .live = 3 };
+    check.retain();
+    check.retain();
+    try std.testing.expectEqual(@as(usize, 0), check.release(&gpa));
+    try std.testing.expectEqual(@as(u32, 0), gpa.checks);
+    try std.testing.expectEqual(@as(usize, 3), check.release(&gpa));
+    try std.testing.expectEqual(@as(u32, 1), gpa.checks);
+
+    // A factory created after the last one was destroyed starts a new count.
+    gpa.live = 0;
+    check.retain();
+    try std.testing.expectEqual(@as(usize, 0), check.release(&gpa));
+    try std.testing.expectEqual(@as(u32, 2), gpa.checks);
+}
+
+test "FactoryLeakCheck finds no leaks on a DebugAllocator whose allocations were freed" {
+    var check: FactoryLeakCheck = .{};
+    var gpa: std.heap.DebugAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    check.retain();
+    const buf = try gpa.allocator().alloc(u8, 64);
+    gpa.allocator().free(buf);
+    try std.testing.expectEqual(@as(usize, 0), check.release(&gpa));
 }
 
 test "zzdds extension factory creates participant with generated default config" {
