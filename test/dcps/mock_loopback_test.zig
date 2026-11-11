@@ -1445,8 +1445,11 @@ test "mock_loopback: onParticipantLost fires on_reliable_writer_ready(false) whe
     const disc_w = try SpdpSedpDiscovery.init(alloc, mock_w.transport(), 0, 100);
     // Short lease so the reader's own checkLeases() notices W's silence
     // (after W is deleted below) within this test's bounded polling window,
-    // instead of waiting out the 10s default.
-    const cfg_w = config_mod.Config{ .participant = .{ .lease_duration_ms = 250 } };
+    // instead of waiting out the 10s default. Not shorter: only this thread
+    // delivers W's traffic, while R checks leases on its own timer, so a
+    // stall of this thread longer than the lease expires W before the
+    // match is checked.
+    const cfg_w = config_mod.Config{ .participant = .{ .lease_duration_ms = 1000 } };
     var factory_w = try DomainParticipantFactoryImpl.init(
         alloc,
         mock_w.transport(),
