@@ -15,6 +15,7 @@ pub const Config = struct {
     rtps: RtpsConfig = .{},
     discovery: DiscoveryConfig = .{},
     qos: QosDefaults = .{},
+    trace: TraceConfig = .{},
 };
 
 pub const DomainConfig = struct {
@@ -219,6 +220,30 @@ pub const QosDefaults = struct {
     history_kind: HistoryKind = .keep_last,
     history_depth: i32 = 1,
 };
+
+/// The RTPS wire trace (`src/trace.zig`). Used only in a `-Dwire-trace`
+/// build; otherwise validated and ignored.
+pub const TraceConfig = struct {
+    /// Where events go: nowhere, stderr, stdout or a file.
+    sink: TraceSink = .none,
+    scope: TraceScope = .all,
+    format: TraceFormat = .text,
+    filter_mode: TraceFilterMode = .exclude,
+    /// The GUID prefixes `filter_mode` applies to.
+    filter_participants: []const [12]u8 = &.{},
+};
+
+pub const TraceSink = union(enum) {
+    none,
+    stderr,
+    stdout,
+    /// A file path, owned by the config.
+    file: []const u8,
+};
+
+pub const TraceScope = enum { all, discovery, user };
+pub const TraceFormat = enum { text, ndjson };
+pub const TraceFilterMode = enum { exclude, include };
 
 // ── Minimal QoS kind enums (full types will live in qos/policy.zig) ──────────
 

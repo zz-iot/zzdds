@@ -1079,6 +1079,9 @@ pub const DomainParticipantImpl = struct {
 
     /// Wire tracer applied to all user-plane protocol adapters (zero-size when disabled).
     tracer: trace_mod.Tracer,
+    /// Wire tracer for discovery's built-in endpoints, handed to the
+    /// discovery plugin when it starts serving this participant.
+    discovery_tracer: trace_mod.Tracer,
 
     /// Monotonic clock used for internal interval timers (deadline, liveliness).
     /// Resolved from the factory's ClockRegistry at participant creation time.
@@ -1169,7 +1172,9 @@ pub const DomainParticipantImpl = struct {
         listener: DDS.DomainParticipantListener,
         mask: DDS.StatusMask,
         handle: DDS.InstanceHandle_t,
-        tracer: trace_mod.Tracer,
+        /// Replaces the sink `config.trace` names; its scope and filter
+        /// still apply. See trace.zig's `tracersFor`.
+        trace_sink: ?trace_mod.Sink,
         timer_clock: time_mod.Clock,
     ) !*Self {
         // When TCP user-data is enabled, construct a dedicated TcpTransport for
@@ -1242,11 +1247,17 @@ pub const DomainParticipantImpl = struct {
             },
             .data_listen_port = 0,
             .meta_userdata_listen_port = 0,
-            .tracer = tracer,
+            .tracer = trace_mod.Tracer.noop(),
+            .discovery_tracer = trace_mod.Tracer.noop(),
             .timer_clock = timer_clock,
             .mu = .{},
         };
         errdefer alloc.destroy(self);
+        // From the participant's own copy of the config, which outlives the
+        // tracers (they borrow its filter list).
+        const tracers = trace_mod.tracersFor(&self.config.trace, trace_sink);
+        self.tracer = tracers.user;
+        self.discovery_tracer = tracers.discovery;
         self.listener_box = try ListenerBox(DDS.DomainParticipantListener).create(alloc, listener);
         errdefer alloc.destroy(self.listener_box);
         self.qos = try qos.clone(alloc);
@@ -1555,6 +1566,7 @@ pub const DomainParticipantImpl = struct {
             .builtin_endpoint_set = BUILTIN_ENDPOINTS,
             .initial_peers = udp_cfg.initial_peers,
             .data_reachable = data_reachable,
+            .tracer = self.discovery_tracer,
         };
         try self.discovery.start(&ann, &self.disc_callbacks);
         self.discovery_started = true;

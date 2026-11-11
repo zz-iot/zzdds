@@ -19,6 +19,7 @@ const transport = @import("../transport/interface.zig");
 const guid_mod = @import("../rtps/guid.zig");
 const header_mod = @import("../rtps/message/header.zig");
 const Runtime = @import("../runtime/core.zig").Runtime;
+const trace = @import("../trace.zig");
 const Locator = transport.Locator;
 const Transport = transport.Transport;
 
@@ -102,6 +103,10 @@ pub const ParticipantAnnouncement = struct {
     /// pass is needed. Set only by DomainParticipantImpl when it constructed
     /// a dedicated data transport.
     data_reachable: ?DataLocatorReachability = null,
+    /// Traces this participant's discovery endpoints (SPDP, SEDP, WLP) for
+    /// as long as the plugin serves it. Null traces nothing. A plugin with
+    /// no RTPS endpoints of its own ignores it.
+    tracer: ?trace.Tracer = null,
 };
 
 /// Injected capability letting discovery (SPDP/SEDP, always UDP) ask whether a
