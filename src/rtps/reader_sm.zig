@@ -646,6 +646,7 @@ pub const StatefulReader = struct {
         if (wp.?.received.contains(sn)) {
             self.tracer.submit(.{ .recv_data_dup = .{
                 .src_prefix = writer_guid.prefix,
+                .dst_prefix = self.guid.prefix,
                 .writer_eid = writer_guid.entity_id,
                 .sn = sn,
             } });
@@ -836,6 +837,7 @@ pub const StatefulReader = struct {
         if (!self.reliable and sn <= wp.received.max()) {
             self.tracer.submit(.{ .recv_data_dup = .{
                 .src_prefix = change.writer_guid.prefix,
+                .dst_prefix = self.guid.prefix,
                 .writer_eid = change.writer_guid.entity_id,
                 .sn = sn,
             } });
@@ -844,6 +846,7 @@ pub const StatefulReader = struct {
 
         self.tracer.submit(.{ .recv_data = .{
             .src_prefix = change.writer_guid.prefix,
+            .dst_prefix = self.guid.prefix,
             .writer_eid = change.writer_guid.entity_id,
             .reader_eid = self.guid.entity_id,
             .sn = sn,
@@ -1018,6 +1021,7 @@ pub const StatefulReader = struct {
                 if (diff <= 0) {
                     self.tracer.submit(.{ .recv_heartbeat_dup = .{
                         .src_prefix = writer_guid.prefix,
+                        .dst_prefix = self.guid.prefix,
                         .writer_eid = writer_guid.entity_id,
                         .count = count,
                     } });
@@ -1049,6 +1053,7 @@ pub const StatefulReader = struct {
 
             self.tracer.submit(.{ .recv_heartbeat = .{
                 .src_prefix = writer_guid.prefix,
+                .dst_prefix = self.guid.prefix,
                 .writer_eid = writer_guid.entity_id,
                 .reader_eid = self.guid.entity_id,
                 .first_sn = first_sn,
@@ -1120,6 +1125,7 @@ pub const StatefulReader = struct {
             if (!wp.guid.eql(writer_guid)) continue;
             self.tracer.submit(.{ .recv_gap = .{
                 .src_prefix = writer_guid.prefix,
+                .dst_prefix = self.guid.prefix,
                 .writer_eid = writer_guid.entity_id,
                 .reader_eid = self.guid.entity_id,
                 .gap_start = gap_start,
@@ -1186,6 +1192,7 @@ pub const StatefulReader = struct {
         const sns = wp.missingSnSet(last_sn);
         self.tracer.submit(.{ .send_acknack = .{
             .src_prefix = self.guid.prefix,
+            .dst_prefix = wp.guid.prefix,
             .reader_eid = self.guid.entity_id,
             .writer_eid = wp.guid.entity_id,
             .base_sn = sns.base,
@@ -1234,6 +1241,7 @@ pub const StatefulReader = struct {
         const count = self.ack_count;
         self.tracer.submit(.{ .send_acknack = .{
             .src_prefix = self.guid.prefix,
+            .dst_prefix = wp.guid.prefix,
             .reader_eid = self.guid.entity_id,
             .writer_eid = wp.guid.entity_id,
             .base_sn = sns.base,

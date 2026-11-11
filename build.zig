@@ -384,8 +384,7 @@ pub fn build(b: *std.Build) void {
     const ipv4 = b.option(bool, "ipv4", "Include IPv4 UDP transport (default: true)") orelse true;
     const ipv6 = b.option(bool, "ipv6", "Include IPv6 UDP transport (default: true)") orelse true;
     const interface_monitor = b.option(bool, "interface-monitor", "Include interface change monitoring; if false, interfaces are enumerated once at startup (default: true)") orelse true;
-    const wire_trace = b.option(bool, "wire-trace", "Include RTPS wire trace subsystem (default: false)") orelse false;
-    const guid_filter = b.option(bool, "guid-filter", "Include GUID-prefix filtering in wire trace (default: false; only meaningful with wire-trace)") orelse false;
+    const wire_trace = b.option(bool, "wire-trace", "Include the RTPS wire trace; each participant's config chooses what is traced and where (default: false)") orelse false;
 
     const xtypes = b.option(bool, "xtypes", "Include partial DDS-XTypes support: DataRepresentationQosPolicy and optional PID_TYPE_INFORMATION in SEDP; no TypeLookup service (default: true)") orelse true;
     const content_subscription_profile = b.option(bool, "content-subscription-profile", "Enable Content-Subscription profile parser/evaluator for ContentFilteredTopic and QueryCondition; MultiTopic not implemented (DDS v1.4 Annex A, default: true)") orelse true;
@@ -406,7 +405,6 @@ pub fn build(b: *std.Build) void {
         opts.addOption(bool, "ipv6", ipv6);
         opts.addOption(bool, "interface_monitor", interface_monitor);
         opts.addOption(bool, "wire_trace", wire_trace);
-        opts.addOption(bool, "guid_filter", guid_filter);
         opts.addOption(bool, "xtypes", xtypes);
         opts.addOption(bool, "content_subscription_profile", content_subscription_profile);
         opts.addOption(bool, "debug_allocator", debug_allocator);

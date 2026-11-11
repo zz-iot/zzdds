@@ -389,8 +389,12 @@ releasing `writer.mu`.
    `scope_levels`; runtime override via `logFn`. Scopes: `zzdds_rtps`, `zzdds_spdp`,
    `zzdds_sedp`, `zzdds_transport`, `zzdds_dcps`.
 2. `src/trace.zig` — structured RTPS wire events. Comptime-gated by `-Dwire-trace`;
-   `Tracer` is zero-size and all calls are dead-code eliminated when disabled. `Sink`
-   vtable with `SyncSink`, `AsyncRingSink`, `NoopSink`. NDJSON or text output.
+   `Tracer` is zero-size and all calls are dead-code eliminated when disabled. In a
+   `-Dwire-trace` build, each participant's `[trace]` config picks the sink (stderr,
+   stdout or a file), scope (discovery, user endpoints or both), format and participant
+   filter. The build flag decides cost; configuration decides behavior, and works from
+   every binding. A Zig application may supply its own `Sink` instead
+   (`setTraceSink`). NDJSON or text output.
 
 These are independent because diagnostic logging and wire tracing have different
 audiences (developers vs. protocol analyzers) and different verbosity profiles.
@@ -451,8 +455,10 @@ Wireshark correlation and deterministic tests. Both paths embed `ZZDDS_VENDOR_ID
 ## Build System
 
 **Conditional compilation via build options, not runtime flags.**
-`-Dipv4`, `-Dipv6`, `-Dinterface-monitor`, `-Dwire-trace`, `-Dguid-filter`,
-`-Dxtypes`, `-Dcontent-subscription-profile`. Dead-code elimination removes unused
+`-Dipv4`, `-Dipv6`, `-Dinterface-monitor`, `-Dwire-trace`,
+`-Dxtypes`, `-Dcontent-subscription-profile`. A flag decides only whether code is
+compiled in; once it is, what it does at runtime is configuration (the wire trace's
+filter, for one, is a config setting, not the former `-Dguid-filter` flag). Dead-code elimination removes unused
 paths at compile time — no runtime overhead, no `#ifdef`-style branching at call sites.
 
 ---

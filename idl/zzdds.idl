@@ -93,6 +93,43 @@ module zzdds {
         @default(1)                           long                          history_depth;
     };
 
+    // Which of a participant's RTPS endpoints the wire trace covers:
+    // discovery's built-in endpoints (SPDP, SEDP and WLP), the user's
+    // DataWriters and DataReaders, or both.
+    enum TraceScope {
+        TRACE_ALL,
+        TRACE_DISCOVERY,
+        TRACE_USER
+    };
+
+    enum TraceFormat {
+        TRACE_TEXT,
+        TRACE_NDJSON
+    };
+
+    // How TraceConfig::filter_participants selects events: TRACE_EXCLUDE
+    // traces every event except those to or from a listed participant,
+    // TRACE_INCLUDE only those.
+    enum TraceFilterMode {
+        TRACE_EXCLUDE,
+        TRACE_INCLUDE
+    };
+
+    // The RTPS wire trace. Takes effect only in a library built with
+    // -Dwire-trace; otherwise it is validated and ignored, with a warning
+    // when a sink is set.
+    struct TraceConfig {
+        // "none", "stderr", "stdout", or a file path. A file is opened, and
+        // truncated, the first time a participant in the process uses it,
+        // and stays open until the process exits.
+        @default("none")        string          sink;
+        @default(TRACE_ALL)     TraceScope      scope;
+        @default(TRACE_TEXT)    TraceFormat     format;
+        @default(TRACE_EXCLUDE) TraceFilterMode filter_mode;
+        // GUID prefixes, 24 hex digits each.
+                                StringSeq       filter_participants;
+    };
+
     struct DomainParticipantConfig {
         DomainConfig      domain;
         ParticipantConfig participant;
@@ -100,6 +137,7 @@ module zzdds {
         RtpsConfig        rtps;
         DiscoveryConfig   discovery;
         QosDefaults       qos;
+        TraceConfig       trace;
     };
 
     // Process-wide configuration. Deliberately minimal for now — just what a

@@ -46,8 +46,7 @@ from it.
 | `-Dipv4` | true | Exclude IPv4 UDP transport |
 | `-Dipv6` | true | Exclude IPv6 UDP transport |
 | `-Dinterface-monitor` | true | Enumerate NICs once at startup |
-| `-Dwire-trace` | false | `Tracer` is zero-size; all trace calls are dead-code eliminated |
-| `-Dguid-filter` | false | No GUID-prefix filter in wire trace (only meaningful with wire-trace) |
+| `-Dwire-trace` | false | `Tracer` is zero-size; all trace calls are dead-code eliminated. When true, each participant's `[trace]` config chooses what is traced and where (see Wire Trace) |
 | `-Dxtypes` | true | When false: suppress `PID_TYPE_INFORMATION` in SEDP announcements. Note: no TypeLookup service is implemented; XTypes type discovery from remote participants is not supported regardless of this flag. |
 | `-Dcontent-subscription-profile` | true | When false: disable the ContentFilteredTopic/QueryCondition SQL parser and evaluator (DDS v1.4 Annex A). MultiTopic is not implemented. |
 
@@ -273,6 +272,13 @@ reliability_kind = "BEST_EFFORT_RELIABILITY_QOS"  # or "RELIABLE_RELIABILITY_QOS
 durability_kind = "VOLATILE_DURABILITY_QOS"       # or "TRANSIENT_LOCAL_DURABILITY_QOS" | "TRANSIENT_DURABILITY_QOS" | "PERSISTENT_DURABILITY_QOS"
 history_kind = "KEEP_LAST_HISTORY_QOS"            # or "KEEP_ALL_HISTORY_QOS"
 history_depth = 1
+
+[trace]                  # used only in a -Dwire-trace build; see Wire Trace
+sink = "none"            # "none" | "stderr" | "stdout" | a file path
+scope = "TRACE_ALL"      # or "TRACE_DISCOVERY" | "TRACE_USER"
+format = "TRACE_TEXT"    # or "TRACE_NDJSON"
+filter_mode = "TRACE_EXCLUDE"  # or "TRACE_INCLUDE"
+filter_participants = [] # GUID prefixes, 24 hex digits each
 ```
 
 `ProcessConfig` (also in `idl/zzdds.idl`) is deliberately minimal today — just
@@ -316,50 +322,51 @@ For runtime filtering, override `std_options.logFn`.
 
 ## Wire Trace (`src/trace.zig`)
 
-A second, independent observability system for structured RTPS wire events. Zero overhead when
-disabled — `Tracer` is a zero-size struct and every `tracer.submit(...)` call is dead-code
-eliminated at compile time (requires `-Dwire-trace=false`, the default).
+A second, independent observability system for structured RTPS wire events: each DATA,
+HEARTBEAT, ACKNACK and GAP a participant's endpoints send or receive, with the sending
+participant and, where known, the one it went to (`dst`).
 
-Enable at build time:
+**Cost is a build choice, behavior is configuration.** `-Dwire-trace=true` compiles the trace
+in; without it (the default) `Tracer` is a zero-size struct and every `tracer.submit(...)` call
+is dead-code eliminated. What a `-Dwire-trace` build traces, and where, is each participant's
+`[trace]` config (`zzdds::TraceConfig`), so a C, C++ or Java application can trace from
+`zzdds.toml` with no code:
 
-```sh
-zig build -Dwire-trace=true
-zig build -Dwire-trace=true -Dguid-filter=true   # + GUID-prefix filter
+```toml
+[default_participant_config.trace]
+sink = "stderr"            # "none" (default) | "stderr" | "stdout" | a file path
+scope = "TRACE_DISCOVERY"  # SPDP/SEDP/WLP built-in endpoints; or "TRACE_USER" | "TRACE_ALL"
+format = "TRACE_TEXT"      # or "TRACE_NDJSON" (one JSON object per line)
+filter_mode = "TRACE_INCLUDE"
+filter_participants = ["011b87d8376af345fb91073d"]
 ```
 
-**Synchronous output (stderr):**
+- **Sinks** are opened once per process and shared by every participant that names them (a file
+  by identity, so `trace.txt` and `./trace.txt` are one sink); they
+  stay open until the process exits and flush every event, so a crash or `exit` loses none. A
+  file is truncated when first opened, so give each process its own path. Stderr output holds
+  the process's stderr lock, so it does not interleave with log lines.
+- **The filter** selects events by the participants they involve, the sender or the
+  destination: `TRACE_EXCLUDE` (the default; an empty list traces everything) drops events
+  involving a listed participant, `TRACE_INCLUDE` keeps only those.
+- **Without `-Dwire-trace`** the `[trace]` section is still validated, so a config valid in one
+  build is valid in the other, and ignored; a configured sink logs one warning per process.
+
+A Zig application can install a sink of its own, an in-memory one in a test or an
+`AsyncRingSink`, in place of the configured one; the scope and filter still apply:
 
 ```zig
-var buf: [256]u8 = undefined;
-var stderr_writer = std.Io.File.stderr().writer(io, &buf);
-var sink = trace.SyncSink{ .writer = &stderr_writer, .format = .text };
-factory.setTraceConfig(.{ .sink = sink.sink() });
-```
-
-**Async ring buffer to file:**
-
-```zig
-var file  = try std.Io.Dir.cwd().createFile(io, "trace.ndjson", .{});
-// set up a file writer (see std.Io.File.Writer) and pass its *std.Io.Writer to AsyncRingSink
 var asink = try trace.AsyncRingSink.init(alloc, 4096, file_writer_ptr, .ndjson);
-try asink.startFlushThread();
-factory.setTraceConfig(.{ .sink = asink.sink() });
-// ... use factory ...
+try asink.startFlushThread();      // or call asink.flush() from your own loop
+factory.setTraceSink(asink.sink());
+// ... create participants, use them ...
 asink.deinit();  // flushes remaining events before returning
 ```
 
-**Output formats:** `.ndjson` (one JSON object per line) or `.text` (short human-readable lines).
-
-`TraceConfig` is stored on `DomainParticipantFactoryImpl` and applied to every participant and
-state machine it creates. For discovery state machines (SPDP/SEDP), wire the tracer before
-passing to the factory:
-
-```zig
-const tc = trace.TraceConfig{ .sink = my_sink.sink() };
-disc_impl.setTracer(tc.tracer());   // wires SPDP + SEDP tracers
-factory.setTraceConfig(tc);         // wires user DataWriter/DataReader tracers
-```
+A participant computes its tracers from its config (`trace.tracersFor`) when it is created: one
+for its user DataWriters and DataReaders, and one it hands to the discovery plugin through
+`ParticipantAnnouncement.tracer` when discovery starts serving it.
 
 **Key types:** `TraceEvent` (tagged union covering all RTPS submessages + `skipped`),
-`GuidFilter` (empty slice = accept all), `Sink` vtable, `SyncSink`, `AsyncRingSink`,
-`NoopSink`, `Tracer`.
+`GuidFilter` (include/exclude by participant), `Sink` vtable, `SyncSink`, `AsyncRingSink`,
+`NoopSink`, `Tracer`, `Tracers`.

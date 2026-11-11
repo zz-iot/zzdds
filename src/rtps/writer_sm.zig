@@ -1407,6 +1407,7 @@ pub const StatefulWriter = struct {
             }
             self.tracer.submit(.{ .send_data = .{
                 .src_prefix = self.guid.prefix,
+                .dst_prefix = rp.guid.prefix,
                 .writer_eid = self.guid.entity_id,
                 .reader_eid = rp.guid.entity_id,
                 .sn = ch.sequence_number,
@@ -1639,6 +1640,7 @@ pub const StatefulWriter = struct {
                 }
                 self.tracer.submit(.{ .send_data = .{
                     .src_prefix = self.guid.prefix,
+                    .dst_prefix = rp.guid.prefix,
                     .writer_eid = self.guid.entity_id,
                     .reader_eid = rp.guid.entity_id,
                     .sn = ch.sequence_number,
@@ -1678,6 +1680,7 @@ pub const StatefulWriter = struct {
             };
             self.tracer.submit(.{ .send_data = .{
                 .src_prefix = self.guid.prefix,
+                .dst_prefix = rp.guid.prefix,
                 .writer_eid = self.guid.entity_id,
                 .reader_eid = rp.guid.entity_id,
                 .sn = ch.sequence_number,
@@ -2091,6 +2094,7 @@ pub const StatefulWriter = struct {
             );
             self.tracer.submit(.{ .send_heartbeat = .{
                 .src_prefix = self.guid.prefix,
+                .dst_prefix = rp.guid.prefix,
                 .writer_eid = self.guid.entity_id,
                 .reader_eid = rp.guid.entity_id,
                 .first_sn = first_sn,
@@ -2207,6 +2211,7 @@ pub const StatefulWriter = struct {
 
             self.tracer.submit(.{ .recv_acknack = .{
                 .src_prefix = reader_guid.prefix,
+                .dst_prefix = self.guid.prefix,
                 .reader_eid = reader_guid.entity_id,
                 .writer_eid = self.guid.entity_id,
                 .base_sn = nack_set.base,
@@ -2241,6 +2246,7 @@ pub const StatefulWriter = struct {
                 fn call(w: *Self, proxy: *const ReaderProxy, ch: *const CacheChange, s: *[SCRATCH_SIZE]u8, frag_budget: *usize) void {
                     w.tracer.submit(.{ .send_data = .{
                         .src_prefix = w.guid.prefix,
+                        .dst_prefix = proxy.guid.prefix,
                         .writer_eid = w.guid.entity_id,
                         .reader_eid = proxy.guid.entity_id,
                         .sn = ch.sequence_number,
@@ -2407,6 +2413,7 @@ pub const StatefulWriter = struct {
                 });
                 self.tracer.submit(.{ .send_data = .{
                     .src_prefix = self.guid.prefix,
+                    .dst_prefix = rp.guid.prefix,
                     .writer_eid = self.guid.entity_id,
                     .reader_eid = rp.guid.entity_id,
                     .sn = ch.sequence_number,
@@ -2488,6 +2495,7 @@ pub const StatefulWriter = struct {
                 });
                 self.tracer.submit(.{ .send_data = .{
                     .src_prefix = self.guid.prefix,
+                    .dst_prefix = rp.guid.prefix,
                     .writer_eid = self.guid.entity_id,
                     .reader_eid = rp.guid.entity_id,
                     .sn = ch.sequence_number,

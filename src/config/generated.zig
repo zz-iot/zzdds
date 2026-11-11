@@ -44,6 +44,7 @@ pub fn toRuntimeConfig(allocator: std.mem.Allocator, cfg: *const ext.DomainParti
         .history_kind = toHistoryKind(cfg.qos.history_kind),
         .history_depth = cfg.qos.history_depth,
     };
+    runtime.trace = try toTraceConfig(allocator, &cfg.trace);
     return runtime;
 }
 
@@ -57,6 +58,7 @@ pub fn deinitRuntimeConfig(allocator: std.mem.Allocator, cfg: *schema.Config) vo
     if (cfg.transport.udp.initial_peers.len != 0) freeStringSlice(allocator, cfg.transport.udp.initial_peers);
     if (cfg.discovery.initial_peers.len != 0) freeStringSlice(allocator, cfg.discovery.initial_peers);
     if (cfg.discovery.static_config_file.len != 0) allocator.free(cfg.discovery.static_config_file);
+    deinitTraceConfig(allocator, &cfg.trace);
     // Zero only the heap-owning fields so a second deinit call is safe (len == 0
     // means the guards above skip the free).  Cannot use std.mem.zeroes(schema.Config)
     // because ReliabilityKind has no tag with value 0.
@@ -69,6 +71,66 @@ pub fn deinitRuntimeConfig(allocator: std.mem.Allocator, cfg: *schema.Config) vo
     cfg.transport.udp.initial_peers = &.{};
     cfg.discovery.initial_peers = &.{};
     cfg.discovery.static_config_file = "";
+}
+
+/// Validated whether or not the library traces (see the IDL's TraceConfig),
+/// so a config that works in one build works in the other.
+fn toTraceConfig(allocator: std.mem.Allocator, trace: *const ext.TraceConfig) !schema.TraceConfig {
+    var result = schema.TraceConfig{
+        .scope = switch (trace.scope) {
+            .TRACE_ALL => .all,
+            .TRACE_DISCOVERY => .discovery,
+            .TRACE_USER => .user,
+            _ => return error.InvalidValue,
+        },
+        .format = switch (trace.format) {
+            .TRACE_TEXT => .text,
+            .TRACE_NDJSON => .ndjson,
+            _ => return error.InvalidValue,
+        },
+        .filter_mode = switch (trace.filter_mode) {
+            .TRACE_EXCLUDE => .exclude,
+            .TRACE_INCLUDE => .include,
+            _ => return error.InvalidValue,
+        },
+    };
+    errdefer deinitTraceConfig(allocator, &result);
+    result.filter_participants = try parseGuidPrefixes(allocator, &trace.filter_participants);
+    const sink = trace.sink;
+    result.sink = if (sink.len == 0 or std.mem.eql(u8, sink, "none"))
+        .none
+    else if (std.mem.eql(u8, sink, "stderr"))
+        .stderr
+    else if (std.mem.eql(u8, sink, "stdout"))
+        .stdout
+    else
+        .{ .file = try allocator.dupe(u8, sink) };
+    return result;
+}
+
+fn deinitTraceConfig(allocator: std.mem.Allocator, trace: *schema.TraceConfig) void {
+    switch (trace.sink) {
+        .file => |path| allocator.free(path),
+        else => {},
+    }
+    if (trace.filter_participants.len != 0) allocator.free(trace.filter_participants);
+    trace.sink = .none;
+    trace.filter_participants = &.{};
+}
+
+/// Each entry is a GUID prefix as 24 hex digits.
+fn parseGuidPrefixes(allocator: std.mem.Allocator, seq: *const ext.StringSeq) ![]const [12]u8 {
+    if (seq._length == 0) return &.{};
+    const buf = seq._buffer orelse return error.NullBuffer;
+    const out = try allocator.alloc([12]u8, seq._length);
+    errdefer allocator.free(out);
+    for (buf[0..seq._length], out) |item, *slot| {
+        if (@intFromPtr(item) == 0) return error.NullBuffer;
+        const hex = std.mem.span(item);
+        if (hex.len != 24) return error.InvalidValue;
+        _ = std.fmt.hexToBytes(slot, hex) catch return error.InvalidValue;
+    }
+    return out;
 }
 
 fn freeStringSlice(allocator: std.mem.Allocator, slice: []const []const u8) void {
@@ -251,6 +313,50 @@ test "generated DomainParticipantConfig adapter maps overrides" {
     try std.testing.expectEqual(schema.DiscoveryKind.static, runtime.discovery.kind);
     try std.testing.expectEqual(schema.ReliabilityKind.reliable, runtime.qos.reliability_kind);
     try std.testing.expectEqual(@as(i32, 8), runtime.qos.history_depth);
+}
+
+test "generated DomainParticipantConfig adapter maps the trace config" {
+    var generated = ext.DomainParticipantConfig.default();
+    generated.trace.scope = .TRACE_DISCOVERY;
+    generated.trace.format = .TRACE_NDJSON;
+    generated.trace.filter_mode = .TRACE_INCLUDE;
+    var prefixes = [_][*:0]const u8{ "0102030405060708090a0b0c", "AABBCCDDEEFF001122334455" };
+    const borrowed = ext.StringSeq{ ._maximum = 2, ._length = 2, ._buffer = @ptrCast(&prefixes), ._release = false };
+    const saved_filter = generated.trace.filter_participants;
+    generated.trace.filter_participants = borrowed;
+    defer generated.trace.filter_participants = saved_filter;
+    const saved_sink = generated.trace.sink;
+    defer generated.trace.sink = saved_sink;
+
+    for ([_]struct { []const u8, schema.TraceSink }{
+        .{ "none", .none },
+        .{ "", .none },
+        .{ "stderr", .stderr },
+        .{ "stdout", .stdout },
+        .{ "logs/trace.txt", .{ .file = "logs/trace.txt" } },
+    }) |case| {
+        generated.trace.sink = case[0];
+        var runtime = try toRuntimeConfig(std.testing.allocator, &generated);
+        defer deinitRuntimeConfig(std.testing.allocator, &runtime);
+        try std.testing.expectEqualDeep(case[1], runtime.trace.sink);
+        try std.testing.expectEqual(schema.TraceScope.discovery, runtime.trace.scope);
+        try std.testing.expectEqual(schema.TraceFormat.ndjson, runtime.trace.format);
+        try std.testing.expectEqual(schema.TraceFilterMode.include, runtime.trace.filter_mode);
+        try std.testing.expectEqual(@as(usize, 2), runtime.trace.filter_participants.len);
+        try std.testing.expectEqual([12]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, runtime.trace.filter_participants[0]);
+        try std.testing.expectEqual(@as(u8, 0xAA), runtime.trace.filter_participants[1][0]);
+    }
+}
+
+test "generated DomainParticipantConfig adapter rejects a malformed trace filter prefix" {
+    var generated = ext.DomainParticipantConfig.default();
+    const saved = generated.trace.filter_participants;
+    defer generated.trace.filter_participants = saved;
+    for ([_][*:0]const u8{ "0102", "0102030405060708090a0b0g", "0102030405060708090a0b0c0d" }) |bad| {
+        var one = [_][*:0]const u8{bad};
+        generated.trace.filter_participants = .{ ._maximum = 1, ._length = 1, ._buffer = @ptrCast(&one), ._release = false };
+        try std.testing.expectError(error.InvalidValue, toRuntimeConfig(std.testing.allocator, &generated));
+    }
 }
 
 test "generated DomainParticipantConfig adapter rejects non-positive history_depth" {

@@ -42,7 +42,8 @@ pub const DomainParticipantFactoryImpl = struct {
     guid_strategy: GuidStrategy,
     factory_qos: DDS.DomainParticipantFactoryQos,
     default_dp_qos: DDS.DomainParticipantQos,
-    trace_config: trace_mod.TraceConfig,
+    /// See `setTraceSink`.
+    trace_sink: ?trace_mod.Sink = null,
     clock_registry: ClockRegistry,
 
     /// Active participants owned by this factory; guarded by `mu`.
@@ -89,7 +90,6 @@ pub const DomainParticipantFactoryImpl = struct {
             .guid_strategy = guid_strategy,
             .factory_qos = .{},
             .default_dp_qos = .{},
-            .trace_config = .{},
             .clock_registry = reg,
             .participants = .empty,
             .next_handle = 1,
@@ -108,10 +108,14 @@ pub const DomainParticipantFactoryImpl = struct {
         self.alloc.destroy(self);
     }
 
-    /// Configure the wire tracer applied to all participants created by this factory.
-    /// Call before `create_participant`; has no effect on already-created participants.
-    pub fn setTraceConfig(self: *Self, tc: trace_mod.TraceConfig) void {
-        self.trace_config = tc;
+    /// Sends the wire trace of participants created from now on to `sink`
+    /// instead of the sink their config names; their config's scope and
+    /// filter still apply (trace.zig's `tracersFor`). For a Zig application
+    /// that wants a sink of its own, such as an in-memory one in a test or
+    /// an `AsyncRingSink`. Null restores the configured sinks. `sink` must
+    /// outlive those participants. Does nothing without `-Dwire-trace`.
+    pub fn setTraceSink(self: *Self, sink: ?trace_mod.Sink) void {
+        self.trace_sink = sink;
     }
 
     /// Selects the runtime for participants created from now on, taking an
@@ -295,7 +299,7 @@ pub const DomainParticipantFactoryImpl = struct {
             if (a_listener) |l| l.* else DDS.noop_DomainParticipantListener,
             mask,
             handle,
-            self.trace_config.tracer(),
+            self.trace_sink,
             // On a runtime, timed QoS runs on its clock.
             if (rt) |r| r.clock else timer_clock,
         ) catch {

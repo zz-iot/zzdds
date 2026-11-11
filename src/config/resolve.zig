@@ -204,6 +204,31 @@ test "resolveParticipantConfigFrom: applies a file over defaults" {
     try std.testing.expectEqual(@as(u16, 7400), cfg.transport.udp.port_base);
 }
 
+test "resolveParticipantConfigFrom: reads a [trace] section" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = "zzdds_resolve_trace_test.toml";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data =
+        \\[trace]
+        \\sink = "stderr"
+        \\scope = "TRACE_DISCOVERY"
+        \\format = "TRACE_NDJSON"
+        \\filter_mode = "TRACE_INCLUDE"
+        \\filter_participants = ["011b87d8376af345fb91073d"]
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var cfg = try resolveParticipantConfigFrom(arena.allocator(), path);
+    defer cfg.deinit(arena.allocator());
+    try std.testing.expectEqualStrings("stderr", cfg.trace.sink);
+    try std.testing.expectEqual(ext.TraceScope.TRACE_DISCOVERY, cfg.trace.scope);
+    try std.testing.expectEqual(ext.TraceFormat.TRACE_NDJSON, cfg.trace.format);
+    try std.testing.expectEqual(ext.TraceFilterMode.TRACE_INCLUDE, cfg.trace.filter_mode);
+    try std.testing.expectEqual(@as(u32, 1), cfg.trace.filter_participants._length);
+}
+
 test "resolveParticipantConfigFrom: missing file propagates FileNotFound" {
     try std.testing.expectError(
         error.FileNotFound,

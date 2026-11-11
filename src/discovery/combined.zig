@@ -327,6 +327,9 @@ pub const SpdpSedpDiscovery = struct {
         // its endpoints exist first. SEDP then listens before SPDP fires its
         // initial announcement and remote peers begin sending SEDP and WLP
         // traffic.
+        // This participant's tracer, replacing the one a previous
+        // participant's start installed.
+        self.setTracer(local.tracer orelse trace.Tracer.noop());
         try self.wlp.start(local, cbs);
         try self.sedp.start(local, cbs);
 

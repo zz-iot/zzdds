@@ -8,6 +8,23 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-11
+
+- The wire trace is configured per participant: a `-Dwire-trace` build traces what its
+  `[trace]` config section (`zzdds::TraceConfig`) asks for, so C, C++ and Java applications
+  can trace from `zzdds.toml` with no code. It sets the sink (`"none"`, the default,
+  `"stderr"`, `"stdout"` or a file path), the scope (discovery's built-in endpoints, user
+  endpoints or both), the format, and a participant filter (include or exclude listed GUID
+  prefixes, matching an event's sender or destination). Discovery traffic is now traced too
+  without extra wiring. Without `-Dwire-trace` the section is validated and ignored, with
+  one warning when a sink is set.
+- Trace events record the participant a message was sent to, where known (`dst`), and the
+  NDJSON format's ACKNACK and GAP lines are valid JSON.
+- **Breaking** for Zig: `DomainParticipantFactoryImpl.setTraceConfig` and
+  `trace.TraceConfig` are replaced by `setTraceSink`, which replaces the configured sink
+  with the application's own while the config's scope and filter still apply. The
+  `-Dguid-filter` build option is removed: filtering is configuration.
+
 ## 2026-11-10
 
 - Update zidl to 0.3.29 and adopt its split runtimes. zzdds exports zidl's codec as the

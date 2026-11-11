@@ -1,32 +1,28 @@
 //! Wire trace subsystem for Zenzen DDS.
 //!
-//! Controlled by two build options (both default false):
-//!   -Dwire-trace=true   — include the trace machinery
-//!   -Dguid-filter=true  — include per-GUID-prefix filtering
+//! Compiled in by `-Dwire-trace=true` (default false). Without it, `Tracer`
+//! is a zero-size struct and every `tracer.submit(...)` call is a
+//! comptime-eliminated noop: no overhead of any kind reaches the binary.
 //!
-//! When `wire_trace = false`, `Tracer` is a zero-size struct and every
-//! `tracer.submit(...)` call is a comptime-eliminated noop. No overhead of any
-//! kind reaches the binary.
+//! What is traced, and where it goes, is each participant's configuration
+//! (`[trace]` in zzdds.toml, or `zzdds::TraceConfig`): the sink (none,
+//! stderr, stdout or a file), the scope (discovery's built-in endpoints,
+//! the user's endpoints, or both), the format, and a participant filter.
+//! See `tracersFor`. A build without `-Dwire-trace` validates that
+//! configuration and ignores it, warning once when a sink is set.
 //!
-//! Usage (application side):
+//! A Zig application can instead give the factory its own `Sink` (an
+//! in-memory one for a test, say, or an `AsyncRingSink`), which replaces
+//! the configured sink while the scope and filter still apply:
 //!
-//!   // Synchronous write to stderr:
-//!   var stderr_writer = std.Io.File.stderr().writer(io, &buf);
-//!   var sink = trace.SyncSink{ .writer = &stderr_writer, .format = .text };
-//!   var tc   = trace.TraceConfig{ .sink = sink.sink() };
-//!   factory  = try DomainParticipantFactory.init(alloc, .{ .trace = tc, ... });
-//!
-//!   // Async ring buffer → file:
-//!   var file   = try std.Io.Dir.cwd().createFile(io, "trace.ndjson", .{});
-//!   var asink  = try trace.AsyncRingSink.init(alloc, 4096, file_writer_ptr, .ndjson);
-//!   try asink.startFlushThread();
-//!   var tc     = trace.TraceConfig{ .sink = asink.sink() };
-//!
-//!   // Or, with no thread (a manual runtime's loop, say), drain it there:
-//!   //   asink.flush();
+//!   var asink = try trace.AsyncRingSink.init(alloc, 4096, file_writer_ptr, .ndjson);
+//!   try asink.startFlushThread();   // or call asink.flush() from your own loop
+//!   factory.setTraceSink(asink.sink());
 
 const std = @import("std");
 const build_opts = @import("build_options");
+const schema = @import("config/schema.zig");
+const log = @import("log.zig");
 const guid_mod = @import("rtps/guid.zig");
 const sn_mod = @import("rtps/sequence_number.zig");
 const sub_mod = @import("rtps/message/submessage.zig");
@@ -42,8 +38,6 @@ pub const RtpsTimestamp = time_mod.RtpsTimestamp;
 
 /// True when wire tracing is compiled in.
 pub const enabled = build_opts.wire_trace;
-/// True when GUID-prefix filtering is compiled in (only meaningful when enabled).
-pub const filter_enabled = build_opts.guid_filter;
 
 // ── TraceEvent ────────────────────────────────────────────────────────────────
 
@@ -82,6 +76,9 @@ pub const TraceEvent = union(enum) {
         sn: SequenceNumber,
         key_hash: [16]u8 = std.mem.zeroes([16]u8),
         data_len: u32,
+        /// GUID prefix of the participant the message was sent to, where
+        /// known (not for a multicast or locator-addressed send).
+        dst_prefix: GuidPrefix = GuidPrefix.unknown,
     };
 
     pub const HeartbeatFields = struct {
@@ -92,6 +89,7 @@ pub const TraceEvent = union(enum) {
         last_sn: SequenceNumber,
         count: i32,
         flags: u8,
+        dst_prefix: GuidPrefix = GuidPrefix.unknown,
     };
 
     pub const AckNackFields = struct {
@@ -102,6 +100,7 @@ pub const TraceEvent = union(enum) {
         bitmap: SequenceNumberSet,
         count: i32,
         final: bool,
+        dst_prefix: GuidPrefix = GuidPrefix.unknown,
     };
 
     pub const GapFields = struct {
@@ -110,6 +109,7 @@ pub const TraceEvent = union(enum) {
         reader_eid: EntityId,
         gap_start: SequenceNumber,
         gap_list: SequenceNumberSet,
+        dst_prefix: GuidPrefix = GuidPrefix.unknown,
     };
 
     pub const InfoTsFields = struct {
@@ -124,12 +124,14 @@ pub const TraceEvent = union(enum) {
         src_prefix: GuidPrefix,
         writer_eid: EntityId,
         sn: SequenceNumber,
+        dst_prefix: GuidPrefix = GuidPrefix.unknown,
     };
 
     pub const HbDupFields = struct {
         src_prefix: GuidPrefix,
         writer_eid: EntityId,
         count: i32,
+        dst_prefix: GuidPrefix = GuidPrefix.unknown,
     };
 
     /// Extract the source GUID prefix from any event variant.
@@ -146,22 +148,53 @@ pub const TraceEvent = union(enum) {
             .recv_info_ts, .skipped => GuidPrefix.unknown,
         };
     }
+
+    /// The participants `event` involves: the one that sent the message and
+    /// the one it was sent to. `GuidPrefix.unknown` for either one not
+    /// known.
+    pub fn participants(event: TraceEvent) [2]GuidPrefix {
+        return switch (event) {
+            inline .send_data,
+            .recv_data,
+            .send_heartbeat,
+            .recv_heartbeat,
+            .send_acknack,
+            .recv_acknack,
+            .send_gap,
+            .recv_gap,
+            .recv_data_dup,
+            .recv_heartbeat_dup,
+            => |e| .{ e.src_prefix, e.dst_prefix },
+            .recv_info_dst => |e| .{ GuidPrefix.unknown, e.prefix },
+            .recv_info_ts, .skipped => .{ GuidPrefix.unknown, GuidPrefix.unknown },
+        };
+    }
 };
 
 // ── GuidFilter ────────────────────────────────────────────────────────────────
 
-/// GUID prefix filter. Empty slice = accept all events (fast path: one len check).
-/// Gated at the call site by `filter_enabled`; the struct is always defined so
-/// `TraceConfig` has a stable layout regardless of build options.
-pub const GuidFilter = struct {
-    prefixes: []const GuidPrefix = &.{},
+pub const FilterMode = enum {
+    /// Every event except those involving a listed participant.
+    exclude,
+    /// Only events involving a listed participant.
+    include,
+};
 
-    /// Returns true if `prefix` matches any entry in the filter list,
-    /// or if the list is empty (accept-all mode).
-    pub fn matches(self: GuidFilter, prefix: GuidPrefix) bool {
-        if (self.prefixes.len == 0) return true;
-        for (self.prefixes) |p| if (p.eql(prefix)) return true;
-        return false;
+/// Selects events by the participants they involve (`TraceEvent.participants`):
+/// the sender, or the participant the message was sent to. The default, an
+/// empty exclude list, accepts everything.
+pub const GuidFilter = struct {
+    mode: FilterMode = .exclude,
+    /// GUID prefixes.
+    prefixes: []const [12]u8 = &.{},
+
+    pub fn accepts(self: GuidFilter, event: TraceEvent) bool {
+        if (self.prefixes.len == 0) return self.mode == .exclude;
+        const involved = event.participants();
+        const listed = for (self.prefixes) |p| {
+            if (std.mem.eql(u8, &p, &involved[0].bytes) or std.mem.eql(u8, &p, &involved[1].bytes)) break true;
+        } else false;
+        return listed == (self.mode == .include);
     }
 };
 
@@ -201,9 +234,25 @@ fn writeSns(w: *std.Io.Writer, set: SequenceNumberSet) !void {
     try w.writeAll("\"}");
 }
 
+/// `,"dst":"<prefix>"` when the event's destination participant is known.
+fn writeNdjsonDst(w: *std.Io.Writer, dst: GuidPrefix) !void {
+    if (dst.eql(GuidPrefix.unknown)) return;
+    try w.writeAll(",\"dst\":\"");
+    try writeGuidPrefix(w, dst);
+    try w.writeAll("\"");
+}
+
+/// ` dst=<prefix>` when the event's destination participant is known.
+fn writeTextDst(w: *std.Io.Writer, dst: GuidPrefix) !void {
+    if (dst.eql(GuidPrefix.unknown)) return;
+    try w.writeAll(" dst=");
+    try writeGuidPrefix(w, dst);
+}
+
 fn formatNdjson(w: *std.Io.Writer, event: TraceEvent) !void {
     const tag = @tagName(event);
     try w.print("{{\"t\":\"{s}\"", .{tag});
+    try writeNdjsonDst(w, event.participants()[1]);
     switch (event) {
         .send_data, .recv_data => |e| {
             try w.writeAll(",\"src\":\"");
@@ -232,7 +281,7 @@ fn formatNdjson(w: *std.Io.Writer, event: TraceEvent) !void {
             try writeEntityId(w, e.reader_eid);
             try w.writeAll("\",\"writer\":\"");
             try writeEntityId(w, e.writer_eid);
-            try w.writeAll(",\"sns\":");
+            try w.writeAll("\",\"sns\":");
             try writeSns(w, e.bitmap);
             try w.print(",\"count\":{},\"final\":{}", .{ e.count, e.final });
         },
@@ -243,18 +292,14 @@ fn formatNdjson(w: *std.Io.Writer, event: TraceEvent) !void {
             try writeEntityId(w, e.writer_eid);
             try w.writeAll("\",\"reader\":\"");
             try writeEntityId(w, e.reader_eid);
-            try w.print(",\"gap_start\":{}", .{e.gap_start});
+            try w.print("\",\"gap_start\":{}", .{e.gap_start});
             try w.writeAll(",\"gap_list\":");
             try writeSns(w, e.gap_list);
         },
         .recv_info_ts => |e| {
             try w.print(",\"sec\":{},\"frac\":{}", .{ e.timestamp.seconds, e.timestamp.fraction });
         },
-        .recv_info_dst => |e| {
-            try w.writeAll(",\"prefix\":\"");
-            try writeGuidPrefix(w, e.prefix);
-            try w.writeAll("\"");
-        },
+        .recv_info_dst => {},
         .recv_data_dup => |e| {
             try w.writeAll(",\"src\":\"");
             try writeGuidPrefix(w, e.src_prefix);
@@ -277,6 +322,12 @@ fn formatNdjson(w: *std.Io.Writer, event: TraceEvent) !void {
 }
 
 fn formatText(w: *std.Io.Writer, event: TraceEvent) !void {
+    try formatTextBody(w, event);
+    if (event != .recv_info_dst) try writeTextDst(w, event.participants()[1]);
+    try w.writeAll("\n");
+}
+
+fn formatTextBody(w: *std.Io.Writer, event: TraceEvent) !void {
     switch (event) {
         .send_data => |e| {
             try w.writeAll("SEND DATA  src=");
@@ -285,7 +336,7 @@ fn formatText(w: *std.Io.Writer, event: TraceEvent) !void {
             try writeEntityId(w, e.writer_eid);
             try w.writeAll(" reader=");
             try writeEntityId(w, e.reader_eid);
-            try w.print(" sn={} len={}\n", .{ e.sn, e.data_len });
+            try w.print(" sn={} len={}", .{ e.sn, e.data_len });
         },
         .recv_data => |e| {
             try w.writeAll("RECV DATA  src=");
@@ -294,7 +345,7 @@ fn formatText(w: *std.Io.Writer, event: TraceEvent) !void {
             try writeEntityId(w, e.writer_eid);
             try w.writeAll(" reader=");
             try writeEntityId(w, e.reader_eid);
-            try w.print(" sn={} len={}\n", .{ e.sn, e.data_len });
+            try w.print(" sn={} len={}", .{ e.sn, e.data_len });
         },
         .send_heartbeat => |e| {
             try w.writeAll("SEND HB    src=");
@@ -303,7 +354,7 @@ fn formatText(w: *std.Io.Writer, event: TraceEvent) !void {
             try writeEntityId(w, e.writer_eid);
             try w.writeAll(" reader=");
             try writeEntityId(w, e.reader_eid);
-            try w.print(" [{},{}] count={} flags=0x{x}\n", .{
+            try w.print(" [{},{}] count={} flags=0x{x}", .{
                 e.first_sn, e.last_sn, e.count, e.flags,
             });
         },
@@ -314,7 +365,7 @@ fn formatText(w: *std.Io.Writer, event: TraceEvent) !void {
             try writeEntityId(w, e.writer_eid);
             try w.writeAll(" reader=");
             try writeEntityId(w, e.reader_eid);
-            try w.print(" [{},{}] count={} flags=0x{x}\n", .{
+            try w.print(" [{},{}] count={} flags=0x{x}", .{
                 e.first_sn, e.last_sn, e.count, e.flags,
             });
         },
@@ -325,7 +376,7 @@ fn formatText(w: *std.Io.Writer, event: TraceEvent) !void {
             try writeEntityId(w, e.reader_eid);
             try w.writeAll(" writer=");
             try writeEntityId(w, e.writer_eid);
-            try w.print(" base={} bits={} count={} final={}\n", .{
+            try w.print(" base={} bits={} count={} final={}", .{
                 e.base_sn, e.bitmap.num_bits, e.count, e.final,
             });
         },
@@ -336,50 +387,49 @@ fn formatText(w: *std.Io.Writer, event: TraceEvent) !void {
             try writeEntityId(w, e.reader_eid);
             try w.writeAll(" writer=");
             try writeEntityId(w, e.writer_eid);
-            try w.print(" base={} bits={} count={} final={}\n", .{
+            try w.print(" base={} bits={} count={} final={}", .{
                 e.base_sn, e.bitmap.num_bits, e.count, e.final,
             });
         },
         .send_gap => |e| {
             try w.writeAll("SEND GAP   src=");
             try writeGuidPrefix(w, e.src_prefix);
-            try w.print(" start={} base={} bits={}\n", .{
+            try w.print(" start={} base={} bits={}", .{
                 e.gap_start, e.gap_list.base, e.gap_list.num_bits,
             });
         },
         .recv_gap => |e| {
             try w.writeAll("RECV GAP   src=");
             try writeGuidPrefix(w, e.src_prefix);
-            try w.print(" start={} base={} bits={}\n", .{
+            try w.print(" start={} base={} bits={}", .{
                 e.gap_start, e.gap_list.base, e.gap_list.num_bits,
             });
         },
         .recv_info_ts => |e| {
-            try w.print("RECV INFO_TS sec={} frac={}\n", .{
+            try w.print("RECV INFO_TS sec={} frac={}", .{
                 e.timestamp.seconds, e.timestamp.fraction,
             });
         },
         .recv_info_dst => |e| {
             try w.writeAll("RECV INFO_DST prefix=");
             try writeGuidPrefix(w, e.prefix);
-            try w.writeAll("\n");
         },
         .recv_data_dup => |e| {
             try w.writeAll("RECV DATA(dup) src=");
             try writeGuidPrefix(w, e.src_prefix);
             try w.writeAll(" writer=");
             try writeEntityId(w, e.writer_eid);
-            try w.print(" sn={}\n", .{e.sn});
+            try w.print(" sn={}", .{e.sn});
         },
         .recv_heartbeat_dup => |e| {
             try w.writeAll("RECV HB(dup) src=");
             try writeGuidPrefix(w, e.src_prefix);
             try w.writeAll(" writer=");
             try writeEntityId(w, e.writer_eid);
-            try w.print(" count={}\n", .{e.count});
+            try w.print(" count={}", .{e.count});
         },
         .skipped => |e| {
-            try w.print("--- SKIPPED {} events (ring overflow) ---\n", .{e.count});
+            try w.print("--- SKIPPED {} events (ring overflow) ---", .{e.count});
         },
     }
 }
@@ -422,17 +472,22 @@ pub const NoopSink = struct {
 
 // ── SyncSink ─────────────────────────────────────────────────────────────────
 
-/// Serializes each event immediately to a `*std.Io.Writer`.
-/// Blocks the calling thread; never drops events.
+/// Serializes each event immediately to a `*std.Io.Writer`, one at a time
+/// (events come from many threads), and flushes it. Blocks the calling
+/// thread; never drops events.
 pub const SyncSink = struct {
     writer: *std.Io.Writer,
     format: Format,
+    mu: mutex_mod.Mutex = .{},
 
     const Self = @This();
 
     fn submitFn(ctx: *anyopaque, event: TraceEvent) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        self.mu.lock();
+        defer self.mu.unlock();
         formatEvent(self.writer, self.format, event) catch {};
+        self.writer.flush() catch {};
     }
     fn deinitFn(_: *anyopaque) void {}
 
@@ -595,9 +650,7 @@ const TracerActive = struct {
     f: GuidFilter,
 
     pub fn submit(self: *const @This(), event: TraceEvent) void {
-        if (comptime filter_enabled) {
-            if (!self.f.matches(event.srcPrefix())) return;
-        }
+        if (!self.f.accepts(event)) return;
         self.s.submit(event);
     }
 
@@ -615,25 +668,189 @@ const TracerInert = struct {
 
 pub const Tracer = if (enabled) TracerActive else TracerInert;
 
-// ── TraceConfig ───────────────────────────────────────────────────────────────
-// Passed to DomainParticipantFactory at init time.
+// ── Configured tracers ────────────────────────────────────────────────────────
 
-const TraceConfigActive = struct {
-    sink: Sink = NoopSink.sink(),
-    filter: GuidFilter = .{},
-
-    pub fn tracer(self: @This()) Tracer {
-        return .{ .s = self.sink, .f = self.filter };
-    }
+/// A participant's tracers: one for discovery's built-in endpoints (SPDP,
+/// SEDP and WLP), one for its user DataWriters and DataReaders.
+pub const Tracers = struct {
+    discovery: Tracer = Tracer.noop(),
+    user: Tracer = Tracer.noop(),
 };
 
-const TraceConfigInert = struct {
-    pub fn tracer(_: @This()) Tracer {
+/// The tracers for a participant configured with `cfg`: its sink, or
+/// `override` in place of it, for the endpoints its scope covers, through
+/// its filter. A sink that cannot be opened is reported and traces nothing.
+/// Without `-Dwire-trace` both trace nothing, and a configured sink is
+/// reported once per process. `cfg` must outlive the tracers (its filter
+/// list is borrowed).
+pub fn tracersFor(cfg: *const schema.TraceConfig, override: ?Sink) Tracers {
+    if (comptime !enabled) {
+        if (cfg.sink != .none and !warned_not_built.swap(true, .monotonic))
+            log.dcps.warn("trace: a trace sink is configured, but this zzdds was built without -Dwire-trace; nothing is traced", .{});
         return .{};
     }
-};
+    const sink = override orelse configuredSink(cfg.sink, cfg.format) orelse return .{};
+    const tracer: Tracer = .{ .s = sink, .f = .{
+        .mode = switch (cfg.filter_mode) {
+            .exclude => .exclude,
+            .include => .include,
+        },
+        .prefixes = cfg.filter_participants,
+    } };
+    return .{
+        .discovery = if (cfg.scope == .user) Tracer.noop() else tracer,
+        .user = if (cfg.scope == .discovery) Tracer.noop() else tracer,
+    };
+}
 
-pub const TraceConfig = if (enabled) TraceConfigActive else TraceConfigInert;
+var warned_not_built = std.atomic.Value(bool).init(false);
+
+/// A configured sink, opened once per process: participants that name the
+/// same stream or file share it, however they spell the file's path, and it
+/// stays open until the process exits, flushing every event, so a crash or
+/// `exit` loses none. The format is the first opener's. Null for `.none`,
+/// or after reporting a failure to open.
+fn configuredSink(target: schema.TraceSink, format: schema.TraceFormat) ?Sink {
+    if (target == .none) return null;
+    registry_mu.lock();
+    defer registry_mu.unlock();
+    var it = registry_head;
+    while (it) |s| : (it = s.next) if (s.target.eql(target)) return s.sink();
+    const s = StreamSink.open(target, switch (format) {
+        .text => .text,
+        .ndjson => .ndjson,
+    }) catch |err| switch (err) {
+        error.AlreadyOpen => return already_open.?.sink(),
+        else => {
+            switch (target) {
+                .file => |path| log.dcps.warn("trace: cannot open trace file '{s}': {s}; nothing is traced", .{ path, @errorName(err) }),
+                else => log.dcps.warn("trace: cannot open the trace stream: {s}; nothing is traced", .{@errorName(err)}),
+            }
+            return null;
+        },
+    };
+    s.next = registry_head;
+    registry_head = s;
+    return s.sink();
+}
+
+var registry_mu: mutex_mod.Mutex = .{};
+var registry_head: ?*StreamSink = null;
+/// Set with `error.AlreadyOpen` from `StreamSink.open`, under `registry_mu`.
+var already_open: ?*StreamSink = null;
+
+/// A sink on stderr, stdout or a file, from configuration. Never freed:
+/// see `configuredSink`. Stderr writes hold the process's stderr lock, so
+/// they do not interleave with log output.
+const StreamSink = struct {
+    target: Target,
+    format: Format,
+    mu: mutex_mod.Mutex = .{},
+    file: std.Io.File,
+    /// A file sink's canonical path, which another spelling of its path
+    /// resolves to. Null where the platform cannot resolve one.
+    real_path: ?[]const u8 = null,
+    file_writer: std.Io.File.Writer = undefined,
+    buf: [4096]u8 = undefined,
+    next: ?*StreamSink = null,
+
+    const Target = union(enum) {
+        stderr,
+        stdout,
+        file: []const u8,
+
+        fn eql(self: Target, other: schema.TraceSink) bool {
+            return switch (self) {
+                .stderr => other == .stderr,
+                .stdout => other == .stdout,
+                .file => |path| other == .file and std.mem.eql(u8, path, other.file),
+            };
+        }
+    };
+
+    /// The process-lifetime allocations behind configured sinks.
+    const alloc = std.heap.page_allocator;
+
+    fn open(target: schema.TraceSink, format: Format) !*StreamSink {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const self = try alloc.create(StreamSink);
+        errdefer alloc.destroy(self);
+        self.* = switch (target) {
+            .none => unreachable,
+            .stderr => .{ .target = .stderr, .format = format, .file = std.Io.File.stderr() },
+            .stdout => .{ .target = .stdout, .format = format, .file = std.Io.File.stdout() },
+            .file => |path| blk: {
+                // Opened without truncating, so another spelling of a path
+                // already open (`./trace.txt`, a different case on Windows, a
+                // symbolic link) is found before its trace is erased. The
+                // canonical path names one file across every mounted
+                // filesystem, which an inode number alone does not.
+                const flags: std.Io.Dir.CreateFileOptions = .{ .truncate = false };
+                const file = if (std.fs.path.isAbsolute(path))
+                    try std.Io.Dir.createFileAbsolute(io, path, flags)
+                else
+                    try std.Io.Dir.cwd().createFile(io, path, flags);
+                errdefer file.close(io);
+                const real_path = try canonicalPath(io, file);
+                errdefer if (real_path) |p| alloc.free(p);
+                if (real_path) |p| {
+                    var it = registry_head;
+                    while (it) |s| : (it = s.next) {
+                        const other = s.real_path orelse continue;
+                        if (std.mem.eql(u8, other, p)) {
+                            already_open = s;
+                            return error.AlreadyOpen;
+                        }
+                    }
+                }
+                try file.setLength(io, 0);
+                const owned = try alloc.dupe(u8, path);
+                break :blk .{ .target = .{ .file = owned }, .format = format, .file = file, .real_path = real_path };
+            },
+        };
+        self.file_writer = self.file.writerStreaming(io, &self.buf);
+        return self;
+    }
+
+    /// The open file's canonical path, or null where the platform cannot
+    /// resolve one, so only the path's exact spelling is shared.
+    fn canonicalPath(io: std.Io, file: std.Io.File) !?[]const u8 {
+        const buf = try alloc.alloc(u8, std.fs.max_path_bytes);
+        defer alloc.free(buf);
+        const len = file.realPath(io, buf) catch |err| switch (err) {
+            error.OperationUnsupported => return null,
+            else => {
+                log.dcps.warn("trace: cannot resolve the trace file's path: {s}; only its exact spelling shares it", .{@errorName(err)});
+                return null;
+            },
+        };
+        return try alloc.dupe(u8, buf[0..len]);
+    }
+
+    fn submitFn(ctx: *anyopaque, event: TraceEvent) void {
+        const self: *StreamSink = @ptrCast(@alignCast(ctx));
+        if (self.target == .stderr) {
+            var buf: [512]u8 = undefined;
+            const locked = std.debug.lockStderr(&buf);
+            defer std.debug.unlockStderr();
+            const w = &locked.file_writer.interface;
+            formatEvent(w, self.format, event) catch {};
+            w.flush() catch {};
+            return;
+        }
+        self.mu.lock();
+        defer self.mu.unlock();
+        formatEvent(&self.file_writer.interface, self.format, event) catch {};
+        self.file_writer.interface.flush() catch {};
+    }
+    fn deinitFn(_: *anyopaque) void {}
+
+    const vtable: Sink.Vtable = .{ .submit = &submitFn, .deinit = &deinitFn };
+
+    fn sink(self: *StreamSink) Sink {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+};
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -655,24 +872,145 @@ fn testDataEvent() TraceEvent {
 
 // ── GuidFilter tests ──────────────────────────────────────────────────────────
 
-test "GuidFilter: empty prefixes list accepts all" {
+fn eventBetween(src: GuidPrefix, dst: GuidPrefix) TraceEvent {
+    return .{ .send_heartbeat = .{
+        .src_prefix = src,
+        .writer_eid = zero_eid,
+        .reader_eid = zero_eid,
+        .first_sn = 1,
+        .last_sn = 1,
+        .count = 1,
+        .flags = 0,
+        .dst_prefix = dst,
+    } };
+}
+
+test "GuidFilter: the default, an empty exclude list, accepts everything" {
     const f = GuidFilter{};
-    try testing.expect(f.matches(zero_prefix));
-    const other = GuidPrefix{ .bytes = @splat(1) };
-    try testing.expect(f.matches(other));
+    try testing.expect(f.accepts(testDataEvent()));
+    try testing.expect(f.accepts(testInfoTsEvent()));
 }
 
-test "GuidFilter: non-empty list accepts matching prefix" {
-    const target = GuidPrefix{ .bytes = @splat(0xAB) };
-    const f = GuidFilter{ .prefixes = &.{target} };
-    try testing.expect(f.matches(target));
+test "GuidFilter: an empty include list accepts nothing" {
+    const f = GuidFilter{ .mode = .include };
+    try testing.expect(!f.accepts(testDataEvent()));
 }
 
-test "GuidFilter: non-empty list rejects non-matching prefix" {
-    const target = GuidPrefix{ .bytes = @splat(0xAB) };
-    const other = GuidPrefix{ .bytes = @splat(0xCD) };
-    const f = GuidFilter{ .prefixes = &.{target} };
-    try testing.expect(!f.matches(other));
+test "GuidFilter: include matches the sender or the destination" {
+    const a = GuidPrefix{ .bytes = @splat(0xA1) };
+    const b = GuidPrefix{ .bytes = @splat(0xB2) };
+    const c = GuidPrefix{ .bytes = @splat(0xC3) };
+    const f = GuidFilter{ .mode = .include, .prefixes = &.{b.bytes} };
+    try testing.expect(f.accepts(eventBetween(a, b)));
+    try testing.expect(f.accepts(eventBetween(b, a)));
+    try testing.expect(!f.accepts(eventBetween(a, c)));
+    // An event with no known participant involves none listed.
+    try testing.expect(!f.accepts(testInfoTsEvent()));
+}
+
+test "GuidFilter: exclude drops events to or from a listed participant" {
+    const a = GuidPrefix{ .bytes = @splat(0xA1) };
+    const b = GuidPrefix{ .bytes = @splat(0xB2) };
+    const c = GuidPrefix{ .bytes = @splat(0xC3) };
+    const f = GuidFilter{ .mode = .exclude, .prefixes = &.{b.bytes} };
+    try testing.expect(!f.accepts(eventBetween(a, b)));
+    try testing.expect(!f.accepts(eventBetween(b, c)));
+    try testing.expect(f.accepts(eventBetween(a, c)));
+    try testing.expect(f.accepts(testInfoTsEvent()));
+}
+
+test "TracerActive: the filter decides what reaches the sink" {
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var ss = SyncSink{ .writer = &w, .format = .text };
+    const a = GuidPrefix{ .bytes = @splat(0xA1) };
+    const b = GuidPrefix{ .bytes = @splat(0xB2) };
+    const tc = TracerActive{ .s = ss.sink(), .f = .{ .mode = .include, .prefixes = &.{b.bytes} } };
+    tc.submit(eventBetween(a, a));
+    try testing.expectEqual(@as(usize, 0), w.end);
+    tc.submit(eventBetween(a, b));
+    try testing.expect(std.mem.indexOf(u8, w.buffer[0..w.end], "SEND HB") != null);
+}
+
+test "formatEvent: a known destination is printed, an unknown one is not" {
+    const a = GuidPrefix{ .bytes = @splat(0xA1) };
+    const b = GuidPrefix{ .bytes = @splat(0xB2) };
+    try checkFmt(.text, eventBetween(a, b), " dst=b2b2b2b2b2b2b2b2b2b2b2b2");
+    try checkFmt(.ndjson, eventBetween(a, b), "\"dst\":\"b2b2b2b2b2b2b2b2b2b2b2b2\"");
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try formatEvent(&w, .text, eventBetween(a, GuidPrefix.unknown));
+    try testing.expect(std.mem.indexOf(u8, w.buffer[0..w.end], "dst=") == null);
+}
+
+test "formatEvent ndjson: every event type is one valid JSON object" {
+    const p = GuidPrefix{ .bytes = @splat(0xAB) };
+    const events = [_]TraceEvent{
+        testDataEvent(),    testRecvDataEvent(),             testSendHbEvent(),  testRecvHbEvent(),
+        testSendAnEvent(),  testRecvAnEvent(),               testSendGapEvent(), testRecvGapEvent(),
+        testInfoTsEvent(),  testInfoDstEvent(),              testDataDupEvent(), testHbDupEvent(),
+        eventBetween(p, p), .{ .skipped = .{ .count = 2 } },
+    };
+    for (events) |ev| {
+        var buf: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try formatEvent(&w, .ndjson, ev);
+        const line = w.buffer[0..w.end];
+        try testing.expectEqual(@as(u8, '\n'), line[line.len - 1]);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, line[0 .. line.len - 1], .{});
+        parsed.deinit();
+    }
+}
+
+test "tracersFor: the scope picks which tracers trace, and an override replaces the sink" {
+    if (comptime !enabled) return error.SkipZigTest;
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var ss = SyncSink{ .writer = &w, .format = .text };
+    for ([_]schema.TraceScope{ .all, .discovery, .user }) |scope| {
+        w.end = 0;
+        const cfg = schema.TraceConfig{ .scope = scope };
+        const t = tracersFor(&cfg, ss.sink());
+        t.discovery.submit(testDataEvent());
+        const after_discovery = w.end;
+        t.user.submit(testDataEvent());
+        try testing.expectEqual(scope != .user, after_discovery > 0);
+        try testing.expectEqual(scope != .discovery, w.end > after_discovery);
+    }
+}
+
+test "tracersFor: no sink and no override traces nothing" {
+    const cfg = schema.TraceConfig{};
+    const t = tracersFor(&cfg, null);
+    t.discovery.submit(testDataEvent());
+    t.user.submit(testDataEvent());
+}
+
+test "tracersFor: a configured file sink is opened once and shared" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = "zzdds_trace_sink_test.txt";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const cfg = schema.TraceConfig{ .sink = .{ .file = path } };
+    const first = tracersFor(&cfg, null);
+    // A sink that failed to open would leave the no-op sink, which every
+    // tracer shares.
+    try testing.expect(first.user.s.vtable != &noop_vtable);
+    const second = tracersFor(&cfg, null);
+    try testing.expectEqual(first.user.s.ctx, second.user.s.ctx);
+    // Another spelling of the same path shares the sink rather than
+    // truncating the file under it.
+    const dotted = schema.TraceConfig{ .sink = .{ .file = "./" ++ path } };
+    first.user.submit(testRecvDataEvent());
+    const third = tracersFor(&dotted, null);
+    try testing.expectEqual(first.user.s.ctx, third.user.s.ctx);
+    first.user.submit(testDataEvent());
+    second.discovery.submit(testSendHbEvent());
+    const written = try std.Io.Dir.cwd().readFileAlloc(io, path, testing.allocator, .limited(4096));
+    defer testing.allocator.free(written);
+    try testing.expect(std.mem.indexOf(u8, written, "RECV DATA") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "SEND DATA") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "SEND HB") != null);
 }
 
 // ── formatEvent tests ─────────────────────────────────────────────────────────

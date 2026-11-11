@@ -639,8 +639,8 @@ or an optimisation on an already-improved path):
   listeners (zzdds raises DATA_AVAILABLE on install when data is already buffered) and
   `enable-defer` (the entity is still disabled). The CI network diagnostics stay. Open
   follow-up: process-side discovery visibility is thin (SPDP has three debug log lines
-  and SEDP none, and the wire tracer, `-Dwire-trace`, has to be configured in code by
-  each application).
+  and SEDP none). A `-Dwire-trace` build can now trace discovery traffic from any
+  binding through a participant's `[trace]` config, but no CI lane builds one yet.
 - **Stack dumps for hung or unfinished test processes — examples/integration tiers done;
   other harnesses remain.** `examples/_common.py`'s `LiveProcess.stop()` (shared by the
   examples and integration tiers) now prints every thread's stack between "Begin/End
