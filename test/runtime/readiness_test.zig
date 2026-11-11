@@ -112,11 +112,25 @@ const Backend = struct {
     }
 };
 
-/// Waits until `sock` has input queued. Loopback delivery is complete when
-/// `sendto` returns, so every datagram sent to it before is then queued.
+/// Waits until `sock` has input queued. That is one datagram: loopback
+/// delivery need not be complete when `sendto` returns (macOS hands each
+/// datagram to its input thread), so others sent before may still be on
+/// the way. `awaitDelivered` waits for all of them.
 fn awaitReadable(sock: *Sock) !void {
     var fds = [1]zsock.PollFd{.{ .fd = zsock.pollHandle(sock.fd), .events = zsock.POLL.IN, .revents = 0 }};
     if (zsock.poll(&fds, 10_000) == 0) return error.Timeout;
+}
+
+/// Waits until every datagram `tx` has sent so far is queued where it was
+/// sent. Loopback keeps one sender's datagrams in order, whatever socket
+/// each is for, so once one more sent to a fresh socket has arrived, all
+/// those before it have too.
+fn awaitDelivered(tx: *Sock) !void {
+    var fence: Sock = undefined;
+    try fence.init();
+    defer fence.deinit();
+    try tx.sendTo(&fence);
+    try awaitReadable(&fence);
 }
 
 // ── The backend ───────────────────────────────────────────────────────────────
@@ -278,7 +292,7 @@ test "service handles ready sources round robin, within its budget" {
     defer for (&socks) |*s| b.backend().unregister(&s.source);
 
     for (&socks) |*s| for (0..3) |_| try tx.sendTo(s);
-    for (&socks) |*s| try awaitReadable(s);
+    try awaitDelivered(&tx);
 
     const first = b.backend().service(4);
     try testing.expectEqual(@as(u32, 4), first.serviced);
@@ -499,8 +513,7 @@ test "a source's own service may unregister it, and is not called on it again, a
         for (&closing) |*cl| try tx.sendTo(&cl.sock);
         try tx.sendTo(&other);
     }
-    for (&closing) |*cl| try awaitReadable(&cl.sock);
-    try awaitReadable(&other);
+    try awaitDelivered(&tx);
 
     // Returns at once, rather than waiting for the service it runs in.
     _ = b.backend().service(16);
@@ -912,9 +925,9 @@ test "a UDP transport sends a gather list as one datagram without flattening it,
     if (builtin.os.tag != .windows) try testing.expect(SendSpy.last_flags & posix.MSG.DONTWAIT != 0);
     // The list reached the syscall as given.
     try testing.expectEqual(gather.len, SendSpy.last_iovecs);
-    try awaitReadable(&sock);
     var buf: [16]u8 = undefined;
     for (0..2) |_| {
+        try awaitReadable(&sock);
         const n = c.recv(sock.fd, &buf, buf.len, DONTWAIT);
         try testing.expectEqualStrings("abcde", buf[0..@intCast(n)]);
     }

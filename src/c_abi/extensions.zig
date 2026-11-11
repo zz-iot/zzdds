@@ -70,6 +70,8 @@ const FactoryOwner = struct {
     /// internal per-`ParticipantStack` delegate with its own, independent,
     /// single-view box.
     fac_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    /// Allocates from `debug_gpa`: see `debugGpaRelease`.
+    on_debug_gpa: bool = false,
 
     fn deinit(self: *@This()) void {
         self.fac_c_abi.free(self.alloc);
@@ -77,7 +79,9 @@ const FactoryOwner = struct {
         self.stacks.deinit(self.alloc);
         self.default_dp_qos.deinit(self.alloc);
         self.default_config.deinit(self.alloc);
+        const on_debug_gpa = self.on_debug_gpa;
         self.alloc.destroy(self);
+        if (on_debug_gpa) debugGpaRelease();
     }
 
     fn createParticipant(
@@ -1191,13 +1195,42 @@ pub export fn zzdds_cft_match_sample(
 const debug_gpa_config: std.heap.DebugAllocatorConfig = if (build_options.debug_allocator_stack_traces) .{} else .{ .stack_trace_frames = 0 };
 var debug_gpa: std.heap.DebugAllocator(debug_gpa_config) = .{};
 
+// Factories on `debug_gpa`, counting one from before it allocates anything.
+// Guarded by `debug_gpa_mu`.
+var debug_gpa_factories: u32 = 0;
+var debug_gpa_mu: Mutex = .{};
+
+fn debugGpaRetain() void {
+    debug_gpa_mu.lock();
+    defer debug_gpa_mu.unlock();
+    debug_gpa_factories += 1;
+}
+
+// A factory's allocator must outlive it and everything created through it,
+// so once the last factory on `debug_gpa` is destroyed nothing it allocated
+// may still be live: what is, leaked or is freed late. The allocator logs
+// each such allocation (with where it was made, given stack traces), and
+// this then fails the process. The lock keeps a factory being created
+// meanwhile from allocating during the check.
+fn debugGpaRelease() void {
+    debug_gpa_mu.lock();
+    defer debug_gpa_mu.unlock();
+    debug_gpa_factories -= 1;
+    if (debug_gpa_factories > 0) return;
+    const leaks = debug_gpa.detectLeaks();
+    if (leaks > 0) std.debug.panic("-Ddebug-allocator: {d} allocation(s) still live after the last factory was destroyed", .{leaks});
+}
+
 fn createFactory(allocator: ?*const zidl_bindings.ZidlAllocator) !ZZDDS.DomainParticipantFactory {
+    const on_debug_gpa = allocator == null and build_options.debug_allocator;
     const alloc = if (allocator) |a|
         zidl_bindings.toAllocator(a)
-    else if (build_options.debug_allocator)
+    else if (on_debug_gpa)
         debug_gpa.allocator()
     else
         std.heap.c_allocator;
+    if (on_debug_gpa) debugGpaRetain();
+    errdefer if (on_debug_gpa) debugGpaRelease();
     const owner = try alloc.create(FactoryOwner);
     errdefer alloc.destroy(owner);
     // Lazily resolves+commits the process-wide config on the very first factory
@@ -1207,7 +1240,7 @@ fn createFactory(allocator: ?*const zidl_bindings.ZidlAllocator) !ZZDDS.DomainPa
     // transfer into owner.default_config — if ProcessConfig ever grows more
     // fields, whichever of them aren't moved into `owner` will need freeing here.
     const proc_cfg = try process_config.getForNewFactory(alloc);
-    owner.* = .{ .alloc = alloc, .default_config = proc_cfg.default_participant_config };
+    owner.* = .{ .alloc = alloc, .default_config = proc_cfg.default_participant_config, .on_debug_gpa = on_debug_gpa };
     return .{ .ptr = owner, .vtable = &factory_vtable };
 }
 
