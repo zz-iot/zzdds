@@ -747,8 +747,9 @@ const StreamSink = struct {
     format: Format,
     mu: mutex_mod.Mutex = .{},
     file: std.Io.File,
-    /// A file sink's file, which another spelling of its path finds.
-    inode: ?std.Io.File.INode = null,
+    /// A file sink's canonical path, which another spelling of its path
+    /// resolves to. Null where the platform cannot resolve one.
+    real_path: ?[]const u8 = null,
     file_writer: std.Io.File.Writer = undefined,
     buf: [4096]u8 = undefined,
     next: ?*StreamSink = null,
@@ -781,27 +782,49 @@ const StreamSink = struct {
             .file => |path| blk: {
                 // Opened without truncating, so another spelling of a path
                 // already open (`./trace.txt`, a different case on Windows, a
-                // link) is found before its trace is erased. Read access
-                // lets `stat` query the file on Windows.
-                const flags: std.Io.Dir.CreateFileOptions = .{ .read = true, .truncate = false };
+                // symbolic link) is found before its trace is erased. The
+                // canonical path names one file across every mounted
+                // filesystem, which an inode number alone does not.
+                const flags: std.Io.Dir.CreateFileOptions = .{ .truncate = false };
                 const file = if (std.fs.path.isAbsolute(path))
                     try std.Io.Dir.createFileAbsolute(io, path, flags)
                 else
                     try std.Io.Dir.cwd().createFile(io, path, flags);
                 errdefer file.close(io);
-                const inode = (try file.stat(io)).inode;
-                var it = registry_head;
-                while (it) |s| : (it = s.next) if (s.inode == inode) {
-                    already_open = s;
-                    return error.AlreadyOpen;
-                };
+                const real_path = try canonicalPath(io, file);
+                errdefer if (real_path) |p| alloc.free(p);
+                if (real_path) |p| {
+                    var it = registry_head;
+                    while (it) |s| : (it = s.next) {
+                        const other = s.real_path orelse continue;
+                        if (std.mem.eql(u8, other, p)) {
+                            already_open = s;
+                            return error.AlreadyOpen;
+                        }
+                    }
+                }
                 try file.setLength(io, 0);
                 const owned = try alloc.dupe(u8, path);
-                break :blk .{ .target = .{ .file = owned }, .format = format, .file = file, .inode = inode };
+                break :blk .{ .target = .{ .file = owned }, .format = format, .file = file, .real_path = real_path };
             },
         };
         self.file_writer = self.file.writerStreaming(io, &self.buf);
         return self;
+    }
+
+    /// The open file's canonical path, or null where the platform cannot
+    /// resolve one, so only the path's exact spelling is shared.
+    fn canonicalPath(io: std.Io, file: std.Io.File) !?[]const u8 {
+        const buf = try alloc.alloc(u8, std.fs.max_path_bytes);
+        defer alloc.free(buf);
+        const len = file.realPath(io, buf) catch |err| switch (err) {
+            error.OperationUnsupported => return null,
+            else => {
+                log.dcps.warn("trace: cannot resolve the trace file's path: {s}; only its exact spelling shares it", .{@errorName(err)});
+                return null;
+            },
+        };
+        return try alloc.dupe(u8, buf[0..len]);
     }
 
     fn submitFn(ctx: *anyopaque, event: TraceEvent) void {
