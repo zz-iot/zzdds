@@ -341,7 +341,8 @@ filter_mode = "TRACE_INCLUDE"
 filter_participants = ["011b87d8376af345fb91073d"]
 ```
 
-- **Sinks** are opened once per process and shared by every participant that names them; they
+- **Sinks** are opened once per process and shared by every participant that names them (a file
+  by identity, so `trace.txt` and `./trace.txt` are one sink); they
   stay open until the process exits and flush every event, so a crash or `exit` loses none. A
   file is truncated when first opened, so give each process its own path. Stderr output holds
   the process's stderr lock, so it does not interleave with log lines.

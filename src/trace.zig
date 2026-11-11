@@ -706,9 +706,10 @@ pub fn tracersFor(cfg: *const schema.TraceConfig, override: ?Sink) Tracers {
 var warned_not_built = std.atomic.Value(bool).init(false);
 
 /// A configured sink, opened once per process: participants that name the
-/// same stream or file share it, and it stays open until the process exits,
-/// flushing every event, so a crash or `exit` loses none. The format is the
-/// first opener's. Null for `.none`, or after reporting a failure to open.
+/// same stream or file share it, however they spell the file's path, and it
+/// stays open until the process exits, flushing every event, so a crash or
+/// `exit` loses none. The format is the first opener's. Null for `.none`,
+/// or after reporting a failure to open.
 fn configuredSink(target: schema.TraceSink, format: schema.TraceFormat) ?Sink {
     if (target == .none) return null;
     registry_mu.lock();
@@ -718,12 +719,15 @@ fn configuredSink(target: schema.TraceSink, format: schema.TraceFormat) ?Sink {
     const s = StreamSink.open(target, switch (format) {
         .text => .text,
         .ndjson => .ndjson,
-    }) catch |err| {
-        switch (target) {
-            .file => |path| log.dcps.warn("trace: cannot open trace file '{s}': {s}; nothing is traced", .{ path, @errorName(err) }),
-            else => log.dcps.warn("trace: cannot open the trace stream: {s}; nothing is traced", .{@errorName(err)}),
-        }
-        return null;
+    }) catch |err| switch (err) {
+        error.AlreadyOpen => return already_open.?.sink(),
+        else => {
+            switch (target) {
+                .file => |path| log.dcps.warn("trace: cannot open trace file '{s}': {s}; nothing is traced", .{ path, @errorName(err) }),
+                else => log.dcps.warn("trace: cannot open the trace stream: {s}; nothing is traced", .{@errorName(err)}),
+            }
+            return null;
+        },
     };
     s.next = registry_head;
     registry_head = s;
@@ -732,6 +736,8 @@ fn configuredSink(target: schema.TraceSink, format: schema.TraceFormat) ?Sink {
 
 var registry_mu: mutex_mod.Mutex = .{};
 var registry_head: ?*StreamSink = null;
+/// Set with `error.AlreadyOpen` from `StreamSink.open`, under `registry_mu`.
+var already_open: ?*StreamSink = null;
 
 /// A sink on stderr, stdout or a file, from configuration. Never freed:
 /// see `configuredSink`. Stderr writes hold the process's stderr lock, so
@@ -741,6 +747,8 @@ const StreamSink = struct {
     format: Format,
     mu: mutex_mod.Mutex = .{},
     file: std.Io.File,
+    /// A file sink's file, which another spelling of its path finds.
+    inode: ?std.Io.File.INode = null,
     file_writer: std.Io.File.Writer = undefined,
     buf: [4096]u8 = undefined,
     next: ?*StreamSink = null,
@@ -771,13 +779,25 @@ const StreamSink = struct {
             .stderr => .{ .target = .stderr, .format = format, .file = std.Io.File.stderr() },
             .stdout => .{ .target = .stdout, .format = format, .file = std.Io.File.stdout() },
             .file => |path| blk: {
-                const owned = try alloc.dupe(u8, path);
-                errdefer alloc.free(owned);
+                // Opened without truncating, so another spelling of a path
+                // already open (`./trace.txt`, a different case on Windows, a
+                // link) is found before its trace is erased. Read access
+                // lets `stat` query the file on Windows.
+                const flags: std.Io.Dir.CreateFileOptions = .{ .read = true, .truncate = false };
                 const file = if (std.fs.path.isAbsolute(path))
-                    try std.Io.Dir.createFileAbsolute(io, path, .{})
+                    try std.Io.Dir.createFileAbsolute(io, path, flags)
                 else
-                    try std.Io.Dir.cwd().createFile(io, path, .{});
-                break :blk .{ .target = .{ .file = owned }, .format = format, .file = file };
+                    try std.Io.Dir.cwd().createFile(io, path, flags);
+                errdefer file.close(io);
+                const inode = (try file.stat(io)).inode;
+                var it = registry_head;
+                while (it) |s| : (it = s.next) if (s.inode == inode) {
+                    already_open = s;
+                    return error.AlreadyOpen;
+                };
+                try file.setLength(io, 0);
+                const owned = try alloc.dupe(u8, path);
+                break :blk .{ .target = .{ .file = owned }, .format = format, .file = file, .inode = inode };
             },
         };
         self.file_writer = self.file.writerStreaming(io, &self.buf);
@@ -950,12 +970,22 @@ test "tracersFor: a configured file sink is opened once and shared" {
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
     const cfg = schema.TraceConfig{ .sink = .{ .file = path } };
     const first = tracersFor(&cfg, null);
+    // A sink that failed to open would leave the no-op sink, which every
+    // tracer shares.
+    try testing.expect(first.user.s.vtable != &noop_vtable);
     const second = tracersFor(&cfg, null);
     try testing.expectEqual(first.user.s.ctx, second.user.s.ctx);
+    // Another spelling of the same path shares the sink rather than
+    // truncating the file under it.
+    const dotted = schema.TraceConfig{ .sink = .{ .file = "./" ++ path } };
+    first.user.submit(testRecvDataEvent());
+    const third = tracersFor(&dotted, null);
+    try testing.expectEqual(first.user.s.ctx, third.user.s.ctx);
     first.user.submit(testDataEvent());
     second.discovery.submit(testSendHbEvent());
     const written = try std.Io.Dir.cwd().readFileAlloc(io, path, testing.allocator, .limited(4096));
     defer testing.allocator.free(written);
+    try testing.expect(std.mem.indexOf(u8, written, "RECV DATA") != null);
     try testing.expect(std.mem.indexOf(u8, written, "SEND DATA") != null);
     try testing.expect(std.mem.indexOf(u8, written, "SEND HB") != null);
 }
