@@ -1615,6 +1615,67 @@ test "a reliable-ready event reaches the reader's extension listener as a listen
     m.runtime.deinit();
 }
 
+/// Records a writer's matched and ready calls in order. At the first match it
+/// makes a second reader match and become ready, as discovery and the
+/// handshake can while the first reader's ready event is still queued.
+const TwoPeerReady = struct {
+    dw: *DataWriterImpl,
+    calls: [8]enum { matched, ready } = undefined,
+    n: usize = 0,
+    second_added: bool = false,
+
+    fn record(self: *TwoPeerReady, call: @TypeOf(self.calls[0])) void {
+        if (self.n < self.calls.len) self.calls[self.n] = call;
+        self.n += 1;
+    }
+
+    fn onMatched(_: *anyopaque, _: *const DDS.PublicationMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
+        const self: *TwoPeerReady = @ptrCast(@alignCast(ld.?));
+        self.record(.matched);
+        if (self.second_added) return;
+        self.second_added = true;
+        var b = self.dw.guid;
+        std.mem.asBytes(&b)[0] ^= 0x5a;
+        self.dw.recordPublicationMatched(2, true);
+        DataWriterImpl.notifyReaderProtocolReady(self.dw, b, true);
+    }
+
+    fn onReady(_: DDS.InstanceHandle_t, _: bool, ld: ?*anyopaque) callconv(.c) void {
+        const self: *TwoPeerReady = @ptrCast(@alignCast(ld.?));
+        self.record(.ready);
+    }
+};
+
+test "a ready event never runs ahead of a match queued before it, though an earlier ready event is still queued" {
+    var m: Manual = undefined;
+    m.init();
+    var pair: Pair = undefined;
+    try pair.init(&m.runtime, .BEST_EFFORT_RELIABILITY_QOS, null);
+    m.runtime.releaseOwner();
+    try settle(&m);
+
+    var rec: TwoPeerReady = .{ .dw = pair.dw };
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dw.setListenerEx(.{
+        .listener_data = &rec,
+        .on_publication_matched = TwoPeerReady.onMatched,
+        .on_reliable_reader_ready = TwoPeerReady.onReady,
+    }, DDS.STATUS_MASK_ALL));
+    // The first reader matches and is ready; its match callback adds the
+    // second while the first's ready event waits behind it.
+    var a = pair.dw.guid;
+    std.mem.asBytes(&a)[0] ^= 0xa5;
+    pair.dw.recordPublicationMatched(1, true);
+    DataWriterImpl.notifyReaderProtocolReady(pair.dw, a, true);
+    try settle(&m);
+
+    try testing.expectEqual(@as(usize, 4), rec.n);
+    try testing.expectEqualSlices(@TypeOf(rec.calls[0]), &.{ .matched, .ready, .matched, .ready }, rec.calls[0..4]);
+
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
 // ── Helping waits ─────────────────────────────────────────────────────────────
 
 fn seconds(n: i32) DDS.Duration_t {
