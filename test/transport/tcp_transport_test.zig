@@ -878,6 +878,51 @@ test "tcp transport: connection recovery after fd close" {
     try testing.expectEqual(@as(usize, 2), latch.n);
 }
 
+test "tcp transport: a send whose write fails on its connection shuts it down and re-dials" {
+    // A send on a socket the same process just shut down can still succeed
+    // on Windows (see the generation test below).
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
+    const alloc = testing.allocator;
+
+    const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    defer server.deinit();
+    try server.transport().attachBackend(hp.backend());
+    const st = server.transport();
+    var latch = Latch{};
+    var ctr = LatchCounter{ .latch = &latch };
+    const port = try listenAndGetPort(st, ctr.handler(), alloc);
+    defer st.unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port), ctr.handler());
+
+    const client = try TcpTransport.init(alloc, .{});
+    defer client.deinit();
+    try client.transport().attachBackend(hp.backend());
+    const ct = client.transport();
+    const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
+
+    try ct.send(&dest, "first");
+    latch.waitFor(1);
+    try testing.expectEqual(@as(u32, 1), ct.connectionGeneration(&dest));
+
+    // The client's own connection stops taking writes, still registered:
+    // the next send's write fails, abandons it and dials a new one.
+    {
+        client.conn_mu.lock();
+        defer client.conn_mu.unlock();
+        var it = client.connections.valueIterator();
+        while (it.next()) |co| {
+            co.*.send_mu.lock();
+            defer co.*.send_mu.unlock();
+            try testing.expectEqual(@as(c_int, 0), std.c.shutdown(co.*.fd, 1)); // SHUT_WR
+        }
+    }
+    try sendEventually(ct, &dest, "second");
+    latch.waitFor(2);
+    try testing.expectEqual(@as(u32, 2), ct.connectionGeneration(&dest));
+}
+
 test "tcp transport: connectionGeneration increments on reconnect, not on ordinary reuse" {
     var hp: HostedPoll = undefined;
     try hp.init(testing.allocator);
