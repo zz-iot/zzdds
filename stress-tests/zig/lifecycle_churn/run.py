@@ -34,7 +34,7 @@ BAD = ("FAIL:", "panic", "Segmentation fault", "General protection",
 
 def build(tsan: bool) -> Path:
     log = _common.mktemp_logdir("churn-stress") / "build.log"
-    cmd = ["zig", "build", *_common.shared_runtime_args(), *_common.debug_allocator_args()]
+    cmd = ["zig", "build", *_common.debug_allocator_args()]
     if tsan:
         cmd.append("-Dsanitize-thread=true")
     if not _common.run_build(cmd, cwd=APP_DIR, log_path=log, timeout=900):

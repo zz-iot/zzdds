@@ -388,8 +388,7 @@ pub const Discovery = struct {
         /// runtime through `attach_runtime`, so a participant on the shared
         /// runtime may use it. There `wlp_tick` runs only when an
         /// endpoint's timer check is due, not on a fixed period, so the
-        /// plugin must not depend on one. Removed with the `-Dshared-runtime`
-        /// migration option
+        /// plugin must not depend on one. Removed with the threaded path
         /// (docs/design/concurrency/runtime.md#coexistence-during-migration).
         shared_runtime_ready: bool = false,
 
@@ -474,8 +473,7 @@ pub const Discovery = struct {
         /// discovery runs, or is stopping, on a different runtime; otherwise
         /// the runtime replaces one an earlier participant used. Null for a plugin with
         /// no work of its own.
-        /// Removed with the `-Dshared-runtime` migration option, once every
-        /// plugin runs on a runtime.
+        /// Required once the threaded path is removed.
         attach_runtime: ?*const fn (ctx: *anyopaque, rt: *Runtime) anyerror!void = null,
     };
 

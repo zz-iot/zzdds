@@ -530,8 +530,7 @@ pub const Transport = struct {
         capabilities: Capabilities,
 
         /// The transport runs no thread of its own, so a participant on the
-        /// shared runtime may use it. Removed with the `-Dshared-runtime`
-        /// migration option
+        /// shared runtime may use it. Removed with the threaded path
         /// (docs/design/concurrency/runtime.md#coexistence-during-migration).
         shared_runtime_ready: bool = false,
 

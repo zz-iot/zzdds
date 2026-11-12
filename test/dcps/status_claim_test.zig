@@ -654,7 +654,7 @@ test "DATA_AVAILABLE: a listener whose change was consumed does not run" {
     try testing.expectEqual(@as(u32, 1), calls);
 }
 
-test "DATA_AVAILABLE: begin_access that cannot queue on_data_available leaves it changed" {
+test "DATA_AVAILABLE: begin_access raises on_data_available without allocating" {
     var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
@@ -684,19 +684,8 @@ test "DATA_AVAILABLE: begin_access that cannot queue on_data_available leaves it
     _ = sub.begin_access();
     impl.alloc = saved;
     fx.settle();
-    if (zzdds.runtime.enabled) {
-        // On the shared runtime it is posted to the reader's own listener
-        // queue, which needs no allocation, so it is raised regardless.
-        try testing.expectEqual(@as(u32, 1), calls);
-        _ = sub.end_access();
-        return;
-    }
-    try testing.expectEqual(@as(u32, 0), calls);
-    try testing.expect(drStatusChanges(dr) & DDS.DATA_AVAILABLE_STATUS != 0);
-
-    // So a later notification still runs it.
-    _ = sub.notify_datareaders();
-    fx.settle();
+    // It is posted to the reader's own listener queue, which needs no
+    // allocation, so it is raised regardless.
     try testing.expectEqual(@as(u32, 1), calls);
     _ = sub.end_access();
 }

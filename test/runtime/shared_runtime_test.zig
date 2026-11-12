@@ -1,6 +1,4 @@
-//! Participants on the shared runtime, in the `-Dshared-runtime` migration
-//! build (docs/design/concurrency/runtime.md#coexistence-during-migration):
-//! runtime selection, the default runtime, operational ownership and
+//! Participants on the shared runtime: runtime selection, the default runtime, operational ownership and
 //! automatic retirement (#selected-selection-hierarchy,
 //! #default-registry-and-implicit-construction,
 //! #operational-ownership-versus-storage-retention), and in-process delivery
@@ -45,10 +43,6 @@ const nil_participant = zzdds.dcps.nil_participant;
 
 const testing = std.testing;
 const alloc = testing.allocator;
-
-comptime {
-    if (!rt.enabled) @compileError("built against the library with -Dshared-runtime off");
-}
 
 /// A manual runtime over the scripted backend. Must not move after `init`.
 const Manual = struct {

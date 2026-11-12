@@ -24,7 +24,6 @@ const runtime_mod = @import("../runtime/core.zig");
 const default_registry = @import("../runtime/default_registry.zig");
 const tcp_transport = @import("../transport/tcp.zig");
 const log_mod = @import("../log.zig");
-const build_opts = @import("build_options");
 
 pub const ClockRegistry = clock_registry_mod.ClockRegistry;
 
@@ -53,8 +52,8 @@ pub const DomainParticipantFactoryImpl = struct {
 
     mu: Mutex,
 
-    /// The runtime new participants use in a `-Dshared-runtime` build, with
-    /// the factory's own owner reference; guarded by `mu`. Null: each
+    /// The runtime new participants use, with the factory's own owner
+    /// reference; guarded by `mu`. Null: each
     /// creation resolves the default runtime
     /// (docs/design/concurrency/runtime.md#selected-selection-hierarchy).
     runtime: ?*runtime_mod.Runtime = null,
@@ -122,8 +121,7 @@ pub const DomainParticipantFactoryImpl = struct {
     /// owner reference to it and releasing the previous selection's.
     /// Existing participants keep theirs, and until they are all freed,
     /// creation on another runtime fails. Fails if `rt` is already retiring.
-    pub fn selectRuntime(self: *Self, rt: ?*runtime_mod.Runtime) error{ SharedRuntimeDisabled, Retiring }!void {
-        if (!build_opts.shared_runtime) return error.SharedRuntimeDisabled;
+    pub fn selectRuntime(self: *Self, rt: ?*runtime_mod.Runtime) error{Retiring}!void {
         if (rt) |r| if (!r.tryRetainOwner()) return error.Retiring;
         self.mu.lock();
         const old = self.runtime;
@@ -135,9 +133,7 @@ pub const DomainParticipantFactoryImpl = struct {
     /// Takes an owner reference to the selected runtime, or else the default
     /// one, for a new participant, after checking the participant's
     /// transports and discovery can run on it; null (with a diagnostic) when
-    /// creation must fail. The migration build never falls back to the
-    /// threaded path
-    /// (docs/design/concurrency/runtime.md#coexistence-during-migration).
+    /// creation must fail.
     fn acquireRuntimeFor(self: *Self, config: config_mod.Config) ?*runtime_mod.Runtime {
         if (!self.transport.vtable.shared_runtime_ready or
             (config.transport.tcp.enabled and !tcp_transport.shared_runtime_ready))
@@ -282,10 +278,7 @@ pub const DomainParticipantFactoryImpl = struct {
 
         const timer_clock = self.clock_registry.get(config.participant.timer_clock_name);
 
-        const rt: ?*runtime_mod.Runtime = if (build_opts.shared_runtime)
-            self.acquireRuntimeFor(config) orelse return null
-        else
-            null;
+        const rt: ?*runtime_mod.Runtime = self.acquireRuntimeFor(config) orelse return null;
 
         const p = participant_mod.DomainParticipantImpl.init(
             self.alloc,

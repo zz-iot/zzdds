@@ -48,7 +48,6 @@ const c_abi_handle = @import("../util/c_abi_handle.zig");
 const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 const Runtime = @import("../runtime/core.zig").Runtime;
 const default_registry = @import("../runtime/default_registry.zig");
-const build_opts = @import("build_options");
 
 // ── Push-notification types ───────────────────────────────────────────────────
 
@@ -708,7 +707,6 @@ pub const WaitSetImpl = struct {
     /// The default runtime when a wait may help it, listed for `wakeNotify`
     /// until `endDefaultWait`.
     fn beginDefaultWait(self: *Self, w: *DefaultWait) ?*Runtime {
-        if (!build_opts.shared_runtime) return null;
         const r = default_registry.global.helping() orelse return null;
         self.cv_mu.lock();
         w.* = .{ .runtime = r, .next = self.default_waits };

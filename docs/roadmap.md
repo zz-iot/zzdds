@@ -1063,8 +1063,7 @@ design items, implementation gates and acceptance criteria are listed in that in
 The runtime core is in `src/runtime/`: take-turns contexts, the ready queue
 ([publication handshake](design/concurrency/architecture.md#ready-queue-publication)),
 timers, the progress backend, the manual `drive` and hosted workers on `std.Io.Threaded`,
-and retirement. Participants use it in the default build (`-Dshared-runtime=false`, a
-contributor migration switch, selects the threaded path until it is deleted): a factory may select the runtime, each participant holds
+and retirement. Every participant uses it: a factory may select the runtime, each participant holds
 an owner reference, and creation fails for transports or discovery plugins that run their
 own threads (the in-process memory transport, direct discovery, RTPS discovery, UDP and
 TCP qualify so far). Received datagrams are copied into each participant's ingress context,
@@ -1151,11 +1150,10 @@ cancellation) or resource waits.
 The first vertical slice runs one reliable reader/writer pair through the same trace
 under a manual and a hosted driver: match, delivery, the acknowledgment and data waits, a
 missed deadline, and retirement begun from listeners, with the runtime's last owner
-deleted inside its own listener. The runtime is the default, and CI runs every lane on it
-and none on the threaded path; tests that check delivery and listeners deterministically
+deleted inside its own listener. Every participant runs on the runtime; tests that check delivery and listeners deterministically
 install a manual runtime they drive themselves (`test/support/manual_runtime.zig`).
-Remaining work: delete the threaded path together with `-Dshared-runtime`, then the gaps
-above. The review-era
+Remaining work: delete the threads components still start without a runtime, then the
+gaps above. The review-era
 synchronization prototype and bounded models stay on the `concurrency-broker-specs` branch
 (see the [evidence inventory](design/probes/README.md)). Advanced extension objects (explicit runtime owners/refs, listener groups, resource
 scopes) additionally depend on zidl's managed-reference/construction-only Config

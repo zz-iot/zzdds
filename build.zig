@@ -388,20 +388,12 @@ pub fn build(b: *std.Build) void {
 
     const xtypes = b.option(bool, "xtypes", "Include partial DDS-XTypes support: DataRepresentationQosPolicy and optional PID_TYPE_INFORMATION in SEDP; no TypeLookup service (default: true)") orelse true;
     const content_subscription_profile = b.option(bool, "content-subscription-profile", "Enable Content-Subscription profile parser/evaluator for ContentFilteredTopic and QueryCondition; MultiTopic not implemented (DDS v1.4 Annex A, default: true)") orelse true;
-    // Contributor-only migration switch (docs/design/concurrency/runtime.md#coexistence-during-migration):
-    // participants run on the shared runtime, the default; false selects the
-    // threaded path. Deleted with the threaded path.
-    const shared_runtime = b.option(bool, "shared-runtime", "Contributors only: false selects the threaded path, which is being deleted (default: true)") orelse true;
 
-    // `build_options_shared_runtime` is the same set with the switch on, for
-    // the shared-runtime tests, which run in every build while it exists.
-    // With the switch on they reuse the main library graph instead.
     // `build_options_lib` is `build_options` for libzzdds itself, which alone
     // may compile the codec's C ABI in (see cdr_exports_in_library below).
     const build_options = b.addOptions();
-    const build_options_shared_runtime = b.addOptions();
     const build_options_lib = b.addOptions();
-    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime, build_options_lib }) |opts| {
+    for ([_]*std.Build.Step.Options{ build_options, build_options_lib }) |opts| {
         opts.addOption(bool, "config_authoring", config_authoring);
         opts.addOption(bool, "ipv4", ipv4);
         opts.addOption(bool, "ipv6", ipv6);
@@ -412,9 +404,6 @@ pub fn build(b: *std.Build) void {
         opts.addOption(bool, "debug_allocator", debug_allocator);
         opts.addOption(bool, "debug_allocator_stack_traces", debug_allocator_stack_traces);
     }
-    build_options.addOption(bool, "shared_runtime", shared_runtime);
-    build_options_shared_runtime.addOption(bool, "shared_runtime", true);
-    build_options_lib.addOption(bool, "shared_runtime", shared_runtime);
     // A ThreadSanitizer build is position-independent *executable* code, so
     // Zig gives the codec archive's thread-locals local-exec TLS, which a
     // shared library cannot link ("relocation R_X86_64_TPOFF32 ... cannot be
@@ -422,7 +411,6 @@ pub fn build(b: *std.Build) void {
     // instead of linking the archive; executables still link the archive.
     const cdr_exports_in_library = sanitize_thread;
     build_options.addOption(bool, "cdr_exports_in_library", false);
-    build_options_shared_runtime.addOption(bool, "cdr_exports_in_library", false);
     build_options_lib.addOption(bool, "cdr_exports_in_library", cdr_exports_in_library);
     // Pass ZZDDS_XTYPES preprocessor define to zidl so dcps.idl gates XTypes
     // content (DataRepresentationQosPolicy and its uses) at code-generation time.
@@ -438,16 +426,16 @@ pub fn build(b: *std.Build) void {
         if (!std.fs.path.isAbsolute(path)) @panic("-Dtypesupport-package must be absolute");
         break :blk .{ .cwd_relative = path };
     } else zidl_dep.path("packages/zidl-typesupport");
-    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime, build_options_lib }) |opts| opts.addOption(bool, "typesupport_library", typesupport_enabled);
+    for ([_]*std.Build.Step.Options{ build_options, build_options_lib }) |opts| opts.addOption(bool, "typesupport_library", typesupport_enabled);
     const resource_authoring = b.option(bool, "resource-authoring", "Enable experimental strict TOML resources") orelse false;
     const resources_enabled = b.option(bool, "resource-construction", "Enable experimental programmatic DDS resource construction") orelse resource_authoring;
     if (resource_authoring and !resources_enabled) @panic("resource authoring requires resource construction");
-    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime, build_options_lib }) |opts| {
+    for ([_]*std.Build.Step.Options{ build_options, build_options_lib }) |opts| {
         opts.addOption(bool, "resource_authoring", resource_authoring);
         opts.addOption(bool, "resource_construction", resources_enabled);
     }
     const typesupport_dynamic = b.option(bool, "typesupport-dynamic", "Include OS dynamic loading (disable for static providers only)") orelse true;
-    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime, build_options_lib }) |opts| opts.addOption(bool, "typesupport_dynamic", typesupport_dynamic);
+    for ([_]*std.Build.Step.Options{ build_options, build_options_lib }) |opts| opts.addOption(bool, "typesupport_dynamic", typesupport_dynamic);
     const typesupport_mod = if (typesupport_enabled)
         typesupportModule(b, typesupport_package, target, optimize, runtime.codec)
     else
@@ -1081,8 +1069,6 @@ pub fn build(b: *std.Build) void {
                 const cpp_lifetime_run = b.addRunArtifact(cpp_lifetime);
                 // Own domain, as above: 7400 + 250*101 = 32650, still below 32768.
                 cpp_lifetime_run.setEnvironmentVariable("ZZDDS_TEST_DOMAIN_BASE", "101");
-                // Rejected registrations are checked only on the shared runtime.
-                cpp_lifetime_run.setEnvironmentVariable("ZZDDS_SHARED_RUNTIME", if (shared_runtime) "1" else "0");
                 if (prev_lifetime_run) |prev| cpp_lifetime_run.step.dependOn(prev);
                 prev_lifetime_run = &cpp_lifetime_run.step;
                 binding_smoke_step.dependOn(&cpp_lifetime_run.step);
@@ -1524,9 +1510,6 @@ pub fn build(b: *std.Build) void {
                 const run_java_smoke = b.addRunArtifact(launcher);
                 run_java_smoke.addDirectoryArg2(library_dir, .{ .make_absolute = true });
                 run_java_smoke.addArgs(&.{ maybe_java_for_jni.?, "--enable-native-access=ALL-UNNAMED", "-Xss8m", "-cp", "build-tmp/java-binding-smoke" });
-                // JavaSmoke checks the shared runtime's one-listener-at-a-time
-                // rule only on that runtime.
-                run_java_smoke.addArg(b.fmt("-Dzzdds.sharedRuntime={}", .{shared_runtime}));
                 run_java_smoke.addDirectoryArg2(library_dir, .{ .prefix = "-Djava.library.path=", .make_absolute = true });
                 run_java_smoke.addArg("JavaSmoke");
                 run_java_smoke.step.dependOn(&compile_java_smoke.step);
@@ -1754,35 +1737,8 @@ pub fn build(b: *std.Build) void {
         }).step);
     }
 
-    // Shared-runtime build tests: they need the migration switch on, so a
-    // -Dshared-runtime=false build gives them a second library graph with it
-    // on (docs/design/concurrency/runtime.md#coexistence-during-migration).
-    const zzdds_mod_shared_runtime = if (shared_runtime) zzdds_mod else blk: {
-        const m = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zidl_cdr", .module = runtime.codec },
-                .{ .name = "zidl_bindings", .module = runtime.bindings },
-                .{ .name = "zzdds_generated", .module = generated_dcps_mod },
-                .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod },
-                .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod },
-            },
-        });
-        m.addOptions("build_options", build_options_shared_runtime);
-        if (resource_authoring_source) |source| m.addImport("resource_authoring_generated", b.createModule(.{
-            .root_source_file = source,
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{ .{ .name = "zidl_cdr", .module = runtime.codec }, .{ .name = "zidl_bindings", .module = runtime.bindings } },
-        }));
-        if (typesupport_enabled) m.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target, optimize, runtime.codec));
-        m.link_libc = true;
-        if (need_c_abi) linkCdr(m, cdr_lib.?);
-        break :blk m;
-    };
-    const shared_runtime_test_files = [_][]const u8{
+    // The runtime with DCPS endpoints, readiness and RTPS discovery.
+    const runtime_dcps_test_files = [_][]const u8{
         "test/runtime/shared_runtime_test.zig",
         "test/runtime/readiness_test.zig",
         "test/runtime/rtps_discovery_test.zig",
@@ -1790,14 +1746,14 @@ pub fn build(b: *std.Build) void {
     // Shared with the DCPS tests below: the readiness and discovery tests
     // open real sockets, so each binary needs its own domain.
     var dcps_test_domain: u32 = 1;
-    for (shared_runtime_test_files) |src| {
+    for (runtime_dcps_test_files) |src| {
         const t = b.addTest(.{
             .name = std.fs.path.stem(src),
             .root_module = b.createModule(.{
                 .root_source_file = b.path(src),
                 .target = target,
                 .imports = &.{
-                    .{ .name = "zzdds", .module = zzdds_mod_shared_runtime },
+                    .{ .name = "zzdds", .module = zzdds_mod },
                     .{ .name = "zzdds_generated", .module = generated_dcps_mod },
                     .{ .name = "test_domain", .module = test_domain_mod },
                 },
@@ -2295,35 +2251,9 @@ pub fn build(b: *std.Build) void {
         }).step);
     }
 
-    // Shared-runtime build tests, with the migration switch on as in `test`
-    // (a second library graph on a -Dshared-runtime=false build): without
-    // them coverage misses the listener lanes and most of the runtime core.
-    const zzdds_mod_llvm_safe_shared_runtime = if (shared_runtime) zzdds_mod_llvm_safe else blk: {
-        const m = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
-            .target = target_llvm_safe,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zidl_cdr", .module = runtime_llvm_safe.codec },
-                .{ .name = "zidl_bindings", .module = runtime_llvm_safe.bindings },
-                .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
-                .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod_llvm_safe },
-                .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod_llvm_safe },
-            },
-        });
-        m.addOptions("build_options", build_options_shared_runtime);
-        if (resource_authoring_source) |source| m.addImport("resource_authoring_generated", b.createModule(.{
-            .root_source_file = source,
-            .target = target_llvm_safe,
-            .optimize = optimize,
-            .imports = &.{ .{ .name = "zidl_cdr", .module = runtime_llvm_safe.codec }, .{ .name = "zidl_bindings", .module = runtime_llvm_safe.bindings } },
-        }));
-        if (typesupport_enabled) m.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target_llvm_safe, optimize, runtime_llvm_safe.codec));
-        m.link_libc = true;
-        if (need_c_abi) linkCdr(m, cdr_lib_llvm_safe.?);
-        break :blk m;
-    };
-    for (shared_runtime_test_files) |src| {
+    // The runtime with DCPS endpoints, as in `test`: without it coverage misses the
+    // listener lanes and most of the runtime core.
+    for (runtime_dcps_test_files) |src| {
         const t = b.addTest(.{
             .name = std.fs.path.stem(src),
             .use_llvm = true,
@@ -2331,7 +2261,7 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(src),
                 .target = target_llvm_safe,
                 .imports = &.{
-                    .{ .name = "zzdds", .module = zzdds_mod_llvm_safe_shared_runtime },
+                    .{ .name = "zzdds", .module = zzdds_mod_llvm_safe },
                     .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
                     .{ .name = "test_domain", .module = test_domain_mod },
                 },
@@ -2453,42 +2383,15 @@ pub fn build(b: *std.Build) void {
         tsan_step.dependOn(&b.addRunArtifact(t).step);
     }
 
-    // Shared-runtime build tests (TSan), as in `test`
-    const zzdds_mod_tsan_shared_runtime = if (shared_runtime) zzdds_mod_tsan else blk: {
-        const m = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-            .sanitize_thread = true,
-            .imports = &.{
-                .{ .name = "zidl_cdr", .module = runtime_tsan.codec },
-                .{ .name = "zidl_bindings", .module = runtime_tsan.bindings },
-                .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
-                .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod_tsan },
-                .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod_tsan },
-            },
-        });
-        m.addOptions("build_options", build_options_shared_runtime);
-        if (resource_authoring_source) |source| m.addImport("resource_authoring_generated", b.createModule(.{
-            .root_source_file = source,
-            .target = target,
-            .optimize = optimize,
-            .sanitize_thread = true,
-            .imports = &.{ .{ .name = "zidl_cdr", .module = runtime_tsan.codec }, .{ .name = "zidl_bindings", .module = runtime_tsan.bindings } },
-        }));
-        if (typesupport_enabled) m.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target, optimize, runtime_tsan.codec));
-        m.link_libc = true;
-        if (need_c_abi) linkCdr(m, cdr_lib_tsan.?);
-        break :blk m;
-    };
+    // The runtime with DCPS endpoints (TSan), as in `test`.
     var tsan_dcps_test_domain: u32 = 1;
-    for (shared_runtime_test_files) |src| {
+    for (runtime_dcps_test_files) |src| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(src),
             .target = target,
             .sanitize_thread = true,
             .imports = &.{
-                .{ .name = "zzdds", .module = zzdds_mod_tsan_shared_runtime },
+                .{ .name = "zzdds", .module = zzdds_mod_tsan },
                 .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
                 .{ .name = "test_domain", .module = test_domain_mod },
             },

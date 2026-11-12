@@ -338,12 +338,8 @@ int main() {
 
     CHECK(dr->get_listener() == nullptr);
 
-    // Only the shared runtime waits for a running callback when deleting.
-    const char *shared = std::getenv("ZZDDS_SHARED_RUNTIME");
-    if (shared && std::atoi(shared) != 0) {
-        check_rejected_registrations(
-            sub, std::static_pointer_cast<::zzdds::TopicImpl>(topic_r)->as_topic_description());
-    }
+    check_rejected_registrations(
+        sub, std::static_pointer_cast<::zzdds::TopicImpl>(topic_r)->as_topic_description());
 
     // Deletion retires the wrapper before returning, even if native references
     // postpone freeing the handle. Its calls no longer reach the core.

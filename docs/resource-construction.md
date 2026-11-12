@@ -95,18 +95,17 @@ still apply. `ready` means all local constructors succeeded, not that entities a
 announced, matched, enabled by the caller's factory policy, or remotely reachable.
 No runtime is created or selected by this layer.
 
-Calls to an instance are serialized by its owner. DDS creation can synchronously
-invoke inherited listeners: the builder holds no mutex across those calls.
-A callback may request `cancel`, or call `destroy`, which requests cancellation
-and returns `ConstructionInProgress`. It never waits for its own constructor.
-Cancellation is checked after DDS calls; it does not interrupt one in progress.
-Listener callbacks run on the shared runtime's
-queued lanes. A callback on another worker must send lifecycle requests to the
-instance's owner rather than calling this owner-serialized API concurrently.
-If a callback deletes the endpoint currently being created, #107's constructor
-returns nil and the graph build fails safely. General external lifecycle mutation,
-including deleting other already-created endpoints behind the builder, is unsupported.
-Prefer cancellation of the enclosing construction instead.
+Calls to an instance are serialized by its owner. The builder holds no mutex
+across DDS calls or the registration hooks it runs. A hook may request `cancel`,
+or call `destroy`, which requests cancellation and returns
+`ConstructionInProgress`. It never waits for its own constructor. Cancellation is
+checked after DDS calls; it does not interrupt one in progress.
+Listener callbacks run as turns of the shared runtime, not inside DDS creation.
+A callback on another worker must send lifecycle requests to the instance's
+owner rather than calling this owner-serialized API concurrently. General
+external lifecycle mutation, including deleting already-created endpoints behind
+the builder, is unsupported. Prefer cancellation of the enclosing construction
+instead.
 
 A failed build exposes no endpoints through the accessors and attempts immediate
 rollback. If cleanup fails, it retains the partial graph and `cleanup_error`. `destroy` visits participants in reverse order, drains and deletes their recorded

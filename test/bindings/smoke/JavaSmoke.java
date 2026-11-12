@@ -373,12 +373,10 @@ public class JavaSmoke {
         System.out.println("  writer.dispose() via loan path: OK");
         System.out.println("  listener shared by two readers, one deleted: OK");
 
-        if (Boolean.getBoolean("zzdds.sharedRuntime")) {
-            checkOneIdentity(zdSubscriber, topicReader, readerQos, writer, sample);
-            System.out.println("  one listener object runs one callback at a time across readers: OK");
-            checkRejectedRegistrations(zdPublisher, topicWriter, writerQos);
-            System.out.println("  rejected listener registrations are released: OK");
-        }
+        checkOneIdentity(zdSubscriber, topicReader, readerQos, writer, sample);
+        System.out.println("  one listener object runs one callback at a time across readers: OK");
+        checkRejectedRegistrations(zdPublisher, topicWriter, writerQos);
+        System.out.println("  rejected listener registrations are released: OK");
 
         int deleteRc = publisher.delete_datawriter(rawWriter);
         check(deleteRc == 0, "delete_datawriter() rc == 0 (would be PRECONDITION_NOT_MET if any loan_raw call above leaked its outstanding-loan count)");

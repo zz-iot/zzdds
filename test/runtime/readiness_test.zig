@@ -1,5 +1,4 @@
-//! The readiness backend and the UDP transport on it, in the
-//! `-Dshared-runtime` migration build
+//! The readiness backend and the UDP transport on it
 //! (docs/design/concurrency/transport-adapters.md): a wake racing a wait,
 //! the poller handing over to another waiter, round-robin servicing within a
 //! budget, and unregistering a source while it is being serviced
@@ -36,10 +35,6 @@ const nil_participant = zzdds.dcps.nil_participant;
 
 const testing = std.testing;
 const alloc = testing.allocator;
-
-comptime {
-    if (!rt.enabled) @compileError("built against the library with -Dshared-runtime off");
-}
 
 // Every test is skipped where the platform has no readiness backend.
 
@@ -915,7 +910,7 @@ test "a UDP transport sends a gather list as one datagram without flattening it,
     SendSpy.reset();
     udp.test_hooks.before_send = SendSpy.hook;
 
-    // Not on a runtime: a blocking send, as on the threaded path.
+    // Not on a runtime: a blocking send.
     try testing.expectEqual(SendOutcome.completed, try t.sendGather(&to, &gather));
     // Windows has no MSG_DONTWAIT: there the socket itself is nonblocking.
     if (builtin.os.tag != .windows) try testing.expectEqual(@as(u32, 0), SendSpy.last_flags & posix.MSG.DONTWAIT);

@@ -1,5 +1,4 @@
-//! RTPS discovery (SPDP, SEDP and WLP) on the shared runtime, in the
-//! `-Dshared-runtime` migration build
+//! RTPS discovery (SPDP, SEDP and WLP) on the shared runtime
 //! (docs/design/concurrency/runtime.md#thread-mapping): announcements, lease
 //! checks and the built-in writers' heartbeats are timers on the runtime
 //! clock, and what discovery receives is processed in runtime contexts. On a
@@ -37,10 +36,6 @@ const nil_participant = zzdds.dcps.nil_participant;
 
 const testing = std.testing;
 const alloc = testing.allocator;
-
-comptime {
-    if (!rt.enabled) @compileError("built against the library with -Dshared-runtime off");
-}
 
 const SEC: i64 = std.time.ns_per_s;
 const MS: i64 = std.time.ns_per_ms;

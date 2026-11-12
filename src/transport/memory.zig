@@ -13,21 +13,15 @@
 //!   port-offset delta and calls transport.listen() on that data port.
 //!   send() routes by destination port via the shared MemoryBus handler map.
 //!
-//! RELIABLE caveat:
-//!   StatefulWriter holds its mutex during write() and sends an inline
-//!   HEARTBEAT only to RELIABLE reader proxies (writer_sm.zig guards the call
-//!   with `if (rp.reliable)`). For BEST_EFFORT QoS, delivery is deadlock-free.
-//!   RELIABLE QoS tests should use MockTransport until writer_sm locking is
-//!   refactored to release the lock before calling transport.send(). On the
-//!   shared runtime (-Dshared-runtime) the receiving participant queues each
-//!   message for its runtime instead, so RELIABLE works there.
+//! Delivery: the receiving participant queues each message for its runtime,
+//!   under the bus lock, rather than processing it on the sender's stack, so
+//!   RELIABLE writers, which send while holding their own lock, work too.
 //!
 //! See also: discovery/direct.zig, delivery/intraprocess.zig
 
 const std = @import("std");
 const iface = @import("interface.zig");
 const mutex_mod = @import("../util/mutex.zig");
-const build_opts = @import("build_options");
 
 pub const Locator = iface.Locator;
 pub const Transport = iface.Transport;
@@ -150,13 +144,8 @@ pub const MemoryTransport = struct {
         };
         const src: Locator = if (self.unicast_locs.items.len > 0) self.unicast_locs.items[0] else .invalid;
         self.bus.mu.lock();
+        defer self.bus.mu.unlock();
         const handler: ?ReceiveHandler = self.bus.handlers.get(port);
-        if (build_opts.shared_runtime) {
-            defer self.bus.mu.unlock();
-            if (handler) |h| h.on_receive(h.ctx, data, src, iface.Channel.none);
-            return;
-        }
-        self.bus.mu.unlock();
         if (handler) |h| h.on_receive(h.ctx, data, src, iface.Channel.none);
     }
 

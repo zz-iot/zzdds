@@ -861,20 +861,21 @@ Requirements that follow from the table:
 The runtime landed incrementally, starting with the first vertical slice, and the threaded
 path stayed the default until the runtime could replace it:
 
-* A build option (`-Dshared-runtime`, on by default since the flip below) selects the
-  runtime. It is a migration switch, not a supported configuration: it is not part of
-  `zzdds.idl`, the configuration file or the C ABI, and it is documented only for
-  contributors.
-* With the option on, every participant in the build uses the runtime. There is no
-  mixing within a build: an entity or QoS the runtime does not yet support fails creation
-  visibly (the constructor's ordinary nil result, with a diagnostic) and never falls back
+* A build option (`-Dshared-runtime`) selected the runtime. It was a migration switch,
+  not a supported configuration: it was not part of `zzdds.idl`, the configuration file
+  or the C ABI, and it was documented only for contributors.
+* With the option on, every participant in the build used the runtime. There was no
+  mixing within a build: an entity or QoS the runtime did not yet support failed creation
+  visibly (the constructor's ordinary nil result, with a diagnostic) and never fell back
   to the threaded path.
-* With the option off, the build is the threaded implementation, which releases shipped
+* With the option off, the build was the threaded implementation, which releases shipped
   until the default flipped.
 * Until the flip, CI built and tested both settings. The option build ran the runtime's
   own tests and every existing test whose features it supported, a set that grew with
   each migrated endpoint kind.
 * Once the runtime passed the full test, interoperability and examples suites, the
-  default flipped to the runtime. From the flip, CI tests the runtime only: the threaded
-  path and the option are deleted together next, and nothing is added to the threaded
-  path meanwhile.
+  default flipped to the runtime. From the flip, CI tests the runtime only, and nothing
+  is added to the threaded path.
+* The option is removed: every participant runs on the runtime. The threads that
+  transports, discovery and writers still start when they have no runtime or backend
+  (participants always give them one) are deleted next, one component at a time.
