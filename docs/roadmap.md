@@ -1025,7 +1025,9 @@ Distribution model in [`language-bindings.md`](language-bindings.md). The zidl b
 generate these don't exist yet — see `zidl/docs/roadmap.md`.
 
 - **Python / .NET** — inline CDR; C-ABI layer via ctypes / P/Invoke.
-- **Rust** — dual-mode: `pure` (via `zidl-rs`) and `zig-ffi` (for embedded/perf).
+- **Rust** — [design reopened after shared CDR consolidation](design/rust-bindings-plan.md).
+  Proposed first path reuses the native C ABI with owned Rust values; the
+  earlier pure/zig-ffi mode list is superseded. No supported backend exists.
 
 ### dds-rtps interop suite — upstream coverage gaps
 
