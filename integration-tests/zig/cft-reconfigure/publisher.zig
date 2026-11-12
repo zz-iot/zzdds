@@ -150,12 +150,14 @@ pub fn main(init: std.process.Init) !void {
 
     // -- Wait for both of the subscriber's readers (witness + filtered) to
     // match before writing anything, so phase1 is guaranteed to actually
-    // reach both. --
+    // reach both. The writer's status is polled, not the count the listener
+    // last saw: on the threaded runtime two matches' callbacks can arrive in
+    // the opposite order, leaving the listener's count at 1. --
     const match_deadline = monoNs(io) + MATCH_TIMEOUT_NS;
-    while (state.matched_current_count.load(.acquire) < 2) {
+    while (writerMatched(dw) < 2) {
         if (monoNs(io) > match_deadline) {
             std.debug.print("  matched: writer listener={d} status={d} GoTopic_reader={d}\n", .{ state.matched_current_count.load(.acquire), writerMatched(dw), readerMatched(go_dr) });
-            std.debug.print("FAIL: fewer than 2 readers matched within {d}s (got {d})\n", .{ @divExact(MATCH_TIMEOUT_NS, std.time.ns_per_s), state.matched_current_count.load(.acquire) });
+            std.debug.print("FAIL: fewer than 2 readers matched within {d}s (got {d})\n", .{ @divExact(MATCH_TIMEOUT_NS, std.time.ns_per_s), writerMatched(dw) });
             std.process.exit(1);
         }
         sleepNs(io, POLL_PERIOD_NS);
@@ -204,7 +206,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const drain_deadline = monoNs(io) + DRAIN_TIMEOUT_NS;
-    while (state.matched_current_count.load(.acquire) != 0) {
+    // Polls the status too: polling it above consumed changes the listener
+    // would otherwise have reported, so the listener's count can be stale.
+    while (writerMatched(dw) != 0) {
         if (monoNs(io) > drain_deadline) {
             std.debug.print("  matched: writer listener={d} status={d}\n", .{ state.matched_current_count.load(.acquire), writerMatched(dw) });
             std.debug.print("FAIL: subscriber did not disconnect within 15s\n", .{});

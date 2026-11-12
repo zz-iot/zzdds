@@ -133,12 +133,15 @@ public class Publisher {
 
         // -- Wait for both of the subscriber's readers (witness + filtered)
         // to match before writing anything, so phase1 is guaranteed to
-        // actually reach both. --
+        // actually reach both. The writer's status is polled, not the count
+        // the listener last saw: on the threaded runtime two matches'
+        // callbacks can arrive in the opposite order, leaving the
+        // listener's count at 1. --
         long deadline = System.currentTimeMillis() + MATCH_TIMEOUT_MS;
-        while (state.matchedCurrentCount.get() < 2) {
+        while (writerMatched(dw) < 2) {
             if (System.currentTimeMillis() > deadline) {
                 System.err.println("  matched: writer listener=" + state.matchedCurrentCount.get() + " status=" + writerMatched(dw) + " GoTopic_reader=" + readerMatched(goDr));
-                System.err.println("FAIL: fewer than 2 readers matched within " + (MATCH_TIMEOUT_MS / 1000) + "s (got " + state.matchedCurrentCount.get() + ")");
+                System.err.println("FAIL: fewer than 2 readers matched within " + (MATCH_TIMEOUT_MS / 1000) + "s (got " + writerMatched(dw) + ")");
                 System.exit(1);
             }
             Thread.sleep(POLL_PERIOD_MS);
@@ -190,7 +193,9 @@ public class Publisher {
         }
 
         deadline = System.currentTimeMillis() + DRAIN_TIMEOUT_MS;
-        while (state.matchedCurrentCount.get() != 0) {
+        // Polls the status too: polling it above consumed changes the
+        // listener would otherwise have reported, so its count can be stale.
+        while (writerMatched(dw) != 0) {
             if (System.currentTimeMillis() > deadline) {
                 System.err.println("  matched: writer listener=" + state.matchedCurrentCount.get() + " status=" + writerMatched(dw));
                 System.err.println("FAIL: subscriber did not disconnect within " + (DRAIN_TIMEOUT_MS / 1000) + "s");
