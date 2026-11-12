@@ -34,3 +34,5 @@ pub const poll_backend = @import("poll_backend.zig");
 pub const PollBackend = poll_backend.PollBackend;
 pub const Hosted = @import("hosted.zig").Hosted;
 pub const default_registry = @import("default_registry.zig");
+/// Test support; see testing.zig.
+pub const testing = @import("testing.zig");

@@ -10,7 +10,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const time_mod = @import("../../util/time.zig");
 const iface = @import("../interface.zig");
 
 pub const IfAddr = iface.IfAddr;
@@ -246,23 +245,20 @@ fn enumerateWindows(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(IfAdd
 
 // ── PollingMonitor ────────────────────────────────────────────────────────────
 
+/// Enumerates interfaces once, at `start`. It never re-polls them: a UDP
+/// transport does that on its participant's runtime (UdpTransport's
+/// IfacePoll), so `callback` is never called.
 pub const PollingMonitor = struct {
     alloc: std.mem.Allocator,
-    interval_ms: u32,
     callback: ?IfChangeCallback,
-    thread: ?std.Thread,
-    stopping: std.atomic.Value(bool),
     prev_addrs: std.ArrayListUnmanaged(IfAddr),
 
     const Self = @This();
 
-    pub fn init(alloc: std.mem.Allocator, interval_ms: u32) Self {
+    pub fn init(alloc: std.mem.Allocator) Self {
         return .{
             .alloc = alloc,
-            .interval_ms = interval_ms,
             .callback = null,
-            .thread = null,
-            .stopping = std.atomic.Value(bool).init(false),
             .prev_addrs = .empty,
         };
     }
@@ -274,32 +270,6 @@ pub const PollingMonitor = struct {
     /// Return an InterfaceMonitor vtable view of this PollingMonitor.
     pub fn monitor(self: *Self) InterfaceMonitor {
         return .{ .ctx = self, .vtable = &vtable };
-    }
-
-    fn threadMain(self: *Self) void {
-        var current: std.ArrayListUnmanaged(IfAddr) = .empty;
-        defer current.deinit(self.alloc);
-
-        while (!self.stopping.load(.acquire)) {
-            // Sleep in short chunks to stay responsive to stop requests.
-            var slept_ms: u32 = 0;
-            while (slept_ms < self.interval_ms and !self.stopping.load(.acquire)) {
-                time_mod.sleepNs(50 * std.time.ns_per_ms);
-                slept_ms += 50;
-            }
-            if (self.stopping.load(.acquire)) break;
-
-            enumerateInterfaces(self.alloc, &current) catch continue;
-
-            if (addrListChanged(&self.prev_addrs, &current)) {
-                // Swap: prev becomes current, then we'll overwrite current next iteration.
-                const tmp = self.prev_addrs;
-                self.prev_addrs = current;
-                current = tmp;
-
-                if (self.callback) |cb| cb.on_change(cb.ctx);
-            }
-        }
     }
 
     pub fn addrListChanged(a: *const std.ArrayListUnmanaged(IfAddr), b: *const std.ArrayListUnmanaged(IfAddr)) bool {
@@ -318,26 +288,14 @@ pub const PollingMonitor = struct {
     fn vtStart(ctx: *anyopaque, cb: IfChangeCallback) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.callback = cb;
-        self.stopping.store(false, .release);
-        // Populate initial snapshot regardless -- transport needs this once
-        // at startup to bind sockets to the right addresses.
+        // The transport needs this snapshot once at startup to bind sockets
+        // to the right addresses.
         try enumerateInterfaces(self.alloc, &self.prev_addrs);
-        // interval_ms == 0 means "disabled": no periodic re-poll thread, for
-        // static-topology deployments that never expect interface changes
-        // and want no recurring getifaddrs()-driven allocation at all after
-        // startup. Without this check, interval_ms == 0 would busy-loop
-        // threadMain's sleep chunking with zero delay.
-        if (self.interval_ms == 0) return;
-        self.thread = try std.Thread.spawn(.{}, threadMain, .{self});
     }
 
     fn vtStop(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.stopping.store(true, .release);
-        if (self.thread) |t| {
-            t.join();
-            self.thread = null;
-        }
+        self.callback = null;
     }
 
     fn vtEnumerate(ctx: *anyopaque, out: *std.ArrayListUnmanaged(IfAddr), alloc: std.mem.Allocator) anyerror!void {
