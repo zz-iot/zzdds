@@ -855,19 +855,24 @@ test "tcp transport: connection recovery after fd close" {
     latch.waitFor(1);
     try testing.expectEqual(@as(usize, 1), latch.n);
 
-    // Close the client-side connection fd to simulate network failure.
-    // vtSend will detect the write failure on next send and re-dial.
+    // The server hangs up, simulating a network failure: the client's
+    // backend reads the end of the stream and closes the connection. Shut
+    // down, not closed: closing the fd would leave its source registered
+    // with a handle a new connection may reuse. And on the server's side, as
+    // in the generation test below: on Windows a send on a socket the same
+    // process just shut down can still report success.
     {
-        client.conn_mu.lock();
-        var key = tcp_mod.RemoteKey{ .addr = std.mem.zeroes([16]u8), .port = port, .family = .v4 };
-        @memcpy(key.addr[0..4], &[_]u8{ 127, 0, 0, 1 });
-        const conn = client.connections.get(key);
-        if (conn) |co| _ = std.c.close(co.fd);
-        client.conn_mu.unlock();
+        server.conn_mu.lock();
+        defer server.conn_mu.unlock();
+        for (server.live_connections.items) |co| {
+            co.send_mu.lock();
+            defer co.send_mu.unlock();
+            if (co.fd_open.load(.acquire)) _ = std.c.shutdown(co.fd, 2); // SHUT_RDWR
+        }
     }
+    try waitLive(client, 0);
 
-    // Send again — vtSend detects the dead connection, re-dials, and succeeds.
-    // (No sleep needed: vtSend retries on write failure.)
+    // Send again — no connection is left, so vtSend re-dials and succeeds.
     try ct.send(&dest, "second");
     latch.waitFor(2);
     try testing.expectEqual(@as(usize, 2), latch.n);
