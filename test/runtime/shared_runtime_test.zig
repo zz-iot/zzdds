@@ -2997,6 +2997,54 @@ test "deleting a participant whose reader is parked on a listener held elsewhere
     try testing.expect(!ov.release_timed_out);
 }
 
+/// Deletes the reader whose turn is about to take its listener's right, as
+/// another thread can between the turn's last check and the take.
+const DeleteBeforeTake = struct {
+    var dr: DDS.DataReader = undefined;
+    var rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR;
+    var io: std.Io = undefined;
+    var done: std.Io.Event = .unset;
+
+    fn hook(lane: *@FieldType(DataReaderImpl, "listeners")) void {
+        lane.test_before_take = null;
+        rc = dr.get_subscriber().delete_datareader(dr);
+        done.set(io);
+    }
+};
+
+test "a reader deleted as its turn takes a listener held elsewhere does not park, so its participant's deletion does not wait for that listener" {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    var ov: Overlap = .{ .io = h.io() };
+    var o = PairOptions.bestEffort();
+    o.dr_listener = ov.readerListener();
+    o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+    var holding: Pair = undefined;
+    try holding.initWith(&h.runtime, o);
+    var deleted: Pair = undefined;
+    try deleted.initWith(&h.runtime, o);
+    h.runtime.releaseOwner();
+
+    try holding.write(0);
+    try ov.entered.waitTimeout(h.io(), ten_seconds);
+    DeleteBeforeTake.dr = deleted.dr.toDDSDataReader();
+    DeleteBeforeTake.io = h.io();
+    deleted.dr.listeners.test_before_take = DeleteBeforeTake.hook;
+    try deleted.write(0);
+    try DeleteBeforeTake.done.waitTimeout(h.io(), ten_seconds);
+    try testing.expectEqual(DDS.RETCODE_OK, DeleteBeforeTake.rc);
+    // A turn parked after its reader left the group would be out of the
+    // participant deletion's reach, which would then wait for the listener
+    // held through the other participant, released only after this returns.
+    try deleted.deinit();
+    try testing.expectEqual(@as(u32, 1), ov.inside.load(.seq_cst));
+    ov.release.set(h.io());
+
+    try holding.deinit();
+    try h.deinit();
+    try testing.expect(!ov.release_timed_out);
+}
+
 /// Deletes the participant of the reader it listens to.
 const DeleteParticipantFromListener = struct {
     io: std.Io,

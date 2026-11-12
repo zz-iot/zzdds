@@ -347,6 +347,8 @@ pub const PendingListeners = struct {
     claim_waits: std.atomic.Value(u32) = .init(0),
     /// Runs at the start of `enter`.
     test_before_enter: if (builtin.is_test) ?*const fn (lane: *PendingListeners) void else void = if (builtin.is_test) null else {},
+    /// Runs at the start of a turn's `take`.
+    test_before_take: if (builtin.is_test) ?*const fn (lane: *PendingListeners) void else void = if (builtin.is_test) null else {},
     /// The identity whose right this turn holds, or was granted.
     held: ?*Identity = null,
     /// The identity this owner is parked on.
@@ -620,6 +622,9 @@ pub const PendingListeners = struct {
     /// Takes `id`'s execution right for this turn, or parks on it.
     fn take(self: *PendingListeners, id: *Identity) bool {
         std.debug.assert(frames.?.lane == self);
+        if (builtin.is_test) {
+            if (self.test_before_take) |hook| hook(self);
+        }
         self.mu.lock();
         if (self.held) |h| {
             if (h == id) {
@@ -632,6 +637,12 @@ pub const PendingListeners = struct {
             self.mu.unlock();
             giveUp(h);
             self.mu.lock();
+        }
+        // Closed since the turn last checked: the owner's deletion has left
+        // the group, so the participant's deletion could not cancel a park.
+        if (self.closed) {
+            self.mu.unlock();
+            return false;
         }
         id.retain();
         if (id.tryAcquire(&self.waiter)) {
