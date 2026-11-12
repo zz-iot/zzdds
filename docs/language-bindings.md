@@ -28,7 +28,9 @@ the language; see `zidl/docs/runtime_libraries.md` §"CDR Runtime Strategy":
 
 - C / C++: link `zidl-cdr` (stable C ABI archive; part of the zidl package)
 - Zig: import `zidl_cdr` for codecs and `zidl_bindings` for generated binding support
-- Java / Python / C#: none — CDR is inlined into the generated file
+- Java: `zidl-cdr-java` pure Java JAR for shared-runtime generators; older
+  generators inline CDR. The Java SDK installs the matching JAR under `share/java`.
+- Python / C#: none — CDR is inlined into the generated file
 - Rust pure: `zidl-rs` crate; the `zzdds` Rust crate re-exports it as
   `zzdds::cdr` so users only need one `cargo add`
 - Rust zig-ffi: types from `zidl-types-rs`; FFI into the Zig runtime

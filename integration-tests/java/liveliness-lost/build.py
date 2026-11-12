@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "examples"))
-from _common import require_path, run_build, zzdds_zig_out
+from _common import java_sdk_sources, javac_cmd, require_path, run_build, zzdds_zig_out
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BUILD_DIR = SCRIPT_DIR / "build"
@@ -65,14 +65,12 @@ def main() -> int:
         shutil.rmtree(CLASSES_DIR)
     CLASSES_DIR.mkdir(parents=True)
     sources = (
-        glob.glob(str(zig_out / "java" / "io" / "zzdds" / "dcps" / "*.java"))
-        + glob.glob(str(zig_out / "java" / "io" / "zzdds" / "ext" / "*.java"))
-        + glob.glob(str(zig_out / "java" / "io" / "zzdds" / "runtime" / "*.java"))
+        java_sdk_sources(zig_out)
         + glob.glob(str(GENERATED_DIR / "*.java"))
         + [str(SCRIPT_DIR / "Publisher.java"), str(SCRIPT_DIR / "Subscriber.java")]
     )
     if not run_build(
-        ["javac", "-d", str(CLASSES_DIR), *sources],
+        javac_cmd(zig_out, "-d", str(CLASSES_DIR), *sources),
         cwd=SCRIPT_DIR,
         log_path=BUILD_DIR / "javac.log",
     ):

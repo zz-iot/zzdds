@@ -102,6 +102,25 @@ def run_env(zig_out: Path) -> dict:
     return env
 
 
+def java_classpath(zig_out: Path, *entries: Path) -> str:
+    """Add the SDK's codec JAR; old inline-codec SDKs have none."""
+    override = os.environ.get("ZIDL_CDR_JAR")
+    jars = [Path(override).expanduser()] if override else sorted((zig_out / "share" / "java").glob("zidl-cdr-java*.jar"))
+    if len(jars) > 1:
+        raise RuntimeError("Multiple zidl CDR JARs found; set ZIDL_CDR_JAR to the matching runtime")
+    if jars and not jars[0].is_file():
+        raise FileNotFoundError(f"ZIDL_CDR_JAR does not exist: {jars[0]}")
+    return os.pathsep.join(str(path.resolve()) for path in [*entries, *jars])
+
+
+def java_sdk_sources(zig_out: Path) -> list[str]:
+    return [str(path) for path in sorted((zig_out / "java").rglob("*.java"))]
+
+
+def javac_cmd(zig_out: Path, *args: str) -> list[str]:
+    return ["javac", "-encoding", "UTF-8", "-cp", java_classpath(zig_out, Path(".")), *args]
+
+
 def java_cmd(zig_out: Path, classpath: Path, main_class: str, *args: str) -> list[str]:
     lib_dir = zig_out / ("bin" if sys.platform == "win32" else "lib")
     return [
@@ -110,7 +129,7 @@ def java_cmd(zig_out: Path, classpath: Path, main_class: str, *args: str) -> lis
         "-Xss8m",
         f"-Djava.library.path={lib_dir}",
         "-cp",
-        str(classpath),
+        java_classpath(zig_out, classpath),
         main_class,
         *args,
     ]

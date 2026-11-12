@@ -149,6 +149,11 @@ jobs:
       - name: DebugAllocator lane (default allocator path only, additive to the matrix above)
         run: zig build test -Ddebug-allocator=true
 
+      - name: Install Python (Java codec runtime build)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install JDK (java-binding needs jni.h, not just a JRE)
         uses: actions/setup-java@v4
         with:

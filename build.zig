@@ -99,6 +99,39 @@ const ZidlSource = struct {
         return self.dependency.path(sub);
     }
 };
+const JavaCdr = struct { jar: std.Build.LazyPath };
+
+fn javaCdrRuntime(b: *std.Build, source: ZidlSource) ?JavaCdr {
+    b.dependOnDirectoryContents(source.path("packages"));
+    const script_path = if (source.source) |root|
+        std.fs.path.join(b.allocator, &.{ root, "packages/zidl-cdr-java/build.py" }) catch @panic("OOM")
+    else
+        source.dependency.builder.root.joinString(b.allocator, "packages/zidl-cdr-java/build.py") catch @panic("OOM");
+    const package_dir = std.fs.path.dirname(script_path) orelse unreachable;
+    std.Io.Dir.cwd().access(b.graph.io, package_dir, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => @panic("cannot inspect zidl Java runtime package"),
+    };
+    b.dependOnDirectoryContents(source.path("packages/zidl-cdr-java"));
+    // Pre-runtime zidl releases generate inline codecs and need no JAR.
+    std.Io.Dir.cwd().access(b.graph.io, script_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => @panic("cannot inspect zidl Java runtime sources"),
+    };
+    const python = b.findProgram(.{ .names = &.{ "python3", "python" } }) orelse "python3";
+    const javac = b.findProgram(.{ .names = &.{"javac"} }) orelse "javac";
+    const build_jar = b.addSystemCommand(&.{python});
+    build_jar.addFileArg(source.path("packages/zidl-cdr-java/build.py"));
+    build_jar.addArgs(&.{ "build", "--javac", javac, "--output" });
+    const jar = build_jar.addOutputFileArg("zidl-cdr-java.jar");
+    build_jar.addFileInput(source.path("packages/zidl-cdr-java/src/main/java/io/zidl/cdr/Cdr.java"));
+    build_jar.addFileInput(source.path("build.zig.zon"));
+    build_jar.addFileInput(source.path("LICENSE"));
+    const install = b.addInstallFile(jar, "share/java/zidl-cdr-java.jar");
+    b.getInstallStep().dependOn(&install.step);
+    return .{ .jar = jar };
+}
+
 const Runtime = struct { codec: *std.Build.Module, bindings: *std.Build.Module };
 
 fn runtimeModules(b: *std.Build, source: ZidlSource, dependency: *std.Build.Dependency, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, sanitize_thread: bool) Runtime {
@@ -1311,6 +1344,8 @@ pub fn build(b: *std.Build) void {
     // ── Java language binding ─────────────────────────────────────────────────
 
     if (java_binding) {
+        const java_cdr = javaCdrRuntime(b, zidl_dep);
+
         // dcps.idl and zzdds.idl's Java ext-binding are generated with
         // different --java-package values (io.zzdds.dcps / io.zzdds.ext):
         // several ext-binding interfaces share a simple name with a
@@ -1429,6 +1464,10 @@ pub fn build(b: *std.Build) void {
                 gen_smoke_java.addFileArg(smoke_idl);
 
                 const compile_java_smoke = b.addSystemCommand(&.{ javac, "-d", "build-tmp/java-binding-smoke" });
+                if (java_cdr) |runtime_jar| {
+                    compile_java_smoke.addArg("-cp");
+                    compile_java_smoke.addFileArg(runtime_jar.jar);
+                }
                 compile_java_smoke.addArgs(&.{"test/bindings/smoke/JavaSmoke.java"});
                 for (&[_][]const u8{ "Binding_smoke.java", "BindingSmokeStatusTypeSupport.java", "BindingSmokeStatusDataWriter.java", "BindingSmokeStatusDataReader.java" }) |f| {
                     compile_java_smoke.addFileArg(gen_smoke_java_dir.path(b, f));
@@ -1510,6 +1549,10 @@ pub fn build(b: *std.Build) void {
                 const run_java_smoke = b.addRunArtifact(launcher);
                 run_java_smoke.addDirectoryArg2(library_dir, .{ .make_absolute = true });
                 run_java_smoke.addArgs(&.{ maybe_java_for_jni.?, "--enable-native-access=ALL-UNNAMED", "-Xss8m", "-cp", "build-tmp/java-binding-smoke" });
+                if (java_cdr) |runtime_jar| {
+                    run_java_smoke.addArg("--zidl-cdr-runtime");
+                    run_java_smoke.addFileArg(runtime_jar.jar);
+                }
                 run_java_smoke.addDirectoryArg2(library_dir, .{ .prefix = "-Djava.library.path=", .make_absolute = true });
                 run_java_smoke.addArg("JavaSmoke");
                 run_java_smoke.step.dependOn(&compile_java_smoke.step);
