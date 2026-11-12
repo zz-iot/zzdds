@@ -529,18 +529,14 @@ pub const Transport = struct {
         /// Read directly; does not go through a function call.
         capabilities: Capabilities,
 
-        /// The transport runs no thread of its own, so a participant on the
-        /// shared runtime may use it. Removed with the threaded path
-        /// (docs/design/concurrency/runtime.md#coexistence-during-migration).
-        shared_runtime_ready: bool = false,
-
-        /// For a transport with sockets, on the shared runtime: from now on
-        /// its sockets are sources of `backend`, which services them, and
-        /// it starts no receive threads. Called for each participant before
-        /// it listens. Fails while sockets are open on another backend (or
-        /// on threads), or if `backend` waits on no sources; with none
-        /// open, `backend` replaces an earlier one, whose runtime may have
-        /// retired. Null: the transport has no sockets (memory, mock, lossy)
+        /// For a transport with sockets: from now on its sockets are sources
+        /// of `backend`, which services them. Called for each participant
+        /// before it listens. Fails while sockets are open on another
+        /// backend, or if `backend` waits on no sources; with none open,
+        /// `backend` replaces an earlier one, whose runtime may have retired. A failure fails the participant's creation. A transport
+        /// with sockets must implement it and start no thread of its own:
+        /// nothing else services them. A wrapper (lossy) forwards it. Null:
+        /// the transport has no sockets (memory, mock)
         /// (docs/design/concurrency/transport-adapters.md#progress-backend).
         attach_backend: ?*const fn (ctx: *anyopaque, backend: ProgressBackend) anyerror!void = null,
 

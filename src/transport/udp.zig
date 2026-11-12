@@ -74,7 +74,6 @@ const ChannelTable = @import("channel_table.zig").ChannelTable;
 const backend_mod = @import("../runtime/backend.zig");
 const ProgressBackend = backend_mod.ProgressBackend;
 const Source = backend_mod.Source;
-const poll_backend = @import("../runtime/poll_backend.zig");
 const sock = @import("../util/sock.zig");
 const MAX_GATHER = @import("../rtps/message/builder.zig").MAX_IOVECS;
 const runtime_mod = @import("../runtime/core.zig");
@@ -2047,7 +2046,6 @@ const SendSource = struct {
 
 const udp_vtable = Transport.Vtable{
     .capabilities = .{ .unicast = true, .multicast = true },
-    .shared_runtime_ready = poll_backend.supported,
     .attach_backend = UdpTransport.vtAttachBackend,
     .attach_runtime = UdpTransport.vtAttachRuntime,
     .can_reach = UdpTransport.vtCanReach,

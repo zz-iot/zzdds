@@ -60,6 +60,11 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   files and the Zig schema, along with the factory's `ClockRegistry`. Timed QoS runs on the
   participant's runtime clock. Configuration files should drop it: it is no longer a known
   key, which a strict read rejects.
+- **Breaking** for Zig: the `shared_runtime_ready` flag is removed from `Transport.Vtable`
+  and `Discovery.Vtable`, and `tcp_transport.shared_runtime_ready` with it. Participant
+  creation no longer checks it: a plugin that cannot run on the runtime fails creation from
+  `attach_backend` or `attach_runtime`, whose docs now state the contract (no threads of its
+  own; no fixed `wlp_tick` period).
 - **The shared runtime is the default.** Participants run on its hosted workers: receive,
   discovery, heartbeats and timers are runtime turns instead of a thread per socket and per
   concern. Listeners run as runtime turns too, so one can run after the call that caused it

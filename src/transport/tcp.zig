@@ -52,9 +52,6 @@ const WritableWaiter = iface.WritableWaiter;
 const RoomWaiter = iface.RoomWaiter;
 const MAX_RECEIVE_HANDLERS = iface.MAX_RECEIVE_HANDLERS;
 
-/// Whether a participant on the shared runtime may use this transport.
-pub const shared_runtime_ready = poll_backend.supported;
-
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const MAX_MSG_LEN: u32 = 4 * 1024 * 1024; // 4 MiB sanity cap
@@ -1432,7 +1429,6 @@ pub const TcpTransport = struct {
 
 const tcp_vtable = Transport.Vtable{
     .capabilities = .{ .unicast = true, .multicast = false },
-    .shared_runtime_ready = shared_runtime_ready,
     .attach_backend = TcpTransport.vtAttachBackend,
     .can_reach = TcpTransport.vtCanReach,
     .send = TcpTransport.vtSend,

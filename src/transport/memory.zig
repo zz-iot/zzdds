@@ -195,7 +195,6 @@ pub const MemoryTransport = struct {
 
 const mem_vtable = Transport.Vtable{
     .capabilities = .{ .unicast = true, .multicast = false },
-    .shared_runtime_ready = true,
     .can_reach = MemoryTransport.vtCanReach,
     .send = MemoryTransport.vtSend,
     .listen = MemoryTransport.vtListen,

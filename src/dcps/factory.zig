@@ -21,7 +21,6 @@ const trace_mod = @import("../trace.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const runtime_mod = @import("../runtime/core.zig");
 const default_registry = @import("../runtime/default_registry.zig");
-const tcp_transport = @import("../transport/tcp.zig");
 const log_mod = @import("../log.zig");
 
 pub const Transport = participant_mod.Transport;
@@ -123,20 +122,9 @@ pub const DomainParticipantFactoryImpl = struct {
     }
 
     /// Takes an owner reference to the selected runtime, or else the default
-    /// one, for a new participant, after checking the participant's
-    /// transports and discovery can run on it; null (with a diagnostic) when
-    /// creation must fail.
-    fn acquireRuntimeFor(self: *Self, config: config_mod.Config) ?*runtime_mod.Runtime {
-        if (!self.transport.vtable.shared_runtime_ready or
-            (config.transport.tcp.enabled and !tcp_transport.shared_runtime_ready))
-        {
-            log_mod.dcps.warn("create_participant: the transport is not supported on the shared runtime yet", .{});
-            return null;
-        }
-        if (!self.discovery.vtable.shared_runtime_ready) {
-            log_mod.dcps.warn("create_participant: the discovery plugin is not supported on the shared runtime yet", .{});
-            return null;
-        }
+    /// one, for a new participant, and attaches the transport and discovery
+    /// to it; null (with a diagnostic) when creation must fail.
+    fn acquireRuntimeFor(self: *Self) ?*runtime_mod.Runtime {
         self.mu.lock();
         const selected = self.runtime;
         const retained = if (selected) |rt| rt.tryRetainOwner() else false;
@@ -267,7 +255,7 @@ pub const DomainParticipantFactoryImpl = struct {
             .entity_id = participant_mod.EntityIds.participant,
         };
 
-        const rt = self.acquireRuntimeFor(config) orelse return null;
+        const rt = self.acquireRuntimeFor() orelse return null;
 
         const p = participant_mod.DomainParticipantImpl.init(
             self.alloc,

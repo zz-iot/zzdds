@@ -120,10 +120,10 @@ pub const LossyTransport = struct {
         alloc.destroy(self);
     }
 
-    /// Runnable on the shared runtime exactly when the inner transport is: the
-    /// shim has no work of its own.
+    /// The shim has no work of its own: it runs on a runtime exactly as the
+    /// inner transport does, attaching it in turn.
     pub fn transport(self: *LossyTransport) Transport {
-        return .{ .ctx = self, .vtable = if (self.inner.vtable.shared_runtime_ready) &ready_vtable else &lossy_vtable };
+        return .{ .ctx = self, .vtable = &lossy_vtable };
     }
 
     // ── Vtable implementations ────────────────────────────────────────────────
@@ -232,12 +232,6 @@ const lossy_vtable = Transport.Vtable{
     .attach_backend = LossyTransport.vtAttachBackend,
     .attach_runtime = LossyTransport.vtAttachRuntime,
     .close = LossyTransport.vtClose,
-};
-
-const ready_vtable = blk: {
-    var v = lossy_vtable;
-    v.shared_runtime_ready = true;
-    break :blk v;
 };
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

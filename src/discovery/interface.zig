@@ -384,14 +384,6 @@ pub const Discovery = struct {
     vtable: *const Vtable,
 
     pub const Vtable = struct {
-        /// The plugin runs no thread of its own, or puts its work on the
-        /// runtime through `attach_runtime`, so a participant on the shared
-        /// runtime may use it. There `wlp_tick` runs only when an
-        /// endpoint's timer check is due, not on a fixed period, so the
-        /// plugin must not depend on one. Removed with the threaded path
-        /// (docs/design/concurrency/runtime.md#coexistence-during-migration).
-        shared_runtime_ready: bool = false,
-
         /// Begin discovery. The plugin should start sending participant announcements
         /// and listening for remote announcements. Callbacks are stored and invoked
         /// as peers are discovered. A plugin serves one participant at a
@@ -461,19 +453,19 @@ pub const Discovery = struct {
         deinit: *const fn (ctx: *anyopaque) void,
 
         /// RTPS §8.7.2.2.3: drive WLP's periodic AUTOMATIC/MANUAL_BY_PARTICIPANT
-        /// liveliness broadcast. Called from participant.zig's checkTimers()
-        /// tick (piggybacking on the existing DEADLINE/LIVELINESS timer
-        /// thread rather than a dedicated one). No-op for plugins that don't
-        /// implement WLP (standalone SpdpEndpoints, DirectDiscovery).
+        /// liveliness broadcast. Called from participant.zig's checkTimers(),
+        /// which runs only when an endpoint's timer check is due, not on a
+        /// fixed period: a plugin must not depend on one. No-op for plugins
+        /// that don't implement WLP (standalone SpdpEndpoints, DirectDiscovery).
         wlp_tick: *const fn (ctx: *anyopaque, now_ns: i64, info: WlpTickInfo) void,
 
         /// Puts the plugin's own work on the participant's runtime, before
         /// `start`: its timers on the runtime clock, and what it receives
         /// queued for runtime contexts. Fails while another participant's
         /// discovery runs, or is stopping, on a different runtime; otherwise
-        /// the runtime replaces one an earlier participant used. Null for a plugin with
-        /// no work of its own.
-        /// Required once the threaded path is removed.
+        /// the runtime replaces one an earlier participant used, and a failure
+        /// fails the participant's creation. A plugin must start no thread of
+        /// its own. Null for a plugin with no work of its own.
         attach_runtime: ?*const fn (ctx: *anyopaque, rt: *Runtime) anyerror!void = null,
     };
 

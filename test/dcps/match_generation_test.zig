@@ -42,7 +42,6 @@ const testing = std.testing;
 
 const CapturingDisc = struct {
     const vtable = Discovery.Vtable{
-        .shared_runtime_ready = true,
         .start = start,
         .stop = noop,
         .prepare_writer = noopAW,

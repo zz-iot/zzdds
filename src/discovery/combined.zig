@@ -273,7 +273,6 @@ pub const SpdpSedpDiscovery = struct {
     // ── Discovery vtable ──────────────────────────────────────────────────────
 
     const vtable = Discovery.Vtable{
-        .shared_runtime_ready = true,
         .start = vtStart,
         .stop = vtStop,
         .prepare_writer = vtPrepareWriter,
