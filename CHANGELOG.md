@@ -46,6 +46,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 - A writer no longer starts a heartbeat thread. Its periodic HEARTBEAT, probe deadlines and
   reconnection repair run as a timer on its runtime; a `StatefulWriter` used without a
   runtime sends no periodic HEARTBEAT.
+- SPDP no longer starts a timer thread. Its announcements and lease checks run as timers on
+  its runtime; `SpdpEndpoints` used without a runtime announces only once, at `start`, and
+  checks leases only when its owner calls `checkLeases`.
 - **The shared runtime is the default.** Participants run on its hosted workers: receive,
   discovery, heartbeats and timers are runtime turns instead of a thread per socket and per
   concern. Listeners run as runtime turns too, so one can run after the call that caused it
