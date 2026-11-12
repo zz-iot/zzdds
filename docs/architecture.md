@@ -174,12 +174,11 @@ defer lossy.deinit(alloc);
 
 Used in RELIABLE retransmit and NACK-triggered resend tests.
 
-### ClockRegistry (`src/util/clock_registry.zig`)
+### Timer clock
 
-Maps string names to `Clock` instances. Pre-populated with `"default"` / `"monotonic"` /
-`"realtime"` / `"boottime"`. The `timer_clock_name` config field selects which clock
-`DomainParticipantFactoryImpl` uses for all internal timers. Custom clocks can be registered
-before creating a factory.
+Every participant's internal timers (deadline, liveliness, lease checks, heartbeats) read its
+runtime's scheduling clock. A test drives them with a manual runtime's clock
+(`test/support/manual_runtime.zig`).
 
 ### ContentFilteredTopic and QueryCondition evaluator (`src/dcps/filter.zig`)
 
@@ -226,7 +225,6 @@ name = ""                   # empty = auto
 lease_duration_ms = 10000
 announcement_period_ms = 3000
 guid_strategy = "GUID_SPEC_RANDOM"  # "GUID_SPEC_RANDOM" | "GUID_HOST_BASED" | "GUID_FULLY_RANDOM"
-timer_clock_name = "default" # clock used for all timers: "default" | "monotonic" | "realtime" | "boottime"
 
 [rtps]
 fragment_size = 16384       # max RTPS message size before DATA_FRAG splitting (bytes)

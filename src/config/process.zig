@@ -105,7 +105,7 @@ pub fn resetForTesting() void {
 // NOTE: every `ProcessConfig` passed to `configure()` below comes from
 // `resolve.resolveProcessConfig()`, never a bare `.{}` literal — `configure`
 // always calls `.deinit()` on its input, and a bare literal has non-empty
-// string fields (e.g. `timer_clock_name`) that were never duped, which
+// string fields (e.g. `multicast_group_v4`) that were never duped, which
 // crashes. See resolve.zig's module doc comment.
 
 test "configure then getForNewFactory returns a clone of the configured value" {
@@ -184,13 +184,13 @@ test "configure stores the persistent copy through the caller's own allocator, n
     // (the bug this test guards against — the persistent singleton used to
     // always live in std.heap.c_allocator regardless of what was passed
     // here), this pointer would fall outside `buf`.
-    const stored_ptr = @intFromPtr(state.?.default_participant_config.participant.timer_clock_name.ptr);
+    const stored_ptr = @intFromPtr(state.?.default_participant_config.transport.udp.multicast_group_v4.ptr);
     const buf_start = @intFromPtr(&buf[0]);
     try std.testing.expect(stored_ptr >= buf_start and stored_ptr < buf_start + buf.len);
 
     var got = try getForNewFactory(std.testing.allocator);
     defer got.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("default", got.default_participant_config.participant.timer_clock_name);
+    try std.testing.expectEqualStrings("239.255.0.1", got.default_participant_config.transport.udp.multicast_group_v4);
 }
 
 test "configureFromFile resolves and installs in one step" {

@@ -179,7 +179,7 @@ test "resolveParticipantConfig: pure defaults, safely deinit-able" {
     try std.testing.expectEqual(expected.discovery.kind, cfg.discovery.kind);
     // Non-empty defaults must remain independently owned after temporary storage
     // has been freed.
-    try std.testing.expectEqualStrings("default", cfg.participant.timer_clock_name);
+    try std.testing.expectEqualStrings("239.255.0.1", cfg.transport.udp.multicast_group_v4);
 }
 
 test "resolveParticipantConfigFrom: applies a file over defaults" {

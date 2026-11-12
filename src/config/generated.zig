@@ -12,7 +12,6 @@ pub fn toRuntimeConfig(allocator: std.mem.Allocator, cfg: *const ext.DomainParti
     var runtime = schema.Config{};
     // Zero non-empty string defaults BEFORE errdefer so deinitRuntimeConfig
     // won't call free() on read-only literals if we fail early.
-    runtime.participant.timer_clock_name = "";
     runtime.transport.udp.multicast_group_v4 = "";
     runtime.transport.udp.multicast_group_v6 = "";
     errdefer deinitRuntimeConfig(allocator, &runtime);
@@ -23,7 +22,6 @@ pub fn toRuntimeConfig(allocator: std.mem.Allocator, cfg: *const ext.DomainParti
     runtime.participant.lease_duration_ms = cfg.participant.lease_duration_ms;
     runtime.participant.announcement_period_ms = cfg.participant.announcement_period_ms;
     runtime.participant.guid_strategy = toGuidStrategy(cfg.participant.guid_strategy);
-    runtime.participant.timer_clock_name = try dupeString(allocator, cfg.participant.timer_clock_name);
     runtime.transport.udp = try toUdpConfig(allocator, &cfg.transport.udp);
     runtime.transport.tcp.enabled = cfg.transport.tcp.enabled;
     runtime.transport.tcp.bind_address = try dupeString(allocator, cfg.transport.tcp.bind_address);
@@ -50,7 +48,6 @@ pub fn toRuntimeConfig(allocator: std.mem.Allocator, cfg: *const ext.DomainParti
 
 pub fn deinitRuntimeConfig(allocator: std.mem.Allocator, cfg: *schema.Config) void {
     if (cfg.participant.name.len != 0) allocator.free(cfg.participant.name);
-    if (cfg.participant.timer_clock_name.len != 0) allocator.free(cfg.participant.timer_clock_name);
     if (cfg.transport.tcp.bind_address.len != 0) allocator.free(cfg.transport.tcp.bind_address);
     if (cfg.transport.udp.multicast_group_v4.len != 0) allocator.free(cfg.transport.udp.multicast_group_v4);
     if (cfg.transport.udp.multicast_group_v6.len != 0) allocator.free(cfg.transport.udp.multicast_group_v6);
@@ -63,7 +60,6 @@ pub fn deinitRuntimeConfig(allocator: std.mem.Allocator, cfg: *schema.Config) vo
     // means the guards above skip the free).  Cannot use std.mem.zeroes(schema.Config)
     // because ReliabilityKind has no tag with value 0.
     cfg.participant.name = "";
-    cfg.participant.timer_clock_name = "";
     cfg.transport.tcp.bind_address = "";
     cfg.transport.udp.multicast_group_v4 = "";
     cfg.transport.udp.multicast_group_v6 = "";

@@ -413,9 +413,9 @@ does not replace this handshake. Small wrapping hardware counters need an adapte
 a documented unambiguous deadline horizon or extended counter; do not assume MCU ticks
 are already a wide absolute clock.
 
-Existing src/util/clock_registry.zig permits realtime/custom clocks, stores borrowed
-Clock values and falls back to default on unknown names. Do not reuse that fallback
-for an explicitly selected runtime scheduling clock. Preserve participant clock
+The former clock registry (removed with the `timer_clock_name` setting) permitted
+realtime/custom clocks, stored borrowed Clock values and fell back to default on unknown
+names. Do not reintroduce that fallback for an explicitly selected runtime scheduling clock. Preserve participant clock
 semantics only through a compatible timer adapter. Virtual or externally advanced
 clocks additionally need advance/change notification; do not interpret their deadlines
 as host sleep intervals. Supporting every existing custom clock in every backend is

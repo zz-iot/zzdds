@@ -48,14 +48,18 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   DEADLINE, LIVELINESS and held-data checks run only as a timer on its runtime, and what it
   receives always goes through its ingress context. The factory attaches the runtime before
   checking the participant's own TCP transport, so a participant that fails there is torn
-  down like any other. The `timer_clock_name` participant setting has no effect: timed QoS
-  runs on the runtime's clock.
+  down like any other.
 - A writer no longer starts a heartbeat thread. Its periodic HEARTBEAT, probe deadlines and
   reconnection repair run as a timer on its runtime; a `StatefulWriter` used without a
   runtime sends no periodic HEARTBEAT.
 - SPDP no longer starts a timer thread. Its announcements and lease checks run as timers on
   its runtime; `SpdpEndpoints` used without a runtime announces only once, at `start`, and
   checks leases only when its owner calls `checkLeases`.
+- **Breaking**: the `timer_clock_name` participant setting is removed, from `zzdds.idl`'s
+  `ParticipantConfig` (and so the generated C, C++ and Java config types), configuration
+  files and the Zig schema, along with the factory's `ClockRegistry`. Timed QoS runs on the
+  participant's runtime clock. Configuration files should drop it: it is no longer a known
+  key, which a strict read rejects.
 - **The shared runtime is the default.** Participants run on its hosted workers: receive,
   discovery, heartbeats and timers are runtime turns instead of a thread per socket and per
   concern. Listeners run as runtime turns too, so one can run after the call that caused it

@@ -36,7 +36,6 @@ module zzdds {
         @default(10000) unsigned long lease_duration_ms;
         @default(3000)  unsigned long announcement_period_ms;
         @default(GUID_SPEC_RANDOM) GuidStrategy guid_strategy;
-        @default("default") string timer_clock_name;
     };
 
     @mutable struct UdpConfig {

@@ -47,11 +47,6 @@ pub const ParticipantConfig = struct {
     announcement_period_ms: u32 = 3_000,
     /// Strategy for generating the 12-byte GUID prefix.
     guid_strategy: GuidStrategy = .spec_random,
-    /// Name of the clock to use for internal interval timers (deadline,
-    /// liveliness, SPDP lease). Must be registered in the factory's
-    /// ClockRegistry. Built-in names: "default", "monotonic", "realtime",
-    /// "boottime". Falls back to "default" (monotonic) on unknown names.
-    timer_clock_name: []const u8 = "default",
 };
 
 pub const RtpsConfig = struct {

@@ -315,14 +315,14 @@ test "support factory: get_default_participant_config on a custom-allocator fact
     // testing.allocator's own tracking would reject as an invalid free.
     var config = ZZDDS.DomainParticipantConfig{};
     config.participant._toml_applied = true;
-    config.participant.timer_clock_name = try std.heap.c_allocator.dupe(u8, "external-default");
+    config.transport.udp.multicast_group_v4 = try std.heap.c_allocator.dupe(u8, "external-default");
     defer config.deinit(std.heap.c_allocator);
 
     try testing.expectEqual(DDS.RETCODE_OK, ext_factory.get_default_participant_config(&config));
     // The returned config must be genuinely c_allocator-owned -- not
     // owner.alloc-owned -- so the `defer` above (and any subsequent call)
     // frees it correctly regardless of the factory's own allocator.
-    try testing.expectEqualStrings("default", config.participant.timer_clock_name);
+    try testing.expectEqualStrings("239.255.0.1", config.transport.udp.multicast_group_v4);
 }
 
 test "support factory: get_default_participant_qos on a custom-allocator factory doesn't mismatch the caller's c_allocator-owned input" {

@@ -18,14 +18,11 @@ const guid_gen = @import("../util/guid_gen.zig");
 const config_mod = @import("../config/schema.zig");
 const generated_config_mod = @import("../config/generated.zig");
 const trace_mod = @import("../trace.zig");
-const clock_registry_mod = @import("../util/clock_registry.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const runtime_mod = @import("../runtime/core.zig");
 const default_registry = @import("../runtime/default_registry.zig");
 const tcp_transport = @import("../transport/tcp.zig");
 const log_mod = @import("../log.zig");
-
-pub const ClockRegistry = clock_registry_mod.ClockRegistry;
 
 pub const Transport = participant_mod.Transport;
 pub const Discovery = participant_mod.Discovery;
@@ -43,7 +40,6 @@ pub const DomainParticipantFactoryImpl = struct {
     default_dp_qos: DDS.DomainParticipantQos,
     /// See `setTraceSink`.
     trace_sink: ?trace_mod.Sink = null,
-    clock_registry: ClockRegistry,
 
     /// Active participants owned by this factory; guarded by `mu`.
     participants: std.ArrayListUnmanaged(*participant_mod.DomainParticipantImpl),
@@ -77,8 +73,6 @@ pub const DomainParticipantFactoryImpl = struct {
         guid_strategy: GuidStrategy,
         config: config_mod.Config,
     ) !*Self {
-        var reg = try ClockRegistry.init(alloc);
-        errdefer reg.deinit();
         const self = try alloc.create(Self);
         self.* = .{
             .alloc = alloc,
@@ -89,7 +83,6 @@ pub const DomainParticipantFactoryImpl = struct {
             .guid_strategy = guid_strategy,
             .factory_qos = .{},
             .default_dp_qos = .{},
-            .clock_registry = reg,
             .participants = .empty,
             .next_handle = 1,
             .mu = .{},
@@ -102,7 +95,6 @@ pub const DomainParticipantFactoryImpl = struct {
         for (self.participants.items) |p| p.deinit();
         self.participants.deinit(self.alloc);
         if (self.runtime) |rt| rt.releaseOwner();
-        self.clock_registry.deinit();
         self.default_dp_qos.deinit(self.alloc);
         self.alloc.destroy(self);
     }
