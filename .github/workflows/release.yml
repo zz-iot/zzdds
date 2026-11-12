@@ -141,6 +141,11 @@ jobs:
         run: zig build test -Dtarget=x86_64-linux-musl
 
       # Exercise the generated C/C++/Java bindings on every release platform.
+      - name: Install Python (Java codec runtime build)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install JDK (java-binding needs jni.h, not just a JRE)
         uses: actions/setup-java@v4
         with:
@@ -306,11 +311,22 @@ jobs:
         with:
           version: ${{ needs.prepare.outputs.zig_version }}
 
+      - name: Install JDK (Java SDK and JNI)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Python (Java runtime and bundle verification)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       # --summary all leaves a full step tree in the log -- cheap, and it made
       # the "verify" false-negative below (a shell bug, not a build bug)
       # obvious once package-libs finally ran for real.
-      - name: Build install tree (C + C++ bindings)
-        run: zig build -Dc-binding=true -Dcpp-binding=true -Doptimize=ReleaseSafe install --summary all
+      - name: Build install tree (C + C++ + Java bindings)
+        run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true -Doptimize=ReleaseSafe install --summary all
 
       - name: Verify install tree is complete
         shell: bash
@@ -353,11 +369,6 @@ jobs:
           mv zig-out "$dir"
           tar -czf "${dir}.tar.gz" "$dir"
 
-      - name: Install Python (for verify_release_bundle.py)
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
       # Extract the tarball we just made into an unrelated directory and prove a
       # downstream project can consume it from there. Linux: full path --
       # find_package + pkg-config, build examples/{c,cpp}/hello_world, run a
@@ -378,7 +389,7 @@ jobs:
           tarball="zzdds-${{ needs.prepare.outputs.full_version }}-${{ matrix.name }}.tar.gz"
           args=""
           [ "${{ runner.os }}" = "macOS" ] && args="--skip-example-run"
-          python scripts/verify_release_bundle.py --bundle "$tarball" $args
+          python scripts/verify_release_bundle.py --bundle "$tarball" --with-java $args
 
       - name: Upload bundle
         uses: actions/upload-artifact@v4

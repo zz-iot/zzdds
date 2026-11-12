@@ -32,6 +32,58 @@ class ExecutablePathTests(unittest.TestCase):
             self.assertEqual(executable_path(root / "sample"), root / "sample.exe")
 
 
+class JavaClasspathTests(unittest.TestCase):
+    def setUp(self):
+        self.env = patch.dict(os.environ, {}, clear=True)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_inline_sdk_and_shared_runtime_sdk(self):
+        with tempfile.TemporaryDirectory(prefix="java sdk ") as tmp:
+            root = Path(tmp)
+            classes = root / "classes"
+            self.assertEqual(_common.java_classpath(root, classes), str(classes.resolve()))
+            jar = root / "share/java/zidl-cdr-java.jar"
+            jar.parent.mkdir(parents=True)
+            jar.touch()
+            for separator in (":", ";"):
+                with patch("_common.os.pathsep", separator):
+                    expected = separator.join(map(str, (classes.resolve(), jar.resolve())))
+                    self.assertEqual(_common.java_classpath(root, classes), expected)
+                    cmd = _common.java_cmd(root, classes, "Main")
+                    self.assertEqual(cmd[cmd.index("-cp") + 1], expected)
+            self.assertIn(str(jar.resolve()), _common.javac_cmd(root, "Main.java")[4])
+
+    def test_sdk_sources_include_both_binding_packages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            expected = []
+            for name in ("dcps/Dcps.java", "ext/PublisherImpl.java", "runtime/ZzddsRuntime.java"):
+                source = root / "java/io/zzdds" / name
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.touch()
+                expected.append(str(source))
+            self.assertEqual(_common.java_sdk_sources(root), sorted(expected))
+
+    def test_ambiguous_jars_need_an_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory = root / "share/java"
+            directory.mkdir(parents=True)
+            jars = [directory / ("zidl-cdr-java-" + version + ".jar") for version in ("1", "2")]
+            for jar in jars:
+                jar.touch()
+            with self.assertRaisesRegex(RuntimeError, "Multiple"):
+                _common.java_classpath(root)
+            with patch.dict(os.environ, {"ZIDL_CDR_JAR": str(jars[1])}):
+                self.assertEqual(_common.java_classpath(root), str(jars[1].resolve()))
+
+    def test_missing_explicit_jar_is_an_error(self):
+        with patch.dict(os.environ, {"ZIDL_CDR_JAR": "/not-present/zidl-cdr-java.jar"}):
+            with self.assertRaises(FileNotFoundError):
+                _common.java_classpath(Path("sdk"))
+
+
 SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
 
 

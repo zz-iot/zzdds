@@ -268,6 +268,33 @@ def check_pkgconfig(prefix: Path, work: Path) -> None:
     log(f"pkg-config: consumer binary ran -- {proc.stdout.strip()}")
 
 
+def check_java(prefix: Path, examples: Path, skip_run: bool, domain: int) -> None:
+    java_root = prefix / "java/io/zzdds"
+    for path in [java_root / "dcps/Dcps.java", java_root / "ext/Zzdds.java",
+                 java_root / "runtime/ZzddsRuntime.java"]:
+        if not path.is_file():
+            fail(f"Java SDK source missing: {path}")
+    if not any((prefix / path).is_file() for path in
+               ["lib/libzzdds_jni.so", "lib/libzzdds_jni.dylib", "bin/zzdds_jni.dll", "lib/zzdds_jni.dll"]):
+        fail("Java SDK has no JNI library")
+    if "io.zidl.cdr" in (java_root / "dcps/Dcps.java").read_text(encoding="utf-8"):
+        if not (prefix / "share/java/zidl-cdr-java.jar").is_file():
+            fail("Java SDK codecs require share/java/zidl-cdr-java.jar")
+    env = os.environ.copy()
+    env["ZZDDS_ZIG_OUT"] = str(prefix.resolve())
+    env.pop("ZIDL_EXECUTABLE", None)
+    env.pop("ZIDL_CDR_JAR", None)
+    example = examples / "java/hello_world"
+    build = subprocess.run([sys.executable, str(example / "build.py")], env=env, timeout=300)
+    if build.returncode:
+        fail("Java hello_world did not compile against the relocated SDK")
+    if not skip_run:
+        result = subprocess.run([sys.executable, str(example / "run.py"), "-d", str(domain)], env=env, timeout=90)
+        if result.returncode:
+            fail("Java hello_world failed against the relocated SDK")
+    log("Java SDK: relocated generator, sources, codec classpath and JNI checked")
+
+
 # ── driver ─────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -286,6 +313,7 @@ def main() -> int:
     ap.add_argument("--example-langs", default="c,cpp",
                     help="comma-separated hello_world ports to build against the bundle "
                          "(default 'c,cpp'; the useful narrower value is 'c').")
+    ap.add_argument("--with-java", action="store_true", help="compile/run Java hello_world using the relocated Java SDK (JDK required)")
     ap.add_argument("--work", type=Path, default=None, help="working directory (default: a fresh temp dir)")
     ap.add_argument("--keep", action="store_true", help="do not delete the working directory on exit")
     ap.add_argument("--domain-base", type=int, default=58,
@@ -343,6 +371,9 @@ def main() -> int:
                 log(f"hello_world ({name}): built against the bundle; --skip-example-run set, not running the pair")
             else:
                 run_hello_world_pair(build, prefix, args.domain_base + i)
+
+        if args.with_java:
+            check_java(prefix, args.examples_dir, args.skip_example_run, args.domain_base + 2)
 
         check_pkgconfig(prefix, work)
 
