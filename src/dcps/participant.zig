@@ -1110,8 +1110,7 @@ pub const DomainParticipantImpl = struct {
     /// for why that matters here specifically).
     timer_thread: ?std.Thread = null,
     /// The shared runtime this participant holds an owner reference to, set
-    /// by `attachRuntime` before `start` in a `-Dshared-runtime` build and
-    /// released last in `deinit`
+    /// by `attachRuntime` before `start` and released last in `deinit`
     /// (docs/design/concurrency/runtime.md#operational-ownership-versus-storage-retention).
     runtime: ?*runtime_mod.Runtime = null,
     /// With a runtime: the context that processes received datagrams, one

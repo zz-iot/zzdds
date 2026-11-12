@@ -1,12 +1,8 @@
-//! Shared runtime (docs/design/concurrency/runtime.md). Participants use it
-//! only in a `-Dshared-runtime` build, and endpoints move onto it one kind at
-//! a time (docs/design/concurrency/runtime.md#coexistence-during-migration).
+//! Shared runtime (docs/design/concurrency/runtime.md). Every participant
+//! runs on one.
 
 const core = @import("core.zig");
 const backend = @import("backend.zig");
-
-/// Whether this is a `-Dshared-runtime` build.
-pub const enabled = @import("build_options").shared_runtime;
 
 pub const Runtime = core.Runtime;
 pub const Context = core.Context;

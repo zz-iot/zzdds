@@ -367,9 +367,8 @@ test "a writer its announcement's match callback deletes is not returned by crea
     fx.settle();
     try testing.expectEqual(DDS.RETCODE_OK, Probe.rc);
     try testing.expect(pub_.lookup_datawriter(TOPIC).ptr == zzdds.dcps.NIL_PTR);
-    // On the shared runtime the match is reported after creation returns,
-    // so only the threaded path can hand back a writer already deleted.
-    if (!zzdds.runtime.enabled) try testing.expect(dw.ptr == zzdds.dcps.NIL_PTR);
+    // The match is reported after creation returned the writer.
+    try testing.expect(dw.ptr != zzdds.dcps.NIL_PTR);
 }
 
 test "a reader its announcement's match callback deletes is not returned by create_datareader" {
@@ -393,8 +392,8 @@ test "a reader its announcement's match callback deletes is not returned by crea
     fx.settle();
     try testing.expectEqual(DDS.RETCODE_OK, Probe.rc);
     try testing.expect(sub.lookup_datareader(TOPIC).ptr == zzdds.dcps.NIL_PTR);
-    // As for the writer: only the threaded path can return it deleted.
-    if (!zzdds.runtime.enabled) try testing.expect(dr.ptr == zzdds.dcps.NIL_PTR);
+    // As for the writer: the match is reported after creation returned it.
+    try testing.expect(dr.ptr != zzdds.dcps.NIL_PTR);
 }
 
 test "a writer whose announcement cannot be reserved is not created" {

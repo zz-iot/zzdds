@@ -11,8 +11,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const shared_runtime = b.option(bool, "shared-runtime", "Build zzdds with -Dshared-runtime; false selects the threaded path, being deleted (contributors only; default: true)") orelse true;
-    const zzdds_dep = b.dependency("zzdds", .{ .target = target, .optimize = optimize, .@"shared-runtime" = shared_runtime });
+    const zzdds_dep = b.dependency("zzdds", .{ .target = target, .optimize = optimize });
     const zzdds_mod = zzdds_dep.module("zzdds");
     const zzdds_gen = zzdds_dep.module("zzdds_generated");
 

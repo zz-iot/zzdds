@@ -40,16 +40,6 @@ def zzdds_zig_out() -> Path:
     return Path(os.environ.get("ZZDDS_ZIG_OUT", str(REPO_ROOT.parent / "zig-out")))
 
 
-def shared_runtime_args() -> list[str]:
-    """The `zig build` arguments that select the runtime for a Zig app.
-
-    The shared runtime is the default. ZZDDS_SHARED_RUNTIME=0 builds the app's
-    own zzdds dependency with -Dshared-runtime=false (the threaded path, being
-    deleted), to match installed libraries built that way.
-    """
-    return ["-Dshared-runtime=false"] if os.environ.get("ZZDDS_SHARED_RUNTIME") == "0" else []
-
-
 def debug_allocator_args() -> list[str]:
     """The `zig build` arguments that put a Zig app's own zzdds dependency on
     a DebugAllocator.
@@ -70,7 +60,7 @@ def debug_allocator_args() -> list[str]:
 
 def zig_build_cmd() -> list[str]:
     """The `zig build` command for an example or integration-test Zig app."""
-    return ["zig", "build", "-Doptimize=ReleaseSafe", *shared_runtime_args()]
+    return ["zig", "build", "-Doptimize=ReleaseSafe"]
 
 
 def executable_path(path: Path) -> Path:

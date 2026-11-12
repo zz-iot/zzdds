@@ -10,6 +10,13 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-12
 
+- **Breaking** for contributors: the `-Dshared-runtime` build option is removed, along with
+  the matching option in the example, integration-test and stress builds and their runner
+  scripts' `ZZDDS_SHARED_RUNTIME` variable. Every participant runs on the shared runtime.
+- **Breaking** for Zig: `DomainParticipantFactoryImpl.selectRuntime` no longer returns
+  `error.SharedRuntimeDisabled`, and `zzdds.runtime.enabled` is removed.
+- The binding smoke tests check one-callback-at-a-time listener identities and released
+  rejected registrations unconditionally.
 - **The shared runtime is the default.** Participants run on its hosted workers: receive,
   discovery, heartbeats and timers are runtime turns instead of a thread per socket and per
   concern. Listeners run as runtime turns too, so one can run after the call that caused it

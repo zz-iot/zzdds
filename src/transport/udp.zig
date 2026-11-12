@@ -835,16 +835,13 @@ pub const UdpTransport = struct {
         if (mon) |m| {
             self.monitor = m;
         } else {
-            // build_opts.interface_monitor == false: interfaces are
-            // enumerated once at startup only (PollingMonitor.vtStart does
-            // this unconditionally), never re-polled -- interval_ms = 0 is
-            // PollingMonitor's own sentinel for "no periodic re-poll thread".
-            // On the shared runtime, which must start no thread, the
-            // transport re-polls on runtime timers instead
-            // (startIfacePollLocked).
-            const poll_interval: u32 = if (build_opts.interface_monitor and !build_opts.shared_runtime) config.interface_poll_interval_ms else 0;
+            // PollingMonitor.vtStart enumerates interfaces once at startup,
+            // and interval_ms = 0 is its sentinel for "no periodic re-poll
+            // thread": the shared runtime starts no thread, so the transport
+            // re-polls on runtime timers instead (startIfacePollLocked), when
+            // build_opts.interface_monitor is on.
             const pm = try alloc.create(polling.PollingMonitor);
-            pm.* = polling.PollingMonitor.init(alloc, poll_interval);
+            pm.* = polling.PollingMonitor.init(alloc, 0);
             self.monitor = pm.monitor();
             owned_pm = pm;
         }
