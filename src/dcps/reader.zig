@@ -3364,6 +3364,14 @@ pub const DataReaderImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
+        // A writer is reported ready after its match: see the writer's
+        // notifyReaderProtocolReady.
+        if (ready) {
+            self.mu.lock();
+            const match_pending = self.status_changes & DDS.SUBSCRIPTION_MATCHED_STATUS != 0;
+            self.mu.unlock();
+            if (match_pending) self.raise(DDS.SUBSCRIPTION_MATCHED_STATUS);
+        }
         const event: listener_lane.ReadyEvent = .{ .guid = writer_guid, .ready = ready };
         if (!self.listeners.postReady(event)) dispatchReadyFn(self, event);
     }

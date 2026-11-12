@@ -1093,12 +1093,12 @@ fn onReaderReadyForReadyTest(_: DDS.InstanceHandle_t, ready: bool, ld: ?*anyopaq
     state.onReady(ready);
 }
 
-test "mock_loopback: on_reliable_reader_ready fires after AckNack handshake, strictly after on_publication_matched" {
+fn expectReaderReadyAfterMatched(kind: DDS.ReliabilityQosPolicyKind) !void {
     const alloc = testAllocator();
     var dw_qos = DDS.DataWriterQos{};
     var dr_qos = DDS.DataReaderQos{};
-    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
-    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dw_qos.reliability.kind = kind;
+    dr_qos.reliability.kind = kind;
 
     const net = try MockNetwork.init(alloc);
     defer net.deinit();
@@ -1173,6 +1173,14 @@ test "mock_loopback: on_reliable_reader_ready fires after AckNack handshake, str
     try state.expectMatchedBeforeReady();
 }
 
+test "mock_loopback: on_reliable_reader_ready fires after AckNack handshake, strictly after on_publication_matched" {
+    try expectReaderReadyAfterMatched(.RELIABLE_RELIABILITY_QOS);
+}
+
+test "mock_loopback: on_reliable_reader_ready fires at a BEST_EFFORT match, strictly after on_publication_matched" {
+    try expectReaderReadyAfterMatched(.BEST_EFFORT_RELIABILITY_QOS);
+}
+
 // ── on_reliable_writer_ready extended listener ────────────────────────────────
 
 fn onSubMatchedForReadyTest(_: *anyopaque, _: *const DDS.SubscriptionMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
@@ -1185,12 +1193,12 @@ fn onWriterReadyForReadyTest(_: DDS.InstanceHandle_t, ready: bool, ld: ?*anyopaq
     state.onReady(ready);
 }
 
-test "mock_loopback: on_reliable_writer_ready fires after a targeted heartbeat, strictly after on_subscription_matched" {
+fn expectWriterReadyAfterMatched(kind: DDS.ReliabilityQosPolicyKind) !void {
     const alloc = testAllocator();
     var dw_qos = DDS.DataWriterQos{};
     var dr_qos = DDS.DataReaderQos{};
-    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
-    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dw_qos.reliability.kind = kind;
+    dr_qos.reliability.kind = kind;
 
     const net = try MockNetwork.init(alloc);
     defer net.deinit();
@@ -1263,6 +1271,14 @@ test "mock_loopback: on_reliable_writer_ready fires after a targeted heartbeat, 
     // Heartbeat naming this reader on top of SEDP matching, which
     // on_subscription_matched alone does not wait for.
     try state.expectMatchedBeforeReady();
+}
+
+test "mock_loopback: on_reliable_writer_ready fires after a targeted heartbeat, strictly after on_subscription_matched" {
+    try expectWriterReadyAfterMatched(.RELIABLE_RELIABILITY_QOS);
+}
+
+test "mock_loopback: on_reliable_writer_ready fires at a BEST_EFFORT match, strictly after on_subscription_matched" {
+    try expectWriterReadyAfterMatched(.BEST_EFFORT_RELIABILITY_QOS);
 }
 
 // ── on_reliable_writer_ready: participant.mu must not be held during it ──────

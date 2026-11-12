@@ -332,8 +332,15 @@ pub const PendingListeners = struct {
     state: State = .idle,
     /// The owner is deleted: nothing pending starts.
     closed: bool = false,
+    /// What is pending, in the order first posted. A status kind appears at
+    /// most once: it claims, when it runs, every change made before then. A
+    /// READY entry appears once per run of events posted with no other kind
+    /// posted between them, and `ready_counts` at its index counts them, so
+    /// an event never runs ahead of a kind posted before it.
     kinds: [max_kinds]DDS.StatusMask = undefined,
+    ready_counts: [max_kinds]u32 = undefined,
     n_kinds: u8 = 0,
+    /// The READY entries' events, in order; their counts sum to its length.
     events: std.ArrayListUnmanaged(ReadyEvent) = .empty,
     /// Invocations in progress through the owner, on any thread.
     active: u32 = 0,
@@ -364,7 +371,8 @@ pub const PendingListeners = struct {
     linked: bool = false,
     drop_next: ?*PendingListeners = null,
 
-    const max_kinds = 16;
+    /// Every status kind, and a READY entry before and after each.
+    const max_kinds = 2 * 16 + 1;
 
     const State = enum { idle, queued, running, parked };
 
@@ -427,7 +435,7 @@ pub const PendingListeners = struct {
         self.mu.lock();
         // Dropped without memory, like a datagram.
         if (!self.closed) {
-            if (self.events.append(self.alloc, event)) |_| self.addKindLocked(READY) else |_| {}
+            if (self.events.append(self.alloc, event)) |_| self.addReadyLocked() else |_| {}
         }
         self.submitUnlock();
         return true;
@@ -537,26 +545,76 @@ pub const PendingListeners = struct {
     }
 
     fn addKindLocked(self: *PendingListeners, kind: DDS.StatusMask) void {
-        std.debug.assert(@popCount(kind) == 1);
+        std.debug.assert(@popCount(kind) == 1 and kind != READY);
         for (self.kinds[0..self.n_kinds]) |k| if (k == kind) return;
+        std.debug.assert(self.n_kinds < max_kinds);
         self.kinds[self.n_kinds] = kind;
         self.n_kinds += 1;
     }
 
+    /// Counts an event just appended to `events`: in the last READY entry
+    /// if nothing was posted after it, else in a new one.
+    fn addReadyLocked(self: *PendingListeners) void {
+        if (self.n_kinds > 0 and self.kinds[self.n_kinds - 1] == READY) {
+            self.ready_counts[self.n_kinds - 1] += 1;
+            return;
+        }
+        std.debug.assert(self.n_kinds < max_kinds);
+        self.kinds[self.n_kinds] = READY;
+        self.ready_counts[self.n_kinds] = 1;
+        self.n_kinds += 1;
+    }
+
     fn popKindLocked(self: *PendingListeners) void {
-        std.mem.copyForwards(DDS.StatusMask, self.kinds[0 .. self.n_kinds - 1], self.kinds[1..self.n_kinds]);
+        const n = self.n_kinds;
+        std.mem.copyForwards(DDS.StatusMask, self.kinds[0 .. n - 1], self.kinds[1..n]);
+        std.mem.copyForwards(u32, self.ready_counts[0 .. n - 1], self.ready_counts[1..n]);
         self.n_kinds -= 1;
+    }
+
+    /// Opens a slot at the front.
+    fn pushFrontLocked(self: *PendingListeners, kind: DDS.StatusMask, ready_count: u32) void {
+        std.debug.assert(self.n_kinds < max_kinds);
+        const n = self.n_kinds;
+        std.mem.copyBackwards(DDS.StatusMask, self.kinds[1 .. n + 1], self.kinds[0..n]);
+        std.mem.copyBackwards(u32, self.ready_counts[1 .. n + 1], self.ready_counts[0..n]);
+        self.kinds[0] = kind;
+        self.ready_counts[0] = ready_count;
+        self.n_kinds += 1;
     }
 
     /// Puts a kind (and event) not invoked back at the front, ahead of
     /// anything posted since.
     fn unpopLocked(self: *PendingListeners, kind: DDS.StatusMask, event: ?ReadyEvent) void {
-        if (event) |e| self.events.insert(self.alloc, 0, e) catch {};
+        if (kind == READY) {
+            const e = event orelse return;
+            self.events.insert(self.alloc, 0, e) catch return;
+            if (self.n_kinds > 0 and self.kinds[0] == READY) {
+                self.ready_counts[0] += 1;
+            } else {
+                self.pushFrontLocked(READY, 1);
+            }
+            return;
+        }
         var i: usize = 0;
         while (i < self.n_kinds and self.kinds[i] != kind) i += 1;
-        if (i == self.n_kinds) self.n_kinds += 1;
-        std.mem.copyBackwards(DDS.StatusMask, self.kinds[1 .. i + 1], self.kinds[0..i]);
-        self.kinds[0] = kind;
+        if (i < self.n_kinds) {
+            self.removeAtLocked(i);
+            // The READY entries it separated are one run now: merged, so
+            // entries stay within `max_kinds` however often this repeats.
+            if (i > 0 and i < self.n_kinds and self.kinds[i - 1] == READY and self.kinds[i] == READY) {
+                self.ready_counts[i - 1] += self.ready_counts[i];
+                self.removeAtLocked(i);
+            }
+        }
+        self.pushFrontLocked(kind, 0);
+    }
+
+    fn removeAtLocked(self: *PendingListeners, i: usize) void {
+        const n = self.n_kinds;
+        std.mem.copyForwards(DDS.StatusMask, self.kinds[i .. n - 1], self.kinds[i + 1 .. n]);
+        std.mem.copyForwards(u32, self.ready_counts[i .. n - 1], self.ready_counts[i + 1 .. n]);
+        self.n_kinds -= 1;
     }
 
     /// Submits `req` if something is pending and nothing is in flight.
@@ -693,7 +751,8 @@ pub const PendingListeners = struct {
             var event: ?ReadyEvent = null;
             if (kind == READY) {
                 if (self.events.items.len > 0) event = self.events.orderedRemove(0);
-                if (self.events.items.len == 0) {
+                if (self.ready_counts[0] > 0) self.ready_counts[0] -= 1;
+                if (self.ready_counts[0] == 0 or self.events.items.len == 0) {
                     self.popKindLocked();
                     left -= 1;
                 }
@@ -798,3 +857,27 @@ pub const PendingListeners = struct {
         group.end();
     }
 };
+
+test "restoring a status that was posted again merges the ready runs it separated" {
+    var lane = PendingListeners.init(std.testing.allocator, undefined);
+    defer lane.events.deinit(std.testing.allocator);
+    const matched = DDS.PUBLICATION_MATCHED_STATUS;
+    const event: ReadyEvent = .{ .guid = std.mem.zeroes(Guid), .ready = true };
+    // [MATCHED, READY(1)]: the turn takes MATCHED, and while it waits to be
+    // admitted MATCHED and a ready event are posted again, then it is
+    // restored. Repeated, as busy identities can make it.
+    lane.addKindLocked(matched);
+    try lane.events.append(std.testing.allocator, event);
+    lane.addReadyLocked();
+    for (0..4 * PendingListeners.max_kinds) |_| {
+        lane.popKindLocked();
+        lane.addKindLocked(matched);
+        try lane.events.append(std.testing.allocator, event);
+        lane.addReadyLocked();
+        lane.unpopLocked(matched, null);
+    }
+    try std.testing.expectEqual(@as(u8, 2), lane.n_kinds);
+    try std.testing.expectEqual(matched, lane.kinds[0]);
+    try std.testing.expectEqual(READY, lane.kinds[1]);
+    try std.testing.expectEqual(@as(u32, @intCast(lane.events.items.len)), lane.ready_counts[1]);
+}
