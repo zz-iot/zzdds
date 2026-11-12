@@ -599,12 +599,22 @@ pub const PendingListeners = struct {
         var i: usize = 0;
         while (i < self.n_kinds and self.kinds[i] != kind) i += 1;
         if (i < self.n_kinds) {
-            const n = self.n_kinds;
-            std.mem.copyForwards(DDS.StatusMask, self.kinds[i .. n - 1], self.kinds[i + 1 .. n]);
-            std.mem.copyForwards(u32, self.ready_counts[i .. n - 1], self.ready_counts[i + 1 .. n]);
-            self.n_kinds -= 1;
+            self.removeAtLocked(i);
+            // The READY entries it separated are one run now: merged, so
+            // entries stay within `max_kinds` however often this repeats.
+            if (i > 0 and i < self.n_kinds and self.kinds[i - 1] == READY and self.kinds[i] == READY) {
+                self.ready_counts[i - 1] += self.ready_counts[i];
+                self.removeAtLocked(i);
+            }
         }
         self.pushFrontLocked(kind, 0);
+    }
+
+    fn removeAtLocked(self: *PendingListeners, i: usize) void {
+        const n = self.n_kinds;
+        std.mem.copyForwards(DDS.StatusMask, self.kinds[i .. n - 1], self.kinds[i + 1 .. n]);
+        std.mem.copyForwards(u32, self.ready_counts[i .. n - 1], self.ready_counts[i + 1 .. n]);
+        self.n_kinds -= 1;
     }
 
     /// Submits `req` if something is pending and nothing is in flight.
@@ -847,3 +857,27 @@ pub const PendingListeners = struct {
         group.end();
     }
 };
+
+test "restoring a status that was posted again merges the ready runs it separated" {
+    var lane = PendingListeners.init(std.testing.allocator, undefined);
+    defer lane.events.deinit(std.testing.allocator);
+    const matched = DDS.PUBLICATION_MATCHED_STATUS;
+    const event: ReadyEvent = .{ .guid = std.mem.zeroes(Guid), .ready = true };
+    // [MATCHED, READY(1)]: the turn takes MATCHED, and while it waits to be
+    // admitted MATCHED and a ready event are posted again, then it is
+    // restored. Repeated, as busy identities can make it.
+    lane.addKindLocked(matched);
+    try lane.events.append(std.testing.allocator, event);
+    lane.addReadyLocked();
+    for (0..4 * PendingListeners.max_kinds) |_| {
+        lane.popKindLocked();
+        lane.addKindLocked(matched);
+        try lane.events.append(std.testing.allocator, event);
+        lane.addReadyLocked();
+        lane.unpopLocked(matched, null);
+    }
+    try std.testing.expectEqual(@as(u8, 2), lane.n_kinds);
+    try std.testing.expectEqual(matched, lane.kinds[0]);
+    try std.testing.expectEqual(READY, lane.kinds[1]);
+    try std.testing.expectEqual(@as(u32, @intCast(lane.events.items.len)), lane.ready_counts[1]);
+}

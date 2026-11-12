@@ -192,6 +192,7 @@ test {
     _ = @import("dcps/subscriber.zig");
     _ = @import("dcps/participant.zig");
     _ = @import("dcps/factory.zig");
+    _ = @import("dcps/listener_lane.zig");
     _ = @import("rtps/protocol_adapters.zig");
     _ = @import("discovery/spdp.zig");
     _ = @import("discovery/sedp.zig");
