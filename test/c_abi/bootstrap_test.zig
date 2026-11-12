@@ -1892,18 +1892,18 @@ test "readerSetListenerEx: real C-ABI set_listener_ex delegates to DataReaderImp
 const DestroyFromListener = struct {
     boxed: *anyopaque,
     dp: DDS.DomainParticipant,
-    done: std.atomic.Value(bool) = .init(false),
+    done: std.Io.Event = .unset,
     rc: DDS.ReturnCode_t = -1,
 
     fn onMissed(_: *anyopaque, _: *const DDS.OfferedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
         const self: *DestroyFromListener = @ptrCast(@alignCast(ld.?));
-        if (self.done.load(.acquire)) return;
+        if (self.done.isSet()) return;
         const ext = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, self.boxed);
         const f = ext.vtable.as_DomainParticipantFactory(ext.ptr);
         self.rc = self.dp.delete_contained_entities();
         if (self.rc == DDS.RETCODE_OK) self.rc = f.delete_participant(self.dp);
         extensions.zzdds_destroy_factory(self.boxed);
-        self.done.store(true, .release);
+        self.done.set(testing.io);
     }
 };
 
@@ -1920,8 +1920,6 @@ test "support factory: the last factory can be destroyed from a listener that de
     const dw = publisher.create_datawriter(topic, q, .{ .listener_data = &ctx, .on_offered_deadline_missed = DestroyFromListener.onMissed }, DDS.OFFERED_DEADLINE_MISSED_STATUS);
     try testing.expect(dw.ptr != zzdds.dcps.NIL_PTR);
     writeRawViaOp(dw, KEY_HASH, &PAYLOAD);
-    var i: u32 = 0;
-    while (!ctx.done.load(.acquire) and i < 100) : (i += 1) zzdds.util.time.sleepNs(50 * std.time.ns_per_ms);
-    try testing.expect(ctx.done.load(.acquire));
+    try ctx.done.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
     try testing.expectEqual(DDS.RETCODE_OK, ctx.rc);
 }
