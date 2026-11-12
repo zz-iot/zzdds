@@ -2095,7 +2095,7 @@ test "a connection that closes with part of a frame unwritten frees it, runs its
     try testing.expectError(error.ChannelClosed, t.sendOnChannel(channel, &s.to, "x"));
 }
 
-test "a TCP transport refuses a backend that waits on no sockets, a second backend, and one once it listens" {
+test "a TCP transport refuses a backend that waits on no sockets, a second backend, and listening or sending without one" {
     if (!rt.poll_backend.supported) return error.SkipZigTest;
     var sb = rt.ScriptedBackend.init(1_000);
     var backends: [2]Backend = undefined;
@@ -2110,12 +2110,11 @@ test "a TCP transport refuses a backend that waits on no sockets, a second backe
     try t.attachBackend(backends[0].backend());
     try testing.expectError(error.AttachedElsewhere, t.attachBackend(backends[1].backend()));
 
-    // Listening on its own thread already.
+    // Nothing would service a listen socket or a connection without one.
     var frames: Frames = .{};
     defer frames.deinit();
-    const threaded = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
-    defer threaded.deinit();
-    try threaded.transport().listen(&loopback, frames.handler());
-    defer threaded.transport().unlisten(&loopback, frames.handler());
-    try testing.expectError(error.AlreadyListening, threaded.transport().attachBackend(backends[1].backend()));
+    const unattached = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    defer unattached.deinit();
+    try testing.expectError(error.NoProgressBackend, unattached.transport().listen(&loopback, frames.handler()));
+    try testing.expectError(error.NoProgressBackend, unattached.transport().send(&loopback, "ping"));
 }

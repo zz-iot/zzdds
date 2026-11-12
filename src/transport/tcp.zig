@@ -1,13 +1,10 @@
 //! TCP transport implementation (IPv4 + IPv6).
 //!
-//! Threading model:
-//!   Without a backend: one accept thread per TcpTransport instance (started
-//!   by vtListen), and one recv thread per accepted or dialed connection.
-//!   On the shared runtime (vtAttachBackend): no threads. The listen socket
-//!   and every connection are sources of the runtime's backend, which
-//!   accepts, reads frames and completes nonblocking dials as each becomes
-//!   ready, and sends never block
-//!   (docs/design/concurrency/transport-adapters.md).
+//! Threading model: no threads. The transport is attached to its runtime's
+//! progress backend (vtAttachBackend) before it listens or sends: the listen
+//! socket and every connection are sources of that backend, which accepts,
+//! reads frames and completes nonblocking dials as each becomes ready, and
+//! sends never block (docs/design/concurrency/transport-adapters.md).
 //!
 //! Framing: RTPS-over-TCP §9.4 — each RTPS message is prefixed by a 4-byte
 //! big-endian length field: [length: u32 BE][RTPS message bytes × length].
@@ -21,11 +18,9 @@
 //! rather than opening a second TCP stream. Useful when the discovery locator
 //! and the data locator resolve to the same physical host.
 //!
-//! Shutdown: deinit closes the listen fd and all connection fds, which unblocks
-//! all blocking recv/accept calls. Threads exit and are joined before memory is
-//! freed. A connection that closes earlier is joined and freed by the next
-//! dial or accept (TcpTransport.reapExited); on a backend, by the service
-//! that finds it closed (TcpTransport.closeOnBackend).
+//! Shutdown: deinit takes the listen socket and every connection off the
+//! backend and closes them. A connection that closes earlier is freed by the
+//! service that finds it closed (TcpTransport.closeOnBackend).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -63,7 +58,6 @@ pub const shared_runtime_ready = poll_backend.supported;
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const MAX_MSG_LEN: u32 = 4 * 1024 * 1024; // 4 MiB sanity cap
-const POLL_TIMEOUT_MS: i32 = 50;
 /// Most pieces in one gather-list send, after the length prefix.
 const MAX_GATHER: usize = 128;
 /// What one read on a backend takes from a stream when no frame is partly
@@ -83,25 +77,6 @@ const SO_NOSIGPIPE: u32 = switch (builtin.os.tag) {
     .macos, .ios, .tvos, .watchos, .visionos => 0x1022,
     else => 0,
 };
-
-// ── Windows WSAPoll wrapper ───────────────────────────────────────────────────
-// posix.pollfd and posix.POLL are broken on Windows in Zig 0.16.0 (ws2_32.zig
-// does not declare pollfd or POLL). Use WSAPoll directly on Windows.
-
-const WinPoll = if (builtin.os.tag == .windows) struct {
-    const WSAPOLLFD = extern struct {
-        fd: usize, // Windows SOCKET = UINT_PTR; @intFromPtr(posix.socket_t) gives this
-        events: i16,
-        revents: i16,
-    };
-    const POLLIN: i16 = 0x0300; // POLLRDNORM | POLLRDBAND
-
-    extern "ws2_32" fn WSAPoll(
-        fdArray: [*]WSAPOLLFD,
-        fds: std.os.windows.ULONG,
-        timeout: c_int,
-    ) callconv(.winapi) c_int;
-} else struct {};
 
 const INVALID_SOCKET: posix.socket_t = sock.invalid;
 
@@ -273,81 +248,27 @@ fn sockaddrToRemoteKey(addr: *const posix.sockaddr) ?RemoteKey {
     }
 }
 
-// ── I/O helpers ───────────────────────────────────────────────────────────────
-
-fn readExact(fd: posix.socket_t, buf: []u8) !void {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = c.recv(fd, buf.ptr + off, buf.len - off, 0);
-        if (n < 0) {
-            // posix.errno() reads the CRT's errno, which POSIX send()/recv()
-            // set on failure — but Winsock never touches it; Windows reports
-            // socket errors exclusively via WSAGetLastError(). Checking
-            // posix.errno() here on Windows reads stale/unrelated state, not
-            // the real failure reason: at best that just always misses the
-            // EINTR retry (harmless — Windows sockets here are blocking, so
-            // there's no legitimate EINTR-equivalent to retry for anyway),
-            // but if that stale value ever happens to coincide with EINTR's
-            // numeric code, this becomes an infinite busy-retry on a socket
-            // that will never succeed. Skip the classification entirely on
-            // Windows and fail immediately — correct either way, and never
-            // a hang.
-            if (comptime builtin.os.tag != .windows) {
-                const err = posix.errno(n);
-                if (err == .INTR) continue;
-            }
-            return error.RecvFailed;
-        }
-        if (n == 0) return error.ConnectionClosed;
-        off += @intCast(n);
-    }
-}
-
-fn writeAll(fd: posix.socket_t, data: []const u8) !void {
-    var off: usize = 0;
-    while (off < data.len) {
-        const n = c.send(fd, data.ptr + off, data.len - off, @intCast(MSG_NOSIGNAL));
-        if (n < 0) {
-            // See the matching comment in readExact — posix.errno() is not a
-            // valid way to classify a Winsock failure on Windows.
-            if (comptime builtin.os.tag != .windows) {
-                const err = posix.errno(n);
-                if (err == .INTR) continue;
-            }
-            return error.SendFailed;
-        }
-        off += @intCast(n);
-    }
-}
-
 // ── TcpConnection ─────────────────────────────────────────────────────────────
 
 pub const TcpConnection = struct {
     alloc: std.mem.Allocator,
     fd: posix.socket_t,
-    /// Guards exactly-once close of `fd`. Both recvLoop (natural peer disconnect)
-    /// and deinit (forced shutdown) may try to close; the CAS ensures only one
-    /// succeeds and prevents double-close / fd-reuse hazards.
+    /// Guards exactly-once close of `fd`: the connection's service (end of
+    /// stream, failed dial or write) and deinit (forced shutdown) may both try
+    /// to close; the CAS ensures only one succeeds and prevents double-close /
+    /// fd-reuse hazards.
     fd_open: std.atomic.Value(bool),
     remote: RemoteKey,
     send_mu: Mutex,
-    recv_thread: std.Thread,
-    thread_started: bool,
     owner: *TcpTransport,
-    /// This connection's slot in TcpTransport.channels, set before its recv
-    /// thread starts and handed to every on_receive. Its generation is the
+    /// This connection's slot in TcpTransport.channels, set before it is a
+    /// source and handed to every on_receive. Its generation is the
     /// slot's, so it identifies this connection object, not the remote's
     /// latest connection (TcpTransport.connection_generations).
     channel: Channel = Channel.none,
     /// Set under conn_mu by whoever creates the connection once it is in
-    /// live_connections; until then the creator joins and frees it itself.
+    /// live_connections; until then the creator closes and frees it itself.
     registered: bool = false,
-    /// Set under conn_mu by the recv thread on its way out.
-    exited: bool = false,
-    /// TcpTransport.exited's link, under conn_mu.
-    next_exited: ?*TcpConnection = null,
-
-    // On a backend (TcpTransport.backend):
 
     /// The connection as a source of the backend, registered along with
     /// `registered` until the connection closes.
@@ -558,13 +479,10 @@ const Listener = struct {
     source: Source,
 };
 
-/// Shut down and close `conn.fd` exactly once. Safe to call from recvLoop,
-/// vtSend's redial-on-failure path, ensureConnection's error paths, and
-/// deinit. shutdown() before close() interrupts a thread currently blocked
-/// in recv() on this fd (POSIX §2.9.7; same on Windows) — harmless to call
-/// on a connection whose own recv thread is the caller (recvLoop's
-/// self-close) or whose fd is already closed (shutdown on a bad fd is a
-/// silently-ignored error, not a crash).
+/// Shut down and close `conn.fd` exactly once. Safe to call from the
+/// connection's close (finishClose), from deinit, and on a dial that was
+/// never registered (discardUnsourced). Shutdown on a bad fd is a
+/// silently-ignored error, not a crash.
 ///
 /// The winning caller also notifies any ReceiveHandler.on_channel_closed
 /// registrant — this is the single choke point every death path (natural
@@ -574,7 +492,7 @@ const Listener = struct {
 /// The close is serialized against vtSendOnChannel via send_mu: without
 /// this, vtSendOnChannel's re-check of fd_open under send_mu is meaningless,
 /// since closeConnFdOnce could still close (and the OS could reuse) the fd
-/// between that check and the actual writeAll calls. Released before the
+/// between that check and the actual writes. Released before the
 /// on_channel_closed notification, not held across it — a handler's
 /// callback re-entering vtSendOnChannel on this same connection must not
 /// deadlock against this function still holding the lock.
@@ -597,20 +515,16 @@ pub const TcpTransport = struct {
     alloc: std.mem.Allocator,
     config: schema.TcpConfig,
 
-    /// Guards connections, live_connections, exited, reaping, listen_fd,
+    /// Guards connections, live_connections, reaping, listen_fd,
     /// listen_port, listen_* state, listener.
     conn_mu: Mutex,
     /// Active connections keyed by remote endpoint (for vtSend lookup).
     connections: std.AutoHashMapUnmanaged(RemoteKey, *TcpConnection),
-    /// Registered connections whose recv thread has not been joined: those
-    /// in `connections`, and those that closed but are not yet reaped. Each
-    /// holds its slot's owner reference.
+    /// Registered connections not yet closed. Each holds its slot's owner
+    /// reference.
     live_connections: std.ArrayListUnmanaged(*TcpConnection),
-    /// Registered connections whose recv thread has exited, for the next
-    /// reapExited to join and free.
-    exited: ?*TcpConnection = null,
-    /// reapExited and closeOnBackend calls between taking connections and
-    /// freeing them; deinit waits for them on reap_cond.
+    /// closeOnBackend calls between taking a connection and freeing it;
+    /// deinit waits for them on reap_cond.
     reaping: u32 = 0,
     reap_cond: Condvar = .{},
     /// Every connection's channel slot. A send holds a reference while it
@@ -628,7 +542,7 @@ pub const TcpTransport = struct {
     connection_generations: std.AutoHashMapUnmanaged(RemoteKey, u32),
 
     /// Guards handlers list. Separate from conn_mu to avoid deadlock:
-    /// recv threads call dispatchToHandlers without holding conn_mu.
+    /// services call dispatchToHandlers without holding conn_mu.
     handler_mu: Mutex,
     handlers: std.ArrayListUnmanaged(ReceiveHandler),
 
@@ -639,18 +553,16 @@ pub const TcpTransport = struct {
     /// Resolved bind address for locator advertisement.
     /// IPv4: bytes [0..4]; IPv6: all 16 bytes. Set in vtListen from bind_address or defaults.
     listen_addr: [16]u8,
-    /// Incremented whenever the listen socket lifecycle changes. Accept threads
-    /// use this to detect closed/reopened listeners even if the OS reuses fd values.
+    /// Incremented whenever the listen socket lifecycle changes.
     listen_generation: u64,
 
-    accept_thread: ?std.Thread,
     stopping: std.atomic.Value(bool),
 
     lch_mu: Mutex,
     locator_change_handler: ?LocatorChangeHandler,
 
-    /// The shared runtime's backend, which services the listen socket and
-    /// the connections in place of threads. Set before the first listen.
+    /// The progress backend that services the listen socket and the
+    /// connections. Set (attach_backend) before the first listen or send.
     backend: ?ProgressBackend = null,
     /// The listen socket as a source of `backend`.
     listener: ?*Listener = null,
@@ -667,15 +579,6 @@ pub const TcpTransport = struct {
     drains: u64 = 0,
     /// Sends that returned `would_block`, for diagnostics and tests.
     sends_would_block: std.atomic.Value(u64) = .init(0),
-
-    test_hooks: if (builtin.is_test) TestHooks else void = if (builtin.is_test) .{} else {},
-
-    /// Seams for deterministic tests; absent outside test builds.
-    pub const TestHooks = struct {
-        /// Runs once a dialed connection's recv thread has started, before
-        /// the connection is registered.
-        before_register: ?*const fn (t: *TcpTransport, conn: *TcpConnection) void = null,
-    };
 
     const Self = @This();
 
@@ -695,7 +598,6 @@ pub const TcpTransport = struct {
             .listen_family = .v4,
             .listen_addr = std.mem.zeroes([16]u8),
             .listen_generation = 0,
-            .accept_thread = null,
             .stopping = std.atomic.Value(bool).init(false),
             .lch_mu = .{},
             .locator_change_handler = null,
@@ -706,37 +608,20 @@ pub const TcpTransport = struct {
     pub fn deinit(self: *Self) void {
         self.stopping.store(true, .release);
 
-        // shutdown() before close() is required to interrupt threads currently
-        // blocked in accept() or recv() on these fds. A bare close() leaves
-        // blocked threads running indefinitely (per POSIX §2.9.7; same on
-        // Windows with Winsock). Signal every connection's fd here, up front,
-        // so the join loop below costs one bounded wait per thread rather
-        // than N sequential ones — the actual close (and, with it, the
-        // on_channel_closed notification) is deferred to that same loop,
-        // after conn_mu is released: closeConnFdOnce must not be called
-        // while conn_mu is held, since a handler's on_channel_closed
-        // callback re-entering a transport operation that needs conn_mu
-        // (listen/unlisten/send) would deadlock against it.
+        // The connections are closed after conn_mu is released:
+        // closeConnFdOnce must not run under it, since a handler's
+        // on_channel_closed callback re-entering a transport operation that
+        // needs conn_mu (listen/unlisten/send) would deadlock against it.
         var listener: ClosedListener = .{};
         {
             self.conn_mu.lock();
             defer self.conn_mu.unlock();
-            // A reap that started before `stopping` frees what it took; no
-            // other starts now, and no connection registers.
-            if (self.backend == null) {
-                while (self.reaping > 0) self.reap_cond.wait(&self.conn_mu);
-            }
             listener = self.closeListenerLocked();
-            if (self.backend == null) {
-                for (self.live_connections.items) |conn| {
-                    if (conn.fd_open.load(.acquire)) socketShutdown(conn.fd, SHUT_RDWR);
-                }
-            }
         }
 
-        // On a backend, nothing accepts once this returns.
+        // Nothing accepts once this returns.
         listener.finish(self);
-        if (self.backend != null) {
+        {
             self.conn_mu.lock();
             defer self.conn_mu.unlock();
             // A close that started before frees what it took. The rest are
@@ -745,26 +630,9 @@ pub const TcpTransport = struct {
             for (self.live_connections.items) |conn| conn.closing = true;
         }
 
-        // Join recv threads then free. Recv threads may call removeConnection
-        // (acquires conn_mu) after their fd is closed — conn_mu is released
-        // above so those calls can complete before we join. accept_thread is
-        // already joined and nothing registers or reaps once `stopping` is
-        // set, so live_connections is stable — safe to iterate without
-        // conn_mu here.
-        for (self.live_connections.items) |conn| {
-            if (self.backend != null) {
-                self.finishClose(conn);
-                continue;
-            }
-            // Idempotent with recvLoop's own closeConnFdOnce call (CAS-guarded);
-            // this is what actually closes + notifies for a connection recvLoop
-            // hasn't already torn down itself.
-            closeConnFdOnce(conn);
-            if (conn.thread_started) conn.recv_thread.join();
-            // A handler on a recv thread joined later in this loop may still
-            // hold a send's reference; its release frees the connection.
-            self.freeConn(conn);
-        }
+        // Nothing registers or closes a connection once `stopping` is set
+        // and the closes above have finished, so live_connections is stable.
+        for (self.live_connections.items) |conn| self.finishClose(conn);
 
         self.live_connections.deinit(self.alloc);
         self.channels.deinit(self.alloc);
@@ -788,9 +656,8 @@ pub const TcpTransport = struct {
         return gop.value_ptr.*;
     }
 
-    /// Drops the owner's reference to `conn`'s slot, whose recv thread has
-    /// been joined (or never started), and frees it unless a send still
-    /// holds it.
+    /// Drops the owner's reference to `conn`'s slot, and frees it unless a
+    /// send still holds it.
     fn freeConn(self: *Self, conn: *TcpConnection) void {
         if (self.channels.close(conn.channel)) |freed| self.alloc.destroy(freed);
     }
@@ -801,69 +668,18 @@ pub const TcpTransport = struct {
         if (self.channels.release(conn.channel)) |freed| self.alloc.destroy(freed);
     }
 
-    /// Gives a new connection, its recv thread started, an owner: the
-    /// connection map, or the exited list if its thread has already exited.
-    /// The caller has reserved room in both. Under conn_mu.
+    /// Gives a new connection an owner: the connection map. The caller has
+    /// reserved room. Under conn_mu.
     fn registerLocked(self: *Self, conn: *TcpConnection) void {
         conn.registered = true;
         self.live_connections.appendAssumeCapacity(conn);
-        if (conn.exited) {
-            conn.next_exited = self.exited;
-            self.exited = conn;
-        } else {
-            self.connections.putAssumeCapacity(conn.remote, conn);
-        }
+        self.connections.putAssumeCapacity(conn.remote, conn);
     }
 
     /// Room for registerLocked. Under conn_mu.
     fn reserveLocked(self: *Self) !void {
         try self.live_connections.ensureUnusedCapacity(self.alloc, 1);
         try self.connections.ensureUnusedCapacity(self.alloc, 1);
-    }
-
-    /// Called by a recv thread as it exits, after removeConnection.
-    fn markExited(self: *Self, conn: *TcpConnection) void {
-        self.conn_mu.lock();
-        defer self.conn_mu.unlock();
-        conn.exited = true;
-        if (conn.registered) {
-            conn.next_exited = self.exited;
-            self.exited = conn;
-        }
-    }
-
-    /// Joins and frees the connections whose recv thread has exited. Called
-    /// with no lock held, from a dial or an accept, so closed connections
-    /// are freed instead of kept until deinit. Never joins the caller's own
-    /// thread: a recv thread queues itself only on its way out.
-    fn reapExited(self: *Self) void {
-        var list: ?*TcpConnection = undefined;
-        {
-            self.conn_mu.lock();
-            defer self.conn_mu.unlock();
-            if (self.stopping.load(.acquire) or self.exited == null) return;
-            list = self.exited;
-            self.exited = null;
-            var it = list;
-            while (it) |conn| : (it = conn.next_exited) {
-                for (self.live_connections.items, 0..) |live, i| {
-                    if (live == conn) {
-                        _ = self.live_connections.swapRemove(i);
-                        break;
-                    }
-                }
-            }
-            self.reaping += 1;
-        }
-        while (list) |conn| {
-            list = conn.next_exited;
-            conn.recv_thread.join();
-            self.freeConn(conn);
-        }
-        self.conn_mu.lock();
-        defer self.conn_mu.unlock();
-        self.reaping -= 1;
-        if (self.reaping == 0) self.reap_cond.broadcast();
     }
 
     /// The connection a send to `key` uses, with a reference, or null.
@@ -970,28 +786,21 @@ pub const TcpTransport = struct {
         self.listener = null;
         if (self.listen_fd) |fd| {
             // A source's fd is closed once it is off the backend.
-            if (listener == null) {
-                socketShutdown(fd, SHUT_RDWR);
-                socketClose(fd);
-            }
+            if (listener == null) socketClose(fd);
             self.listen_fd = null;
         }
         self.listen_port = 0;
         self.listen_family = .v4;
         self.listen_addr = std.mem.zeroes([16]u8);
         self.listen_generation +%= 1;
-        const t = self.accept_thread;
-        self.accept_thread = null;
-        return .{ .thread = t, .listener = listener };
+        return .{ .listener = listener };
     }
 
     /// What closeListenerLocked leaves to do without conn_mu.
     const ClosedListener = struct {
-        thread: ?std.Thread = null,
         listener: ?*Listener = null,
 
         fn finish(self: ClosedListener, t: *TcpTransport) void {
-            if (self.thread) |th| th.join();
             if (self.listener) |l| {
                 t.backend.?.unregister(&l.source);
                 socketClose(l.fd);
@@ -1005,7 +814,7 @@ pub const TcpTransport = struct {
         defer self.conn_mu.unlock();
         // Only remove the entry if the map still points to this exact connection.
         // A replacement may have been inserted at the same key before this call
-        // (e.g. the old recv thread exits after vtSend already re-dialed) — in
+        // (e.g. the old connection closes after vtSend already re-dialed) — in
         // that case we must not evict the new connection.
         if (self.connections.get(conn.remote)) |stored| {
             if (stored == conn) _ = self.connections.remove(conn.remote);
@@ -1016,23 +825,22 @@ pub const TcpTransport = struct {
     /// reuse_connection_by_host is set), dialing a new one if none exists.
     /// The caller releases the returned connection with releaseConn.
     ///
-    /// The blocking `connect()` syscall is made WITHOUT holding conn_mu so that
-    /// concurrent sends to other peers, deinit, and acceptLoop are not blocked.
-    /// A TOCTOU race (two threads both see no connection and both dial) is resolved
-    /// by a re-check under the lock after dialing: the loser closes its socket and
-    /// returns the winner's connection.
+    /// The nonblocking `connect()` is made WITHOUT holding conn_mu. A TOCTOU
+    /// race (two threads both see no connection and both dial) is resolved
+    /// by a re-check under the lock after dialing (registerDialed): the loser
+    /// closes its socket and returns the winner's connection.
     fn ensureConnection(self: *Self, key: RemoteKey) !*TcpConnection {
         // Fast path: connection already exists.
         {
             self.conn_mu.lock();
             defer self.conn_mu.unlock();
             if (self.stopping.load(.acquire)) return error.TransportClosed;
+            if (self.backend == null) return error.NoProgressBackend;
             if (self.lookupLocked(key)) |conn| return conn;
         }
 
         // Slow path: dial without holding conn_mu.
-        self.reapExited();
-        const new_conn = try dialConnection(self.alloc, key, self.backend != null);
+        const new_conn = try dialConnection(self.alloc, key);
         new_conn.owner = self;
         new_conn.channel = self.channels.insert(self.alloc, new_conn) catch |err| {
             socketClose(new_conn.fd);
@@ -1040,65 +848,24 @@ pub const TcpTransport = struct {
             return err;
         };
 
-        // Stamp the generation before spawning the recv thread — same
-        // ordering requirement as acceptLoop (see its comment). Bumping here,
-        // before knowing whether this dial wins or loses the TOCTOU race
-        // below, is deliberate: connection_generations is already documented
-        // as monotonic and not required to correspond 1:1 to surviving
-        // connections (bumpGenerationLocked's own doc comment), so a spurious
-        // extra bump from a losing racer is harmless — it still leaves every
-        // live TcpConnection object with its own distinct generation, which
-        // is all Channel identity needs.
+        // Bumping here, before knowing whether this dial wins or loses the
+        // TOCTOU race in registerDialed, is deliberate: connection_generations
+        // is already documented as monotonic and not required to correspond
+        // 1:1 to surviving connections (bumpGenerationLocked's own doc
+        // comment), so a spurious extra bump from a losing racer is harmless
+        // — it still leaves every live TcpConnection object with its own
+        // distinct generation, which is all Channel identity needs.
         {
             self.conn_mu.lock();
             defer self.conn_mu.unlock();
             _ = self.bumpGenerationLocked(key);
         }
-        if (self.backend != null) return self.registerDialed(new_conn, key);
-
-        new_conn.recv_thread = std.Thread.spawn(.{}, recvLoop, .{new_conn}) catch |err| {
-            socketClose(new_conn.fd);
-            self.freeConn(new_conn);
-            return err;
-        };
-        new_conn.thread_started = true;
-        if (builtin.is_test) {
-            if (self.test_hooks.before_register) |hook| hook(self, new_conn);
-        }
-
-        // Re-acquire to insert; handle concurrent dial (TOCTOU).
-        self.conn_mu.lock();
-
-        // Re-check: another thread may have connected to the same peer while
-        // we dialed, or the transport began closing.
-        const refused: ?anyerror = if (self.stopping.load(.acquire))
-            error.TransportClosed
-        else if (self.reserveLocked()) null else |err| err;
-        const winner = if (refused == null) self.lookupLocked(key) else null;
-
-        if (refused != null or winner != null) {
-            // Lost the race (or no room) — discard our connection and use the
-            // winner's.
-            socketShutdown(new_conn.fd, SHUT_RDWR);
-            self.conn_mu.unlock();
-            new_conn.recv_thread.join();
-            // recvLoop already called closeConnFdOnce before returning; use
-            // the same guard to avoid double-closing a potentially-reused fd.
-            closeConnFdOnce(new_conn);
-            self.freeConn(new_conn);
-            return winner orelse refused.?;
-        }
-
-        self.registerLocked(new_conn);
-        // The caller's reference; the slot is open while conn_mu is held.
-        _ = self.channels.acquire(new_conn.channel).?;
-        self.conn_mu.unlock();
-        return new_conn;
+        return self.registerDialed(new_conn, key);
     }
 
-    // ── On a backend ──────────────────────────────────────────────────────────
+    // ── On the backend ────────────────────────────────────────────────────────
 
-    /// Registers a connection dialed on a backend, with a reference for the
+    /// Registers a connection dialed on the backend, with a reference for the
     /// caller, unless another dial to the remote won meanwhile or the
     /// transport is closing.
     fn registerDialed(self: *Self, conn: *TcpConnection, key: RemoteKey) !*TcpConnection {
@@ -1147,8 +914,6 @@ pub const TcpTransport = struct {
             .fd_open = std.atomic.Value(bool).init(true),
             .remote = remote,
             .send_mu = .{},
-            .recv_thread = undefined,
-            .thread_started = false,
             .owner = self,
         };
         conn.channel = self.channels.insert(self.alloc, conn) catch {
@@ -1383,8 +1148,6 @@ pub const TcpTransport = struct {
             return error.AttachedElsewhere;
         }
         if (!backend.hasSources()) return error.BackendHasNoSources;
-        // A listener or connections already on threads would keep them.
-        if (self.listen_fd != null or self.live_connections.items.len > 0) return error.AlreadyListening;
         self.backend = backend;
     }
 
@@ -1421,13 +1184,13 @@ pub const TcpTransport = struct {
         if (iovecs.len > MAX_GATHER) return error.MessageTooLarge;
         var total: usize = 0;
         for (iovecs) |iov| total += iov.len;
-        if (total == 0) return error.EmptyMessage; // 0-length prefix triggers fatal framing error in recvLoop
+        if (total == 0) return error.EmptyMessage; // a 0-length prefix is a fatal framing error for the receiver
         if (total > MAX_MSG_LEN) return error.MessageTooLarge;
         return @intCast(total);
     }
 
-    /// Writes one frame on `conn`: blocking without a backend, never on one.
-    /// error.ChannelClosed once its fd is closed.
+    /// Writes one frame on `conn`, never blocking. error.ChannelClosed once
+    /// its fd is closed.
     fn sendFrame(self: *Self, conn: *TcpConnection, iovecs: []const IoVec) !SendOutcome {
         var hdr: [4]u8 = undefined;
         std.mem.writeInt(u32, &hdr, try frameLen(iovecs), .big);
@@ -1438,17 +1201,12 @@ pub const TcpTransport = struct {
         // a closed fd is never written to (on POSIX the fd number can
         // otherwise be reused by the OS for an unrelated socket).
         if (!conn.fd_open.load(.acquire)) return error.ChannelClosed;
-        if (self.backend != null) return self.sendFrameNonblockingLocked(conn, &hdr, iovecs);
-        try writeAll(conn.fd, &hdr);
-        for (iovecs) |iov| try writeAll(conn.fd, iov.base[0..iov.len]);
-        return .completed;
+        return self.sendFrameNonblockingLocked(conn, &hdr, iovecs);
     }
 
-    /// After a write on `conn` failed. Without a backend, closes it, which
-    /// ends its recv thread. On one, shuts it down: its service then reads
+    /// After a write on `conn` failed: shuts it down, so its service reads
     /// the end of the stream and closes it.
-    fn abandonConnection(self: *Self, conn: *TcpConnection) void {
-        if (self.backend == null) return closeConnFdOnce(conn);
+    fn abandonConnection(conn: *TcpConnection) void {
         conn.send_mu.lock();
         defer conn.send_mu.unlock();
         if (conn.fd_open.load(.acquire)) socketShutdown(conn.fd, SHUT_RDWR);
@@ -1475,11 +1233,9 @@ pub const TcpTransport = struct {
         // Removing by `key` would be a no-op, leaving the dead entry in the map
         // and causing ensureConnection to return the same dead connection again.
         self.removeConnection(conn);
-        // Mark the old fd as closed before re-dialing. ensureConnection may
-        // get the same fd number back from the OS. If the old recv thread
-        // later calls closeConnFdOnce, the CAS will see fd_open=false and
-        // skip the close, preventing it from closing the reused fd.
-        self.abandonConnection(conn);
+        // Shut the old connection down before re-dialing: its service reads
+        // the end of the stream and closes it.
+        abandonConnection(conn);
         const new_conn = try self.ensureConnection(key);
         defer self.releaseConn(new_conn);
         return self.sendFrame(new_conn, iovecs) catch |err| switch (err) {
@@ -1530,6 +1286,13 @@ pub const TcpTransport = struct {
         };
 
         self.conn_mu.lock();
+
+        // The listen socket and its connections are serviced only as
+        // sources on a backend.
+        if (self.backend == null) {
+            self.conn_mu.unlock();
+            return error.NoProgressBackend;
+        }
 
         if (self.listen_fd != null) {
             if (self.listen_family != family) {
@@ -1588,25 +1351,13 @@ pub const TcpTransport = struct {
         self.listen_addr = advertise_addr;
         self.listen_generation +%= 1;
 
-        if (self.backend) |b| {
-            self.listenOnBackend(b, fd) catch |err| {
-                // Not yet a source, so closed here.
-                _ = self.closeListenerLocked();
-                self.rollbackHandler(handler);
-                self.conn_mu.unlock();
-                return err;
-            };
-            self.conn_mu.unlock();
-            return;
-        }
-
-        self.accept_thread = std.Thread.spawn(.{}, acceptLoop, .{self}) catch |err| {
+        self.listenOnBackend(self.backend.?, fd) catch |err| {
+            // Not yet a source, so closed here.
             _ = self.closeListenerLocked();
             self.rollbackHandler(handler);
             self.conn_mu.unlock();
             return err;
         };
-
         self.conn_mu.unlock();
     }
 
@@ -1731,7 +1482,7 @@ fn serviceListener(ctx: *anyopaque, budget: u32) u32 {
 }
 
 /// Source.service for a connection on a backend: reads what is queued now
-/// and dispatches each complete frame as recvLoop does, keeping a partial
+/// and dispatches each complete frame to the handlers, keeping a partial
 /// one for the next read. A frame a handler has no room for is held, and
 /// reading stops until it is taken. Closes the connection at the end of its
 /// stream or on a bad frame.
@@ -1803,210 +1554,6 @@ fn onConnWritable(ctx: *anyopaque) void {
     conn.send_mu.unlock();
     if (failed) return self.closeOnBackend(conn);
     if (drained) self.unblock(conn);
-}
-
-// ── Accept loop ───────────────────────────────────────────────────────────────
-
-fn acceptLoop(self: *TcpTransport) void {
-    outer: while (!self.stopping.load(.acquire)) {
-        const listen_snapshot = blk: {
-            self.conn_mu.lock();
-            defer self.conn_mu.unlock();
-            break :blk .{
-                .fd = self.listen_fd orelse return,
-                .generation = self.listen_generation,
-            };
-        };
-
-        // Poll with timeout so we check the stopping flag every 50 ms.
-        if (comptime builtin.os.tag == .windows) {
-            var pfds = [1]WinPoll.WSAPOLLFD{.{
-                .fd = @intFromPtr(listen_snapshot.fd),
-                .events = WinPoll.POLLIN,
-                .revents = 0,
-            }};
-            // WSAPoll returns SOCKET_ERROR (-1) on a real error, 0 on timeout,
-            // and a positive count when revents is non-empty — these need to
-            // be told apart the same way the POSIX branch below tells a
-            // genuine poll() error from a timeout. Treating -1 the same as 0
-            // (as `if (n <= 0) continue;` used to) meant a real poll error on
-            // Windows was silently treated as "nothing happened yet, keep
-            // polling forever" instead of breaking out of the loop.
-            const n = WinPoll.WSAPoll(&pfds, 1, POLL_TIMEOUT_MS);
-            if (n < 0) break; // WSAPoll error
-            if (n == 0) continue; // timeout — re-check stopping
-            if (pfds[0].revents & WinPoll.POLLIN == 0) break; // POLLERR/POLLHUP
-        } else {
-            var pfds = [1]posix.pollfd{.{
-                .fd = listen_snapshot.fd,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            }};
-            const n_ready = posix.poll(&pfds, POLL_TIMEOUT_MS) catch |err| {
-                if (err == error.SignalInterrupt) continue :outer;
-                break;
-            };
-            if (n_ready == 0) continue; // timeout — re-check stopping
-            if (pfds[0].revents & posix.POLL.IN == 0) break; // POLLERR/POLLHUP/POLLNVAL
-        }
-
-        var client_addr: posix.sockaddr.storage = undefined;
-        var client_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-
-        self.conn_mu.lock();
-        if (self.listen_fd == null or
-            self.listen_fd.? != listen_snapshot.fd or
-            self.listen_generation != listen_snapshot.generation)
-        {
-            self.conn_mu.unlock();
-            return;
-        }
-        const conn_fd = socketAccept(listen_snapshot.fd, &client_addr, &client_len) orelse {
-            self.conn_mu.unlock();
-            if (self.stopping.load(.acquire)) return;
-            // Every path here retries (continue :outer) regardless of the
-            // specific error — this classification only decides whether to
-            // also log a warning. posix.errno() cannot see the real reason
-            // on Windows (see readExact's comment on why); skip straight to
-            // the fallback warning there rather than misreport it as INTR/AGAIN.
-            if (comptime builtin.os.tag != .windows) {
-                const err = posix.errno(@as(c_int, -1));
-                if (err == .INTR or err == .AGAIN) continue :outer;
-                // Transient errors (ECONNABORTED, EMFILE, ENOBUFS, …) should be
-                // retried; a permanent shutdown is signalled by the stopping flag
-                // or listen_fd going null, both checked at the top of the loop.
-                log.transport.warn("tcp: transient accept error: {}", .{err});
-                continue :outer;
-            }
-            log.transport.warn("tcp: transient accept error", .{});
-            continue :outer;
-        };
-        self.conn_mu.unlock();
-        // Ahead of taking a slot, so a freed one is reused, and never this
-        // connection, which has no thread yet.
-        self.reapExited();
-
-        setSockNoSigPipe(conn_fd);
-
-        const remote = sockaddrToRemoteKey(@ptrCast(&client_addr)) orelse {
-            socketClose(conn_fd);
-            continue;
-        };
-
-        const conn = self.alloc.create(TcpConnection) catch {
-            socketClose(conn_fd);
-            continue;
-        };
-        conn.* = .{
-            .alloc = self.alloc,
-            .fd = conn_fd,
-            .fd_open = std.atomic.Value(bool).init(true),
-            .remote = remote,
-            .send_mu = .{},
-            .recv_thread = undefined,
-            .thread_started = false,
-            .owner = self,
-        };
-        // The channel must be set before the recv thread can dispatch anything.
-        conn.channel = self.channels.insert(self.alloc, conn) catch {
-            socketClose(conn_fd);
-            self.alloc.destroy(conn);
-            continue;
-        };
-
-        {
-            self.conn_mu.lock();
-            defer self.conn_mu.unlock();
-            _ = self.bumpGenerationLocked(remote);
-        }
-
-        conn.recv_thread = std.Thread.spawn(.{}, recvLoop, .{conn}) catch {
-            socketClose(conn_fd);
-            self.freeConn(conn);
-            continue;
-        };
-        conn.thread_started = true;
-
-        self.conn_mu.lock();
-        if (self.stopping.load(.acquire)) {
-            self.conn_mu.unlock();
-            discardUnregistered(conn);
-            return;
-        }
-        self.reserveLocked() catch {
-            self.conn_mu.unlock();
-            discardUnregistered(conn);
-            continue;
-        };
-        self.registerLocked(conn);
-        self.conn_mu.unlock();
-    }
-}
-
-/// Stops, joins and frees a connection its creator could not register.
-fn discardUnregistered(conn: *TcpConnection) void {
-    socketShutdown(conn.fd, SHUT_RDWR);
-    conn.recv_thread.join();
-    closeConnFdOnce(conn); // recvLoop may have already closed; CAS prevents double-close
-    conn.owner.freeConn(conn);
-}
-
-// ── Recv loop ─────────────────────────────────────────────────────────────────
-
-fn recvLoop(conn: *TcpConnection) void {
-    outer: while (!conn.owner.stopping.load(.acquire)) {
-        // Poll with timeout so the stopping flag is checked every 50 ms.
-        if (comptime builtin.os.tag == .windows) {
-            var pfds = [1]WinPoll.WSAPOLLFD{.{
-                .fd = @intFromPtr(conn.fd),
-                .events = WinPoll.POLLIN,
-                .revents = 0,
-            }};
-            // WSAPoll returns SOCKET_ERROR (-1) on a real error, 0 on timeout,
-            // and a positive count when revents is non-empty — these need to
-            // be told apart the same way the POSIX branch below tells a
-            // genuine poll() error from a timeout. Treating -1 the same as 0
-            // (as `if (n <= 0) continue;` used to) meant a real poll error on
-            // Windows was silently treated as "nothing happened yet, keep
-            // polling forever" instead of breaking out of the loop.
-            const n = WinPoll.WSAPoll(&pfds, 1, POLL_TIMEOUT_MS);
-            if (n < 0) break; // WSAPoll error
-            if (n == 0) continue; // timeout — re-check stopping
-            if (pfds[0].revents & WinPoll.POLLIN == 0) break; // POLLERR/POLLHUP
-        } else {
-            var pfds = [1]posix.pollfd{.{
-                .fd = conn.fd,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            }};
-            const n_ready = posix.poll(&pfds, POLL_TIMEOUT_MS) catch |err| {
-                if (err == error.SignalInterrupt) continue :outer;
-                break;
-            };
-            if (n_ready == 0) continue; // timeout
-            if (pfds[0].revents & posix.POLL.IN == 0) break; // POLLERR/POLLHUP
-        }
-
-        var len_buf: [4]u8 = undefined;
-        readExact(conn.fd, &len_buf) catch break :outer;
-
-        const msg_len = std.mem.readInt(u32, &len_buf, .big);
-        if (msg_len == 0 or msg_len > MAX_MSG_LEN) break :outer;
-
-        const buf = conn.owner.alloc.alloc(u8, msg_len) catch break :outer;
-        defer conn.owner.alloc.free(buf);
-
-        readExact(conn.fd, buf) catch break :outer;
-
-        const src = remoteKeyToLocator(&conn.remote);
-        conn.owner.dispatchToHandlers(buf, src, conn.channel);
-    }
-
-    conn.owner.removeConnection(conn);
-    // Close the fd immediately to release the OS resource. deinit will skip
-    // the close for this connection (fd_open CAS will return false).
-    closeConnFdOnce(conn);
-    conn.owner.markExited(conn);
 }
 
 // ── Socket helpers ────────────────────────────────────────────────────────────
@@ -2081,13 +1628,13 @@ fn bindListenTcp(bind_address: []const u8, port: u16, family: AddrFamily) !posix
 
 /// Dials `key`. A `nonblocking` dial may return a connection whose dial is
 /// still in progress (`connecting`).
-fn dialConnection(alloc: std.mem.Allocator, key: RemoteKey, nonblocking: bool) !*TcpConnection {
+fn dialConnection(alloc: std.mem.Allocator, key: RemoteKey) !*TcpConnection {
     const af: u32 = if (key.family == .v4) posix.AF.INET else posix.AF.INET6;
     const fd = try socketCreate(af, posix.SOCK.STREAM);
     errdefer socketClose(fd);
 
     setSockNoSigPipe(fd);
-    if (nonblocking) try setNonblocking(fd);
+    try setNonblocking(fd);
 
     const rc = switch (key.family) {
         .v4 => blk: {
@@ -2112,7 +1659,7 @@ fn dialConnection(alloc: std.mem.Allocator, key: RemoteKey, nonblocking: bool) !
     var connecting = false;
     if (rc != 0) {
         if (comptime !poll_backend.supported) return error.ConnectFailed;
-        if (!nonblocking or !sock.connectPending(sock.lastError())) return error.ConnectFailed;
+        if (!sock.connectPending(sock.lastError())) return error.ConnectFailed;
         connecting = true;
     }
 
@@ -2123,8 +1670,6 @@ fn dialConnection(alloc: std.mem.Allocator, key: RemoteKey, nonblocking: bool) !
         .fd_open = std.atomic.Value(bool).init(true),
         .remote = key,
         .send_mu = .{},
-        .recv_thread = undefined,
-        .thread_started = false,
         .owner = undefined,
         .connecting = connecting,
     };

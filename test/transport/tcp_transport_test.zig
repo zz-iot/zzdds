@@ -9,6 +9,7 @@ const LocatorWire = iface.LocatorWire;
 const LocatorKind = iface.LocatorKind;
 const ReceiveHandler = iface.ReceiveHandler;
 const time_mod = zzdds.util.time;
+const HostedPoll = zzdds.runtime.testing.HostedPoll;
 
 const testing = std.testing;
 
@@ -151,9 +152,13 @@ test "Locator.wireKind tcp_v4 and tcp_v6" {
 }
 
 test "TcpTransport.vtCanReach returns true for tcp, false for udp" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const t_ptr = try TcpTransport.init(alloc, .{});
     defer t_ptr.deinit();
+    try t_ptr.transport().attachBackend(hp.backend());
     const t = t_ptr.transport();
 
     try testing.expect(t.canReach(&Locator.tcp4(.{ 127, 0, 0, 1 }, 0)));
@@ -165,10 +170,14 @@ test "TcpTransport.vtCanReach returns true for tcp, false for udp" {
 // ── RTPS-TCP framing: send + receive a message ────────────────────────────────
 
 test "tcp transport: loopback send and receive" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
 
     const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer server.deinit();
+    try server.transport().attachBackend(hp.backend());
     const st = server.transport();
 
     var received: []u8 = &.{};
@@ -201,6 +210,7 @@ test "tcp transport: loopback send and receive" {
 
     const client = try TcpTransport.init(alloc, .{});
     defer client.deinit();
+    try client.transport().attachBackend(hp.backend());
     const ct = client.transport();
 
     const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
@@ -218,10 +228,14 @@ test "tcp transport: loopback send and receive" {
 // ── Multiple handlers on the same port (fan-out) ──────────────────────────────
 
 test "tcp transport: fan-out to two handlers" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
 
     const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer server.deinit();
+    try server.transport().attachBackend(hp.backend());
     const st = server.transport();
 
     var latch_a = Latch{};
@@ -241,6 +255,7 @@ test "tcp transport: fan-out to two handlers" {
 
     const client = try TcpTransport.init(alloc, .{});
     defer client.deinit();
+    try client.transport().attachBackend(hp.backend());
     const ct = client.transport();
 
     const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
@@ -262,6 +277,9 @@ test "tcp transport: fan-out to two handlers" {
 // ── Connection reuse by host ──────────────────────────────────────────────────
 
 test "tcp transport: default does not reuse by host" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
 
     var latch_a = Latch{};
@@ -271,8 +289,10 @@ test "tcp transport: default does not reuse by host" {
 
     const server_a = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer server_a.deinit();
+    try server_a.transport().attachBackend(hp.backend());
     const server_b = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer server_b.deinit();
+    try server_b.transport().attachBackend(hp.backend());
 
     const port_a = try listenAndGetPort(server_a.transport(), ca.handler(), alloc);
     const port_b = try listenAndGetPort(server_b.transport(), cb.handler(), alloc);
@@ -284,6 +304,7 @@ test "tcp transport: default does not reuse by host" {
 
     const client = try TcpTransport.init(alloc, .{});
     defer client.deinit();
+    try client.transport().attachBackend(hp.backend());
     const ct = client.transport();
 
     const loc_a = Locator.tcp4(.{ 127, 0, 0, 1 }, port_a);
@@ -304,6 +325,9 @@ test "tcp transport: default does not reuse by host" {
 }
 
 test "tcp transport: connection reuse by host is opt-in" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
 
     var latch_a = Latch{};
@@ -313,8 +337,10 @@ test "tcp transport: connection reuse by host is opt-in" {
 
     const server_a = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer server_a.deinit();
+    try server_a.transport().attachBackend(hp.backend());
     const server_b = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer server_b.deinit();
+    try server_b.transport().attachBackend(hp.backend());
 
     const port_a = try listenAndGetPort(server_a.transport(), ca.handler(), alloc);
     const port_b = try listenAndGetPort(server_b.transport(), cb.handler(), alloc);
@@ -326,13 +352,14 @@ test "tcp transport: connection reuse by host is opt-in" {
 
     const client = try TcpTransport.init(alloc, .{ .reuse_connection_by_host = true });
     defer client.deinit();
+    try client.transport().attachBackend(hp.backend());
     const ct = client.transport();
 
     const loc_a = Locator.tcp4(.{ 127, 0, 0, 1 }, port_a);
     const loc_b = Locator.tcp4(.{ 127, 0, 0, 1 }, port_b);
 
-    try ct.send(&loc_a, "discovery");
-    try ct.send(&loc_b, "data");
+    try sendEventually(ct, &loc_a, "discovery");
+    try sendEventually(ct, &loc_b, "data");
     latch_a.waitFor(2);
 
     try testing.expectEqual(@as(usize, 2), latch_a.n);
@@ -346,10 +373,25 @@ test "tcp transport: connection reuse by host is opt-in" {
 
 // ── vtListen: UnsupportedLocator for non-TCP locator ─────────────────────────
 
+test "tcp transport: listening or sending without a progress backend fails: nothing would service it" {
+    const tcp = try TcpTransport.init(testing.allocator, .{ .bind_address = "127.0.0.1" });
+    defer tcp.deinit();
+    const t = tcp.transport();
+    var latch = Latch{};
+    var counter = LatchCounter{ .latch = &latch };
+    try testing.expectError(error.NoProgressBackend, t.listen(&Locator.tcp4(.{ 127, 0, 0, 1 }, 0), counter.handler()));
+    try testing.expectError(error.NoProgressBackend, t.send(&Locator.tcp4(.{ 127, 0, 0, 1 }, 9), "ping"));
+    try testing.expectEqual(@as(usize, 0), tcp.channels.liveCount());
+}
+
 test "tcp transport: vtListen rejects non-TCP locator" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const t_ptr = try TcpTransport.init(alloc, .{});
     defer t_ptr.deinit();
+    try t_ptr.transport().attachBackend(hp.backend());
     const t = t_ptr.transport();
 
     var sentinel: u8 = 0;
@@ -365,10 +407,14 @@ test "tcp transport: vtListen rejects non-TCP locator" {
 // ── vtUnicastLocators: empty before listen, populated after ──────────────────
 
 test "tcp transport: unicastLocators before and after listen" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
 
     const tcp = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer tcp.deinit();
+    try tcp.transport().attachBackend(hp.backend());
     const t = tcp.transport();
 
     var locs: std.ArrayListUnmanaged(Locator) = .empty;
@@ -394,10 +440,14 @@ test "tcp transport: unicastLocators before and after listen" {
 }
 
 test "tcp transport: unlisten last handler stops listener" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
 
     const tcp = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer tcp.deinit();
+    try tcp.transport().attachBackend(hp.backend());
     const t = tcp.transport();
 
     var sentinel: u8 = 0;
@@ -423,15 +473,20 @@ test "tcp transport: unlisten last handler stops listener" {
     if (builtin.os.tag != .windows) {
         const client = try TcpTransport.init(alloc, .{});
         defer client.deinit();
-        try testing.expectError(error.ConnectFailed, client.transport().send(&listen_loc, "after unlisten"));
+        try client.transport().attachBackend(hp.backend());
+        try expectDialRefused(client, &listen_loc);
     }
 }
 
 // ── vtClose via Transport interface ──────────────────────────────────────────
 
 test "tcp transport: vtClose tears down via vtable" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{});
+    try tcp.transport().attachBackend(hp.backend());
     const t = tcp.transport();
     t.close(); // calls deinit(); do NOT call tcp.deinit() again
 }
@@ -439,18 +494,26 @@ test "tcp transport: vtClose tears down via vtable" {
 // ── vtJoinMulticast / vtLeaveMulticast ────────────────────────────────────────
 
 test "tcp transport: joinMulticast returns UnsupportedOperation" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{});
     defer tcp.deinit();
+    try tcp.transport().attachBackend(hp.backend());
     const t = tcp.transport();
     const mc = Locator.udp4(.{ 239, 255, 0, 1 }, 7400);
     try testing.expectError(error.UnsupportedOperation, t.joinMulticast(&mc));
 }
 
 test "tcp transport: leaveMulticast is a no-op" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{});
     defer tcp.deinit();
+    try tcp.transport().attachBackend(hp.backend());
     const t = tcp.transport();
     const mc = Locator.udp4(.{ 239, 255, 0, 1 }, 7400);
     t.leaveMulticast(&mc); // must not crash
@@ -459,9 +522,13 @@ test "tcp transport: leaveMulticast is a no-op" {
 // ── vtSetLocatorChangeHandler ─────────────────────────────────────────────────
 
 test "tcp transport: vtSetLocatorChangeHandler sets and clears" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{});
     defer tcp.deinit();
+    try tcp.transport().attachBackend(hp.backend());
     const t = tcp.transport();
 
     var fired: bool = false;
@@ -483,9 +550,13 @@ test "tcp transport: vtSetLocatorChangeHandler sets and clears" {
 // ── vtListen PortConflict rolls back handler ──────────────────────────────────
 
 test "tcp transport: vtListen PortConflict rolls back handler" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer tcp.deinit();
+    try tcp.transport().attachBackend(hp.backend());
     const t = tcp.transport();
 
     var sentinel_a: u8 = 0;
@@ -512,9 +583,13 @@ test "tcp transport: vtListen PortConflict rolls back handler" {
 }
 
 test "tcp transport: vtListen rejects different address family on active listener" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer tcp.deinit();
+    try tcp.transport().attachBackend(hp.backend());
     const t = tcp.transport();
 
     var sentinel_a: u8 = 0;
@@ -534,9 +609,13 @@ test "tcp transport: vtListen rejects different address family on active listene
 }
 
 test "tcp transport: vtListen rejects more than 64 handlers" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer tcp.deinit();
+    try tcp.transport().attachBackend(hp.backend());
     const t = tcp.transport();
 
     var ctxs: [65]u8 = undefined;
@@ -561,18 +640,26 @@ test "tcp transport: vtListen rejects more than 64 handlers" {
 // ── MessageTooLarge on oversized send ─────────────────────────────────────────
 
 test "tcp transport: vtSend rejects empty message" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{});
     defer tcp.deinit();
+    try tcp.transport().attachBackend(hp.backend());
     const t = tcp.transport();
     const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, 1);
     try testing.expectError(error.EmptyMessage, t.send(&dest, &.{}));
 }
 
 test "tcp transport: vtSend rejects message larger than MAX_MSG_LEN" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{});
     defer tcp.deinit();
+    try tcp.transport().attachBackend(hp.backend());
     const t = tcp.transport();
 
     // Fake oversized slice: size check fires before any I/O so the pointer is never read.
@@ -584,39 +671,47 @@ test "tcp transport: vtSend rejects message larger than MAX_MSG_LEN" {
 
 // ── vtSend to non-listening port returns ConnectFailed ───────────────────────
 
-test "tcp transport: vtSend returns ConnectFailed when no server (IPv4)" {
+test "tcp transport: a send to a port with no server fails its dial (IPv4)" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{});
     defer tcp.deinit();
-    const t = tcp.transport();
+    try tcp.transport().attachBackend(hp.backend());
     // Port 1 is privileged and never has a listener in test environments.
     const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, 1);
-    try testing.expectError(error.ConnectFailed, t.send(&dest, "hello"));
+    try expectDialRefused(tcp, &dest);
 }
 
-test "tcp transport: vtSend returns ConnectFailed when no server (IPv6)" {
+test "tcp transport: a send to a port with no server fails its dial (IPv6)" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{});
     defer tcp.deinit();
-    const t = tcp.transport();
+    try tcp.transport().attachBackend(hp.backend());
     var lo6 = std.mem.zeroes([16]u8);
     lo6[15] = 1; // ::1
     const dest = Locator.tcp6(lo6, 1);
-    t.send(&dest, "hello") catch |err| switch (err) {
-        error.ConnectFailed => return, // expected
+    expectDialRefused(tcp, &dest) catch |err| switch (err) {
         error.SocketCreateFailed => return, // IPv6 not available on this host
         else => return err,
     };
-    return error.ExpectedConnectFailed;
 }
 
 // ── vtListen BindFailed rolls back handler ────────────────────────────────────
 
 test "tcp transport: vtListen BindFailed rolls back registered handler (IPv4)" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     // 192.0.2.x is TEST-NET-1 (RFC 5737): routable but never local, so bind fails.
     const tcp = try TcpTransport.init(alloc, .{ .bind_address = "192.0.2.1" });
     defer tcp.deinit();
+    try tcp.transport().attachBackend(hp.backend());
     const t = tcp.transport();
 
     var sentinel: u8 = 0;
@@ -636,11 +731,15 @@ test "tcp transport: vtListen BindFailed rolls back registered handler (IPv4)" {
 }
 
 test "tcp transport: vtListen BindFailed rolls back registered handler (IPv6)" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     // 2001:db8::/32 is the documentation prefix (RFC 3849): valid IPv6 syntax
     // but not assigned to any local interface, so bind fails with EADDRNOTAVAIL.
     const tcp = try TcpTransport.init(alloc, .{ .bind_address = "2001:db8::1" });
     defer tcp.deinit();
+    try tcp.transport().attachBackend(hp.backend());
     const t = tcp.transport();
 
     var sentinel: u8 = 0;
@@ -673,9 +772,13 @@ test "tcp transport: vtListen BindFailed rolls back registered handler (IPv6)" {
 // ── Empty bind_address uses the concrete listen locator for advertisement ─────
 
 test "tcp transport: IPv6 listen with empty bind_address advertises locator address" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{}); // bind_address = ""
     defer tcp.deinit();
+    try tcp.transport().attachBackend(hp.backend());
     const st = tcp.transport();
 
     var lo6 = std.mem.zeroes([16]u8);
@@ -700,9 +803,13 @@ test "tcp transport: IPv6 listen with empty bind_address advertises locator addr
 }
 
 test "tcp transport: empty bind_address rejects wildcard advertise locator" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{});
     defer tcp.deinit();
+    try tcp.transport().attachBackend(hp.backend());
     const t = tcp.transport();
 
     var sentinel: u8 = 0;
@@ -718,10 +825,14 @@ test "tcp transport: empty bind_address rejects wildcard advertise locator" {
 // ── Connection recovery: re-dial after connection close ──────────────────────
 
 test "tcp transport: connection recovery after fd close" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
 
     const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer server.deinit();
+    try server.transport().attachBackend(hp.backend());
     const st = server.transport();
 
     var latch = Latch{};
@@ -734,6 +845,7 @@ test "tcp transport: connection recovery after fd close" {
 
     const client = try TcpTransport.init(alloc, .{ .reuse_connection_by_host = false });
     defer client.deinit();
+    try client.transport().attachBackend(hp.backend());
     const ct = client.transport();
 
     const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
@@ -762,10 +874,14 @@ test "tcp transport: connection recovery after fd close" {
 }
 
 test "tcp transport: connectionGeneration increments on reconnect, not on ordinary reuse" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
 
     const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer server.deinit();
+    try server.transport().attachBackend(hp.backend());
     const st = server.transport();
 
     var latch = Latch{};
@@ -778,6 +894,7 @@ test "tcp transport: connectionGeneration increments on reconnect, not on ordina
 
     const client = try TcpTransport.init(alloc, .{ .reuse_connection_by_host = false });
     defer client.deinit();
+    try client.transport().attachBackend(hp.backend());
     const ct = client.transport();
     const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
 
@@ -852,6 +969,9 @@ test "tcp transport: connectionGeneration increments on reconnect, not on ordina
 // ── IPv6 loopback send + receive ──────────────────────────────────────────────
 
 test "tcp transport: IPv6 loopback send and receive" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
 
     var lo6 = std.mem.zeroes([16]u8);
@@ -859,6 +979,7 @@ test "tcp transport: IPv6 loopback send and receive" {
 
     const server = try TcpTransport.init(alloc, .{ .bind_address = "::1" });
     defer server.deinit();
+    try server.transport().attachBackend(hp.backend());
     const st = server.transport();
 
     var received: []u8 = &.{};
@@ -905,6 +1026,7 @@ test "tcp transport: IPv6 loopback send and receive" {
 
     const client = try TcpTransport.init(alloc, .{});
     defer client.deinit();
+    try client.transport().attachBackend(hp.backend());
     const ct = client.transport();
 
     const dest = Locator.tcp6(lo6, port);
@@ -921,10 +1043,14 @@ test "tcp transport: IPv6 loopback send and receive" {
 // ── sendOnChannel: exact-connection replies ───────────────────────────────────
 
 test "tcp transport: sendOnChannel replies on the exact accepted connection" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
 
     const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer server.deinit();
+    try server.transport().attachBackend(hp.backend());
     const st = server.transport();
 
     var capture = ChannelCapture{};
@@ -935,6 +1061,7 @@ test "tcp transport: sendOnChannel replies on the exact accepted connection" {
 
     const client = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer client.deinit();
+    try client.transport().attachBackend(hp.backend());
     const ct = client.transport();
 
     // TCP's handler list is transport-wide, not per-connection (see the
@@ -961,19 +1088,27 @@ test "tcp transport: sendOnChannel replies on the exact accepted connection" {
 }
 
 test "tcp transport: sendOnChannel returns ChannelClosed for Channel.none" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{});
     defer tcp.deinit();
+    try tcp.transport().attachBackend(hp.backend());
     const t = tcp.transport();
     const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, 1);
     try testing.expectError(error.ChannelClosed, t.sendOnChannel(iface.Channel.none, &dest, "x"));
 }
 
 test "tcp transport: sendOnChannel returns ChannelClosed for a stale generation" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
 
     const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer server.deinit();
+    try server.transport().attachBackend(hp.backend());
     const st = server.transport();
 
     var capture = ChannelCapture{};
@@ -984,6 +1119,7 @@ test "tcp transport: sendOnChannel returns ChannelClosed for a stale generation"
 
     const client = try TcpTransport.init(alloc, .{});
     defer client.deinit();
+    try client.transport().attachBackend(hp.backend());
     const ct = client.transport();
 
     const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
@@ -998,10 +1134,14 @@ test "tcp transport: sendOnChannel returns ChannelClosed for a stale generation"
 }
 
 test "tcp transport: sendOnChannel returns ChannelClosed after the connection closes, and on_channel_closed fires" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
 
     const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer server.deinit();
+    try server.transport().attachBackend(hp.backend());
     const st = server.transport();
 
     var lifecycle = ChannelLifecycle{};
@@ -1011,6 +1151,7 @@ test "tcp transport: sendOnChannel returns ChannelClosed after the connection cl
     sleepMs(20);
 
     const client = try TcpTransport.init(alloc, .{});
+    try client.transport().attachBackend(hp.backend());
     const ct = client.transport();
 
     const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
@@ -1030,25 +1171,53 @@ test "tcp transport: sendOnChannel returns ChannelClosed after the connection cl
     try testing.expectError(error.ChannelClosed, st.sendOnChannel(lifecycle.channel, &lifecycle.src, "too late"));
 }
 
-/// Waits until `tr` has a connection whose recv thread exited and that the
-/// next dial or accept will reap.
-fn waitExited(tr: *TcpTransport) !void {
+/// A dial nothing accepts fails: at once (ConnectFailed), or once the
+/// backend finds the nonblocking connect refused, which closes and frees the
+/// connection.
+fn expectDialRefused(tr: *TcpTransport, dest: *const Locator) !void {
+    tr.transport().send(dest, "hello") catch |err| switch (err) {
+        error.ConnectFailed => return,
+        else => return err,
+    };
+    try waitLive(tr, 0);
+}
+
+/// Sends `data`, retrying while the connection still holds an earlier frame
+/// (its dial may still be completing): sends never block on a backend.
+fn sendEventually(t: iface.Transport, dest: *const Locator, data: []const u8) !void {
     const deadline = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
     while (true) {
-        tr.conn_mu.lock();
-        const queued = tr.exited != null;
-        tr.conn_mu.unlock();
-        if (queued) return;
-        if (time_mod.nanoTimestamp() >= deadline) return error.ConnectionNeverExited;
-        sleepMs(5);
+        t.send(dest, data) catch |err| switch (err) {
+            error.WouldBlock => {
+                if (time_mod.nanoTimestamp() >= deadline) return err;
+                std.Thread.yield() catch {};
+                continue;
+            },
+            else => return err,
+        };
+        return;
     }
 }
 
-test "tcp transport: accepted connections that close are freed by the next accept, and a stale channel after slot reuse fails" {
+/// Waits until `tr` holds `n` connections that are not yet freed: its
+/// backend frees one once it finds it closed.
+fn waitLive(tr: *TcpTransport, n: usize) !void {
+    const deadline = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
+    while (tr.channels.liveCount() != n) {
+        if (time_mod.nanoTimestamp() >= deadline) return error.ConnectionNeverFreed;
+        std.Thread.yield() catch {};
+    }
+}
+
+test "tcp transport: accepted connections that close are freed, and a stale channel after slot reuse fails" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
 
     const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer server.deinit();
+    try server.transport().attachBackend(hp.backend());
     const st = server.transport();
 
     var lifecycle = ChannelLifecycle{};
@@ -1060,19 +1229,19 @@ test "tcp transport: accepted connections that close are freed by the next accep
     var seen: [rounds]iface.Channel = undefined;
     for (0..rounds) |i| {
         const client = try TcpTransport.init(alloc, .{});
+        try client.transport().attachBackend(hp.backend());
         try client.transport().send(&dest, "ping");
         lifecycle.recv_latch.waitFor(i + 1);
         seen[i] = lifecycle.channel;
         client.deinit();
         lifecycle.closed_latch.waitFor(i + 1);
-        try waitExited(server);
+        try waitLive(server, 0);
     }
 
-    // Each accept reaped the connection before it ahead of taking a slot,
-    // so one slot served every round, with a new generation each time, and
-    // only the last connection is left.
+    // Each connection was freed once it closed, so one slot served every
+    // round, with a new generation each time.
     try testing.expectEqual(@as(usize, 1), server.channels.slotCount());
-    try testing.expectEqual(@as(usize, 1), server.channels.liveCount());
+    try testing.expectEqual(@as(usize, 0), server.channels.liveCount());
     for (seen[1..], seen[0 .. rounds - 1]) |ch, prev| {
         try testing.expectEqual(prev.token, ch.token);
         try testing.expect(prev.generation != ch.generation);
@@ -1082,11 +1251,15 @@ test "tcp transport: accepted connections that close are freed by the next accep
     }
 }
 
-test "tcp transport: dialed connections that close are freed by the next dial" {
+test "tcp transport: dialed connections that close are freed" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
 
     const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer server.deinit();
+    try server.transport().attachBackend(hp.backend());
     const st = server.transport();
 
     var latch = Latch{};
@@ -1097,14 +1270,14 @@ test "tcp transport: dialed connections that close are freed by the next dial" {
 
     const client = try TcpTransport.init(alloc, .{});
     defer client.deinit();
+    try client.transport().attachBackend(hp.backend());
     const ct = client.transport();
 
     for (0..5) |i| {
         try ct.send(&dest, "ping");
         latch.waitFor(i + 1);
-        // The server hangs up; the client's recv thread sees it and exits.
-        // The server's recv thread delivers before its accept registers the
-        // connection, so wait for it to appear.
+        // The server hangs up; the client's backend reads the end of the
+        // stream and frees the connection.
         const deadline = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
         while (true) {
             var hung_up = false;
@@ -1124,62 +1297,23 @@ test "tcp transport: dialed connections that close are freed by the next dial" {
             if (time_mod.nanoTimestamp() >= deadline) return error.AcceptRegistrationNeverObserved;
             sleepMs(5);
         }
-        try waitExited(client);
+        try waitLive(client, 0);
     }
 
-    // Each dial reaped the connection before it ahead of taking a slot, so
-    // one slot served every round, and only the last connection is left.
+    // Each connection was freed once it closed, so one slot served every
+    // round.
     try testing.expectEqual(@as(usize, 1), client.channels.slotCount());
-    try testing.expectEqual(@as(usize, 1), client.channels.liveCount());
-}
-
-test "tcp transport: a dialed connection whose recv thread exits before it is registered is still freed by the next dial" {
-    const alloc = testing.allocator;
-
-    const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
-    defer server.deinit();
-    const st = server.transport();
-
-    var latch = Latch{};
-    var counter = LatchCounter{ .latch = &latch };
-    const port = try listenAndGetPort(st, counter.handler(), alloc);
-    defer st.unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port), counter.handler());
-    const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
-
-    const client = try TcpTransport.init(alloc, .{});
-    defer client.deinit();
-
-    const Hook = struct {
-        var exited = false;
-        // The first dial's connection fails before the dial registers it,
-        // and its recv thread exits.
-        fn f(tr: *TcpTransport, conn: *tcp_mod.TcpConnection) void {
-            tr.test_hooks.before_register = null;
-            _ = std.c.shutdown(conn.fd, 2); // SHUT_RDWR
-            const deadline = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
-            while (time_mod.nanoTimestamp() < deadline) {
-                tr.conn_mu.lock();
-                exited = conn.exited;
-                tr.conn_mu.unlock();
-                if (exited) return;
-                sleepMs(1);
-            }
-        }
-    };
-    client.test_hooks.before_register = Hook.f;
-
-    // The send finds that connection closed and dials again; that dial reaps
-    // the first connection, which is freed once the send releases it.
-    try client.transport().send(&dest, "ping");
-    latch.waitFor(1);
-    try testing.expect(Hook.exited);
-    try testing.expectEqual(@as(usize, 1), client.channels.liveCount());
+    try testing.expectEqual(@as(usize, 0), client.channels.liveCount());
 }
 
 test "tcp transport: deinit fires on_channel_closed for every still-open channel" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
 
     const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    try server.transport().attachBackend(hp.backend());
     const st = server.transport();
 
     var lifecycle = ChannelLifecycle{};
@@ -1189,6 +1323,7 @@ test "tcp transport: deinit fires on_channel_closed for every still-open channel
 
     const client = try TcpTransport.init(alloc, .{});
     defer client.deinit();
+    try client.transport().attachBackend(hp.backend());
     const ct = client.transport();
 
     const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
@@ -1205,18 +1340,26 @@ test "tcp transport: deinit fires on_channel_closed for every still-open channel
 }
 
 test "tcp transport: sendOnChannel rejects empty message" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{});
     defer tcp.deinit();
+    try tcp.transport().attachBackend(hp.backend());
     const t = tcp.transport();
     const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, 1);
     try testing.expectError(error.EmptyMessage, t.sendOnChannel(iface.Channel.none, &dest, &.{}));
 }
 
 test "tcp transport: sendOnChannel rejects message larger than MAX_MSG_LEN" {
+    var hp: HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{});
     defer tcp.deinit();
+    try tcp.transport().attachBackend(hp.backend());
     const t = tcp.transport();
 
     const ptr: [*]const u8 = @ptrFromInt(0x1000);
