@@ -10,6 +10,7 @@ const LocatorKind = iface.LocatorKind;
 const ReceiveHandler = iface.ReceiveHandler;
 const time_mod = zzdds.util.time;
 const HostedPoll = zzdds.runtime.testing.HostedPoll;
+const ManualPoll = zzdds.runtime.testing.ManualPoll;
 
 const testing = std.testing;
 
@@ -885,6 +886,11 @@ test "tcp transport: a send whose write fails on its connection shuts it down an
     var hp: HostedPoll = undefined;
     try hp.init(testing.allocator);
     defer hp.deinit();
+    // The client's sockets are serviced only when the test drives them, so
+    // nothing notices its connection end before the second send writes on it.
+    var mp: ManualPoll = undefined;
+    try mp.init(testing.allocator);
+    defer mp.deinit();
     const alloc = testing.allocator;
 
     const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
@@ -898,12 +904,12 @@ test "tcp transport: a send whose write fails on its connection shuts it down an
 
     const client = try TcpTransport.init(alloc, .{});
     defer client.deinit();
-    try client.transport().attachBackend(hp.backend());
+    try client.transport().attachBackend(mp.backend());
     const ct = client.transport();
     const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
 
     try ct.send(&dest, "first");
-    latch.waitFor(1);
+    try driveUntilReceived(&mp, &latch, 1);
     try testing.expectEqual(@as(u32, 1), ct.connectionGeneration(&dest));
 
     // The client's own connection stops taking writes, still registered:
@@ -911,6 +917,7 @@ test "tcp transport: a send whose write fails on its connection shuts it down an
     {
         client.conn_mu.lock();
         defer client.conn_mu.unlock();
+        try testing.expectEqual(@as(u32, 1), client.connections.count());
         var it = client.connections.valueIterator();
         while (it.next()) |co| {
             co.*.send_mu.lock();
@@ -918,9 +925,22 @@ test "tcp transport: a send whose write fails on its connection shuts it down an
             try testing.expectEqual(@as(c_int, 0), std.c.shutdown(co.*.fd, 1)); // SHUT_WR
         }
     }
-    try sendEventually(ct, &dest, "second");
-    latch.waitFor(2);
+    try ct.send(&dest, "second");
     try testing.expectEqual(@as(u32, 2), ct.connectionGeneration(&dest));
+    try driveUntilReceived(&mp, &latch, 2);
+}
+
+/// Drives `mp` until `latch` counts `n`, for up to 5 s.
+fn driveUntilReceived(mp: *ManualPoll, latch: *Latch, n: usize) !void {
+    const deadline = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
+    while (true) {
+        latch.mu.lock();
+        const got = latch.n;
+        latch.mu.unlock();
+        if (got >= n) return;
+        if (time_mod.nanoTimestamp() >= deadline) return error.NotReceived;
+        try mp.drive(10 * std.time.ns_per_ms);
+    }
 }
 
 test "tcp transport: connectionGeneration increments on reconnect, not on ordinary reuse" {
