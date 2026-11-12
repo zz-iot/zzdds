@@ -47,6 +47,7 @@ const noop_security = @import("../security/noop.zig").noop_security_plugins;
 const history_mod = @import("../rtps/history.zig");
 const time_mod = @import("../util/time.zig");
 const nil = @import("../dcps/nil.zig");
+const listener_lane = @import("../dcps/listener_lane.zig");
 const standalone_create = @import("../util/standalone_create.zig");
 const proto = @import("../protocol/interface.zig");
 
@@ -70,6 +71,8 @@ const FactoryOwner = struct {
     /// internal per-`ParticipantStack` delegate with its own, independent,
     /// single-view box.
     fac_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    /// Allocates from `debug_gpa`: see `FactoryLeakCheck`.
+    on_debug_gpa: bool = false,
 
     fn deinit(self: *@This()) void {
         self.fac_c_abi.free(self.alloc);
@@ -77,7 +80,9 @@ const FactoryOwner = struct {
         self.stacks.deinit(self.alloc);
         self.default_dp_qos.deinit(self.alloc);
         self.default_config.deinit(self.alloc);
+        const on_debug_gpa = self.on_debug_gpa;
         self.alloc.destroy(self);
+        if (build_options.debug_allocator and on_debug_gpa) debugGpaRelease();
     }
 
     fn createParticipant(
@@ -1191,13 +1196,60 @@ pub export fn zzdds_cft_match_sample(
 const debug_gpa_config: std.heap.DebugAllocatorConfig = if (build_options.debug_allocator_stack_traces) .{} else .{ .stack_trace_frames = 0 };
 var debug_gpa: std.heap.DebugAllocator(debug_gpa_config) = .{};
 
+// Counts the factories on one allocator, each from before it allocates
+// anything, and checks the allocator for leaks once the last is destroyed.
+// A factory's allocator must outlive it and everything created through it,
+// so by then nothing it allocated may still be live: what is, leaked or is
+// freed late. The lock keeps a factory being created meanwhile from
+// allocating during the check.
+//
+// Not when the last factory is destroyed from a callback: an entity deleted
+// there, by that callback or one further up its thread, is freed once its
+// callback returns, so it is still live.
+const FactoryLeakCheck = struct {
+    factories: u32 = 0,
+    mu: Mutex = .{},
+
+    fn retain(self: *FactoryLeakCheck) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.factories += 1;
+    }
+
+    // Returns how many allocations are still live if this released the last
+    // factory and `settled` (no frees are pending), else 0. `gpa` is a
+    // DebugAllocator, which also logs each one (with where it was made, given
+    // stack traces).
+    fn release(self: *FactoryLeakCheck, gpa: anytype, settled: bool) usize {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.factories -= 1;
+        if (self.factories > 0 or !settled) return 0;
+        return gpa.detectLeaks();
+    }
+};
+
+var debug_gpa_leak_check: FactoryLeakCheck = .{};
+
+fn debugGpaRetain() void {
+    debug_gpa_leak_check.retain();
+}
+
+fn debugGpaRelease() void {
+    const leaks = debug_gpa_leak_check.release(&debug_gpa, !listener_lane.inCallbackChain());
+    if (leaks > 0) std.debug.panic("-Ddebug-allocator: {d} allocation(s) still live after the last factory was destroyed", .{leaks});
+}
+
 fn createFactory(allocator: ?*const zidl_bindings.ZidlAllocator) !ZZDDS.DomainParticipantFactory {
+    const on_debug_gpa = build_options.debug_allocator and allocator == null;
     const alloc = if (allocator) |a|
         zidl_bindings.toAllocator(a)
-    else if (build_options.debug_allocator)
+    else if (on_debug_gpa)
         debug_gpa.allocator()
     else
         std.heap.c_allocator;
+    if (build_options.debug_allocator and on_debug_gpa) debugGpaRetain();
+    errdefer if (build_options.debug_allocator and on_debug_gpa) debugGpaRelease();
     const owner = try alloc.create(FactoryOwner);
     errdefer alloc.destroy(owner);
     // Lazily resolves+commits the process-wide config on the very first factory
@@ -1207,7 +1259,7 @@ fn createFactory(allocator: ?*const zidl_bindings.ZidlAllocator) !ZZDDS.DomainPa
     // transfer into owner.default_config — if ProcessConfig ever grows more
     // fields, whichever of them aren't moved into `owner` will need freeing here.
     const proc_cfg = try process_config.getForNewFactory(alloc);
-    owner.* = .{ .alloc = alloc, .default_config = proc_cfg.default_participant_config };
+    owner.* = .{ .alloc = alloc, .default_config = proc_cfg.default_participant_config, .on_debug_gpa = on_debug_gpa };
     return .{ .ptr = owner, .vtable = &factory_vtable };
 }
 
@@ -1548,6 +1600,58 @@ fn octets(seq: ?*const ZZDDS.OctetSeq) ?[]const u8 {
     const s = seq orelse return null;
     const buf = s._buffer orelse return if (s._length == 0) &.{} else null;
     return buf[0..s._length];
+}
+
+// Stands in for a DebugAllocator with `live` allocations, which would log
+// each one as an error and so fail the test.
+const FakeLeakDetector = struct {
+    live: usize,
+    checks: u32 = 0,
+
+    fn detectLeaks(self: *FakeLeakDetector) usize {
+        self.checks += 1;
+        return self.live;
+    }
+};
+
+test "FactoryLeakCheck checks for leaks only when the last factory is released" {
+    var check: FactoryLeakCheck = .{};
+    var gpa: FakeLeakDetector = .{ .live = 3 };
+    check.retain();
+    check.retain();
+    try std.testing.expectEqual(@as(usize, 0), check.release(&gpa, true));
+    try std.testing.expectEqual(@as(u32, 0), gpa.checks);
+    try std.testing.expectEqual(@as(usize, 3), check.release(&gpa, true));
+    try std.testing.expectEqual(@as(u32, 1), gpa.checks);
+
+    // A factory created after the last one was destroyed starts a new count.
+    gpa.live = 0;
+    check.retain();
+    try std.testing.expectEqual(@as(usize, 0), check.release(&gpa, true));
+    try std.testing.expectEqual(@as(u32, 2), gpa.checks);
+}
+
+test "FactoryLeakCheck does not check a last factory released while frees are pending" {
+    var check: FactoryLeakCheck = .{};
+    var gpa: FakeLeakDetector = .{ .live = 1 };
+    check.retain();
+    try std.testing.expectEqual(@as(usize, 0), check.release(&gpa, false));
+    try std.testing.expectEqual(@as(u32, 0), gpa.checks);
+
+    // The count still dropped: the next factory is the only one.
+    check.retain();
+    try std.testing.expectEqual(@as(usize, 1), check.release(&gpa, true));
+    try std.testing.expectEqual(@as(u32, 1), gpa.checks);
+}
+
+test "FactoryLeakCheck finds no leaks on a DebugAllocator whose allocations were freed" {
+    var check: FactoryLeakCheck = .{};
+    var gpa: std.heap.DebugAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    check.retain();
+    const buf = try gpa.allocator().alloc(u8, 64);
+    gpa.allocator().free(buf);
+    try std.testing.expectEqual(@as(usize, 0), check.release(&gpa, true));
 }
 
 test "zzdds extension factory creates participant with generated default config" {

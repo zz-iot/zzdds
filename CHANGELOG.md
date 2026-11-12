@@ -24,6 +24,15 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   `trace.TraceConfig` are replaced by `setTraceSink`, which replaces the configured sink
   with the application's own while the config's scope and filter still apply. The
   `-Dguid-filter` build option is removed: filtering is configuration.
+- `-Ddebug-allocator` builds check for leaks. When the last factory created with the default
+  allocator is destroyed, nothing it or its entities allocated may still be live: the
+  DebugAllocator logs each allocation that is, and the process panics. Before, its leak
+  check never ran. A factory destroyed from a listener is not checked, since entities deleted
+  there are freed once the listener returns.
+- The shared-runtime interop lane keeps a failing run's packets, as the TSan lane does.
+- The readiness backend's tests wait until every loopback datagram they send has arrived
+  before servicing. On macOS a datagram can arrive after `sendto` returns, which
+  intermittently failed a test expecting all three of its datagrams.
 - The Java `shape` example's run script keeps its subscriber reading until it is stopped.
   It used to stop after 10 read periods (about 2s), which on a slow runner ended before the
   publisher's JVM had matched and written a sample.

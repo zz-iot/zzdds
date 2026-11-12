@@ -1773,6 +1773,18 @@ jobs:
       - name: Make binaries executable
         run: chmod +x bins/zzdds_shape_main_linux bins/${{ matrix.vendor.binary }}
 
+      # As in the TSan lane: keep a failing run's packets. Some failures seen
+      # only on this lane have not reproduced off the runner.
+      - name: Start packet capture
+        run: |
+          command -v tcpdump >/dev/null || sudo apt-get install -y tcpdump
+          sudo timeout -s INT 3600 tcpdump -i any -U -w /tmp/interop-shared-runtime.pcap udp > /tmp/tcpdump.log 2>&1 &
+          for _ in $(seq 50); do [ -s /tmp/interop-shared-runtime.pcap ] && break; sleep 0.1; done
+          if ! pgrep -x tcpdump >/dev/null || [ ! -s /tmp/interop-shared-runtime.pcap ]; then
+            echo "::warning::Packet capture did not start; a failure will have no packets"
+            cat /tmp/tcpdump.log || true
+          fi
+
       - name: Run interop on the shared runtime (${{ matrix.direction }})
         working-directory: dds-rtps
         run: |
@@ -1786,7 +1798,15 @@ jobs:
           python3 interoperability_report.py -P "$PUB" -S "$SUB" \
             -o /tmp/interop-shared-runtime-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
 
+      - name: Stop packet capture
+        if: always()
+        run: |
+          sudo pkill -INT -x tcpdump || true
+          for _ in $(seq 50); do pgrep -x tcpdump >/dev/null || break; sleep 0.1; done
+          cat /tmp/tcpdump.log || true
+
       - name: Check results
+        id: check
         run: |
           python3 zzdds/scripts/check_interop_results.py \
             /tmp/interop-shared-runtime-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml \
@@ -1800,3 +1820,11 @@ jobs:
         with:
           name: interop-shared-runtime-${{ matrix.vendor.name }}-${{ matrix.direction }}
           path: /tmp/interop-shared-runtime-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
+
+      - name: Upload packet capture
+        if: failure() || (success() && steps.check.outputs.failed_tests != '0')
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-shared-runtime-capture-${{ matrix.vendor.name }}-${{ matrix.direction }}
+          path: /tmp/interop-shared-runtime.pcap
+          retention-days: 7
