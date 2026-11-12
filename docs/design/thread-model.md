@@ -26,8 +26,10 @@ runtime's backend, which they must be attached to before they listen (or, for TC
 Listener callbacks run as turns of their participant's listener group, on a runtime worker
 (or inside the application's `drive()`), not on the stack of the call or receive that
 raised their status. The exception is an explicit traversal: `Subscriber.notify_datareaders()`
-invokes its readers' `on_data_available` on the calling thread before it returns. Either
-way one listener object runs one callback at a time
+invokes a reader's `on_data_available` on the calling thread when it can start at once. When
+that reader's callback, or the listener object it shares, is already running elsewhere, the
+status is queued for a later turn instead, so the call can return before the callback has
+run. Either way one listener object runs one callback at a time
 (docs/design/concurrency/listeners.md). Application listeners should still avoid blocking:
 a blocked callback holds a worker.
 
