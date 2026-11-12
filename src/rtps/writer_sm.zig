@@ -583,10 +583,7 @@ pub const StatefulWriter = struct {
     /// and above). When false (VOLATILE), skip replay — late joiners only receive
     /// data written after they matched.
     replay_on_match: bool,
-    /// Background thread that sends non-final HEARTBEATs periodically so readers
-    /// can NACK and recover if any initial DATA or HEARTBEAT was dropped.
-    /// Null until the first reader proxy is added.
-    hb_thread: ?std.Thread,
+    /// Set by `stopHeartbeat`: nothing arms the periodic HEARTBEAT after.
     hb_stopping: std.atomic.Value(bool),
     /// With a runtime (`attachRuntime`), the periodic HEARTBEAT is a timer
     /// firing in a writer-local context instead of a thread
@@ -694,7 +691,6 @@ pub const StatefulWriter = struct {
             .tracer = trace.Tracer.noop(),
             .frag_size = frag_size,
             .replay_on_match = replay_on_match,
-            .hb_thread = null,
             .hb_stopping = std.atomic.Value(bool).init(false),
             .coherent_active = false,
             .coherent_pending_sns = .empty,
@@ -744,9 +740,10 @@ pub const StatefulWriter = struct {
         return false;
     }
 
-    /// The timer counterpart of `heartbeatThread`'s loop body. Re-arms itself
-    /// while a reliable reader remains; recurrence stops once the runtime
-    /// retires.
+    /// Sends a non-final HEARTBEAT so readers can NACK and recover anything
+    /// dropped, reports expired probes and repairs reconnected streams.
+    /// Re-arms itself while a reliable reader remains; recurrence stops once
+    /// the runtime retires.
     fn onHeartbeatTimer(t: *runtime_mod.Timer, turn: *runtime_mod.Turn) void {
         const self: *Self = @fieldParentPtr("hb_timer", t);
         self.sendHeartbeat(false, false);
@@ -944,15 +941,14 @@ pub const StatefulWriter = struct {
         }
     }
 
-    /// Signal and join the heartbeat thread, without freeing anything else.
+    /// Stop the periodic HEARTBEAT, without freeing anything else.
     /// Idempotent — safe to call more than once (e.g. once from a graceful
-    /// `stop()` and again from `deinit()`): after the first join, `hb_thread`
-    /// is null and subsequent calls are a no-op.
+    /// `stop()` and again from `deinit()`).
     ///
     /// Callers that register `probe_result_fn`/`probe_result_ctx` pointing at
     /// an object they're about to tear down (e.g. a DomainParticipantImpl)
     /// MUST call this — or `deinit()` — before freeing that object: the
-    /// heartbeat thread fires that callback on its own schedule and doesn't
+    /// heartbeat timer fires that callback on its own schedule and doesn't
     /// otherwise know the target is gone.
     pub fn stopHeartbeat(self: *Self) void {
         if (self.runtime) |rt| {
@@ -975,18 +971,6 @@ pub const StatefulWriter = struct {
             return;
         }
         self.hb_stopping.store(true, .release);
-        // hb_thread itself is mu-guarded (addMatchedReader reads/writes it
-        // under mu too, at its own spawn site) -- read-and-clear it under
-        // mu, then join outside the lock. Joining while holding mu would
-        // risk deadlock: heartbeatThread's own loop briefly reacquires mu
-        // (via sendHeartbeat/checkProbeDeadlines/checkConnectionGenerations)
-        // between hb_stopping checks, so it needs mu free to ever notice
-        // hb_stopping and return.
-        self.mu.lock();
-        const maybe_thread = self.hb_thread;
-        self.hb_thread = null;
-        self.mu.unlock();
-        if (maybe_thread) |t| t.join();
     }
 
     /// A queued fire is the timer's own embedded request: nothing to free.
@@ -1235,13 +1219,10 @@ pub const StatefulWriter = struct {
             new_rp.history_floor_sn = history_last;
         }
         if (should_replay) self.replayHistoryToProxyUnlocked(new_rp) else if (new_rp.reliable) self.sendInitialHeartbeatUnlocked(new_rp);
-        // Start the periodic heartbeat thread on the first matched reader so
-        // that dropped DATA or HEARTBEAT packets can be recovered via NACK.
-        if (self.runtime) |rt| {
-            self.armHeartbeatLocked(rt.clock.nowNs());
-        } else if (self.hb_thread == null) {
-            self.hb_thread = std.Thread.spawn(.{}, heartbeatThread, .{self}) catch null;
-        }
+        // Arm the periodic HEARTBEAT on the first matched reader so that
+        // dropped DATA or HEARTBEAT packets can be recovered via NACK. A
+        // writer without a runtime sends none: its owner drives it.
+        if (self.runtime) |rt| self.armHeartbeatLocked(rt.clock.nowNs());
         // Captured under the lock, not re-read from self after unlocking --
         // setProtocolReadyCallback can run concurrently from another thread
         // (it takes the same lock), so self.protocol_ready_fn/ctx are only
@@ -1283,7 +1264,7 @@ pub const StatefulWriter = struct {
     /// recovery path at all for data lost during a connection gap. Not gated
     /// on replay_on_match/wants_replay — those govern DURABILITY-driven
     /// late-join replay, a different concern from recovering an ongoing
-    /// pairing's connection gap. Called periodically from heartbeatThread
+    /// pairing's connection gap. Called periodically from the heartbeat timer
     /// (reuses that existing timer rather than adding a second one); a no-op
     /// for any proxy whose locators are all UDP, since connectionGeneration()
     /// is then always 0.
@@ -3165,24 +3146,6 @@ pub const StatefulWriter = struct {
             // holds its history and repairs the set now, not at the next
             // periodic HEARTBEAT.
             self.sendHeartbeatToProxyLockedWithLastSnAndFirstSn(rp, false, last_sn, first_sn_override);
-        }
-    }
-
-    /// Background thread: sends a non-final HEARTBEAT every HB_INTERVAL_MS ms.
-    /// Readers reply with ACKNACK; writer retransmits any missing data.
-    /// Also checks probe deadlines: reports proxies that haven't ACK'd in time.
-    /// Stopped by setting hb_stopping before calling hb_thread.join().
-    fn heartbeatThread(self: *Self) void {
-        while (!self.hb_stopping.load(.acquire)) {
-            var slept_ms: u64 = 0;
-            while (slept_ms < HB_INTERVAL_MS and !self.hb_stopping.load(.acquire)) {
-                time_mod.sleepNs(50 * std.time.ns_per_ms);
-                slept_ms += 50;
-            }
-            if (self.hb_stopping.load(.acquire)) break;
-            self.sendHeartbeat(false, false);
-            self.checkProbeDeadlines();
-            self.checkConnectionGenerations();
         }
     }
 

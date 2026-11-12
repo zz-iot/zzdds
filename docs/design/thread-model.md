@@ -14,7 +14,6 @@ Started without a runtime, these components still start threads of their own:
 
 - `SpdpSedpDiscovery` owns an SPDP timer thread for periodic participant
   announcements and lease checks.
-- `StatefulWriter` starts a heartbeat thread when the first matched reader is added.
 - `trace.AsyncRingSink` owns an optional flush thread when the application starts it;
   without one, the application drains it with `flush()`.
 
