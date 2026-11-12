@@ -253,13 +253,18 @@ pub const Group = struct {
         p.member_next = self.members;
         if (self.members) |m| m.member_prev = p;
         self.members = p;
+        p.linked = true;
     }
 
     fn remove(self: *Group, p: *PendingListeners) void {
         self.mu.lock();
         defer self.mu.unlock();
+        if (!p.linked) return;
         if (p.member_prev) |prev| prev.member_next = p.member_next else self.members = p.member_next;
         if (p.member_next) |next| next.member_prev = p.member_prev;
+        p.member_prev = null;
+        p.member_next = null;
+        p.linked = false;
     }
 
     /// Counts a request about to be submitted, or an explicit traversal.
@@ -353,6 +358,8 @@ pub const PendingListeners = struct {
     // Guarded by the group's `mu`.
     member_next: ?*PendingListeners = null,
     member_prev: ?*PendingListeners = null,
+    /// In the group's member list: from `attach` until `close`.
+    linked: bool = false,
     drop_next: ?*PendingListeners = null,
 
     const max_kinds = 16;
@@ -385,13 +392,13 @@ pub const PendingListeners = struct {
         group.add(self);
     }
 
-    /// The owner is being freed, so nothing is queued.
+    /// The owner is being freed, so nothing is queued. It left the group at
+    /// `close`: the group may be gone by now, when something pinned the
+    /// owner past its participant's deletion.
     pub fn deinit(self: *PendingListeners) void {
         std.debug.assert(self.state == .idle and self.active == 0 and self.held == null and self.parked_on == null);
-        if (self.group) |g| {
-            g.remove(self);
-            self.ctx.deinit();
-        }
+        std.debug.assert(!self.linked);
+        if (self.group != null) self.ctx.deinit();
         self.events.deinit(self.alloc);
         self.mu.deinit();
     }
@@ -434,6 +441,10 @@ pub const PendingListeners = struct {
         self.events.clearRetainingCapacity();
         self.mu.unlock();
         if (self.shutdown()) self.drop();
+        // Closed, it is never submitted again, so the participant's deletion
+        // has nothing to shut down here. A turn still running counts in the
+        // group's `inflight`, which that deletion waits on.
+        if (self.group) |g| g.remove(self);
     }
 
     /// For the owner's deletion, after `close`: waits for invocations in

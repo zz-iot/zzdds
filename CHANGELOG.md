@@ -24,6 +24,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   `ZZDDS_SHARED_RUNTIME=0`, rather than `-Dshared-runtime=true` when it is `1`.
 - With `-Dshared-runtime` on, the runtime's own tests reuse the main library build instead
   of compiling a second one.
+- On the shared runtime, a DataReader or DataWriter kept alive past its participant's
+  deletion (for example by its protocol endpoint's retirement) no longer refers to the
+  participant's freed listener group: it leaves the group when it is deleted.
 
 ## 2026-11-11
 
