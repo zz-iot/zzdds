@@ -225,12 +225,6 @@ test "participant pin drops only at teardown and registration OOM transfers no o
     defer delivery.deinit();
     for (0..4) |failure_index| {
         const side = try Side.init(&delivery);
-        // Allocator injection requires a quiescent fixture: the timer thread
-        // captures/uses the allocator independently of participant.mu.
-        side.impl().timer_stopping.store(true, .release);
-        if (side.impl().timer_thread) |thread| thread.join();
-        side.impl().timer_thread = null;
-        side.impl().timer_thread_id.store(0, .release);
         const before = a.generation.refs.load(.acquire);
         var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = failure_index });
         side.impl().alloc = failing.allocator();
