@@ -43,11 +43,11 @@ def zzdds_zig_out() -> Path:
 def shared_runtime_args() -> list[str]:
     """The `zig build` arguments that select the runtime for a Zig app.
 
-    ZZDDS_SHARED_RUNTIME=1 (CI's shared-runtime lanes) builds the app's own
-    zzdds dependency with -Dshared-runtime, matching the installed libraries
-    the other bindings load.
+    The shared runtime is the default. ZZDDS_SHARED_RUNTIME=0 builds the app's
+    own zzdds dependency with -Dshared-runtime=false (the threaded path, being
+    deleted), to match installed libraries built that way.
     """
-    return ["-Dshared-runtime=true"] if os.environ.get("ZZDDS_SHARED_RUNTIME") == "1" else []
+    return ["-Dshared-runtime=false"] if os.environ.get("ZZDDS_SHARED_RUNTIME") == "0" else []
 
 
 def debug_allocator_args() -> list[str]:

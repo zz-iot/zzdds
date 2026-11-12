@@ -858,20 +858,23 @@ Requirements that follow from the table:
 <a id="coexistence-during-migration"></a>
 ### Coexistence during migration
 
-The runtime lands incrementally, starting with the first vertical slice, so the threaded
-path stays the default until the runtime can replace it:
+The runtime landed incrementally, starting with the first vertical slice, and the threaded
+path stayed the default until the runtime could replace it:
 
-* A build option (`-Dshared-runtime`, off by default) selects the runtime. It is a
-  migration switch, not a supported configuration: it is not part of `zzdds.idl`, the
-  configuration file or the C ABI, and it is documented only for contributors.
+* A build option (`-Dshared-runtime`, on by default since the flip below) selects the
+  runtime. It is a migration switch, not a supported configuration: it is not part of
+  `zzdds.idl`, the configuration file or the C ABI, and it is documented only for
+  contributors.
 * With the option on, every participant in the build uses the runtime. There is no
   mixing within a build: an entity or QoS the runtime does not yet support fails creation
   visibly (the constructor's ordinary nil result, with a diagnostic) and never falls back
   to the threaded path.
-* With the option off, the build is today's threaded implementation, and releases ship
-  it until the default flips.
-* CI builds and tests both settings while the option exists. The option build runs the
-  runtime's own tests and every existing test whose features it supports; that set grows
-  with each migrated endpoint kind.
-* Once the runtime passes the full test, interoperability and examples suites, the default
-  flips to the runtime. The threaded path and the option are then deleted together.
+* With the option off, the build is the threaded implementation, which releases shipped
+  until the default flipped.
+* Until the flip, CI built and tested both settings. The option build ran the runtime's
+  own tests and every existing test whose features it supported, a set that grew with
+  each migrated endpoint kind.
+* Once the runtime passed the full test, interoperability and examples suites, the
+  default flipped to the runtime. From the flip, CI tests the runtime only: the threaded
+  path and the option are deleted together next, and nothing is added to the threaded
+  path meanwhile.

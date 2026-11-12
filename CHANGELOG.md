@@ -8,6 +8,23 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-12
+
+- **The shared runtime is the default.** Participants run on its hosted workers: receive,
+  discovery, heartbeats and timers are runtime turns instead of a thread per socket and per
+  concern. Listeners run as runtime turns too, so one can run after the call that caused it
+  has returned (`on_data_available` after `wait_for_historical_data()`, for example).
+  `-Dshared-runtime=false` still builds the threaded implementation, for contributors only,
+  until it is deleted.
+- CI runs every lane on the shared runtime and drops the duplicate shared-runtime lanes;
+  nothing tests the threaded implementation any more. The shared-runtime interop lane's
+  packet capture goes with it.
+- The example, integration-test and stress Zig apps build their own zzdds on the shared
+  runtime by default. Their runner scripts pass `-Dshared-runtime=false` when
+  `ZZDDS_SHARED_RUNTIME=0`, rather than `-Dshared-runtime=true` when it is `1`.
+- With `-Dshared-runtime` on, the runtime's own tests reuse the main library build instead
+  of compiling a second one.
+
 ## 2026-11-11
 
 - The wire trace is configured per participant: a `-Dwire-trace` build traces what its

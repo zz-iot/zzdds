@@ -78,9 +78,9 @@ jobs:
         run: zig build test-resource-providers test-resource-inspect -Dresource-authoring=true -Dtypesupport-library=true -Doptimize=${{ matrix.optimize }} --summary all
       - name: Linked descriptors and ordinary compiled adapters without OS loading
         run: zig build test-resource-providers -Dresource-construction=true -Dtypesupport-library=true -Dtypesupport-dynamic=false -Doptimize=${{ matrix.optimize }} --summary all
-      - name: Resource construction, authoring and providers on the shared runtime
+      - name: Strict TOML authoring and profile resolution
         if: runner.os == 'Linux' && matrix.optimize == 'Debug'
-        run: zig build test-resource-authoring test-resource-providers test-resource-inspect -Dresource-authoring=true -Dtypesupport-library=true -Dshared-runtime=true --summary all
+        run: zig build test-resource-authoring -Dresource-authoring=true -Dtypesupport-library=true --summary all
       - name: LLVM ThreadSanitizer provider preparation
         if: runner.os == 'Linux' && matrix.optimize == 'Debug'
         run: zig build test-resource-providers -Dresource-construction=true -Dtypesupport-library=true -Dsanitize-thread=true --summary all

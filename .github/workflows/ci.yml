@@ -96,28 +96,6 @@ jobs:
       - name: DebugAllocator lane (default allocator path only, additive to the matrix above)
         run: zig build test -Ddebug-allocator=true
 
-  # ── Unit tests on the shared runtime (the contributor migration switch) ───
-  # Every test file, on hosted workers unless the test selects a runtime
-  # (test/support/manual_runtime.zig installs one the test drives).
-  test-linux-shared-runtime:
-    name: Linux x86_64 (shared runtime)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: "0.17.0"
-
-      - name: Unit tests
-        run: zig build test -Dshared-runtime=true
-
-      - name: Unit tests under ThreadSanitizer
-        run: zig build test-tsan -Dshared-runtime=true
-
   # ── Unit tests: remaining platforms (independent of interop) ──────────────
   test-other:
     name: ${{ matrix.name }}
@@ -180,12 +158,6 @@ jobs:
       - name: C/C++/Java binding smoke tests
         shell: bash
         run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true -Djava-binding=true 2>&1 | tee "$RUNNER_TEMP/binding-smoke.log"
-
-      # The shared runtime runs one listener identity at a time wherever it
-      # is installed; JavaSmoke checks that only there.
-      - name: C/C++/Java binding smoke tests (shared runtime)
-        shell: bash
-        run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true -Djava-binding=true -Dshared-runtime=true 2>&1 | tee -a "$RUNNER_TEMP/binding-smoke.log"
 
       # build.zig downgrades a missing JDK/JNI headers or javac to a
       # std.log.warn + skip, not a build failure (see build.zig's two
@@ -253,21 +225,6 @@ jobs:
       zzdds_repo: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
       zzdds_ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-  # The same, with zzdds on a -Dshared-runtime build, where every participant
-  # runs on the shared runtime, so a ROS 2 consumer cannot regress on it
-  # unnoticed before it becomes the default.
-  rmw-zzdds-shared-runtime:
-    name: rmw_zzdds (shared runtime)
-    needs: test-linux
-    permissions:
-      contents: read
-    uses: zz-iot/rmw_zzdds/.github/workflows/ci.yml@051b4d45f30c07531043a9faebf1f69b61e36d46
-    with:
-      mode: zzdds-pr
-      zzdds_repo: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-      zzdds_ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      zzdds_shared_runtime: true
-
   # ── examples smoke test ──────────────────────────────────────────────────
   #
   # Builds zzdds with every binding enabled, then runs examples/'s own
@@ -281,29 +238,22 @@ jobs:
   # skip would mean something regressed, not that the environment is just
   # missing an optional piece (see run_all.py's own default, unstrict
   # behavior for the latter case). Windows explicitly excludes only OpenCV.
-  #
-  # Each platform runs twice: on the default build, and on a -Dshared-runtime
-  # build, where every participant runs on the shared runtime (the contributor
-  # migration switch; see docs/roadmap.md), so that build's examples cannot
-  # regress unnoticed before it becomes the default.
 
   examples:
-    name: examples / ${{ matrix.name }}${{ matrix.runtime == 'shared' && ' (shared runtime)' || '' }}
+    name: examples / ${{ matrix.name }}
     needs: test-linux
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        runtime: [threaded, shared]
         include:
           - name: Linux x86_64
             os: ubuntu-latest
             install_opencv: true
             timeout: 42
             # Below `timeout` with room for setup/build before it and the
-            # diagnostics upload after it. A typical run takes ~18 min on the
-            # threaded runtime and ~23 min on the shared one, longer when the
-            # Zig cache misses (e.g. after a zidl bump).
+            # diagnostics upload after it. A typical run takes ~23 min,
+            # longer when the Zig cache misses (e.g. after a zidl bump).
             test_timeout: 35
           # All bindings and mesh scenarios run on Windows. Only OpenCV is
           # excluded, since its Windows toolchain is not installed here.
@@ -316,10 +266,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Windows now also builds nine native Zig examples and runs the full mesh.
     timeout-minutes: ${{ matrix.timeout }}
-    env:
-      # The native Zig apps build their own zzdds, so the runner scripts pass
-      # them -Dshared-runtime too (examples/_common.py's zig_build_cmd).
-      ZZDDS_SHARED_RUNTIME: ${{ matrix.runtime == 'shared' && '1' || '0' }}
 
     steps:
       - name: Check out zzdds
@@ -355,7 +301,7 @@ jobs:
         run: python -m unittest discover -s examples -p test_common.py
 
       - name: Build zzdds
-        run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true -Dshared-runtime=${{ matrix.runtime == 'shared' }} install
+        run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
 
       - name: Prepare failure diagnostics (Linux)
         if: runner.os == 'Linux'
@@ -399,7 +345,7 @@ jobs:
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
-          name: diagnostics-examples-${{ matrix.os }}-${{ matrix.runtime }}
+          name: diagnostics-examples-${{ matrix.os }}
           path: |
             ${{ runner.temp }}/net-diagnostics
             examples/interop/.smoke-logs
@@ -436,9 +382,8 @@ jobs:
   # before pushing, or by CMake itself the moment two scenarios' subdirectories
   # are ever built together again.
   #
-  # As with `examples`, every scenario also runs on a -Dshared-runtime build.
   integration-tests:
-    name: integration-tests / ${{ matrix.scenario }} (${{ matrix.os }}${{ matrix.runtime == 'shared' && ', shared runtime' || '' }})
+    name: integration-tests / ${{ matrix.scenario }} (${{ matrix.os }})
     needs: test-linux
     runs-on: ${{ matrix.os }}
     strategy:
@@ -446,7 +391,6 @@ jobs:
       matrix:
         # Windows builds the C/C++ ports with MSVC (CMake's default generator).
         os: [ubuntu-latest, windows-latest]
-        runtime: [threaded, shared]
         scenario:
           - coherent-sets
           - delete-contained-entities
@@ -465,8 +409,6 @@ jobs:
     # the old monolithic job's 40min, since that budget no longer has to
     # cover all 9 scenarios cumulatively.
     timeout-minutes: 20
-    env:
-      ZZDDS_SHARED_RUNTIME: ${{ matrix.runtime == 'shared' && '1' || '0' }}
 
     steps:
       - name: Check out zzdds
@@ -493,7 +435,7 @@ jobs:
           python-version: "3.12"
 
       - name: Build zzdds (all bindings)
-        run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true -Dshared-runtime=${{ matrix.runtime == 'shared' }} install
+        run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
 
       - name: Prepare failure diagnostics (Linux)
         if: runner.os == 'Linux'
@@ -534,7 +476,7 @@ jobs:
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
-          name: diagnostics-integration-${{ matrix.scenario }}-${{ matrix.os }}-${{ matrix.runtime }}
+          name: diagnostics-integration-${{ matrix.scenario }}-${{ matrix.os }}
           path: |
             ${{ runner.temp }}/net-diagnostics
             integration-tests/interop/.smoke-logs
@@ -559,17 +501,9 @@ jobs:
   # not attempted here rather than assumed to work. This job covers what it
   # covers; extending it further is a stretch goal, not something this
   # comment claims is done.
-  #
-  # As with `examples`, it all also runs on a -Dshared-runtime build, where
-  # every participant runs on the shared runtime: there the races TSan looks
-  # for are between application threads and the runtime's own threads.
   examples-tsan:
-    name: examples (TSAN${{ matrix.runtime == 'shared' && ', shared runtime' || '' }})
+    name: examples (TSAN)
     needs: test-linux
-    strategy:
-      fail-fast: false
-      matrix:
-        runtime: [threaded, shared]
     runs-on: ubuntu-latest
     # Was 20 for 3 examples (zig/c/cpp waitset); now 8 examples (+shape,
     # +custom-allocator in both C and C++) -- more builds and more runs,
@@ -606,13 +540,11 @@ jobs:
         run: sudo sysctl -w vm.mmap_rnd_bits=28
 
       - name: Build zzdds (C + C++ bindings, ThreadSanitizer)
-        run: zig build -Dc-binding=true -Dcpp-binding=true -Dsanitize-thread=true -Dshared-runtime=${{ matrix.runtime == 'shared' }} install
+        run: zig build -Dc-binding=true -Dcpp-binding=true -Dsanitize-thread=true install
 
-      # The Zig examples build their own zzdds, so they take -Dshared-runtime
-      # themselves; the C and C++ ones link the zig-out build above.
       - name: Build zig/waitset (ThreadSanitizer)
         working-directory: examples/zig/waitset
-        run: zig build -Dsanitize-thread=true -Dshared-runtime=${{ matrix.runtime == 'shared' }}
+        run: zig build -Dsanitize-thread=true
 
       # Two distinct bugs were found and fixed here, both confirmed via
       # standalone local repro (not just code review):
@@ -673,7 +605,7 @@ jobs:
 
       - name: Build zig/shape (ThreadSanitizer)
         working-directory: examples/zig/shape
-        run: zig build -Dsanitize-thread=true -Dshared-runtime=${{ matrix.runtime == 'shared' }}
+        run: zig build -Dsanitize-thread=true
 
       - name: Build cpp/shape (ThreadSanitizer)
         run: |
@@ -815,23 +747,16 @@ jobs:
   # CI-sized parameters. run_all.py's own xfail list keeps a currently-known
   # zzdds bug (see stress-tests/README.md "Findings") from reddening the gate
   # while still exercising it. The nightly `schedule` trigger runs a heavier
-  # matrix below. As with `examples`, it all also runs on a -Dshared-runtime
-  # build.
+  # matrix below.
   stress:
-    name: stress${{ matrix.runtime == 'shared' && ' (shared runtime)' || '' }}
+    name: stress
     needs: test-linux
-    strategy:
-      fail-fast: false
-      matrix:
-        runtime: [threaded, shared]
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
       # The stress apps build their own zzdds, so run.py passes them
-      # -Dshared-runtime too (examples/_common.py's shared_runtime_args).
-      ZZDDS_SHARED_RUNTIME: ${{ matrix.runtime == 'shared' && '1' || '0' }}
-      # Likewise -Ddebug-allocator, so zzdds's own allocations in the stress
-      # apps go through a DebugAllocator (debug_allocator_args).
+      # -Ddebug-allocator too, so zzdds's own allocations in the stress
+      # apps go through a DebugAllocator (examples/_common.py's debug_allocator_args).
       ZZDDS_DEBUG_ALLOCATOR: "1"
       # A process that outlives its timeout logs its stacks before it is killed
       # (examples/_common.py's dump_stacks).
@@ -857,7 +782,7 @@ jobs:
         run: sudo sysctl -w vm.mmap_rnd_bits=28
 
       - name: Build zzdds (native, DebugAllocator)
-        run: zig build -Ddebug-allocator=true -Dshared-runtime=${{ matrix.runtime == 'shared' }} install
+        run: zig build -Ddebug-allocator=true install
 
       # gdb for stuck-process stack dumps. ptrace_scope=0 lets it attach to a
       # test process it didn't start. Best-effort: never fails the job.
@@ -918,7 +843,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stress-logs-${{ matrix.runtime }}
+          name: stress-logs
           path: |
             /tmp/elc-stress*/**
             /tmp/churn-stress*/**
@@ -927,25 +852,22 @@ jobs:
 
   # ── Stress tests: ARM64 platforms ─────────────────────────────────────────
   #
-  # The same strict suite as `stress`, on Linux ARM64 and macOS ARM64, on both
-  # builds. ARM64's weaker memory ordering and macOS's scheduler can expose
-  # races x86_64 Linux hides. No TSan lane: TSan on macOS crashes on startup
+  # The same strict suite as `stress`, on Linux ARM64 and macOS ARM64. ARM64's
+  # weaker memory ordering and macOS's scheduler can expose races x86_64 Linux
+  # hides. No TSan lane: TSan on macOS crashes on startup
   # (see test-other), and Linux ARM64 TSan is a separate spike.
   stress-other:
-    name: stress / ${{ matrix.name }}${{ matrix.runtime == 'shared' && ' (shared runtime)' || '' }}
+    name: stress / ${{ matrix.name }}
     needs: test-linux
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: Linux ARM64, os: ubuntu-24.04-arm, runtime: threaded }
-          - { name: Linux ARM64, os: ubuntu-24.04-arm, runtime: shared }
-          - { name: macOS ARM64, os: macos-latest, runtime: threaded }
-          - { name: macOS ARM64, os: macos-latest, runtime: shared }
+          - { name: Linux ARM64, os: ubuntu-24.04-arm }
+          - { name: macOS ARM64, os: macos-latest }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
-      ZZDDS_SHARED_RUNTIME: ${{ matrix.runtime == 'shared' && '1' || '0' }}
       ZZDDS_DEBUG_ALLOCATOR: "1"
       ZZDDS_TEST_LOG_STUCK_STACKS: "1"
 
@@ -963,7 +885,7 @@ jobs:
           python-version: "3.12"
 
       - name: Build zzdds (native, DebugAllocator)
-        run: zig build -Ddebug-allocator=true -Dshared-runtime=${{ matrix.runtime == 'shared' }} install
+        run: zig build -Ddebug-allocator=true install
 
       # gdb (Linux) or lldb (macOS) for stuck-process stack dumps; see
       # `stress`. Best-effort: never fails the job.
@@ -987,7 +909,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stress-logs-${{ matrix.os }}-${{ matrix.runtime }}
+          name: stress-logs-${{ matrix.os }}
           path: ${{ runner.temp }}/stress-logs
           if-no-files-found: ignore
           retention-days: 7
@@ -1265,11 +1187,6 @@ jobs:
           # See the DebugAllocator lane's comment above vendor-interop-debug-allocator.
           - name: debug-allocator
             build_flags: -Doptimize=Debug -Dlog-level=info -Ddebug-allocator=true
-          # See the shared runtime lane's comment above vendor-interop-shared-runtime.
-          - name: shared-runtime
-            build_flags: -Doptimize=ReleaseSafe -Dshared-runtime=true
-          - name: shared-runtime-tsan
-            build_flags: -Doptimize=Debug -Dlog-level=info -Dsanitize-thread -Dshared-runtime=true
 
     steps:
       - name: Check out zzdds
@@ -1336,12 +1253,6 @@ jobs:
           - name: debug-allocator
             suffix: " + DebugAllocator"
             report: interop-debug-allocator-results
-          - name: shared-runtime
-            suffix: " + shared runtime"
-            report: interop-shared-runtime-results
-          - name: shared-runtime-tsan
-            suffix: " + shared runtime + TSAN"
-            report: interop-shared-runtime-tsan-results
 
     steps:
       - name: Check out zzdds
@@ -1711,120 +1622,3 @@ jobs:
         with:
           name: interop-debug-allocator-${{ matrix.vendor.name }}-${{ matrix.direction }}
           path: /tmp/interop-debug-allocator-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
-
-  # ── Interop: Zenzen DDS (shared runtime) vs vendor ────────────────────────
-  #
-  # Same structure as vendor-interop-normal, on a -Dshared-runtime build, where
-  # every participant runs on the shared runtime (the contributor migration
-  # switch; see docs/roadmap.md), so its wire behavior cannot regress unnoticed
-  # before it becomes the default. Its TSan build runs self-interop only: the
-  # TSan vendor lane moves to the runtime when the default flips.
-  vendor-interop-shared-runtime:
-    name: "Shared runtime: ${{ matrix.vendor.name }} / ${{ matrix.direction }}"
-    needs: [setup-matrix, shape-binaries]
-    # See self-interop: run even if another lane's build failed.
-    if: ${{ !cancelled() && needs.setup-matrix.result == 'success' && needs.shape-binaries.result != 'skipped' }}
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        vendor: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
-        direction: [pub, sub]
-
-    steps:
-      - name: Check out zzdds
-        uses: actions/checkout@v4
-        with:
-          path: zzdds
-          persist-credentials: false
-
-      - name: Check out dds-rtps (${{ env.INTEROP_RTPS_REF }})
-        uses: actions/checkout@v4
-        with:
-          repository: zz-iot/dds-rtps
-          ref: ${{ env.INTEROP_RTPS_REF }}
-          path: dds-rtps
-          persist-credentials: false
-
-      - name: Install Python (match omg-dds/dds-rtps interop workflow)
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11.4"
-
-      - name: Install Python dependencies
-        run: pip install --requirement dds-rtps/requirements.txt
-
-      - name: Download zzdds binary (shared runtime)
-        uses: actions/download-artifact@v4
-        with:
-          name: zzdds-shape-linux-shared-runtime
-          path: bins/
-
-      - name: Download vendor binary
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release download ${{ env.INTEROP_RELEASE_TAG }} \
-            --repo omg-dds/dds-rtps \
-            --pattern "${{ matrix.vendor.asset }}" \
-            -D bins/
-          unzip -o bins/${{ matrix.vendor.asset }} -d bins/
-
-      - name: Make binaries executable
-        run: chmod +x bins/zzdds_shape_main_linux bins/${{ matrix.vendor.binary }}
-
-      # As in the TSan lane: keep a failing run's packets. Some failures seen
-      # only on this lane have not reproduced off the runner.
-      - name: Start packet capture
-        run: |
-          command -v tcpdump >/dev/null || sudo apt-get install -y tcpdump
-          sudo timeout -s INT 3600 tcpdump -i any -U -w /tmp/interop-shared-runtime.pcap udp > /tmp/tcpdump.log 2>&1 &
-          for _ in $(seq 50); do [ -s /tmp/interop-shared-runtime.pcap ] && break; sleep 0.1; done
-          if ! pgrep -x tcpdump >/dev/null || [ ! -s /tmp/interop-shared-runtime.pcap ]; then
-            echo "::warning::Packet capture did not start; a failure will have no packets"
-            cat /tmp/tcpdump.log || true
-          fi
-
-      - name: Run interop on the shared runtime (${{ matrix.direction }})
-        working-directory: dds-rtps
-        run: |
-          ZZDDS="$GITHUB_WORKSPACE/bins/zzdds_shape_main_linux"
-          VENDOR="$GITHUB_WORKSPACE/bins/${{ matrix.vendor.binary }}"
-          if [ "${{ matrix.direction }}" = "pub" ]; then
-            PUB="$ZZDDS"; SUB="$VENDOR"
-          else
-            PUB="$VENDOR"; SUB="$ZZDDS"
-          fi
-          python3 interoperability_report.py -P "$PUB" -S "$SUB" \
-            -o /tmp/interop-shared-runtime-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
-
-      - name: Stop packet capture
-        if: always()
-        run: |
-          sudo pkill -INT -x tcpdump || true
-          for _ in $(seq 50); do pgrep -x tcpdump >/dev/null || break; sleep 0.1; done
-          cat /tmp/tcpdump.log || true
-
-      - name: Check results
-        id: check
-        run: |
-          python3 zzdds/scripts/check_interop_results.py \
-            /tmp/interop-shared-runtime-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml \
-            --known-failures zzdds/.github/interop-known-failures.toml \
-            --vendor "${{ matrix.vendor.name }}" --direction ${{ matrix.direction }} \
-            --lane shared-runtime
-
-      - name: Upload report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: interop-shared-runtime-${{ matrix.vendor.name }}-${{ matrix.direction }}
-          path: /tmp/interop-shared-runtime-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
-
-      - name: Upload packet capture
-        if: failure() || (success() && steps.check.outputs.failed_tests != '0')
-        uses: actions/upload-artifact@v4
-        with:
-          name: interop-shared-runtime-capture-${{ matrix.vendor.name }}-${{ matrix.direction }}
-          path: /tmp/interop-shared-runtime.pcap
-          retention-days: 7

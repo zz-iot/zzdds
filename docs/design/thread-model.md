@@ -3,8 +3,9 @@
 This document describes current behavior. Proposed future behavior is tracked in the
 [listener execution contract](concurrency/listeners.md#listener-execution-contract) and
 [concurrency design](concurrency/architecture.md#concurrency-model-state-ownership-and-progress); those drafts do not describe implemented guarantees.
-The runtime's [thread mapping](concurrency/runtime.md#thread-mapping) says where each thread
-below goes when the shared runtime replaces them.
+It describes the threaded path, which a `-Dshared-runtime=false` build still selects until
+it is deleted; the default build runs on the shared runtime instead. The runtime's
+[thread mapping](concurrency/runtime.md#thread-mapping) says where each thread below went.
 
 ## Current Thread Ownership
 

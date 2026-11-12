@@ -4,7 +4,7 @@
 Usage:
     check_interop_results.py <report.xml> [--tsan-log-dir <dir>]
         [--known-failures <file.toml> --vendor <name> --direction pub|sub
-         [--lane normal|tsan|debug-allocator|shared-runtime]]
+         [--lane normal|tsan|debug-allocator]]
 
 Failure output from each test (the pexpect-captured shape_main output, which
 includes any ThreadSanitizer warnings when the binary is built with
@@ -133,7 +133,7 @@ def test_name(case):
     return m.group(1) if m else case.name
 
 
-LANES = ("normal", "tsan", "debug-allocator", "shared-runtime")
+LANES = ("normal", "tsan", "debug-allocator")
 
 
 def load_known_failures(path, vendor, direction, lane):

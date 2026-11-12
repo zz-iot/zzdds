@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
     // WaitSet/conditions), so both sides need the same instrumentation for
     // TSAN to see the full picture.
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer") orelse false;
-    const shared_runtime = b.option(bool, "shared-runtime", "Build zzdds with -Dshared-runtime (contributors only; default: false)") orelse false;
+    const shared_runtime = b.option(bool, "shared-runtime", "Build zzdds with -Dshared-runtime; false selects the threaded path, being deleted (contributors only; default: true)") orelse true;
 
     const zzdds_dep = b.dependency("zzdds", .{
         .target = target,
