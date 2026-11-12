@@ -1114,7 +1114,12 @@ The threaded runtime does not yet wait for a running listener when deleting a re
 writer or participant. So a participant deleted from the callback that a
 `set_listener` on it waits for, or from the release hook of the listener it replaces, can
 be freed under that setter; the shared runtime defers the teardown until the setter
-returns. Builtin-topic readers' listeners run
+returns. The threaded runtime also runs a reader's or writer's listener on the thread
+that changed its status, so one endpoint's callbacks can run at once and arrive out of
+order: a match made inside `create_datawriter` and one made on a receive thread can
+deliver the later `current_count` first, leaving a listener that keeps the last count it
+saw one short. The shared runtime runs them one at a time, each claiming its status when
+it runs. Builtin-topic readers' listeners run
 the same way. One endpoint's listeners run one at a time, and different endpoints' may
 run at once on hosted workers, except that one listener runs one call at a time wherever
 it is installed, including as a parent's listener: the core identifies it by its

@@ -27,6 +27,11 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 - The Java `shape` example's run script keeps its subscriber reading until it is stopped.
   It used to stop after 10 read periods (about 2s), which on a slow runner ended before the
   publisher's JVM had matched and written a sample.
+- The `cft-reconfigure` integration test's publishers wait for the subscriber's readers to
+  match, and later to disconnect, by polling the writer's matched status, not the count
+  their listener last saw.
+  On the threaded runtime one endpoint's listener callbacks can run at once and arrive out
+  of order, which left the listener at 1 of 2 matches. docs/roadmap.md records the gap.
 
 ## 2026-11-10
 
