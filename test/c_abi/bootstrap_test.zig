@@ -1883,3 +1883,45 @@ test "readerSetListenerEx: real C-ABI set_listener_ex delegates to DataReaderImp
     try testing.expectEqual(@as(usize, 1), state.calls);
     try testing.expect(state.last_ready == true);
 }
+
+// ── Destroying the last factory from a listener ──────────────────────────────
+
+/// Deletes its participant and then destroys the factory from the writer's
+/// deadline listener. The participant is freed only after the listener
+/// returns, so a -Ddebug-allocator build must not check for leaks then.
+const DestroyFromListener = struct {
+    boxed: *anyopaque,
+    dp: DDS.DomainParticipant,
+    done: std.atomic.Value(bool) = .init(false),
+    rc: DDS.ReturnCode_t = -1,
+
+    fn onMissed(_: *anyopaque, _: *const DDS.OfferedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
+        const self: *DestroyFromListener = @ptrCast(@alignCast(ld.?));
+        if (self.done.load(.acquire)) return;
+        const ext = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, self.boxed);
+        const f = ext.vtable.as_DomainParticipantFactory(ext.ptr);
+        self.rc = self.dp.delete_contained_entities();
+        if (self.rc == DDS.RETCODE_OK) self.rc = f.delete_participant(self.dp);
+        extensions.zzdds_destroy_factory(self.boxed);
+        self.done.store(true, .release);
+    }
+};
+
+test "support factory: the last factory can be destroyed from a listener that deleted its participant" {
+    const boxed = extensions.zzdds_create_factory();
+    const ext = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, boxed);
+    const dp = ext.create_participant_ex(test_domain.get(), .{}, null, 0, ZZDDS.DomainParticipantConfig.default());
+    try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);
+    var ctx: DestroyFromListener = .{ .boxed = boxed, .dp = dp };
+    const topic = dp.create_topic("DestroyTopic", "DestroyType", .{}, null, 0);
+    const publisher = dp.create_publisher(.{}, null, 0);
+    var q: DDS.DataWriterQos = .{};
+    q.deadline.period = .{ .sec = 0, .nanosec = 50_000_000 };
+    const dw = publisher.create_datawriter(topic, q, .{ .listener_data = &ctx, .on_offered_deadline_missed = DestroyFromListener.onMissed }, DDS.OFFERED_DEADLINE_MISSED_STATUS);
+    try testing.expect(dw.ptr != zzdds.dcps.NIL_PTR);
+    writeRawViaOp(dw, KEY_HASH, &PAYLOAD);
+    var i: u32 = 0;
+    while (!ctx.done.load(.acquire) and i < 100) : (i += 1) zzdds.util.time.sleepNs(50 * std.time.ns_per_ms);
+    try testing.expect(ctx.done.load(.acquire));
+    try testing.expectEqual(DDS.RETCODE_OK, ctx.rc);
+}

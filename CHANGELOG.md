@@ -27,7 +27,8 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 - `-Ddebug-allocator` builds check for leaks. When the last factory created with the default
   allocator is destroyed, nothing it or its entities allocated may still be live: the
   DebugAllocator logs each allocation that is, and the process panics. Before, its leak
-  check never ran.
+  check never ran. A factory destroyed from a listener is not checked, since entities deleted
+  there are freed once the listener returns.
 - The shared-runtime interop lane keeps a failing run's packets, as the TSan lane does.
 - The readiness backend's tests wait until every loopback datagram they send has arrived
   before servicing. On macOS a datagram can arrive after `sendto` returns, which

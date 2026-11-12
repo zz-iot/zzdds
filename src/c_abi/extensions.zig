@@ -47,6 +47,7 @@ const noop_security = @import("../security/noop.zig").noop_security_plugins;
 const history_mod = @import("../rtps/history.zig");
 const time_mod = @import("../util/time.zig");
 const nil = @import("../dcps/nil.zig");
+const listener_lane = @import("../dcps/listener_lane.zig");
 const standalone_create = @import("../util/standalone_create.zig");
 const proto = @import("../protocol/interface.zig");
 
@@ -1201,6 +1202,10 @@ var debug_gpa: std.heap.DebugAllocator(debug_gpa_config) = .{};
 // so by then nothing it allocated may still be live: what is, leaked or is
 // freed late. The lock keeps a factory being created meanwhile from
 // allocating during the check.
+//
+// Not when the last factory is destroyed from a callback: an entity deleted
+// there, by that callback or one further up its thread, is freed once its
+// callback returns, so it is still live.
 const FactoryLeakCheck = struct {
     factories: u32 = 0,
     mu: Mutex = .{},
@@ -1212,13 +1217,14 @@ const FactoryLeakCheck = struct {
     }
 
     // Returns how many allocations are still live if this released the last
-    // factory, else 0. `gpa` is a DebugAllocator, which also logs each one
-    // (with where it was made, given stack traces).
-    fn release(self: *FactoryLeakCheck, gpa: anytype) usize {
+    // factory and `settled` (no frees are pending), else 0. `gpa` is a
+    // DebugAllocator, which also logs each one (with where it was made, given
+    // stack traces).
+    fn release(self: *FactoryLeakCheck, gpa: anytype, settled: bool) usize {
         self.mu.lock();
         defer self.mu.unlock();
         self.factories -= 1;
-        if (self.factories > 0) return 0;
+        if (self.factories > 0 or !settled) return 0;
         return gpa.detectLeaks();
     }
 };
@@ -1230,7 +1236,7 @@ fn debugGpaRetain() void {
 }
 
 fn debugGpaRelease() void {
-    const leaks = debug_gpa_leak_check.release(&debug_gpa);
+    const leaks = debug_gpa_leak_check.release(&debug_gpa, !listener_lane.inCallbackChain());
     if (leaks > 0) std.debug.panic("-Ddebug-allocator: {d} allocation(s) still live after the last factory was destroyed", .{leaks});
 }
 
@@ -1613,16 +1619,29 @@ test "FactoryLeakCheck checks for leaks only when the last factory is released" 
     var gpa: FakeLeakDetector = .{ .live = 3 };
     check.retain();
     check.retain();
-    try std.testing.expectEqual(@as(usize, 0), check.release(&gpa));
+    try std.testing.expectEqual(@as(usize, 0), check.release(&gpa, true));
     try std.testing.expectEqual(@as(u32, 0), gpa.checks);
-    try std.testing.expectEqual(@as(usize, 3), check.release(&gpa));
+    try std.testing.expectEqual(@as(usize, 3), check.release(&gpa, true));
     try std.testing.expectEqual(@as(u32, 1), gpa.checks);
 
     // A factory created after the last one was destroyed starts a new count.
     gpa.live = 0;
     check.retain();
-    try std.testing.expectEqual(@as(usize, 0), check.release(&gpa));
+    try std.testing.expectEqual(@as(usize, 0), check.release(&gpa, true));
     try std.testing.expectEqual(@as(u32, 2), gpa.checks);
+}
+
+test "FactoryLeakCheck does not check a last factory released while frees are pending" {
+    var check: FactoryLeakCheck = .{};
+    var gpa: FakeLeakDetector = .{ .live = 1 };
+    check.retain();
+    try std.testing.expectEqual(@as(usize, 0), check.release(&gpa, false));
+    try std.testing.expectEqual(@as(u32, 0), gpa.checks);
+
+    // The count still dropped: the next factory is the only one.
+    check.retain();
+    try std.testing.expectEqual(@as(usize, 1), check.release(&gpa, true));
+    try std.testing.expectEqual(@as(u32, 1), gpa.checks);
 }
 
 test "FactoryLeakCheck finds no leaks on a DebugAllocator whose allocations were freed" {
@@ -1632,7 +1651,7 @@ test "FactoryLeakCheck finds no leaks on a DebugAllocator whose allocations were
     check.retain();
     const buf = try gpa.allocator().alloc(u8, 64);
     gpa.allocator().free(buf);
-    try std.testing.expectEqual(@as(usize, 0), check.release(&gpa));
+    try std.testing.expectEqual(@as(usize, 0), check.release(&gpa, true));
 }
 
 test "zzdds extension factory creates participant with generated default config" {
