@@ -234,5 +234,5 @@ See [typesupport libraries](typesupport-libraries.md) for ownership, build flags
 validation coverage and the exact supported scope. A runnable two-provider
 example checks separate-process UDP delivery and independent Fast DDS reception
 for keyed and keyless types using explicit XCDR1 QoS. Static provider registration
-can be built without OS dynamic loading. A PR-triggered and manually dispatchable native platform workflow uses
-the pinned release, with C ABI, retirement and UDP checks.
+can be built without OS dynamic loading. CI's `resources-typesupport` job runs native platform checks on every PR
+against the pinned release, with C ABI, retirement and UDP checks.

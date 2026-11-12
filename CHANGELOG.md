@@ -19,6 +19,10 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 - CI runs every lane on the shared runtime and drops the duplicate shared-runtime lanes;
   nothing tests the threaded implementation any more. The shared-runtime interop lane's
   packet capture goes with it.
+- CI's new `resources-typesupport` job tests loadable typesupport, resource construction,
+  authoring and provider bindings on every PR: Linux in Debug and ReleaseSafe, macOS and
+  Windows in ReleaseSafe, and Linux under ThreadSanitizer. It replaces the separate,
+  path-filtered typesupport-platforms and resource-construction workflows.
 - The example, integration-test and stress Zig apps build their own zzdds on the shared
   runtime by default. Their runner scripts pass `-Dshared-runtime=false` when
   `ZZDDS_SHARED_RUNTIME=0`, rather than `-Dshared-runtime=true` when it is `1`.

@@ -29,8 +29,8 @@ shared decoder by default, independently of the resource builder. An explicit
 
 For coordinated development, `-Dzidl-source=/absolute/path/to/zidl` still replaces
 generator, runtime and package sources together with one runtime module. It does not
-change the dependency manifest. Native PR CI tests the pinned release on Linux,
-macOS and Windows in Debug and ReleaseSafe, with Linux ThreadSanitizer checks.
+change the dependency manifest. CI's `resources-typesupport` job tests the pinned release on native Linux in
+Debug and ReleaseSafe and macOS and Windows in ReleaseSafe, with Linux ThreadSanitizer checks.
 Configured CI is separate from evidence of completed remote runs.
 
 ## Pipeline and ownership

@@ -196,6 +196,82 @@ jobs:
       # docs/design/ci-platform-coverage-expansion.md item 3 for the full
       # writeup and follow-up tracking.
 
+  # ── Resources and loadable typesupport ───────────────────────────────────
+  #
+  # The opt-in -Dtypesupport-library, -Dresource-construction and
+  # -Dresource-authoring features (docs/typesupport-libraries.md,
+  # docs/resource-construction.md, docs/resource-authoring.md,
+  # docs/resource-providers.md), compiled out of the default build the jobs
+  # above test. Linux runs Debug and ReleaseSafe; macOS and Windows run
+  # ReleaseSafe, what releases ship. A separate Linux leg runs their lifecycle
+  # tests under ThreadSanitizer.
+  resources-typesupport:
+    name: resources + typesupport / ${{ matrix.name }}
+    needs: test-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux x86_64 Debug, os: ubuntu-latest, optimize: Debug }
+          - { name: Linux x86_64 ReleaseSafe, os: ubuntu-latest, optimize: ReleaseSafe }
+          - { name: macOS ARM64 ReleaseSafe, os: macos-latest, optimize: ReleaseSafe }
+          - { name: Windows x86_64 ReleaseSafe, os: windows-latest, optimize: ReleaseSafe }
+          - { name: Linux x86_64 TSan, os: ubuntu-latest, optimize: Debug, tsan: true }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: "0.17.0"
+
+      - name: Allow inbound UDP (Windows)
+        if: runner.os == 'Windows'
+        run: netsh advfirewall firewall add rule name="zzdds-typesupport-udp" protocol=UDP dir=in action=allow
+
+      - name: "Typesupport libraries: native C ABI, linked providers, dynamic retirement and UDP"
+        if: ${{ !matrix.tsan }}
+        run: python scripts/check_typesupport_platform.py --optimize ${{ matrix.optimize }}
+
+      - name: "Resource construction: resolve, construct, exchange, cancel and clean up"
+        if: ${{ !matrix.tsan }}
+        run: zig build test-resource-construction -Dresource-construction=true -Doptimize=${{ matrix.optimize }} --summary all
+
+      - name: "Resource authoring: strict decoding, profiles and generated sample exchange"
+        if: ${{ !matrix.tsan }}
+        run: zig build test-resource-authoring -Dresource-authoring=true -Doptimize=${{ matrix.optimize }} --summary all
+
+      - name: Resource authoring with loadable typesupport
+        if: ${{ !matrix.tsan && runner.os == 'Linux' && matrix.optimize == 'Debug' }}
+        run: zig build test-resource-authoring -Dresource-authoring=true -Dtypesupport-library=true --summary all
+
+      - name: "Provider bindings: multiple libraries, pinned generations, checked writes and offline CLI"
+        if: ${{ !matrix.tsan }}
+        run: zig build test-resource-providers test-resource-inspect -Dresource-authoring=true -Dtypesupport-library=true -Doptimize=${{ matrix.optimize }} --summary all
+
+      - name: "Provider bindings: linked descriptors and compiled adapters without OS loading"
+        if: ${{ !matrix.tsan }}
+        run: zig build test-resource-providers -Dresource-construction=true -Dtypesupport-library=true -Dtypesupport-dynamic=false -Doptimize=${{ matrix.optimize }} --summary all
+
+      # As in the other TSan jobs.
+      - name: Reduce ASLR entropy for TSan
+        if: ${{ matrix.tsan }}
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Resource construction under ThreadSanitizer
+        if: ${{ matrix.tsan }}
+        run: zig build test-resource-construction -Dresource-construction=true -Dsanitize-thread=true --summary all
+
+      - name: Resource authoring and config under ThreadSanitizer
+        if: ${{ matrix.tsan }}
+        run: zig build test-resource-authoring -Dresource-authoring=true -Dsanitize-thread=true --summary all
+
+      - name: Provider preparation under ThreadSanitizer
+        if: ${{ matrix.tsan }}
+        run: zig build test-resource-providers -Dresource-construction=true -Dtypesupport-library=true -Dsanitize-thread=true --summary all
+
   # ── rmw_zzdds regression gate ────────────────────────────────────────────
   #
   # Builds zz-iot/rmw_zzdds (the experimental ROS 2 middleware backed by zzdds)
