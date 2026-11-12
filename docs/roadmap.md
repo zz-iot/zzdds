@@ -1053,8 +1053,7 @@ as a second option: during migration the runtime sits behind a temporary build o
 and the threaded path is deleted once the runtime replaces it
 ([migration](design/concurrency/runtime.md#migration-from-the-threaded-implementation),
 which also maps each of today's threads onto runtime timers or the transport adapter). Correctness
-(ordering, liveliness, teardown, no races) must be verified in both modes; today's TSan lane
-covers only the threaded model.
+(ordering, liveliness, teardown, no races) must be verified in both modes.
 
 Specified: the [concurrency and broker contracts](design/concurrency-broker-status.md)
 now define the behavioral baseline (take-turns participant/endpoint contexts, one shared
@@ -1064,8 +1063,8 @@ design items, implementation gates and acceptance criteria are listed in that in
 The runtime core is in `src/runtime/`: take-turns contexts, the ready queue
 ([publication handshake](design/concurrency/architecture.md#ready-queue-publication)),
 timers, the progress backend, the manual `drive` and hosted workers on `std.Io.Threaded`,
-and retirement. Participants use it only in a `-Dshared-runtime` build (a contributor
-migration switch, off by default): a factory may select the runtime, each participant holds
+and retirement. Participants use it in the default build (`-Dshared-runtime=false`, a
+contributor migration switch, selects the threaded path until it is deleted): a factory may select the runtime, each participant holds
 an owner reference, and creation fails for transports or discovery plugins that run their
 own threads (the in-process memory transport, direct discovery, RTPS discovery, UDP and
 TCP qualify so far). Received datagrams are copied into each participant's ingress context,
@@ -1152,13 +1151,11 @@ cancellation) or resource waits.
 The first vertical slice runs one reliable reader/writer pair through the same trace
 under a manual and a hosted driver: match, delivery, the acknowledgment and data waits, a
 missed deadline, and retirement begun from listeners, with the runtime's last owner
-deleted inside its own listener. CI runs the unit tests on the runtime too, plain and under
-ThreadSanitizer; tests that check delivery and listeners deterministically install a manual
-runtime they drive themselves (`test/support/manual_runtime.zig`). It runs the stress tests, rmw_zzdds and the interop
-suites on the runtime as well: interop against every vendor, and self-interop under
-ThreadSanitizer. Remaining work is implementation: those tests, the gaps above, then
-broader endpoint migration, thread consolidation onto the shared runtime timers,
-optional-profile builds and the measured latency/footprint work. The review-era
+deleted inside its own listener. The runtime is the default, and CI runs every lane on it
+and none on the threaded path; tests that check delivery and listeners deterministically
+install a manual runtime they drive themselves (`test/support/manual_runtime.zig`).
+Remaining work: delete the threaded path together with `-Dshared-runtime`, then the gaps
+above. The review-era
 synchronization prototype and bounded models stay on the `concurrency-broker-specs` branch
 (see the [evidence inventory](design/probes/README.md)). Advanced extension objects (explicit runtime owners/refs, listener groups, resource
 scopes) additionally depend on zidl's managed-reference/construction-only Config
@@ -1168,7 +1165,7 @@ support; the first shipped subset does not.
 
 Even a minimal two-participant setup runs several background threads. An embedded target
 needs a `DomainParticipant.drive(timeout)` that pumps transport polling + `checkTimers()`
-from the caller's loop with no threads spawned. In the `-Dshared-runtime` build the
+from the caller's loop with no threads spawned. On the shared runtime (the default) the
 readiness adapter in [transport adapters](design/concurrency/transport-adapters.md) now
 exists for UDP: a manual runtime over `PollBackend` runs a reliable pair over
 loopback UDP through `drive()` alone, with no thread started by zzdds, and hosted workers

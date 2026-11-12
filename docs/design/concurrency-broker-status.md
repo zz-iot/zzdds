@@ -69,8 +69,8 @@ local endpoints announced only after local publication, with disposal fencing ev
 announcement ([local endpoint publication, announcement and disposal](concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal));
 reader DATA_AVAILABLE reset by every read/take and claimed by on_data_available, as DDS
 specifies ([reader DATA_AVAILABLE reset](concurrency/listeners.md#reader-data-available-reset));
-the runtime replaces the threaded implementation, behind a temporary build option while
-endpoints migrate ([migration](concurrency/runtime.md#migration-from-the-threaded-implementation));
+the runtime replaces the threaded implementation, now the default, with a temporary build
+option selecting the threaded path until both are deleted ([migration](concurrency/runtime.md#migration-from-the-threaded-implementation));
 one transport contract implemented by readiness, completion, in-process and MCU adapters,
 with the runtime's wait supplied by the adapter and no thread per socket
 ([transport adapters](concurrency/transport-adapters.md)).

@@ -1237,6 +1237,39 @@ test "take_raw: proto_reader already tearing down (but not yet freed) fails clea
     dr.proto_reader.quiesceRelease();
 }
 
+test "DataReader: one its protocol reader pins past the participant's deletion has left the participant's listener group" {
+    // The protocol reader pins its DataReader while it lives. Pinned past the
+    // participant's deletion, the DataReader is freed after the participant
+    // and its listener group, so it must leave the group when it is deleted,
+    // not when it is freed.
+    const alloc = testing.allocator;
+    var mr: ManualRuntime = undefined;
+    mr.init();
+    defer mr.deinit();
+    var delivery = try IntraProcessDelivery.init(alloc);
+    defer delivery.deinit();
+    const t = try delivery.newTransport();
+    defer t.deinit();
+    const d = try delivery.newDiscovery();
+    defer d.deinit();
+    const factory = try DomainParticipantFactoryImpl.init(alloc, t.transport(), d.toDiscovery(), noop_security, .spec_random, .{});
+    defer factory.deinit();
+    const dp = factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
+    const topic = dp.create_topic("RdrVtPinned", "RdrVtType", .{}, null, 0);
+    const td = @as(*TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
+    const dr_dds = sub.create_datareader(td, .{}, nil.nil_dr_listener, 0);
+    mr.settle();
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    const protocol = dr.proto_reader;
+    try testing.expect(protocol.quiesceAcquire());
+    try testing.expectEqual(DDS.RETCODE_OK, dp.delete_contained_entities());
+    try testing.expectEqual(DDS.RETCODE_OK, factory.toDDSFactory().delete_participant(dp));
+    mr.settle();
+    // Frees the DataReader, after its participant.
+    protocol.quiesceRelease();
+}
+
 test "take_next_instance_raw: proto_reader already tearing down (but not yet freed) fails cleanly with ALREADY_DELETED" {
     // Coverage gap #1, rawReadOrTakeNextInstance's own copy of the same
     // guard (src/dcps/reader.zig ~L3438-3440).

@@ -100,7 +100,7 @@ invoke inherited listeners: the builder holds no mutex across those calls.
 A callback may request `cancel`, or call `destroy`, which requests cancellation
 and returns `ConstructionInProgress`. It never waits for its own constructor.
 Cancellation is checked after DDS calls; it does not interrupt one in progress.
-With the contributor `-Dshared-runtime=true` switch, listener callbacks run on
+Listener callbacks run on the shared runtime's
 queued lanes. A callback on another worker must send lifecycle requests to the
 instance's owner rather than calling this owner-serialized API concurrently.
 If a callback deletes the endpoint currently being created, #107's constructor
@@ -157,8 +157,8 @@ zig build test -Dresource-construction=true
 
 The focused target fails explicitly if its opt-in is omitted. The enabled tests
 also join the ordinary test step and emitted native test artifacts. TSan uses LLVM.
-The dedicated workflow runs native Debug/ReleaseSafe on Linux, Windows and macOS,
-plus Linux ThreadSanitizer and shared-runtime construction/authoring/provider checks.
+CI's `resources-typesupport` job runs them on every PR: native Linux in Debug and ReleaseSafe,
+macOS and Windows in ReleaseSafe, plus Linux ThreadSanitizer and authoring checks.
 Remote execution is separate evidence from local Linux checks.
 
 The [acceptance fixture](../test/dcps/resource_construction_test.zig) builds a static

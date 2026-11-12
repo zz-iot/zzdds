@@ -161,8 +161,8 @@ artifact hash during preparation. Tests also destroy the provider manager before
 constructing DDS entities and exchanging samples, proving preparation owns the
 references it needs.
 
-The provider CI matrix covers native Linux/macOS/Windows in Debug and ReleaseSafe,
-including static-only builds. Linux TSan instruments host preparation, loading,
+CI's `resources-typesupport` job covers native Linux in Debug and ReleaseSafe and macOS and
+Windows in ReleaseSafe, including static-only builds. Linux TSan instruments host preparation, loading,
 registration and DDS code. Its generated shared-library fixtures are uninstrumented:
 Zig currently bundles another sanitizer runtime into instrumented DSOs, and dlopen
 cannot allocate that runtime's initial-exec TLS. Their immutable synchronous wire

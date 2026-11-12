@@ -187,9 +187,9 @@ to use distinct immutable artifacts for replacement.
 Library artifacts are specific to OS/architecture: `.so`, `.dylib` or `.dll`. The C
 contract, callback calling convention and generation ownership stay shared. The
 Windows and macOS backends have compile/link checks locally; native behavior is
-not yet advertised as supported. The PR-triggered and manually dispatchable `typesupport-platforms.yml` CI workflow
-runs native Linux/macOS/Windows Debug and ReleaseSafe checks against the pinned
-zidl release. No separate zidl revision or checkout is required.
+not yet advertised as supported. CI's `resources-typesupport` job runs native checks
+against the pinned zidl release on every PR: Linux in Debug and ReleaseSafe, macOS and
+Windows in ReleaseSafe. No separate zidl revision or checkout is required.
 
 Run the same qualification locally:
 

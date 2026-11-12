@@ -149,8 +149,8 @@ trigger runs a heavier matrix (larger N, longer runs, `--large`). Following
 `examples-tsan`, ThreadSanitizer variants of every `lifecycle_churn` scenario run in that
 lane (`reentrant`, `listener` and `cft` each pin a data-race fix, see Findings).
 
-The job also runs all of that on a `-Dshared-runtime` build. To do the same locally, set
-`ZZDDS_SHARED_RUNTIME=1`, which makes each `run.py` build its app with that option. Set
+Set `ZZDDS_SHARED_RUNTIME=0` to build each `run.py` app with `-Dshared-runtime=false`
+(the threaded path, being deleted), matching zzdds libraries built that way. Set
 `ZZDDS_TEST_LOG_STUCK_STACKS=1` to log the stacks of a process that outlives its timeout.
 
 `ZZDDS_DEBUG_ALLOCATOR=1`, which CI sets, makes each `run.py` build its app's zzdds with

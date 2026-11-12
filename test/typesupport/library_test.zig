@@ -50,6 +50,31 @@ const Side = struct {
     }
 };
 
+/// Takes `out.len` samples from `reader`, waiting up to 10 s for each. On the
+/// shared runtime the memory transport delivers on a runtime worker, after
+/// `write` has returned.
+fn takeSamples(reader: DDS.DataReader, out: []zzdds.dcps.TakenSample) !void {
+    const impl: *zzdds.dcps.DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const ws = try zzdds.dcps.WaitSetImpl.init(testing.allocator);
+    defer ws.deinit();
+    const condition = reader.create_readcondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    defer _ = reader.delete_readcondition(condition);
+    const waitset = ws.toDDSWaitSet();
+    try testing.expectEqual(DDS.RETCODE_OK, waitset.attach_condition(condition.as_Condition()));
+    defer _ = waitset.detach_condition(condition.as_Condition());
+    var n: usize = 0;
+    errdefer for (out[0..n]) |taken| testing.allocator.free(taken.data);
+    const timeout: DDS.Duration_t = .{ .sec = 10, .nanosec = 0 };
+    while (n < out.len) {
+        var triggered: DDS.ConditionSeq = .{};
+        defer if (triggered._release) {
+            if (triggered._buffer) |b| testing.allocator.free(b[0..triggered._length]);
+        };
+        if (waitset.vtable.wait(waitset.ptr, &triggered, &timeout) != DDS.RETCODE_OK) return error.NoSample;
+        while (n < out.len) : (n += 1) out[n] = impl.takeRaw() orelse break;
+    }
+}
+
 test "candidate publication, immutable generations and bounded retirement" {
     var m = try ts.Manager.init(testing.allocator, 4);
     defer m.deinit();
@@ -162,13 +187,14 @@ test "registered providers survive removal, validate writes and preserve keyed i
     var wrong_rep = sample;
     wrong_rep[1] = 7;
     try testing.expectError(error.UnsupportedRepresentation, registration.write(writer, .alive, &wrong_rep));
-    const impl: *zzdds.dcps.DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
-    const first = impl.takeRaw() orelse return error.NoSample;
-    defer testing.allocator.free(first.data);
-    const next = impl.takeRaw() orelse return error.NoSample;
-    defer testing.allocator.free(next.data);
+    var taken: [2]zzdds.dcps.TakenSample = undefined;
+    try takeSamples(reader, &taken);
+    defer for (taken) |t| testing.allocator.free(t.data);
+    const first = taken[0];
+    const next = taken[1];
     try testing.expect(first.info.instance_handle != next.info.instance_handle);
     try testing.expectEqualSlices(u8, &sample, first.data);
+    const impl: *zzdds.dcps.DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     try testing.expect(impl.takeRaw() == null);
     // Old registration cannot be overwritten through the legacy/native API.
     const Cleanup = struct {

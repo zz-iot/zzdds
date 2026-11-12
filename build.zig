@@ -389,11 +389,13 @@ pub fn build(b: *std.Build) void {
     const xtypes = b.option(bool, "xtypes", "Include partial DDS-XTypes support: DataRepresentationQosPolicy and optional PID_TYPE_INFORMATION in SEDP; no TypeLookup service (default: true)") orelse true;
     const content_subscription_profile = b.option(bool, "content-subscription-profile", "Enable Content-Subscription profile parser/evaluator for ContentFilteredTopic and QueryCondition; MultiTopic not implemented (DDS v1.4 Annex A, default: true)") orelse true;
     // Contributor-only migration switch (docs/design/concurrency/runtime.md#coexistence-during-migration):
-    // participants run on the shared runtime. Deleted with the threaded path.
-    const shared_runtime = b.option(bool, "shared-runtime", "Contributors only: run participants on the shared runtime (migration in progress; default: false)") orelse false;
+    // participants run on the shared runtime, the default; false selects the
+    // threaded path. Deleted with the threaded path.
+    const shared_runtime = b.option(bool, "shared-runtime", "Contributors only: false selects the threaded path, which is being deleted (default: true)") orelse true;
 
     // `build_options_shared_runtime` is the same set with the switch on, for
     // the shared-runtime tests, which run in every build while it exists.
+    // With the switch on they reuse the main library graph instead.
     // `build_options_lib` is `build_options` for libzzdds itself, which alone
     // may compile the codec's C ABI in (see cdr_exports_in_library below).
     const build_options = b.addOptions();
@@ -1752,31 +1754,34 @@ pub fn build(b: *std.Build) void {
         }).step);
     }
 
-    // Shared-runtime build tests: a second library graph with the migration
-    // switch on, so `test` covers both settings while the switch exists
-    // (docs/design/concurrency/runtime.md#coexistence-during-migration).
-    const zzdds_mod_shared_runtime = b.createModule(.{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "zidl_cdr", .module = runtime.codec },
-            .{ .name = "zidl_bindings", .module = runtime.bindings },
-            .{ .name = "zzdds_generated", .module = generated_dcps_mod },
-            .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod },
-            .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod },
-        },
-    });
-    zzdds_mod_shared_runtime.addOptions("build_options", build_options_shared_runtime);
-    if (resource_authoring_source) |source| zzdds_mod_shared_runtime.addImport("resource_authoring_generated", b.createModule(.{
-        .root_source_file = source,
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{ .{ .name = "zidl_cdr", .module = runtime.codec }, .{ .name = "zidl_bindings", .module = runtime.bindings } },
-    }));
-    if (typesupport_enabled) zzdds_mod_shared_runtime.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target, optimize, runtime.codec));
-    zzdds_mod_shared_runtime.link_libc = true;
-    if (need_c_abi) linkCdr(zzdds_mod_shared_runtime, cdr_lib.?);
+    // Shared-runtime build tests: they need the migration switch on, so a
+    // -Dshared-runtime=false build gives them a second library graph with it
+    // on (docs/design/concurrency/runtime.md#coexistence-during-migration).
+    const zzdds_mod_shared_runtime = if (shared_runtime) zzdds_mod else blk: {
+        const m = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zidl_cdr", .module = runtime.codec },
+                .{ .name = "zidl_bindings", .module = runtime.bindings },
+                .{ .name = "zzdds_generated", .module = generated_dcps_mod },
+                .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod },
+                .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod },
+            },
+        });
+        m.addOptions("build_options", build_options_shared_runtime);
+        if (resource_authoring_source) |source| m.addImport("resource_authoring_generated", b.createModule(.{
+            .root_source_file = source,
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{ .{ .name = "zidl_cdr", .module = runtime.codec }, .{ .name = "zidl_bindings", .module = runtime.bindings } },
+        }));
+        if (typesupport_enabled) m.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target, optimize, runtime.codec));
+        m.link_libc = true;
+        if (need_c_abi) linkCdr(m, cdr_lib.?);
+        break :blk m;
+    };
     const shared_runtime_test_files = [_][]const u8{
         "test/runtime/shared_runtime_test.zig",
         "test/runtime/readiness_test.zig",
@@ -2290,31 +2295,34 @@ pub fn build(b: *std.Build) void {
         }).step);
     }
 
-    // Shared-runtime build tests, on their own library graph with the
-    // migration switch on, as in `test`: without them coverage misses the
-    // listener lanes and most of the runtime core.
-    const zzdds_mod_llvm_safe_shared_runtime = b.createModule(.{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target_llvm_safe,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "zidl_cdr", .module = runtime_llvm_safe.codec },
-            .{ .name = "zidl_bindings", .module = runtime_llvm_safe.bindings },
-            .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
-            .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod_llvm_safe },
-            .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod_llvm_safe },
-        },
-    });
-    zzdds_mod_llvm_safe_shared_runtime.addOptions("build_options", build_options_shared_runtime);
-    if (resource_authoring_source) |source| zzdds_mod_llvm_safe_shared_runtime.addImport("resource_authoring_generated", b.createModule(.{
-        .root_source_file = source,
-        .target = target_llvm_safe,
-        .optimize = optimize,
-        .imports = &.{ .{ .name = "zidl_cdr", .module = runtime_llvm_safe.codec }, .{ .name = "zidl_bindings", .module = runtime_llvm_safe.bindings } },
-    }));
-    if (typesupport_enabled) zzdds_mod_llvm_safe_shared_runtime.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target_llvm_safe, optimize, runtime_llvm_safe.codec));
-    zzdds_mod_llvm_safe_shared_runtime.link_libc = true;
-    if (need_c_abi) linkCdr(zzdds_mod_llvm_safe_shared_runtime, cdr_lib_llvm_safe.?);
+    // Shared-runtime build tests, with the migration switch on as in `test`
+    // (a second library graph on a -Dshared-runtime=false build): without
+    // them coverage misses the listener lanes and most of the runtime core.
+    const zzdds_mod_llvm_safe_shared_runtime = if (shared_runtime) zzdds_mod_llvm_safe else blk: {
+        const m = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target_llvm_safe,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zidl_cdr", .module = runtime_llvm_safe.codec },
+                .{ .name = "zidl_bindings", .module = runtime_llvm_safe.bindings },
+                .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
+                .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod_llvm_safe },
+                .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod_llvm_safe },
+            },
+        });
+        m.addOptions("build_options", build_options_shared_runtime);
+        if (resource_authoring_source) |source| m.addImport("resource_authoring_generated", b.createModule(.{
+            .root_source_file = source,
+            .target = target_llvm_safe,
+            .optimize = optimize,
+            .imports = &.{ .{ .name = "zidl_cdr", .module = runtime_llvm_safe.codec }, .{ .name = "zidl_bindings", .module = runtime_llvm_safe.bindings } },
+        }));
+        if (typesupport_enabled) m.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target_llvm_safe, optimize, runtime_llvm_safe.codec));
+        m.link_libc = true;
+        if (need_c_abi) linkCdr(m, cdr_lib_llvm_safe.?);
+        break :blk m;
+    };
     for (shared_runtime_test_files) |src| {
         const t = b.addTest(.{
             .name = std.fs.path.stem(src),
@@ -2445,31 +2453,34 @@ pub fn build(b: *std.Build) void {
         tsan_step.dependOn(&b.addRunArtifact(t).step);
     }
 
-    // Shared-runtime build tests (TSan)
-    const zzdds_mod_tsan_shared_runtime = b.createModule(.{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .sanitize_thread = true,
-        .imports = &.{
-            .{ .name = "zidl_cdr", .module = runtime_tsan.codec },
-            .{ .name = "zidl_bindings", .module = runtime_tsan.bindings },
-            .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
-            .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod_tsan },
-            .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod_tsan },
-        },
-    });
-    zzdds_mod_tsan_shared_runtime.addOptions("build_options", build_options_shared_runtime);
-    if (resource_authoring_source) |source| zzdds_mod_tsan_shared_runtime.addImport("resource_authoring_generated", b.createModule(.{
-        .root_source_file = source,
-        .target = target,
-        .optimize = optimize,
-        .sanitize_thread = true,
-        .imports = &.{ .{ .name = "zidl_cdr", .module = runtime_tsan.codec }, .{ .name = "zidl_bindings", .module = runtime_tsan.bindings } },
-    }));
-    if (typesupport_enabled) zzdds_mod_tsan_shared_runtime.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target, optimize, runtime_tsan.codec));
-    zzdds_mod_tsan_shared_runtime.link_libc = true;
-    if (need_c_abi) linkCdr(zzdds_mod_tsan_shared_runtime, cdr_lib_tsan.?);
+    // Shared-runtime build tests (TSan), as in `test`
+    const zzdds_mod_tsan_shared_runtime = if (shared_runtime) zzdds_mod_tsan else blk: {
+        const m = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = true,
+            .imports = &.{
+                .{ .name = "zidl_cdr", .module = runtime_tsan.codec },
+                .{ .name = "zidl_bindings", .module = runtime_tsan.bindings },
+                .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
+                .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod_tsan },
+                .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod_tsan },
+            },
+        });
+        m.addOptions("build_options", build_options_shared_runtime);
+        if (resource_authoring_source) |source| m.addImport("resource_authoring_generated", b.createModule(.{
+            .root_source_file = source,
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = true,
+            .imports = &.{ .{ .name = "zidl_cdr", .module = runtime_tsan.codec }, .{ .name = "zidl_bindings", .module = runtime_tsan.bindings } },
+        }));
+        if (typesupport_enabled) m.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target, optimize, runtime_tsan.codec));
+        m.link_libc = true;
+        if (need_c_abi) linkCdr(m, cdr_lib_tsan.?);
+        break :blk m;
+    };
     var tsan_dcps_test_domain: u32 = 1;
     for (shared_runtime_test_files) |src| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
