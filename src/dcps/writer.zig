@@ -761,6 +761,18 @@ pub const DataWriterImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
+        // A reader is reported ready after its match: the participant raises
+        // the match only once its match job ends, which a BEST_EFFORT match,
+        // or a RELIABLE handshake on another executor, can beat. Raised here
+        // while still pending, the match queues ahead of the ready event on
+        // this writer's listener lane, and the participant's raise then finds
+        // it claimed.
+        if (ready) {
+            self.mu.lock();
+            const match_pending = self.status_changes & DDS.PUBLICATION_MATCHED_STATUS != 0;
+            self.mu.unlock();
+            if (match_pending) self.raise(DDS.PUBLICATION_MATCHED_STATUS);
+        }
         const event: listener_lane.ReadyEvent = .{ .guid = reader_guid, .ready = ready };
         if (!self.listeners.postReady(event)) dispatchReadyFn(self, event);
     }
