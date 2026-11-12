@@ -10,15 +10,13 @@ where each thread below went.
 
 ## Current Thread Ownership
 
-The default UDP/SPDP path is multi-threaded:
+Started without a runtime, these components still start threads of their own:
 
-- `UdpTransport` owns one receive thread per active socket/port.
 - `SpdpSedpDiscovery` owns an SPDP timer thread for periodic participant
   announcements and lease checks.
 - `DomainParticipantImpl` owns a timer thread (`timerThreadFn`) that periodically
   calls `checkTimers()` to enforce DEADLINE and LIVELINESS QoS.
 - `StatefulWriter` starts a heartbeat thread when the first matched reader is added.
-- The polling `InterfaceMonitor` owns a polling thread when interface monitoring is enabled.
 - `trace.AsyncRingSink` owns an optional flush thread when the application starts it;
   without one, the application drains it with `flush()`.
 
@@ -26,6 +24,9 @@ The default UDP/SPDP path is multi-threaded:
 deadline/liveliness status updates. In the default path the participant's own timer
 thread drives it; `ManualClock` tests call it directly instead. An embedded/single-threaded
 build would drive it from the application loop (see "Single-Threaded Direction" below).
+
+`UdpTransport` starts no thread: its sockets are sources on its runtime's backend, which
+it must be attached to before it listens.
 
 Listener callbacks may run on transport receive threads in the live UDP path. With
 `MemoryTransport` + `DirectDiscovery`, callbacks happen synchronously on the caller's

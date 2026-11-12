@@ -5,8 +5,9 @@
 //!   Multicast: one socket per (logical_port, address_family), bound to INADDR_ANY,
 //!              with group memberships per interface.
 //!
-//! Threading: one receive thread per active socket (unicast or multicast).
-//! Threads poll with a 50 ms timeout so they notice the stopping flag promptly.
+//! Receiving: every socket (unicast or multicast) is a source on the progress
+//! backend the transport is attached to (`attach_backend`), serviced by its
+//! runtime. No thread is started.
 //!
 //! Live socket set: an InterfaceMonitor fires a callback when interfaces change;
 //! the transport diffs the address list and adds/removes sockets, then invokes
@@ -77,6 +78,7 @@ const poll_backend = @import("../runtime/poll_backend.zig");
 const sock = @import("../util/sock.zig");
 const MAX_GATHER = @import("../rtps/message/builder.zig").MAX_IOVECS;
 const runtime_mod = @import("../runtime/core.zig");
+const rt_testing = @import("../runtime/testing.zig");
 const CloseLatch = @import("../runtime/close_latch.zig").CloseLatch;
 const schema = @import("../config/schema.zig");
 const polling = @import("monitor/polling.zig");
@@ -146,10 +148,6 @@ fn socketSendMsg(fd: posix.socket_t, iovecs: []const IoVec, addr: *const posix.s
     return .completed;
 }
 
-fn socketRecvFrom(fd: posix.socket_t, buf: []u8, src: *posix.sockaddr, src_len: *posix.socklen_t) !usize {
-    return socketRecvFromFlags(fd, buf, src, src_len, 0);
-}
-
 fn socketRecvFromFlags(fd: posix.socket_t, buf: []u8, src: *posix.sockaddr, src_len: *posix.socklen_t, flags: u32) !usize {
     const n = c.recvfrom(fd, buf.ptr, buf.len, flags, src, src_len);
     if (n < 0) return switch (sock.lastError()) {
@@ -194,7 +192,7 @@ test "a failed receive reports the OS's error code" {
     var buf: [1]u8 = undefined;
     var src: posix.sockaddr.storage = undefined;
     var src_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-    try std.testing.expectError(error.RecvFailed, socketRecvFrom(fd, &buf, @ptrCast(&src), &src_len));
+    try std.testing.expectError(error.RecvFailed, socketRecvFromFlags(fd, &buf, @ptrCast(&src), &src_len, 0));
     try std.testing.expect(sock.lastErrorCode() != 0);
 }
 
@@ -221,24 +219,6 @@ fn allowAddrReuse(fd: posix.socket_t) !void {
     if (comptime builtin.os.tag.isDarwin())
         try sockOptInt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, 1);
 }
-
-// ── Windows WSAPoll wrapper ───────────────────────────────────────────────────
-// posix.pollfd and posix.POLL are broken on Windows in Zig 0.16.0 (ws2_32.zig
-// does not declare pollfd or POLL). Use WSAPoll directly on Windows.
-const WinPoll = if (builtin.os.tag == .windows) struct {
-    const WSAPOLLFD = extern struct {
-        fd: usize, // Windows SOCKET = UINT_PTR; @intFromPtr(posix.socket_t) gives this
-        events: i16,
-        revents: i16,
-    };
-    const POLLIN: i16 = 0x0300; // POLLRDNORM | POLLRDBAND
-
-    extern "ws2_32" fn WSAPoll(
-        fdArray: [*]WSAPOLLFD,
-        fds: std.os.windows.ULONG,
-        timeout: c_int,
-    ) callconv(.winapi) c_int;
-} else struct {};
 
 // ── IP address parsing ────────────────────────────────────────────────────────
 // Pure Zig parsers via std.Io.net — no libc/Winsock dependency (inet_pton
@@ -276,21 +256,14 @@ const SocketEntry = struct {
     /// For unicast: the interface IP this socket is bound to (Locator layout).
     /// For multicast: zeroes (INADDR_ANY / IN6ADDR_ANY).
     bound_ip: [16]u8,
-    stopping: std.atomic.Value(bool),
     /// Set once an unexpected receive error on this socket has been reported.
     recv_error_reported: std.atomic.Value(bool) = .init(false),
-    /// What receives on the socket: its own thread, or the backend the
-    /// transport is attached to (UdpTransport.backend).
-    receiver: union(enum) {
-        none,
-        thread: std.Thread,
-        source: Source,
-    } = .none,
+    /// The socket's source on the backend the transport is attached to
+    /// (UdpTransport.backend), once it receives.
+    receiver: ?Source = null,
     transport: *UdpTransport,
-    // Cached here so recvThread never needs to acquire transport.mu.
-    // Eliminates a deadlock: vtUnlisten holds mu while calling thread.join(),
-    // and if recvThread were acquiring mu to look up port_entries, it would
-    // block indefinitely.
+    // Cached here so servicing the socket never needs transport.mu, which
+    // vtUnlisten holds while it unregisters the source.
     handler: ReceiveHandler,
     /// Guards `closed` + the actual close() syscall against a concurrent
     /// sendOnChannel — mirrors TcpConnection.send_mu, adapted to UDP's
@@ -298,63 +271,41 @@ const SocketEntry = struct {
     /// this lock to avoid writing to `fd` after it's been closed and the
     /// number possibly reused by the OS for an unrelated socket, not to
     /// serialize datagram writes against each other (sendto() is already
-    /// atomic per-call at the OS level). Never acquired from recvThread.
+    /// atomic per-call at the OS level). Never acquired while servicing.
     send_mu: mutex_mod.Mutex = .{},
     /// True once this entry's fd has been closed. Mirrors TcpConnection.fd_open
     /// (inverted sense) — checked by sendOnChannel before writing, since a
     /// send that acquired the channel just before retirement still holds
-    /// the entry. Guarded by send_mu. Set exactly once, by joinAndClose.
+    /// the entry. Guarded by send_mu. Set exactly once, by stop.
     closed: bool = false,
     /// This socket's slot in UdpTransport.channels, set before it starts
     /// receiving and handed to every on_receive.
     channel: Channel = Channel.none,
 
-    /// Signal the recv thread to stop, without waiting for it to exit. Safe to
-    /// call on any number of sockets before joining any of them — letting every
-    /// thread observe the flag concurrently means the subsequent joins are each
-    /// bounded by the slowest thread's remaining poll wait, not by their sum.
-    fn requestStop(self: *SocketEntry) void {
-        self.stopping.store(true, .release);
-    }
-
-    /// Wait for the recv thread to exit (already signaled via `requestStop`),
-    /// close the socket, and mark it closed. Call `requestStop` on every
-    /// socket being torn down first; see that method's comment. Does NOT
-    /// notify on_channel_closed — that only fires when the entry is retired
-    /// (see UdpTransport.retireSocketLocked), not on every stop() (e.g. a
-    /// socket that failed to finish opening).
-    fn joinAndClose(self: *SocketEntry) void {
-        switch (self.receiver) {
-            .none => {},
-            .thread => |t| t.join(),
-            .source => |*src| self.transport.backend.?.unregister(src),
-        }
-        self.receiver = .none;
+    /// Unregisters the socket from the backend, closes it, and marks it
+    /// closed. Does NOT notify on_channel_closed — that only fires when the
+    /// entry is retired (see UdpTransport.retireSocketLocked), not on every
+    /// stop() (e.g. a socket that failed to finish opening).
+    fn stop(self: *SocketEntry) void {
+        if (self.receiver) |*src| self.transport.backend.?.unregister(src);
+        self.receiver = null;
         self.send_mu.lock();
         defer self.send_mu.unlock();
         socketClose(self.fd);
         self.closed = true;
     }
 
-    fn stop(self: *SocketEntry) void {
-        self.requestStop();
-        self.joinAndClose();
-    }
-
-    /// Starts receiving: registers the socket with the transport's backend
-    /// when it has one, otherwise starts its receive thread. Under the
-    /// transport's `mu`.
+    /// Starts receiving: registers the socket with the transport's backend.
+    /// Fails without one: attach the transport to a runtime's backend first.
+    /// Under the transport's `mu`.
     fn start(self: *SocketEntry) !void {
-        if (self.transport.backend) |b| {
-            if (builtin.os.tag == .windows) try sock.setNonblocking(self.fd);
-            self.receiver = .{ .source = .{ .handle = self.fd, .ctx = self, .service = serviceSource } };
-            b.register(&self.receiver.source) catch |err| {
-                self.receiver = .none;
-                return err;
-            };
-            return;
-        }
-        self.receiver = .{ .thread = try std.Thread.spawn(.{}, recvThread, .{self}) };
+        const b = self.transport.backend orelse return error.NoProgressBackend;
+        if (builtin.os.tag == .windows) try sock.setNonblocking(self.fd);
+        self.receiver = .{ .handle = self.fd, .ctx = self, .service = serviceSource };
+        b.register(&self.receiver.?) catch |err| {
+            self.receiver = null;
+            return err;
+        };
     }
 };
 
@@ -489,7 +440,7 @@ fn selfDebtForPortEntry(pe: *PortEntry) usize {
 /// datagram is dispatched to all registered handlers.
 ///
 /// Lock ordering: transport.mu → PortEntry.mu (never reversed).
-/// recvThread only acquires PortEntry.mu, never transport.mu.
+/// Servicing a socket only acquires PortEntry.mu, never transport.mu.
 const PortEntry = struct {
     mu: mutex_mod.Mutex,
     handlers: std.ArrayListUnmanaged(ReceiveHandler),
@@ -644,7 +595,6 @@ const PortEntry = struct {
 // ── Receive buffer ────────────────────────────────────────────────────────────
 
 const RECV_BUF = 65_536;
-const POLL_TIMEOUT_MS: i32 = 50;
 
 // ── UdpTransport ─────────────────────────────────────────────────────────────
 
@@ -835,13 +785,11 @@ pub const UdpTransport = struct {
         if (mon) |m| {
             self.monitor = m;
         } else {
-            // PollingMonitor.vtStart enumerates interfaces once at startup,
-            // and interval_ms = 0 is its sentinel for "no periodic re-poll
-            // thread": the shared runtime starts no thread, so the transport
-            // re-polls on runtime timers instead (startIfacePollLocked), when
-            // build_opts.interface_monitor is on.
+            // PollingMonitor enumerates interfaces once at startup. The
+            // transport re-polls them on runtime timers
+            // (startIfacePollLocked) when build_opts.interface_monitor is on.
             const pm = try alloc.create(polling.PollingMonitor);
-            pm.* = polling.PollingMonitor.init(alloc, 0);
+            pm.* = polling.PollingMonitor.init(alloc);
             self.monitor = pm.monitor();
             owned_pm = pm;
         }
@@ -888,11 +836,8 @@ pub const UdpTransport = struct {
         if (self.owned_send_fd_v4 != INVALID_SOCKET) socketClose(self.owned_send_fd_v4);
         if (self.owned_send_fd_v6 != INVALID_SOCKET) socketClose(self.owned_send_fd_v6);
 
-        // Signal every recv thread before joining any of them (see
-        // SocketEntry.requestStop) so N sockets cost one bounded wait, not N.
-        for (self.sockets.items) |s| s.requestStop();
         for (self.sockets.items) |s| {
-            s.joinAndClose();
+            s.stop();
             // Nothing sends on a channel while the transport closes.
             self.alloc.destroy(self.channels.close(s.channel).?);
         }
@@ -1011,7 +956,6 @@ pub const UdpTransport = struct {
             .kind = .unicast,
             .addr_kind = addr_kind,
             .bound_ip = bound_ip,
-            .stopping = std.atomic.Value(bool).init(false),
             .transport = self,
             .handler = handler,
         };
@@ -1075,10 +1019,9 @@ pub const UdpTransport = struct {
     /// The caller must drain `pending` via firePendingClosures after
     /// releasing `mu`.
     ///
-    /// Caller must hold `mu` and must have already called `s.requestStop()`,
-    /// and must not touch `s` again after this returns.
+    /// Caller must hold `mu` and must not touch `s` again after this returns.
     fn retireSocketLocked(self: *Self, s: *SocketEntry, pending: *std.ArrayListUnmanaged(PendingClosure)) void {
-        s.joinAndClose(); // joins the recv thread, closes the fd, sets s.closed
+        s.stop(); // unregisters the source, closes the fd, sets s.closed
         if (self.port_entries.get(s.port)) |pe| {
             pe.appendClosureRecipientsInto(pending, self.alloc, s.channel);
         }
@@ -1086,12 +1029,6 @@ pub const UdpTransport = struct {
     }
 
     fn removeUnicastSockets(self: *Self, ip: [16]u8, port: u32, pending: *std.ArrayListUnmanaged(PendingClosure)) void {
-        // Signal before joining (see SocketEntry.requestStop) — same rationale
-        // as removeSockets, kept consistent even though this usually matches
-        // at most one socket.
-        for (self.sockets.items) |s| {
-            if (s.kind == .unicast and s.port == port and std.mem.eql(u8, &s.bound_ip, &ip)) s.requestStop();
-        }
         var i: usize = self.sockets.items.len;
         while (i > 0) {
             i -= 1;
@@ -1117,7 +1054,6 @@ pub const UdpTransport = struct {
             .kind = .multicast,
             .addr_kind = addr_kind,
             .bound_ip = std.mem.zeroes([16]u8),
-            .stopping = std.atomic.Value(bool).init(false),
             .transport = self,
             .handler = handler,
         };
@@ -1131,14 +1067,6 @@ pub const UdpTransport = struct {
     }
 
     fn removeSockets(self: *Self, port: u32, pending: *std.ArrayListUnmanaged(PendingClosure)) void {
-        // Signal every matching socket's recv thread before joining any of
-        // them (see SocketEntry.requestStop) so tearing down a port with N
-        // bound sockets (one per active interface, plus the explicit loopback
-        // bind — see vtListen) costs one bounded poll wait, not N sequential
-        // ones. This was previously the dominant cost in participant teardown.
-        for (self.sockets.items) |s| {
-            if (s.port == port) s.requestStop();
-        }
         var i: usize = self.sockets.items.len;
         while (i > 0) {
             i -= 1;
@@ -1642,6 +1570,9 @@ pub const UdpTransport = struct {
             .udp_v6 => |u| u.port,
             else => return error.UnsupportedLocatorKind,
         };
+        // Its sockets receive only as sources on a backend; each failing to
+        // open would be logged and skipped, leaving nothing receiving.
+        if (self.backend == null) return error.NoProgressBackend;
         const r = try self.port_entries.getOrPut(self.alloc, port);
         if (r.found_existing) {
             // Port already has sockets — just add the new handler to the fan-out list.
@@ -2137,9 +2068,9 @@ const udp_vtable = Transport.Vtable{
 // ── Receiving on the backend ──────────────────────────────────────────────────
 
 /// Source.service for a socket on the backend: receives what is queued now,
-/// without blocking, into this executor's buffer, and dispatches it as
-/// recvThread does. The handlers (on the shared runtime, each participant's
-/// ingress) copy what they keep.
+/// without blocking, into this executor's buffer, and dispatches it to the
+/// socket's handler. The handlers (each participant's ingress) copy what they
+/// keep.
 fn serviceSource(ctx: *anyopaque, budget: u32) u32 {
     const entry: *SocketEntry = @ptrCast(@alignCast(ctx));
     var buf: [RECV_BUF]u8 = undefined;
@@ -2172,89 +2103,11 @@ fn serviceSource(ctx: *anyopaque, budget: u32) u32 {
     return handled;
 }
 
-// ── Receive thread ────────────────────────────────────────────────────────────
-
 /// Reports an unexpected receive error once per socket: one that persists
 /// would otherwise repeat for as long as the socket lives.
 fn reportRecvError(entry: *SocketEntry, os_error: i32) void {
     if (entry.recv_error_reported.swap(true, .monotonic)) return;
     log.transport.warn("udp: receive error on port {d}: OS error {d}", .{ entry.port, os_error });
-}
-
-/// Reports `recvThread` ending while its socket is still in use: nothing
-/// receives on the socket from then on, so a peer's traffic to it is lost.
-fn reportRecvThreadExit(entry: *const SocketEntry, os_error: i32) void {
-    if (entry.stopping.load(.acquire)) return;
-    log.transport.warn("udp: receive thread for port {d} stopped: OS error {d}; this socket no longer receives", .{ entry.port, os_error });
-}
-
-/// As `reportRecvThreadExit`, for a poll that reported only `revents`, which
-/// carry no OS error code.
-fn reportRecvThreadPollExit(entry: *const SocketEntry, revents: i16) void {
-    if (entry.stopping.load(.acquire)) return;
-    log.transport.warn("udp: receive thread for port {d} stopped: poll events 0x{x}; this socket no longer receives", .{ entry.port, @as(u16, @bitCast(revents)) });
-}
-
-fn recvThread(entry: *SocketEntry) void {
-    var buf: [RECV_BUF]u8 = undefined;
-    var src_store: posix.sockaddr.storage = undefined;
-    var src_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-
-    outer: while (!entry.stopping.load(.acquire)) {
-        if (comptime builtin.os.tag == .windows) {
-            var pfds = [1]WinPoll.WSAPOLLFD{.{
-                .fd = @intFromPtr(entry.fd),
-                .events = WinPoll.POLLIN,
-                .revents = 0,
-            }};
-            const n = WinPoll.WSAPoll(&pfds, 1, POLL_TIMEOUT_MS);
-            if (n <= 0) continue :outer;
-            if (pfds[0].revents & WinPoll.POLLIN == 0) {
-                // POLLERR on a UDP socket is WSAECONNRESET (ICMP Port Unreachable
-                // from a prior send).  Drain the pending error so WSAPoll does not
-                // keep returning POLLERR on subsequent calls, then keep listening.
-                src_len = @sizeOf(posix.sockaddr.storage);
-                _ = socketRecvFrom(entry.fd, &buf, @ptrCast(&src_store), &src_len) catch |err| {
-                    if (err != error.ConnectionResetByPeer) reportRecvError(entry, sock.lastErrorCode());
-                };
-                continue :outer;
-            }
-        } else {
-            var pfds = [1]posix.pollfd{.{
-                .fd = entry.fd,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            }};
-            const n_ready = posix.poll(&pfds, POLL_TIMEOUT_MS) catch {
-                reportRecvThreadExit(entry, sock.lastErrorCode());
-                break :outer;
-            };
-            if (n_ready == 0) continue :outer;
-            if (pfds[0].revents & posix.POLL.IN == 0) {
-                reportRecvThreadPollExit(entry, pfds[0].revents);
-                break :outer;
-            }
-        }
-
-        src_len = @sizeOf(posix.sockaddr.storage);
-        const n = socketRecvFrom(
-            entry.fd,
-            &buf,
-            @ptrCast(&src_store),
-            &src_len,
-        ) catch |err| {
-            if (err == error.WouldBlock or err == error.Interrupted) continue;
-            // On Windows, WSAECONNRESET (ICMP Port Unreachable from a prior send)
-            // can surface here when the OS presents it as readable data rather than
-            // POLLERR.  It is non-fatal for a UDP socket; keep listening.
-            if (err == error.ConnectionResetByPeer) continue;
-            reportRecvThreadExit(entry, sock.lastErrorCode());
-            break;
-        };
-
-        const src_loc = sockaddrToLocator(@ptrCast(&src_store));
-        entry.handler.on_receive(entry.handler.ctx, buf[0..n], src_loc, entry.channel);
-    }
 }
 
 fn sockaddrToLocator(addr: *const posix.sockaddr) Locator {
@@ -2496,12 +2349,16 @@ test "fan-out port dispatch delivers to all registered handlers" {
     const alloc = std.testing.allocator;
     // bind_wildcard = true → single 0.0.0.0 socket; receives loopback traffic.
     // Fixed participant_id avoids TOCTOU races and port re-use between test runs.
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{
         .participant_id = 199,
         .bind_wildcard = true,
         .ipv6_enabled = false,
     }, 0, null);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
 
     // The metatraffic unicast port for domain 0, pid 199:
@@ -2554,12 +2411,16 @@ test "fan-out port dispatch delivers to all registered handlers" {
 
 test "two participants share one UdpTransport; independent teardown" {
     const alloc = std.testing.allocator;
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{
         .participant_id = 198,
         .bind_wildcard = true,
         .ipv6_enabled = false,
     }, 0, null);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
 
     // meta unicast port for domain 0, pid 198: 7400 + 2*198 + 10 = 7806
@@ -2620,11 +2481,15 @@ test "non-wildcard bind still receives loopback traffic" {
     // preferring it as the best reachability tier) would silently receive
     // nothing, even though the send() call itself reports success.
     const alloc = std.testing.allocator;
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{
         .participant_id = 199,
         .bind_wildcard = false,
     }, 0, null);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
 
     const port: u16 = 7400 + 2 * 199 + 10;
@@ -2680,8 +2545,12 @@ test "init auto-assigns participant_id and reserves meta+data fds" {
 
 test "vtListen promotes reserved meta fd on first listen" {
     const alloc = std.testing.allocator;
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{ .ipv6_enabled = false }, 0, null);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
 
     try std.testing.expect(udp.reserved_meta_fd != null);
@@ -2739,11 +2608,15 @@ test "vtListen reserved meta fd also serves advertised IPv6 locators" {
     };
     const mon = InterfaceMonitor{ .ctx = &mon_sentinel, .vtable = &dual_stack_mon_vtable };
 
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{
         .bind_wildcard = true,
         .ipv6_enabled = true,
     }, 0, mon);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
 
     const meta_port = schema.metatrafficUnicastPort(&udp.config, udp.domain_id, udp.participant_id);
@@ -2813,15 +2686,19 @@ test "init with external InterfaceMonitor uses it and calls deinit on close" {
 
 // ── deinit while sockets are active (no unlisten) ────────────────────────────
 
-test "deinit stops active socket threads" {
+test "deinit unregisters active sockets from the backend" {
     const alloc = std.testing.allocator;
     // pid 179: meta = 7400 + 2*179 + 10 = 7768
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{
         .participant_id = 179,
         .bind_wildcard = true,
         .ipv6_enabled = false,
     }, 0, null);
     const t = udp.transport();
+    try t.attachBackend(hp_udp.backend());
 
     const port: u16 = 7768;
     const loc = Locator.udp4(.{ 0, 0, 0, 0 }, port);
@@ -2835,6 +2712,27 @@ test "deinit stops active socket threads" {
     try t.listen(&loc, h);
     // Deinit without unlistening — exercises socket stop in deinit.
     udp.deinit();
+}
+
+test "listening without a progress backend fails: nothing would receive" {
+    const alloc = std.testing.allocator;
+    // pid 157: meta = 7400 + 2*157 + 10 = 7724
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 157,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+    const loc = Locator.udp4(.{ 0, 0, 0, 0 }, 7724);
+    var sentinel: u8 = 0;
+    const h = ReceiveHandler{
+        .ctx = &sentinel,
+        .on_receive = struct {
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
+        }.f,
+    };
+    try std.testing.expectError(error.NoProgressBackend, t.listen(&loc, h));
 }
 
 // ── vtSetLocatorChangeHandler ─────────────────────────────────────────────────
@@ -2877,8 +2775,12 @@ test "vtClose tears down transport via vtable" {
 test "vtListen returns UnsupportedLocatorKind for non-UDP locator" {
     const alloc = std.testing.allocator;
     // pid 176: meta = 7762
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{ .participant_id = 176, .ipv6_enabled = false }, 0, null);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
     const loc = Locator{ .shmem = .{ .host_id = 0, .channel_id = 99 } };
     var sentinel: u8 = 0;
@@ -2894,8 +2796,12 @@ test "vtListen returns UnsupportedLocatorKind for non-UDP locator" {
 test "vtJoinMulticast error paths: UnsupportedLocatorKind and NoHandlerForPort" {
     const alloc = std.testing.allocator;
     // pid 175: meta = 7760
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{ .participant_id = 175, .ipv6_enabled = false }, 0, null);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
 
     const shmem_loc = Locator{ .shmem = .{ .host_id = 0, .channel_id = 99 } };
@@ -2911,12 +2817,16 @@ test "vtJoinMulticast error paths: UnsupportedLocatorKind and NoHandlerForPort" 
 test "vtJoinMulticast and vtLeaveMulticast IPv4 round-trip" {
     const alloc = std.testing.allocator;
     // pid 174: use a dedicated high port for multicast to avoid conflicts
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{
         .participant_id = 174,
         .bind_wildcard = true,
         .ipv6_enabled = false,
     }, 0, null);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
 
     const mc_port: u16 = 55401;
@@ -2962,10 +2872,18 @@ test "two transports join one multicast group on one port, and both receive from
     };
     var ctr = [2]Counter{ .{}, .{} };
 
+    var hp_a: rt_testing.HostedPoll = undefined;
+    try hp_a.init(std.testing.allocator);
+    defer hp_a.deinit();
     const a = try UdpTransport.init(alloc, .{ .participant_id = 181, .ipv6_enabled = false }, 0, null);
     defer a.deinit();
+    try a.transport().attachBackend(hp_a.backend());
+    var hp_b: rt_testing.HostedPoll = undefined;
+    try hp_b.init(std.testing.allocator);
+    defer hp_b.deinit();
     const b = try UdpTransport.init(alloc, .{ .participant_id = 182, .ipv6_enabled = false }, 0, null);
     defer b.deinit();
+    try b.transport().attachBackend(hp_b.backend());
     const ts = [2]*UdpTransport{ a, b };
 
     for (ts, &ctr) |udp, *cnt| {
@@ -3127,12 +3045,16 @@ test "dropMcV6 with empty socket list returns ok" {
 test "hasWildcardSocket returns correct value" {
     const alloc = std.testing.allocator;
     // pid 170: meta = 7400 + 2*170 + 10 = 7750
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{
         .participant_id = 170,
         .bind_wildcard = true,
         .ipv6_enabled = false,
     }, 0, null);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
 
     const port: u16 = 7750;
@@ -3246,20 +3168,28 @@ const ChannelCapture = struct {
 test "sendOnChannel replies from the exact socket a datagram arrived on" {
     const alloc = std.testing.allocator;
 
+    var hp_server: rt_testing.HostedPoll = undefined;
+    try hp_server.init(std.testing.allocator);
+    defer hp_server.deinit();
     const server = try UdpTransport.init(alloc, .{
         .participant_id = 168,
         .bind_wildcard = true,
         .ipv6_enabled = false,
     }, 0, null);
     defer server.deinit();
+    try server.transport().attachBackend(hp_server.backend());
     const st = server.transport();
 
+    var hp_client: rt_testing.HostedPoll = undefined;
+    try hp_client.init(std.testing.allocator);
+    defer hp_client.deinit();
     const client = try UdpTransport.init(alloc, .{
         .participant_id = 167,
         .bind_wildcard = true,
         .ipv6_enabled = false,
     }, 0, null);
     defer client.deinit();
+    try client.transport().attachBackend(hp_client.backend());
     const ct = client.transport();
 
     // meta unicast port, domain 0: 7400 + 2*pid + 10.
@@ -3327,20 +3257,28 @@ test "sendOnChannel replies from the exact socket a datagram arrived on (IPv6)" 
         socketClose(probe);
     }
 
+    var hp_server: rt_testing.HostedPoll = undefined;
+    try hp_server.init(std.testing.allocator);
+    defer hp_server.deinit();
     const server = try UdpTransport.init(alloc, .{
         .participant_id = 156,
         .bind_wildcard = true,
         .ipv4_enabled = false,
     }, 0, null);
     defer server.deinit();
+    try server.transport().attachBackend(hp_server.backend());
     const st = server.transport();
 
+    var hp_client: rt_testing.HostedPoll = undefined;
+    try hp_client.init(std.testing.allocator);
+    defer hp_client.deinit();
     const client = try UdpTransport.init(alloc, .{
         .participant_id = 155,
         .bind_wildcard = true,
         .ipv4_enabled = false,
     }, 0, null);
     defer client.deinit();
+    try client.transport().attachBackend(hp_client.backend());
     const ct = client.transport();
 
     const server_port: u16 = 7400 + 2 * 156 + 10;
@@ -3393,12 +3331,16 @@ test "udp transport: sendOnChannel returns ChannelClosed for Channel.none" {
 
 test "udp transport: sendOnChannel returns ChannelClosed for a stale generation" {
     const alloc = std.testing.allocator;
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{
         .participant_id = 165,
         .bind_wildcard = true,
         .ipv6_enabled = false,
     }, 0, null);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
 
     const port: u16 = 7400 + 2 * 165 + 10;
@@ -3420,12 +3362,16 @@ test "udp transport: sendOnChannel returns ChannelClosed for a stale generation"
 
 test "udp transport: sendOnChannel returns ChannelClosed after the socket is retired" {
     const alloc = std.testing.allocator;
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{
         .participant_id = 164,
         .bind_wildcard = true,
         .ipv6_enabled = false,
     }, 0, null);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
 
     const port: u16 = 7400 + 2 * 164 + 10;
@@ -3457,12 +3403,16 @@ fn waitCaptured(capture: *const ChannelCapture) !void {
 
 test "udp transport: a retired socket's slot is reused under a new generation, and its old channel still fails" {
     const alloc = std.testing.allocator;
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{
         .participant_id = 165,
         .bind_wildcard = true,
         .ipv6_enabled = false,
     }, 0, null);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
 
     const port: u16 = 7400 + 2 * 165 + 10;
@@ -3505,12 +3455,16 @@ test "udp transport: vtUnlisten last handler leaving fires no on_channel_closed 
     // departing handler was the only one registered), so the assertion
     // here is "zero closures fired, no crash".
     const alloc = std.testing.allocator;
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{
         .participant_id = 163,
         .bind_wildcard = true,
         .ipv6_enabled = false,
     }, 0, null);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
 
     const port: u16 = 7400 + 2 * 163 + 10;
@@ -3550,12 +3504,16 @@ test "udp transport: vtUnlisten blocks until a concurrently-captured closure not
     // makes the failure mode obvious if the fix regresses (unlisten
     // returning immediately, well before delivery, rather than only after).
     const alloc = std.testing.allocator;
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{
         .participant_id = 161,
         .bind_wildcard = true,
         .ipv6_enabled = false,
     }, 0, null);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
 
     const port: u16 = 7400 + 2 * 161 + 10;
@@ -3611,12 +3569,16 @@ test "removeUnicastSockets: on_channel_closed reaches real recipients, not a Por
     // before every captured closure has actually been delivered is a bug
     // this test would catch, not a scenario it needs to survive.
     const alloc = std.testing.allocator;
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{
         .participant_id = 162,
         .bind_wildcard = true,
         .ipv6_enabled = false,
     }, 0, null);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
 
     const port: u32 = 7400 + 2 * 162 + 10;
     var closed_count: std.atomic.Value(usize) = .init(0);
@@ -3681,12 +3643,16 @@ test "udp transport: on_channel_closed callback may unlisten its own handler wit
     // forever, and a plain join() would hang the whole test binary instead
     // of just failing this one test.
     const alloc = std.testing.allocator;
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{
         .participant_id = 160,
         .bind_wildcard = true,
         .ipv6_enabled = false,
     }, 0, null);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
 
     const port: u32 = 7400 + 2 * 160 + 10;
@@ -3749,12 +3715,16 @@ test "udp transport: reentrant unlisten on one port does not cancel a pending cl
     // closure notification already queued for its other, still-active
     // registration.
     const alloc = std.testing.allocator;
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{
         .participant_id = 159,
         .bind_wildcard = true,
         .ipv6_enabled = false,
     }, 0, null);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
 
     const port_a: u32 = 7400 + 2 * 159 + 10;
@@ -3830,11 +3800,15 @@ test "udp transport: reentrant unlisten cancels a still-queued duplicate closure
     // an interface flap tearing down a whole port would) queues two
     // closure entries for the same handler on the same port in one batch.
     const alloc = std.testing.allocator;
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
     const udp = try UdpTransport.init(alloc, .{
         .participant_id = 158,
         .bind_wildcard = true,
     }, 0, null);
     defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
 
     const port: u32 = 7400 + 2 * 158 + 10;

@@ -17,6 +17,14 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   `error.SharedRuntimeDisabled`, and `zzdds.runtime.enabled` is removed.
 - The binding smoke tests check one-callback-at-a-time listener identities and released
   rejected registrations unconditionally.
+- **Breaking** for Zig: the UDP transport no longer starts a receive thread per socket.
+  Its sockets receive only as sources on a progress backend, so `listen` on a
+  `UdpTransport` not attached to one (`Transport.attachBackend`) fails with
+  `error.NoProgressBackend`. Participants attach it for you. `PollingMonitor` no longer
+  re-polls interfaces on a thread of its own, and `PollingMonitor.init` drops its
+  interval argument: the transport re-polls them on its runtime.
+- `zzdds.runtime.testing.HostedPoll` runs a hosted runtime over the readiness backend,
+  for tests that drive a transport without a participant.
 - **The shared runtime is the default.** Participants run on its hosted workers: receive,
   discovery, heartbeats and timers are runtime turns instead of a thread per socket and per
   concern. Listeners run as runtime turns too, so one can run after the call that caused it

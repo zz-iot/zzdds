@@ -18,9 +18,10 @@ pool sizes or the external-loop ABI ([open design item](../concurrency-broker-st
 * `Transport.listen` registers a `ReceiveHandler` that the transport calls from its own
   threads. There is no entry a driver could call to service sockets, so the transports
   cannot run without background threads.
-* UDP runs one receive thread per socket: one per interface address and port, plus one
-  per multicast socket. Each polls its socket every 50 ms, receives into a 64 KiB stack
-  buffer and calls every handler with a slice borrowed for the call.
+* UDP ran one receive thread per socket: one per interface address and port, plus one
+  per multicast socket. Each polled its socket every 50 ms, received into a 64 KiB stack
+  buffer and called every handler with a slice borrowed for the call. These threads are
+  gone: UDP now receives only on a backend, and listening without one fails.
 * TCP runs an accept thread and one receive thread per connection. `send` dials with a
   blocking `connect` and writes with a blocking `send` under the connection's send lock,
   so a send can stall its caller for as long as the peer or the network takes.
