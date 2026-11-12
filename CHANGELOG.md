@@ -12,9 +12,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 - `on_reliable_reader_ready` and `on_reliable_writer_ready` (`DataWriterListenerEx`,
   `DataReaderListenerEx`) now come after the `on_publication_matched` or
-  `on_subscription_matched` call for the same match, when there is one. On the shared runtime a BEST_EFFORT
-  match always reported ready first, and a RELIABLE handshake finishing on another runtime
-  worker occasionally did too.
+  `on_subscription_matched` call for the same match, when there is one. On the shared
+  runtime a BEST_EFFORT match always reported ready first, and a RELIABLE handshake
+  finishing on another runtime worker occasionally did too.
 - **Breaking** for contributors: the `-Dshared-runtime` build option is removed, along with
   the matching option in the example, integration-test and stress builds and their runner
   scripts' `ZZDDS_SHARED_RUNTIME` variable. Every participant runs on the shared runtime.
