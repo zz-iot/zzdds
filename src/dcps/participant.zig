@@ -3254,6 +3254,9 @@ pub const DomainParticipantImpl = struct {
         // current generation. Unless settled already, data from the writer
         // is held until every match below is made (see settleWriterLocked).
         const gen = self.newDiscoveryGenLocked(data.guid);
+        // A writer already discovered was checked against every announced
+        // reader then, at its announcement or at the reader's own.
+        const prev_qos = self.discoveredWriterQosLocked(data.guid);
         // A refresh a matched reader no longer matches unmatches it, as a
         // loss does for that reader. Room is made first, as in onWriterLost;
         // without it, no match is removed.
@@ -3282,9 +3285,19 @@ pub const DomainParticipantImpl = struct {
             const result = qm_mod.checkDiscovered(data.qos, &local_rd);
             if (!result.isCompatible()) {
                 // Not yet announced, its first announcement counts this
-                // writer: it checks every writer discovered by then.
-                if (ar.announced) ar.incompat_pending.record(result.incompatible);
+                // writer: it checks every writer discovered by then. A
+                // writer already discovered counts only when it becomes
+                // incompatible: the status counts incompatible writers, not
+                // their announcements. Its loss forgets it. A match removed
+                // here was compatible when made, so it counts even when the
+                // reader's QoS is already incompatible with the writer's
+                // previous announcement: a change prepared but not yet
+                // announced counts only a match its announcement removes.
+                const was_compatible = if (prev_qos) |q| qm_mod.checkDiscovered(q, &local_rd).isCompatible() else true;
+                const removed_before = removed.items.len;
                 if (can_unmatch) unmatchWriterLocked(ar, data.guid, &removed);
+                const unmatched = removed.items.len > removed_before;
+                if (ar.announced and (was_compatible or unmatched)) ar.incompat_pending.record(result.incompatible);
                 continue;
             }
             const part_result = qm_mod.checkPartition(data.partition_names, ar.partition_names);
@@ -3562,6 +3575,7 @@ pub const DomainParticipantImpl = struct {
         }
         // As in onWriterDiscovered.
         const gen = self.newDiscoveryGenLocked(data.guid);
+        const prev_qos = self.discoveredReaderQosLocked(data.guid);
         var removed: std.ArrayListUnmanaged(RemovedReaderJob) = .empty;
         defer removed.deinit(self.alloc);
         const can_unmatch = if (removed.ensureTotalCapacityPrecise(self.alloc, self.active_writers.count())) |_| true else |_| false;
@@ -3592,9 +3606,14 @@ pub const DomainParticipantImpl = struct {
             const result = qm_mod.checkDiscovered(&local_wd, data.qos);
             if (!result.isCompatible()) {
                 // Not yet announced, its first announcement counts this
-                // reader: it checks every reader discovered by then.
-                if (aw.announced) aw.incompat_pending.record(result.incompatible);
+                // reader: it checks every reader discovered by then. As in
+                // onWriterDiscovered, a reader already discovered counts
+                // only when it becomes incompatible, or a match is removed.
+                const was_compatible = if (prev_qos) |q| qm_mod.checkDiscovered(&local_wd, q).isCompatible() else true;
+                const removed_before = removed.items.len;
                 if (can_unmatch) unmatchReaderLocked(aw, data.guid, &removed);
+                const unmatched = removed.items.len > removed_before;
+                if (aw.announced and (was_compatible or unmatched)) aw.incompat_pending.record(result.incompatible);
                 continue;
             }
             const part_result = qm_mod.checkPartition(aw.partition_names, data.partition_names);
@@ -3789,6 +3808,24 @@ pub const DomainParticipantImpl = struct {
             .unicast_locators = dupeLocators(alloc, data.unicast_locators),
             .multicast_locators = dupeLocators(alloc, data.multicast_locators),
         };
+    }
+
+    /// The QoS a discovered writer was last announced with, or null when it is
+    /// not discovered. Points into discovered_writers, so it is valid until
+    /// that changes. Must be called with self.mu held.
+    fn discoveredWriterQosLocked(self: *Self, guid: Guid) ?*const disc.DiscoveredWriterData {
+        for (self.discovered_writers.items) |*dw| {
+            if (dw.guid.eql(guid)) return &dw.qos;
+        }
+        return null;
+    }
+
+    /// As discoveredWriterQosLocked, for a discovered reader.
+    fn discoveredReaderQosLocked(self: *Self, guid: Guid) ?*const disc.DiscoveredReaderData {
+        for (self.discovered_readers.items) |*dr| {
+            if (dr.guid.eql(guid)) return &dr.qos;
+        }
+        return null;
     }
 
     /// Insert or refresh the persistent record for a discovered remote writer.

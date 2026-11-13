@@ -941,8 +941,10 @@ const Reserving = struct {
     sedp: *SedpEndpoints,
     rec: Recorder,
     cbs: Callbacks,
+    prev_log_level: std.log.Level,
 
     fn init(self: *Reserving) !void {
+        self.prev_log_level = std.testing.log_level;
         self.failing = .init(testing.allocator, .{});
         const alloc = self.failing.allocator();
         self.net = try MockNetwork.init(testing.allocator);
@@ -974,11 +976,16 @@ const Reserving = struct {
         self.transport.deinit();
         self.net.deinit();
         self.rec.deinit();
+        std.testing.log_level = self.prev_log_level;
     }
 
     /// Every allocation from now on fails.
     fn exhaust(self: *Reserving) void {
         self.failing.fail_index = self.failing.alloc_index;
+        // The publications writer warns that it skips a live push for lack
+        // of memory -- expected here, not a real error. Suppress it so it
+        // doesn't read as a test failure in build output.
+        std.testing.log_level = .err;
     }
 
     fn writerAnnouncement(guid: Guid) WriterAnnouncement {

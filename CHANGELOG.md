@@ -10,6 +10,13 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-12
 
+- `REQUESTED_INCOMPATIBLE_QOS` and `OFFERED_INCOMPATIBLE_QOS` count each incompatible
+  remote endpoint once, as DDS defines `total_count`, rather than each of its
+  announcements. A known endpoint announced again counts only if it was compatible
+  before or its announcement removes a match; one discovered again after its loss
+  (lease expiry, goodbye, failed liveness probe, SEDP dispose) counts again. In-process
+  discovery counted a reader's incompatible writers twice when the reader was created
+  after them, and every other incompatible reader on the topic again too.
 - `on_reliable_reader_ready` and `on_reliable_writer_ready` (`DataWriterListenerEx`,
   `DataReaderListenerEx`) now come after the `on_publication_matched` or
   `on_subscription_matched` call for the same match, when there is one. On the shared
