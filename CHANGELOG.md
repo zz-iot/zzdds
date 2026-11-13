@@ -37,6 +37,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   refused and closes the connection, and a send while an earlier frame waits on the
   connection reports `would_block`. A closed connection is freed as soon as it closes,
   not by the next dial or accept.
+- A participant no longer has a timer thread or a path that runs without a runtime: its
+  DEADLINE, LIVELINESS and held-data checks run only as a timer on its runtime, and what it
+  receives always goes through its ingress context. The factory attaches the runtime before
+  checking the participant's own TCP transport, so a participant that fails there is torn
+  down like any other. The `timer_clock_name` participant setting has no effect: timed QoS
+  runs on the runtime's clock.
 - **The shared runtime is the default.** Participants run on its hosted workers: receive,
   discovery, heartbeats and timers are runtime turns instead of a thread per socket and per
   concern. Listeners run as runtime turns too, so one can run after the call that caused it

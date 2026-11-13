@@ -196,9 +196,8 @@ pub const DomainParticipantFactoryImpl = struct {
 
     /// Frees `p`, made by this factory, and its use of the runtime.
     fn freeParticipant(self: *Self, p: *participant_mod.DomainParticipantImpl) void {
-        const on_runtime = p.runtime != null;
         p.deinit();
-        if (on_runtime) self.releaseRuntimeUse();
+        self.releaseRuntimeUse();
     }
 
     pub fn toDDSFactory(self: *Self) DDS.DomainParticipantFactory {
@@ -276,9 +275,7 @@ pub const DomainParticipantFactoryImpl = struct {
             .entity_id = participant_mod.EntityIds.participant,
         };
 
-        const timer_clock = self.clock_registry.get(config.participant.timer_clock_name);
-
-        const rt: ?*runtime_mod.Runtime = self.acquireRuntimeFor(config) orelse return null;
+        const rt = self.acquireRuntimeFor(config) orelse return null;
 
         const p = participant_mod.DomainParticipantImpl.init(
             self.alloc,
@@ -293,27 +290,23 @@ pub const DomainParticipantFactoryImpl = struct {
             mask,
             handle,
             self.trace_sink,
-            // On a runtime, timed QoS runs on its clock.
-            if (rt) |r| r.clock else timer_clock,
+            // Timed QoS runs on the runtime's clock.
+            rt.clock,
         ) catch {
-            if (rt) |r| {
-                r.releaseOwner();
-                self.releaseRuntimeUse();
-            }
+            rt.releaseOwner();
+            self.releaseRuntimeUse();
             return null;
         };
-        if (rt) |r| {
-            // The participant's own TCP transport, for user data, runs on
-            // the runtime too.
-            if (p.owned_tcp_transport) |t| t.transport().attachBackend(r.backend) catch |err| {
-                log_mod.dcps.warn("create_participant: the TCP transport cannot run on this runtime ({s})", .{@errorName(err)});
-                p.deinit();
-                r.releaseOwner();
-                self.releaseRuntimeUse();
-                return null;
-            };
-            p.attachRuntime(r);
-        }
+        // The participant takes the owner reference; its deinit releases it.
+        p.attachRuntime(rt);
+        // The participant's own TCP transport, for user data, runs on the
+        // runtime too.
+        if (p.owned_tcp_transport) |t| t.transport().attachBackend(rt.backend) catch |err| {
+            log_mod.dcps.warn("create_participant: the TCP transport cannot run on this runtime ({s})", .{@errorName(err)});
+            p.deinit();
+            self.releaseRuntimeUse();
+            return null;
+        };
         // config_deinit_allocator is set AFTER participants.append so that p.deinit()
         // on any failure path below doesn't free config — the caller retains ownership
         // and handles cleanup on error.

@@ -14,16 +14,13 @@ Started without a runtime, these components still start threads of their own:
 
 - `SpdpSedpDiscovery` owns an SPDP timer thread for periodic participant
   announcements and lease checks.
-- `DomainParticipantImpl` owns a timer thread (`timerThreadFn`) that periodically
-  calls `checkTimers()` to enforce DEADLINE and LIVELINESS QoS.
 - `StatefulWriter` starts a heartbeat thread when the first matched reader is added.
 - `trace.AsyncRingSink` owns an optional flush thread when the application starts it;
   without one, the application drains it with `flush()`.
 
 `DomainParticipantImpl.checkTimers()` walks active writers and readers and fires
-deadline/liveliness status updates. In the default path the participant's own timer
-thread drives it; `ManualClock` tests call it directly instead. An embedded/single-threaded
-build would drive it from the application loop (see "Single-Threaded Direction" below).
+deadline/liveliness status updates. It runs as a timer on the participant's runtime, armed
+for the earliest time anything is due; a manual runtime runs it from `drive()`.
 
 `UdpTransport` starts no thread: its sockets are sources on its runtime's backend, which
 it must be attached to before it listens.

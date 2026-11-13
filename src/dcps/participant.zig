@@ -1097,23 +1097,12 @@ pub const DomainParticipantImpl = struct {
     /// to discovery. Has room for one per local endpoint.
     announcing: std.ArrayListUnmanaged(Announcing) = .empty,
 
-    /// Background thread periodically calling checkTimers() to enforce
-    /// DEADLINE and LIVELINESS QoS -- previously nothing called checkTimers()
-    /// at all, so those statuses only ever fired under a test's ManualClock.
-    /// Spawned once at the end of start(), stopped as the very first step of
-    /// deinit() (before anything else is torn down) so it can never observe
-    /// partially-destroyed participant state -- same lifetime discipline as
-    /// writer_sm.zig's per-writer heartbeat thread and spdp.zig's
-    /// per-participant announcement timer (thread lifetime strictly bounded
-    /// by the owning object's own init/deinit, never reaching across
-    /// objects -- see docs/roadmap.md's "Concurrency model" design-task entry
-    /// for why that matters here specifically).
-    timer_thread: ?std.Thread = null,
     /// The shared runtime this participant holds an owner reference to, set
-    /// by `attachRuntime` before `start` and released last in `deinit`
+    /// by `attachRuntime` before `start` and released last in `deinit`. Every
+    /// participant has one: the factory attaches it
     /// (docs/design/concurrency/runtime.md#operational-ownership-versus-storage-retention).
     runtime: ?*runtime_mod.Runtime = null,
-    /// With a runtime: the context that processes received datagrams, one
+    /// The context that processes received datagrams, one
     /// at a time (docs/design/concurrency/runtime.md#ingress).
     ingress: runtime_mod.Context = undefined,
     ingress_latch: CloseLatch = .{},
@@ -1123,30 +1112,18 @@ pub const DomainParticipantImpl = struct {
     ingress_budget: IngressBudget = IngressBudget.init(ingress_record_limit, ingress_byte_limit),
     /// Datagrams dropped at ingress: a bound reached, or no memory.
     ingress_drops: std.atomic.Value(u64) = .init(0),
-    /// With a runtime: `checkTimers` runs as one timer in this context,
-    /// armed for the earliest time anything is due rather than polled by
-    /// the timer thread.
+    /// `checkTimers` runs as one timer in this context, armed for the
+    /// earliest time anything is due rather than polled.
     timers: runtime_mod.Context = undefined,
     timers_latch: CloseLatch = .{},
     check_timer: runtime_mod.Timer = undefined,
     /// Set by deinit under `check_mu`; nothing arms `check_timer` after.
     check_mu: Mutex = .{},
     check_stopping: bool = false,
-    /// With a runtime: the contexts where this participant's readers and
+    /// The contexts where this participant's readers and
     /// writers run their listeners, apart from the work that changed their
     /// statuses (listener_lane.zig).
     listener_group: listener_lane.Group = undefined,
-    /// Set by timerThreadFn as its first action, read by deinit() to detect
-    /// a self-join (see deinit()'s doc comment). 0 = not yet set; real
-    /// std.Thread.Id values are never 0 in practice on any supported
-    /// platform, so it doubles as the "unset" sentinel.
-    timer_thread_id: std.atomic.Value(std.Thread.Id) = .init(0),
-    timer_stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// Set by deinit() instead of freeing `self` immediately, when deinit()
-    /// is reached reentrantly from the timer thread itself (see deinit()'s
-    /// doc comment). Only ever written and read from that same thread, so
-    /// a plain bool is fine -- no cross-thread visibility is needed for it.
-    pending_self_destroy: bool = false,
 
     /// One box for the whole object, shared across every interface view
     /// (DomainParticipant, Entity, and ZZDDS.DomainParticipant — see
@@ -1300,16 +1277,16 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn listenerGroup(self: *Self) ?*listener_lane.Group {
-        return if (self.runtime != null) &self.listener_group else null;
+        return &self.listener_group;
     }
 
     fn userDataHandler(self: *Self) transport_if.ReceiveHandler {
         return .{
             .ctx = self,
-            .on_receive = if (self.runtime != null) ingressOnReceive else userDataOnReceive,
-            .try_receive = if (self.runtime != null) ingressTryReceive else null,
-            .notify_room = if (self.runtime != null) notifyRoom else null,
-            .cancel_room = if (self.runtime != null) cancelRoom else null,
+            .on_receive = ingressOnReceive,
+            .try_receive = ingressTryReceive,
+            .notify_room = notifyRoom,
+            .cancel_room = cancelRoom,
         };
     }
 
@@ -1419,12 +1396,10 @@ pub const DomainParticipantImpl = struct {
     /// The last of `deinit`: releases the runtime and frees the participant.
     fn finishDestroy(self: *Self) void {
         const alloc = self.alloc;
-        if (self.runtime) |rt| {
-            self.ingress.deinit();
-            self.timers.deinit();
-            self.listener_group.deinit();
-            rt.releaseOwner();
-        }
+        self.ingress.deinit();
+        self.timers.deinit();
+        self.listener_group.deinit();
+        self.runtime.?.releaseOwner();
         self.ingress_budget.deinit();
         alloc.destroy(self);
     }
@@ -1639,22 +1614,8 @@ pub const DomainParticipantImpl = struct {
             }
         }
 
-        // On a runtime the checks are armed as they become due instead.
-        if (self.runtime != null) return;
-
-        // Last step, deliberately: no thread exists yet at this point, so a
-        // spawn failure here needs no stop/join cleanup of its own. Without
-        // this thread, DEADLINE/LIVELINESS enforcement never fires with
-        // nothing to explain why -- too severe to degrade silently, so this
-        // is propagated as a start() error like every other setup failure
-        // above. factory.zig's create_participant() already handles a
-        // start() error by calling p.deinit() (which tolerates a null
-        // timer_thread) and returning null, so no new cleanup path is
-        // needed here.
-        self.timer_thread = std.Thread.spawn(.{}, timerThreadFn, .{self}) catch |err| {
-            log_mod.dcps.warn("participant: failed to spawn timer thread ({s}) -- DEADLINE/LIVELINESS QoS will not be enforced for this participant", .{@errorName(err)});
-            return err;
-        };
+        // The DEADLINE/LIVELINESS checks are armed on the runtime as they
+        // become due (armCheck).
     }
 
     /// Stops discovery and the receives `start` began, those it got to.
@@ -1678,73 +1639,21 @@ pub const DomainParticipantImpl = struct {
         self.meta_userdata_listen_port = 0;
     }
 
-    /// Periodically calls checkTimers() to enforce DEADLINE/LIVELINESS QoS.
-    /// Stopped by setting timer_stopping before calling timer_thread.join()
-    /// (see deinit()) -- same shape as writer_sm.zig's heartbeatThread.
-    fn timerThreadFn(self: *Self) void {
-        self.timer_thread_id.store(std.Thread.getCurrentId(), .release);
-        while (!self.timer_stopping.load(.acquire)) {
-            var slept_ms: u64 = 0;
-            while (slept_ms < TIMER_CHECK_INTERVAL_MS and !self.timer_stopping.load(.acquire)) {
-                time_mod.sleepNs(50 * std.time.ns_per_ms);
-                slept_ms += 50;
-            }
-            if (self.timer_stopping.load(.acquire)) break;
-            self.checkTimers();
-        }
-        // A reentrant deinit() (see its doc comment) deferred the actual
-        // free to here, since it couldn't safely free `self` out from
-        // under this still-running function. The loop above has now
-        // genuinely exited (timer_stopping is true either way), so it's
-        // safe to do now -- nothing below touches `self` again.
-        if (self.pending_self_destroy) self.finishDestroy();
-    }
-
     pub fn deinit(self: *Self) void {
-        // Stop and join the timer thread before anything else -- it calls
-        // checkTimers(), which touches self.mu and self.active_writers/
-        // active_readers; nothing past this point may run concurrently with
-        // it. See timer_thread's field doc comment for why this has to be
-        // the very first thing deinit() does.
-        self.timer_stopping.store(true, .release);
-        // deinit() can be reached from the timer thread itself:
-        // checkTimers() -> a DEADLINE/LIVELINESS notification -> a user
-        // listener that (spec-legally) reentrantly deletes every child
-        // entity and then the participant itself, synchronously, from
-        // inside the callback. Detected once, used below both to avoid
-        // joining the calling thread from itself (deadlock) and to avoid
-        // freeing `self` while checkTimers()/timerThreadFn are still
-        // executing further up this very call stack (see the
-        // pending_self_destroy branch at the end of this function).
-        const self_reentrant = std.Thread.getCurrentId() == self.timer_thread_id.load(.acquire);
-        // On a runtime: from inside a check, the participant is freed once
-        // that turn ends instead.
-        const timers_deferred = self.runtime != null and !self.stopCheckTimer();
-        if (self.timer_thread) |t| {
-            if (self_reentrant) {
-                // A thread joining itself deadlocks, so detach instead --
-                // timer_stopping is already set above, so once this call
-                // unwinds back up to timerThreadFn's loop condition it
-                // exits on its own, and a detached thread's resources are
-                // reclaimed by the OS without a join.
-                t.detach();
-            } else {
-                t.join();
-            }
-            self.timer_thread = null;
-        }
+        // From inside a check, the participant is freed once that turn ends
+        // instead.
+        const timers_deferred = !self.stopCheckTimer();
         // Stop receiving user data before tearing down readers.
         self.stopReceiving();
         // Nothing is delivered after the unlistens above; what was is dropped,
         // and a turn processing it finishes before entities are torn down,
         // unless this is that turn: then the participant is freed after it.
-        const ingress_deferred = self.runtime != null and
-            !self.ingress_latch.close(&self.ingress, Ingress.discard);
+        const ingress_deferred = !self.ingress_latch.close(&self.ingress, Ingress.discard);
         // Likewise for listeners: those queued or parked never start, and
         // those running elsewhere return before entities are torn down. From
         // inside one, the rest follows the last of them, so no listener of
         // this participant runs while its entities are torn down.
-        const listeners_deferred = self.runtime != null and !self.listener_group.close();
+        const listeners_deferred = !self.listener_group.close();
         self.c_abi.retire();
         if (self.status_cond) |sc| sc.c_abi.retire();
         if (self.builtin_sub) |bs| bs.retireHandles();
@@ -1752,14 +1661,13 @@ pub const DomainParticipantImpl = struct {
             self.listener_group.finishWith(.{ .ctx = self, .run = teardownHook });
             return;
         }
-        self.teardown(.{ .timers = timers_deferred, .ingress = ingress_deferred, .self_reentrant = self_reentrant });
+        self.teardown(.{ .timers = timers_deferred, .ingress = ingress_deferred });
     }
 
     /// What `deinit` hands to a turn that will free the participant.
     const Deferred = struct {
         timers: bool = false,
         ingress: bool = false,
-        self_reentrant: bool = false,
     };
 
     fn teardownHook(ctx: *anyopaque) void {
@@ -1876,20 +1784,7 @@ pub const DomainParticipantImpl = struct {
             return;
         }
 
-        // Every step above only touches self's own fields and owned
-        // sub-resources, so it's safe to run reentrantly regardless of
-        // which thread called deinit(). Freeing `self` itself is the one
-        // exception: checkTimers() and timerThreadFn are still executing
-        // further up this exact call stack when self_reentrant is true,
-        // and still need `self` (e.g. to read timer_stopping, already true
-        // above) to unwind safely. Defer the actual free to timerThreadFn,
-        // which performs it as the very last thing it does once its own
-        // loop has genuinely exited -- see timerThreadFn.
-        if (deferred.self_reentrant) {
-            self.pending_self_destroy = true;
-        } else {
-            self.finishDestroy();
-        }
+        self.finishDestroy();
     }
 
     pub fn toDDSParticipant(self: *Self) DDS.DomainParticipant {
@@ -5022,14 +4917,15 @@ pub const DomainParticipantImpl = struct {
         return next;
     }
 
-    /// The runtime counterpart of `timerThreadFn`'s loop body.
+    /// Runs `checkTimers` and re-arms itself for the next time anything is
+    /// due.
     fn onCheckTimer(t: *runtime_mod.Timer, turn: *runtime_mod.Turn) void {
         const self: *Self = @fieldParentPtr("check_timer", t);
         if (self.checkTimersAt(turn.now_ns)) |due_ns| self.armCheck(due_ns);
     }
 
     /// Brings the checks forward to `due_ns`, unless they are armed for then
-    /// or earlier. Without a runtime the timer thread polls instead.
+    /// or earlier. Nothing before `attachRuntime`.
     fn armCheck(self: *Self, due_ns: i64) void {
         const rt = self.runtime orelse return;
         self.check_mu.lock();
