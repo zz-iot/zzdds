@@ -9,11 +9,11 @@
 //!      the StatelessWriter cache.
 //!   2. Register the SPDP multicast locator as the writer's reader-locator.
 //!   3. Call transport.listen + joinMulticast on the SPDP multicast port.
-//!   4. Spawn a timer thread that periodically calls reannounce() (bumping the SN
-//!      before resending) and checks leases. On a runtime (`attachRuntime`),
-//!      arm timers instead: one for the next announcement, one for the
-//!      earliest lease expiry or liveness probe
-//!      (docs/design/concurrency/runtime.md#thread-mapping).
+//!   4. On a runtime (`attachRuntime`), arm timers: one for the next
+//!      announcement, which calls reannounce() (bumping the SN before
+//!      resending), and one for the earliest lease expiry or liveness probe
+//!      (docs/design/concurrency/runtime.md#thread-mapping). No thread is
+//!      started.
 //!
 //! PL-CDR encoding is hand-written (no dependency on zidl-generated code here).
 
@@ -130,7 +130,7 @@ pub const KnownParticipant = struct {
 
 // ── SpdpEndpoints ─────────────────────────────────────────────────────────────
 
-/// SPDP built-in endpoints + background timer thread.
+/// SPDP built-in endpoints and their announcement and lease timers.
 /// Implements SPDP participant discovery only. Endpoint announce/retract vtable
 /// methods are no-ops here; `SpdpSedpDiscovery` composes this with `SedpEndpoints`
 /// and routes endpoint discovery calls to SEDP.
@@ -157,14 +157,12 @@ pub const SpdpEndpoints = struct {
     unsupported_locator_mu: Mutex,
     unsupported_locator_kinds: std.AutoHashMap(i32, void),
 
-    // Timer thread
-    timer_thread: ?std.Thread,
-    shutdown: std.atomic.Value(bool),
     announcement_period_ms: u32,
 
     /// With a runtime (`attachRuntime`), received datagrams are queued for a
-    /// runtime context, and timers replace the timer thread. The timers run
-    /// in their own context, as the thread ran apart from receiving.
+    /// runtime context, and announcements and lease checks are timers in a
+    /// context of their own. Without one, nothing announces periodically or
+    /// checks leases: tests drive `checkLeases` themselves.
     runtime: ?*runtime_mod.Runtime = null,
     rx: QueuedReceive = undefined,
     announce_timer: runtime_mod.Timer = undefined,
@@ -206,7 +204,7 @@ pub const SpdpEndpoints = struct {
     // period for 2× the normal period instead of blasting an immediate unicast
     // reply (which causes an N² burst when N participants start simultaneously).
     // Monotonic ns timestamp; 0 = not in fast mode. Written by discovery callbacks,
-    // read by the timer thread — accessed via atomic to avoid needing the mutex.
+    // read by the announcement timer — accessed via atomic to avoid needing the mutex.
     fast_announce_until_ns: std.atomic.Value(i64),
 
     // Liveness probe: when SPDP silence exceeds the probe trigger threshold,
@@ -242,8 +240,6 @@ pub const SpdpEndpoints = struct {
             .known = std.AutoHashMap(GuidPrefix, KnownParticipant).init(alloc),
             .unsupported_locator_mu = .{},
             .unsupported_locator_kinds = std.AutoHashMap(i32, void).init(alloc),
-            .timer_thread = null,
-            .shutdown = std.atomic.Value(bool).init(false),
             .announcement_period_ms = announcement_period_ms,
             .callbacks = null,
             .spdp_multicast_port = 0,
@@ -264,7 +260,7 @@ pub const SpdpEndpoints = struct {
 
     pub fn deinit(self: *Self) void {
         // No other thread should still be touching `self` by this point
-        // (callers must `stop()`, which joins the timer thread and unlistens
+        // (callers must `stop()`, which cancels the timers and unlistens
         // the receive callback, before `deinit()`), but the lock is cheap and
         // keeps every access to `self.writer` uniformly guarded.
         self.mu.lock();
@@ -480,9 +476,9 @@ pub const SpdpEndpoints = struct {
             };
         }
 
-        // Send an immediate announcement before spawning the timer thread, so
-        // there's no window where the timer's first cycle could race this send
-        // and both end up transmitting the same SN.
+        // Send an immediate announcement before arming the timer, so there's
+        // no window where its first fire could race this send and both end up
+        // transmitting the same SN.
         new_writer.sendAll();
 
         if (self.runtime) |rt| {
@@ -490,12 +486,7 @@ pub const SpdpEndpoints = struct {
             defer self.mu.unlock();
             self.last_announce_ns = rt.clock.nowNs();
             if (!self.timers_stopping) _ = rt.armTimer(&self.announce_timer, self.nextAnnounceNs(self.last_announce_ns));
-            return;
         }
-
-        // Spawn the timer thread.
-        self.shutdown.store(false, .release);
-        self.timer_thread = try std.Thread.spawn(.{}, timerFn, .{self});
     }
 
     /// Re-announce with a fresh sequence number, then transmit. Called once per
@@ -530,11 +521,6 @@ pub const SpdpEndpoints = struct {
             self.mu.unlock();
             rt.cancelTimer(&self.announce_timer);
             rt.cancelTimer(&self.lease_timer);
-        }
-        self.shutdown.store(true, .release);
-        if (self.timer_thread) |t| {
-            t.join();
-            self.timer_thread = null;
         }
         // Unlisten from transport.
         const listen_locator = Locator.udp4(.{ 0, 0, 0, 0 }, self.spdp_multicast_port);
@@ -846,32 +832,9 @@ pub const SpdpEndpoints = struct {
 
     // ── Timer thread ──────────────────────────────────────────────────────────
 
-    fn timerFn(self: *Self) void {
-        var last_announce_ns = self.clock.nowNs();
-
-        while (!self.shutdown.load(.acquire)) {
-            self.clock.sleepNs(100 * std.time.ns_per_ms);
-            if (self.shutdown.load(.acquire)) break;
-
-            const now_ns = self.clock.nowNs();
-            const in_fast = now_ns < self.fast_announce_until_ns.load(.acquire);
-            const period_ns: i64 = if (in_fast)
-                @divTrunc(@as(i64, self.announcement_period_ms), 2) * std.time.ns_per_ms
-            else
-                @as(i64, self.announcement_period_ms) * std.time.ns_per_ms;
-
-            if (now_ns - last_announce_ns >= period_ns) {
-                last_announce_ns = now_ns;
-                self.reannounce();
-            }
-
-            _ = self.checkLeases();
-        }
-    }
-
     /// When the announcement after one sent at `last_ns` is due: half a
-    /// period later while announcing fast, else a whole one, as the timer
-    /// thread decides. At least 1 ms later, so a zero period cannot spin.
+    /// period later while announcing fast, else a whole one. At least 1 ms
+    /// later, so a zero period cannot spin.
     fn nextAnnounceNs(self: *Self, last_ns: i64) i64 {
         const half_ns = @divTrunc(@as(i64, self.announcement_period_ms), 2) * std.time.ns_per_ms;
         const fast = last_ns + half_ns < self.fast_announce_until_ns.load(.acquire);
@@ -879,7 +842,7 @@ pub const SpdpEndpoints = struct {
         return last_ns + @max(period_ns, std.time.ns_per_ms);
     }
 
-    /// The runtime counterpart of the timer thread's announcement.
+    /// Announces again, and re-arms itself for the next announcement.
     fn onAnnounceTimer(t: *runtime_mod.Timer, turn: *runtime_mod.Turn) void {
         const self: *Self = @fieldParentPtr("announce_timer", t);
         self.reannounce();
@@ -889,7 +852,7 @@ pub const SpdpEndpoints = struct {
         if (!self.timers_stopping) _ = self.runtime.?.armTimer(&self.announce_timer, self.nextAnnounceNs(turn.now_ns));
     }
 
-    /// The runtime counterpart of the timer thread's lease checks.
+    /// Checks leases, and re-arms itself for the next time one is due.
     fn onLeaseTimer(t: *runtime_mod.Timer, _: *runtime_mod.Turn) void {
         const self: *Self = @fieldParentPtr("lease_timer", t);
         const due_ns = self.checkLeases() orelse return;
@@ -899,8 +862,7 @@ pub const SpdpEndpoints = struct {
     }
 
     /// Brings the lease checks forward to `due_ns`, unless they are armed
-    /// for then or earlier. Without a runtime the timer thread polls
-    /// instead. Caller holds `mu`.
+    /// for then or earlier. Nothing without a runtime. Caller holds `mu`.
     fn armLeaseLocked(self: *Self, due_ns: i64) void {
         const rt = self.runtime orelse return;
         if (!self.timers_stopping) _ = rt.armTimerNoLater(&self.lease_timer, due_ns);

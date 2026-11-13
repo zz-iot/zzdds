@@ -655,7 +655,6 @@ test "a participant whose enable fails after its discovery started can be enable
     t.unlisten(&taken, squatter);
 
     try testing.expectEqual(DDS.RETCODE_OK, p.a.dp.enable());
-    try testing.expect(p.a.disc.spdp.timer_thread == null);
     try testing.expect(try p.driveUntil(p.now() + 5 * SEC, &p, Pair.bothDiscovered));
     try exchangeOn(&p.runtime, p.a.dp, p.b.dp);
 }
@@ -688,8 +687,6 @@ const UdpPair = struct {
             self.dp[i] = self.factory[i].toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
             try self.factory[i].selectRuntime(null);
             try testing.expect(self.dp[i].ptr != nil_participant.ptr);
-            // Announcements and lease checks are timers: no thread.
-            try testing.expect(self.disc[i].spdp.timer_thread == null);
         }
         if (runtime) |r| r.releaseOwner();
         self.ep = Endpoints.init(self.dp[0], self.dp[1]);

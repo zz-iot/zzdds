@@ -3,17 +3,16 @@
 This document describes current behavior. Proposed future behavior is tracked in the
 [listener execution contract](concurrency/listeners.md#listener-execution-contract) and
 [concurrency design](concurrency/architecture.md#concurrency-model-state-ownership-and-progress); those drafts do not describe implemented guarantees.
-It describes the threaded path. Participants no longer use it: they all run on the shared
-runtime, and the threads below remain only for components started without a runtime until
-they are deleted. The runtime's [thread mapping](concurrency/runtime.md#thread-mapping) says
-where each thread below went.
+Every participant runs on the shared runtime (docs/design/concurrency/runtime.md). The
+runtime's [thread mapping](concurrency/runtime.md#thread-mapping) says where each thread
+of the earlier threaded implementation went.
 
 ## Current Thread Ownership
 
-Started without a runtime, these components still start threads of their own:
+zzdds starts no thread of its own for participants, transports, discovery or writers: they
+run as turns and timers on the participant's runtime, whose hosted workers (or the
+application, through `drive()`) make progress. The one remaining thread is optional:
 
-- `SpdpSedpDiscovery` owns an SPDP timer thread for periodic participant
-  announcements and lease checks.
 - `trace.AsyncRingSink` owns an optional flush thread when the application starts it;
   without one, the application drains it with `flush()`.
 
@@ -21,13 +20,18 @@ Started without a runtime, these components still start threads of their own:
 deadline/liveliness status updates. It runs as a timer on the participant's runtime, armed
 for the earliest time anything is due; a manual runtime runs it from `drive()`.
 
-`UdpTransport` starts no thread: its sockets are sources on its runtime's backend, which
-it must be attached to before it listens.
+`UdpTransport` and `TcpTransport` start no thread: their sockets are sources on their
+runtime's backend, which they must be attached to before they listen (or, for TCP, send).
 
-Listener callbacks may run on transport receive threads in the live UDP path. With
-`MemoryTransport` + `DirectDiscovery`, callbacks happen synchronously on the caller's
-thread. Application listeners should avoid blocking and should not call back into APIs that
-would invert locks held by the receive path.
+Listener callbacks run as turns of their participant's listener group, on a runtime worker
+(or inside the application's `drive()`), not on the stack of the call or receive that
+raised their status. The exception is an explicit traversal: `Subscriber.notify_datareaders()`
+invokes a reader's `on_data_available` on the calling thread when it can start at once. When
+that reader's callback, or the listener object it shares, is already running elsewhere, the
+status is queued for a later turn instead, so the call can return before the callback has
+run. Either way one listener object runs one callback at a time
+(docs/design/concurrency/listeners.md). Application listeners should still avoid blocking:
+a blocked callback holds a worker.
 
 `WaitSet.wait()` blocks only the calling thread.
 
@@ -38,11 +42,12 @@ per-write state (`last_sn`, the `get_key_value` key registry) is guarded
 (`src/dcps/writer.zig` — atomic `last_sn`, `key_registry_mu`). Ordering between concurrent
 writes is not defined — they interleave — but no write is lost or corrupted.
 
-## Single-Threaded Direction
+## Single-Threaded Use
 
-An embedded/single-threaded API such as `DomainParticipant.drive(timeout)` is not
-implemented. The design should keep this possible by preserving non-blocking seams for
-transport polling and by keeping timer checks explicit through `checkTimers()`.
+A manual runtime runs everything a participant does from the application's
+`drive(budget, max_wait)`, with no thread started by zzdds
+(docs/design/concurrency/runtime.md#manual-runtime-driving-and-external-loop-integration).
+Integrating with an external event loop is specified there but not implemented.
 
 ## Type Information Registration
 
