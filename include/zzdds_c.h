@@ -286,6 +286,24 @@ int zzdds_register_type_support_ctx(
     void (*ctx_deinit)(void *ctx)
 );
 
+/* Checked complete-sample admission, installed before creating topics. The
+ * callback validates the complete ALIVE value (key_only=0) or genuine lifecycle
+ * key value (key_only=1), returning 0 and publishing a hash only on success.
+ * Failure is propagated before protocol/history admission even with inline QoS.
+ * A valid all-zero key hash is accepted. Keyless values still require validation.
+ * Processing callbacks are synchronous/reentrant and must not call DDS APIs
+ * or retain payload buffers.
+ * Registrations are immutable: identical callbacks/ctx are idempotent; conflicts,
+ * late installs and attempts to replace with unchecked support fail.
+ * These additive APIs do not strengthen the legacy registration contract. */
+typedef int (*zzdds_process_sample_fn)(const uint8_t *, size_t, int key_only, uint8_t hash_out[16]);
+typedef int (*zzdds_process_sample_ctx_fn)(void *, const uint8_t *, size_t, int key_only, uint8_t hash_out[16]);
+int zzdds_register_type_support_checked(DDS_DomainParticipant, const char *, zzdds_process_sample_fn, int has_key, zzdds_get_field_from_cdr_fn);
+/* ctx ownership transfers only on a new successful install. Equivalent repeat
+ * registration with the same ctx does not transfer/release it a second time.
+ * On failure the caller retains ctx. Cleanup waits for endpoint processor and field-getter pins. */
+int zzdds_register_type_support_checked_ctx(DDS_DomainParticipant, const char *, zzdds_process_sample_ctx_fn, int has_key, zzdds_get_field_from_cdr_ctx_fn, void *ctx, void (*ctx_deinit)(void *));
+
 DDS_InstanceHandle_t zzdds_register_instance_raw(DDS_DataWriter writer, const uint8_t key_hash[16]);
 
 int zzdds_get_key_value_writer(

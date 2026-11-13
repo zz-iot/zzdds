@@ -71,7 +71,7 @@ fn stubComputeKeyHashFromCdrKeyOnly(
 const MemoryTransport = zzdds.intraprocess.MemoryTransport;
 const DirectDiscovery = zzdds.intraprocess.DirectDiscovery;
 
-const Fixture = struct {
+pub const Fixture = struct {
     delivery: IntraProcessDelivery,
     t: *MemoryTransport,
     d: *DirectDiscovery,
@@ -88,7 +88,7 @@ const Fixture = struct {
     dp_boxed: *anyopaque,
     alloc: std.mem.Allocator,
 
-    fn init(alloc: std.mem.Allocator) !Fixture {
+    pub fn init(alloc: std.mem.Allocator) !Fixture {
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
         const t = try delivery.newTransport();
@@ -109,7 +109,7 @@ const Fixture = struct {
         return .{ .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp, .dp_boxed = dp_boxed, .alloc = alloc };
     }
 
-    fn deinit(self: *Fixture) void {
+    pub fn deinit(self: *Fixture) void {
         zidl_bindings.freeEntityBox(self.alloc, self.dp_boxed);
         _ = self.factory.toDDSFactory().delete_participant(self.dp);
         self.factory.deinit();
@@ -118,7 +118,7 @@ const Fixture = struct {
         self.delivery.deinit();
     }
 
-    fn impl(self: *Fixture) *DomainParticipantImpl {
+    pub fn impl(self: *Fixture) *DomainParticipantImpl {
         return @ptrCast(@alignCast(self.dp.ptr));
     }
 };
@@ -500,4 +500,172 @@ test "typesupport C ABI: registration allocation failure destroys each adapter e
             try testing.expectEqual(@as(usize, if (with_context) 1 else 0), cleanup.calls);
         }
     }
+}
+
+fn checkedSample(payload: [*]const u8, len: usize, key_only: c_int, hash: *[16]u8) callconv(.c) c_int {
+    if (len != 2 or payload[0] != @as(u8, if (key_only == 0) 1 else 2)) return -1;
+    hash.* = @splat(0);
+    hash[0] = payload[1];
+    return 0;
+}
+fn checkedGuid(value: u8, kind: u8) zzdds.rtps.Guid {
+    return .{ .prefix = .{ .bytes = @splat(value) }, .entity_id = .{ .entity_key = .{ 0, 0, value }, .entity_kind = kind } };
+}
+
+test "checked C registration rejects before DATA, fragment and prematch admission" {
+    const rtps = zzdds.rtps;
+    for ([_]bool{ false, true }) |reliable| {
+        var fx = try Fixture.init(testing.allocator);
+        defer fx.deinit();
+        try testing.expectEqual(@as(c_int, 0), c_abi_ts.zzdds_register_type_support_checked(fx.dp_boxed, "Checked", checkedSample, 1, null));
+        const ts = fx.impl().type_support_registry.get("Checked").?;
+        const reader = try rtps.StatefulReader.init(testing.allocator, checkedGuid(61, 7), fx.t.transport(), .keep_all, 0, reliable);
+        defer reader.deinit();
+        reader.setSampleProcessor(ts.sample_processor);
+        const Delivered = struct {
+            count: usize = 0,
+            fn onData(ctx: *anyopaque, change: *const rtps.CacheChange) void {
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                std.debug.assert(std.mem.allEqual(u8, &change.key_hash, 0));
+                self.count += 1;
+            }
+        };
+        var delivered = Delivered{};
+        reader.setCallback(.{ .ctx = &delivered, .on_data = Delivered.onData });
+        const writer = checkedGuid(62, 2);
+        try reader.addMatchedWriter(try rtps.WriterProxy.init(testing.allocator, writer, &.{}, &.{}, reliable));
+        var change = rtps.CacheChange{ .kind = .alive, .writer_guid = writer, .sequence_number = 1, .source_timestamp = .zero, .instance_handle = @splat(0), .key_hash = @splat(0xcc), .data = &.{ 0xff, 0 } };
+        try testing.expectError(error.InvalidSample, reader.handleData(writer, change));
+        try testing.expect(!reader.writer_proxies.items[0].received.contains(1));
+        try testing.expectEqual(@as(usize, 0), delivered.count);
+        change.data = &.{ 1, 0 };
+        try reader.handleData(writer, change);
+        try testing.expect(reader.writer_proxies.items[0].received.contains(1));
+        try testing.expectEqual(@as(usize, 1), delivered.count);
+        var first = rtps.message.submessage.DataFragSubmessage{ .flags = 0, .reader_entity_id = rtps.EntityIds.unknown, .writer_entity_id = writer.entity_id, .writer_sn = 2, .fragment_starting_num = 1, .fragments_in_submessage = 1, .fragment_size = 1, .data_size = 2, .inline_qos = null, .serialized_payload = &.{0xff} };
+        var second = first;
+        second.fragment_starting_num = 2;
+        second.serialized_payload = &.{0};
+        try reader.handleDataFrag(writer, .zero, first);
+        try testing.expectError(error.InvalidSample, reader.handleDataFrag(writer, .zero, second));
+        try testing.expect(!reader.writer_proxies.items[0].received.contains(2));
+        try testing.expectEqual(@as(u32, 0), reader.writer_proxies.items[0].reassembly.count());
+        first.serialized_payload = &.{1};
+        try reader.handleDataFrag(writer, .zero, first);
+        try reader.handleDataFrag(writer, .zero, second);
+        try testing.expectEqual(@as(usize, 2), delivered.count);
+        const unmatched_writer = checkedGuid(63, 2);
+        var cache = rtps.unmatched_cache.UnmatchedCache.init(testing.allocator, .{ .max_bytes = 1024, .max_writers = 4, .max_samples_per_writer = 4, .max_partials_per_writer = 4 });
+        defer cache.deinit();
+        change.writer_guid = unmatched_writer;
+        change.data = &.{ 0xff, 0 };
+        change.sequence_number = 1;
+        cache.put(unmatched_writer, rtps.EntityIds.unknown, &change, true, 0, 1000000);
+        _ = try reader.addOrRefreshMatchedWriterWith(try rtps.WriterProxy.init(testing.allocator, unmatched_writer, &.{}, &.{}, reliable), &.{ .cache = &cache }, null);
+        try testing.expect(!reader.writer_proxies.items[1].received.contains(1));
+        try testing.expectEqual(@as(usize, 2), delivered.count);
+        const processor = ts.sample_processor.?;
+        const inline_hash: [16]u8 = @splat(7);
+        try testing.expectEqualSlices(u8, &inline_hash, &try processor.process(processor.ctx, &.{}, .not_alive_disposed, inline_hash));
+        try testing.expectError(error.InvalidSample, processor.process(processor.ctx, &.{ 0xff, 0 }, .not_alive_disposed, inline_hash));
+        const zero: [16]u8 = @splat(0);
+        try testing.expectEqualSlices(u8, &zero, &try processor.process(processor.ctx, &.{ 2, 0 }, .not_alive_disposed, inline_hash));
+    }
+}
+
+const CheckedContext = struct {
+    destroyed: usize = 0,
+    fn process(_: ?*anyopaque, payload: [*]const u8, len: usize, key_only: c_int, out: *[16]u8) callconv(.c) c_int {
+        return checkedSample(payload, len, key_only, out);
+    }
+    fn destroy(ctx: ?*anyopaque) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.destroyed += 1;
+    }
+};
+test "checked contexts are immutable, idempotent and pinned through endpoint retirement" {
+    var state = CheckedContext{};
+    var fx = try Fixture.init(testing.allocator);
+    var live = true;
+    defer if (live) fx.deinit();
+    try testing.expectEqual(@as(c_int, 0), c_abi_ts.zzdds_register_type_support_checked_ctx(fx.dp_boxed, "Pinned", CheckedContext.process, 0, null, &state, CheckedContext.destroy));
+    try testing.expectEqual(@as(c_int, 0), c_abi_ts.zzdds_register_type_support_checked_ctx(fx.dp_boxed, "Pinned", CheckedContext.process, 0, null, &state, CheckedContext.destroy));
+    try testing.expectEqual(@as(c_int, -1), c_abi_ts.zzdds_register_type_support_checked_ctx(fx.dp_boxed, "Pinned", CheckedContext.process, 1, null, &state, CheckedContext.destroy));
+    try testing.expectEqual(@as(c_int, -1), c_abi_ts.zzdds_register_type_support(fx.dp_boxed, "Pinned", stubComputeKeyHashFromCdr, null, null));
+    const processor = fx.impl().type_support_registry.get("Pinned").?.sample_processor.?;
+    processor.retain.?(processor.ctx);
+    fx.deinit();
+    live = false;
+    try testing.expectEqual(@as(usize, 0), state.destroyed);
+    const zero: [16]u8 = @splat(0);
+    try testing.expectEqualSlices(u8, &zero, &try processor.process(processor.ctx, &.{ 1, 42 }, .alive, @splat(1)));
+    try testing.expectError(error.InvalidSample, processor.process(processor.ctx, &.{ 0xff, 0 }, .alive, @splat(0)));
+    processor.release.?(processor.ctx);
+    try testing.expectEqual(@as(usize, 1), state.destroyed);
+}
+
+test "checked registration installs the processor on a real legacy DataReader" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    try testing.expectEqual(@as(c_int, 0), c_abi_ts.zzdds_register_type_support_checked(fx.dp_boxed, "CheckedReader", checkedSample, 1, null));
+    const topic = fx.dp.create_topic("CheckedTopic", "CheckedReader", .{}, null, 0);
+    const sub = fx.dp.create_subscriber(.{}, null, 0);
+    const description = @as(*zzdds.dcps.TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
+    const reader = sub.create_datareader(description, .{}, null, 0);
+    try testing.expect(reader.ptr != nil.NIL_PTR);
+    const dr: *zzdds.dcps.DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    var active = fx.impl().active_readers.valueIterator();
+    var protocol: ?zzdds.protocol.ProtocolReader = null;
+    while (active.next()) |entry| {
+        if (std.mem.eql(u8, entry.type_name, "CheckedReader")) protocol = entry.proto;
+    }
+    const pr = protocol.?;
+    const writer = checkedGuid(64, 2);
+    _ = try pr.addMatchedWriter(&.{ .guid = writer, .unicast_locators = &.{}, .multicast_locators = &.{}, .reliability = .best_effort });
+    pr.handleIncomingChange(writer, 1, .zero, @splat(0xcc), &.{ 0xff, 0 }, .alive, null, null, null, null);
+    try testing.expectEqual(@as(usize, 0), dr.pending.items.len);
+    pr.handleIncomingChange(writer, 1, .zero, @splat(0xcc), &.{ 1, 0 }, .alive, null, null, null, null);
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
+    // A conflicting or newly checked install must not alter an existing topic.
+    const late = fx.dp.create_topic("LateCheckedTopic", "LateCheckedType", .{}, null, 0);
+    try testing.expect(late.ptr != nil.NIL_PTR);
+    try testing.expectEqual(@as(c_int, -1), c_abi_ts.zzdds_register_type_support_checked(fx.dp_boxed, "LateCheckedType", checkedSample, 1, null));
+}
+
+test "checked field getter contexts retain independent DataReader ownership" {
+    const State = struct {
+        destroyed: usize = 0,
+        fn process(_: ?*anyopaque, payload: [*]const u8, len: usize, key_only: c_int, hash: *[16]u8) callconv(.c) c_int {
+            return checkedSample(payload, len, key_only, hash);
+        }
+        fn field(_: ?*anyopaque, _: [*]const u8, _: usize, _: [*]const u8, _: usize, out: *c_abi_ts.ZzddsFilterValue, _: [*]u8, _: usize) callconv(.c) bool {
+            out.* = .{ .kind = 0, .i = 42 };
+            return true;
+        }
+        fn destroy(ctx: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.destroyed += 1;
+        }
+    };
+    var state = State{};
+    var fx = try Fixture.init(testing.allocator);
+    var live = true;
+    defer if (live) fx.deinit();
+    try testing.expectEqual(@as(c_int, 0), c_abi_ts.zzdds_register_type_support_checked_ctx(fx.dp_boxed, "CheckedField", State.process, 1, State.field, &state, State.destroy));
+    const topic = fx.dp.create_topic("CheckedFieldTopic", "CheckedField", .{}, null, 0);
+    const sub = fx.dp.create_subscriber(.{}, null, 0);
+    const td = @as(*zzdds.dcps.TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
+    const dr = sub.create_datareader(td, .{}, null, 0);
+    const impl: *zzdds.dcps.DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+    const getter = impl.get_field_fn.?;
+    try testing.expect(getter.retain != null and getter.release != null);
+    // Hold the same kind of reference a deferred reader operation owns.
+    getter.retain.?(getter.ctx);
+    fx.deinit();
+    live = false;
+    try testing.expectEqual(@as(usize, 0), state.destroyed);
+    var scratch: [1]u8 = undefined;
+    try testing.expectEqual(@as(i64, 42), getter.get(&.{}, "field", &scratch).?.int);
+    getter.release.?(getter.ctx);
+    try testing.expectEqual(@as(usize, 1), state.destroyed);
 }

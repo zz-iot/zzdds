@@ -1,0 +1,6 @@
+module Ingress {
+    @mutable union Choice switch(long) { @id(10) case 0: long number; @id(20) case 1: string text; };
+    @final struct Keyed { @key long id; Choice payload; };
+    @final struct Keyless { Choice payload; };
+    @mutable struct Evolving { @id(1) long number; };
+};

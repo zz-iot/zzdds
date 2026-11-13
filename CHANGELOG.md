@@ -10,6 +10,10 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-13
 
+- Add opt-in checked native/C typesupport registration, including ctx callbacks,
+  before-history processing of DATA/fragments/prematch, immutable installation
+  and callback-context retirement pins. Preserve legacy registration contracts.
+  Generated-callback tests cover keyed/keyless values and evolution defaults.
 - A `set_qos` on a DataReader or DataWriter (or a Subscriber's or Publisher's
   PRESENTATION) counts each discovered remote endpoint it makes incompatible in
   `REQUESTED_INCOMPATIBLE_QOS` / `OFFERED_INCOMPATIBLE_QOS`, as the change is made,
