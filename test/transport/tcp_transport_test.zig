@@ -1241,12 +1241,14 @@ test "tcp transport: sendOnChannel returns ChannelClosed after the connection cl
     try testing.expectError(error.ChannelClosed, st.sendOnChannel(lifecycle.channel, &lifecycle.src, "too late"));
 }
 
-/// A dial nothing accepts fails: at once (ConnectFailed), or once the
-/// backend finds the nonblocking connect refused, which closes and frees the
-/// connection.
+/// A dial nothing accepts fails: at once (ConnectFailed); in the send, when
+/// the backend finds the nonblocking connect refused and closes the
+/// connection before the send queues its frame, and then again on the
+/// re-dial (SendFailed); or after the send returns, when the backend closes
+/// and frees the connection.
 fn expectDialRefused(tr: *TcpTransport, dest: *const Locator) !void {
     tr.transport().send(dest, "hello") catch |err| switch (err) {
-        error.ConnectFailed => return,
+        error.ConnectFailed, error.SendFailed => return try waitLive(tr, 0),
         else => return err,
     };
     try waitLive(tr, 0);
