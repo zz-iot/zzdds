@@ -314,8 +314,11 @@ test "support factory: get_default_participant_config on a custom-allocator fact
     // (the factory's custom allocator) instead of c_allocator, which
     // testing.allocator's own tracking would reject as an invalid free.
     var config = ZZDDS.DomainParticipantConfig{};
-    config.participant._toml_applied = true;
+    // The flag marks the struct whose strings the caller allocated, so
+    // freeing it frees both of them: every string there must be owned.
+    config.transport.udp._toml_applied = true;
     config.transport.udp.multicast_group_v4 = try std.heap.c_allocator.dupe(u8, "external-default");
+    config.transport.udp.multicast_group_v6 = try std.heap.c_allocator.dupe(u8, "ff05::1");
     defer config.deinit(std.heap.c_allocator);
 
     try testing.expectEqual(DDS.RETCODE_OK, ext_factory.get_default_participant_config(&config));
