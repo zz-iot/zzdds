@@ -127,7 +127,6 @@ pub const createGuardCondition = raw_ops.createGuardCondition;
 
 pub const util = struct {
     pub const time = @import("util/time.zig");
-    pub const clock_registry = @import("util/clock_registry.zig");
     pub const guid_gen = @import("util/guid_gen.zig");
     pub const sock = @import("util/sock.zig");
     pub const mutex = @import("util/mutex.zig");
@@ -173,7 +172,6 @@ test {
     _ = @import("rtps/reassembly.zig");
     _ = @import("rtps/unmatched_cache.zig");
     _ = @import("util/time.zig");
-    _ = @import("util/clock_registry.zig");
     _ = @import("util/guid_gen.zig");
     _ = @import("util/sock.zig");
     _ = @import("util/mutex.zig");

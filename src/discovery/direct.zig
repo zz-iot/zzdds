@@ -806,7 +806,6 @@ pub const DirectDiscovery = struct {
 };
 
 const direct_vtable = Discovery.Vtable{
-    .shared_runtime_ready = true,
     .start = DirectDiscovery.vtStart,
     .stop = DirectDiscovery.vtStop,
     .prepare_writer = DirectDiscovery.vtPrepareWriter,

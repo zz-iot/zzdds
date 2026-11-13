@@ -343,7 +343,6 @@ pub const MockTransport = struct {
 };
 
 const mock_vtable = Transport.Vtable{
-    .shared_runtime_ready = true,
     .capabilities = .{ .unicast = true, .multicast = true },
     .can_reach = MockTransport.vtCanReach,
     .send = MockTransport.vtSend,

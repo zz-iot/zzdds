@@ -44,7 +44,6 @@ const REMOTE_LEASE_MS: u32 = 4_000;
 
 const CapturingDisc = struct {
     const vtable = Discovery.Vtable{
-        .shared_runtime_ready = true,
         .start = start,
         .stop = noop,
         .prepare_writer = noopAW,
@@ -125,11 +124,9 @@ const Harness = struct {
         errdefer h.transport.deinit();
         h.injector = try MockTransport.init(alloc, h.net, &.{Locator.udp4(.{ 127, 0, 0, 2 }, 7410)});
         errdefer h.injector.deinit();
-        var config = zzdds.config.Config{};
-        config.participant.timer_clock_name = "manual";
+        const config = zzdds.config.Config{};
         h.factory = try DomainParticipantFactoryImpl.init(alloc, h.transport.transport(), CapturingDisc.discovery(), noop_security, .spec_random, config);
         errdefer h.factory.deinit();
-        try h.factory.clock_registry.register("manual", h.mr.clock());
         h.dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         h.dp_impl = @ptrCast(@alignCast(h.dp.ptr));
         h.sub = h.dp.create_subscriber(.{}, null, 0);

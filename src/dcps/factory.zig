@@ -18,14 +18,10 @@ const guid_gen = @import("../util/guid_gen.zig");
 const config_mod = @import("../config/schema.zig");
 const generated_config_mod = @import("../config/generated.zig");
 const trace_mod = @import("../trace.zig");
-const clock_registry_mod = @import("../util/clock_registry.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const runtime_mod = @import("../runtime/core.zig");
 const default_registry = @import("../runtime/default_registry.zig");
-const tcp_transport = @import("../transport/tcp.zig");
 const log_mod = @import("../log.zig");
-
-pub const ClockRegistry = clock_registry_mod.ClockRegistry;
 
 pub const Transport = participant_mod.Transport;
 pub const Discovery = participant_mod.Discovery;
@@ -43,7 +39,6 @@ pub const DomainParticipantFactoryImpl = struct {
     default_dp_qos: DDS.DomainParticipantQos,
     /// See `setTraceSink`.
     trace_sink: ?trace_mod.Sink = null,
-    clock_registry: ClockRegistry,
 
     /// Active participants owned by this factory; guarded by `mu`.
     participants: std.ArrayListUnmanaged(*participant_mod.DomainParticipantImpl),
@@ -77,8 +72,6 @@ pub const DomainParticipantFactoryImpl = struct {
         guid_strategy: GuidStrategy,
         config: config_mod.Config,
     ) !*Self {
-        var reg = try ClockRegistry.init(alloc);
-        errdefer reg.deinit();
         const self = try alloc.create(Self);
         self.* = .{
             .alloc = alloc,
@@ -89,7 +82,6 @@ pub const DomainParticipantFactoryImpl = struct {
             .guid_strategy = guid_strategy,
             .factory_qos = .{},
             .default_dp_qos = .{},
-            .clock_registry = reg,
             .participants = .empty,
             .next_handle = 1,
             .mu = .{},
@@ -102,7 +94,6 @@ pub const DomainParticipantFactoryImpl = struct {
         for (self.participants.items) |p| p.deinit();
         self.participants.deinit(self.alloc);
         if (self.runtime) |rt| rt.releaseOwner();
-        self.clock_registry.deinit();
         self.default_dp_qos.deinit(self.alloc);
         self.alloc.destroy(self);
     }
@@ -131,20 +122,9 @@ pub const DomainParticipantFactoryImpl = struct {
     }
 
     /// Takes an owner reference to the selected runtime, or else the default
-    /// one, for a new participant, after checking the participant's
-    /// transports and discovery can run on it; null (with a diagnostic) when
-    /// creation must fail.
-    fn acquireRuntimeFor(self: *Self, config: config_mod.Config) ?*runtime_mod.Runtime {
-        if (!self.transport.vtable.shared_runtime_ready or
-            (config.transport.tcp.enabled and !tcp_transport.shared_runtime_ready))
-        {
-            log_mod.dcps.warn("create_participant: the transport is not supported on the shared runtime yet", .{});
-            return null;
-        }
-        if (!self.discovery.vtable.shared_runtime_ready) {
-            log_mod.dcps.warn("create_participant: the discovery plugin is not supported on the shared runtime yet", .{});
-            return null;
-        }
+    /// one, for a new participant, and attaches the transport and discovery
+    /// to it; null (with a diagnostic) when creation must fail.
+    fn acquireRuntimeFor(self: *Self) ?*runtime_mod.Runtime {
         self.mu.lock();
         const selected = self.runtime;
         const retained = if (selected) |rt| rt.tryRetainOwner() else false;
@@ -275,7 +255,7 @@ pub const DomainParticipantFactoryImpl = struct {
             .entity_id = participant_mod.EntityIds.participant,
         };
 
-        const rt = self.acquireRuntimeFor(config) orelse return null;
+        const rt = self.acquireRuntimeFor() orelse return null;
 
         const p = participant_mod.DomainParticipantImpl.init(
             self.alloc,

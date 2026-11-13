@@ -99,8 +99,7 @@ const Fixture = struct {
         errdefer mr.deinit();
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
-        var config = zzdds.config.Config{};
-        config.participant.timer_clock_name = "manual";
+        const config = zzdds.config.Config{};
 
         const t_w = try delivery.newTransport();
         errdefer t_w.deinit();
@@ -108,7 +107,6 @@ const Fixture = struct {
         errdefer d_w.deinit();
         const factory_w = try DomainParticipantFactoryImpl.init(alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .spec_random, config);
         errdefer factory_w.deinit();
-        try factory_w.clock_registry.register("manual", mr.clock());
         const dp_w = factory_w.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const pub_ = dp_w.create_publisher(.{}, null, 0);
         const topic_w = dp_w.create_topic("ClaimTopic", "ClaimType", .{}, null, 0);
@@ -119,7 +117,6 @@ const Fixture = struct {
         errdefer d_r.deinit();
         const factory_r = try DomainParticipantFactoryImpl.init(alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .spec_random, config);
         errdefer factory_r.deinit();
-        try factory_r.clock_registry.register("manual", mr.clock());
         const dp_r = factory_r.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const sub_ = dp_r.create_subscriber(.{}, null, 0);
         const topic_r = dp_r.create_topic("ClaimTopic", "ClaimType", .{}, null, 0);

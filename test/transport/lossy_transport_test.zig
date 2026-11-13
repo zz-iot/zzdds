@@ -197,22 +197,6 @@ const AttachStub = struct {
     }
 };
 
-test "LossyTransport: runs on the shared runtime exactly when its inner transport does" {
-    var stub = StubCtx{};
-    var policy = DropNone{};
-    var inner = stub.transport();
-    const threaded = try LossyTransport.init(testing.allocator, inner, policy.packetPolicy());
-    defer threaded.deinit(testing.allocator);
-    try testing.expect(!threaded.transport().vtable.shared_runtime_ready);
-
-    var ready_vtable = inner.vtable.*;
-    ready_vtable.shared_runtime_ready = true;
-    inner.vtable = &ready_vtable;
-    const ready = try LossyTransport.init(testing.allocator, inner, policy.packetPolicy());
-    defer ready.deinit(testing.allocator);
-    try testing.expect(ready.transport().vtable.shared_runtime_ready);
-}
-
 test "LossyTransport: attaching to a runtime reaches the inner transport" {
     var stub = StubCtx{};
     var policy = DropNone{};

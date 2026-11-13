@@ -69,16 +69,16 @@ const Node = struct {
         return initWith(delivery, false, false);
     }
 
-    /// `threaded_*` presents the plugin as one that runs its own threads.
-    fn initWith(delivery: *IntraProcessDelivery, threaded_transport: bool, threaded_discovery: bool) !Node {
+    /// `unattachable_*` presents the plugin as one that refuses the runtime.
+    fn initWith(delivery: *IntraProcessDelivery, unattachable_transport: bool, unattachable_discovery: bool) !Node {
         const t = try delivery.newTransport();
         errdefer t.deinit();
         const d = try delivery.newDiscovery();
         errdefer d.deinit();
         var transport = t.transport();
-        if (threaded_transport) transport.vtable = &threaded_transport_vtable;
+        if (unattachable_transport) transport.vtable = &unattachable_transport_vtable;
         var discovery = d.toDiscovery();
-        if (threaded_discovery) discovery.vtable = &threaded_discovery_vtable;
+        if (unattachable_discovery) discovery.vtable = &unattachable_discovery_vtable;
         const f = try DomainParticipantFactoryImpl.init(alloc, transport, discovery, noop_security, .spec_random, .{});
         return .{ .transport = t, .discovery = d, .factory = f };
     }
@@ -98,18 +98,28 @@ const Node = struct {
     }
 };
 
-var threaded_transport_vtable: zzdds.transport.Transport.Vtable = undefined;
-var threaded_discovery_vtable: zzdds.discovery.Discovery.Vtable = undefined;
+var unattachable_transport_vtable: zzdds.transport.Transport.Vtable = undefined;
+var unattachable_discovery_vtable: zzdds.discovery.Discovery.Vtable = undefined;
 
-fn presentAsThreaded(delivery: *IntraProcessDelivery) !void {
+/// The in-process plugins, but refusing the runtime, as a socket transport
+/// does on a backend that waits on no sockets.
+fn presentAsUnattachable(delivery: *IntraProcessDelivery) !void {
     const t = try delivery.newTransport();
     defer t.deinit();
     const d = try delivery.newDiscovery();
     defer d.deinit();
-    threaded_transport_vtable = t.transport().vtable.*;
-    threaded_transport_vtable.shared_runtime_ready = false;
-    threaded_discovery_vtable = d.toDiscovery().vtable.*;
-    threaded_discovery_vtable.shared_runtime_ready = false;
+    const Refuse = struct {
+        fn backend(_: *anyopaque, _: rt.ProgressBackend) anyerror!void {
+            return error.BackendHasNoSources;
+        }
+        fn runtime(_: *anyopaque, _: *rt.Runtime) anyerror!void {
+            return error.AttachedElsewhere;
+        }
+    };
+    unattachable_transport_vtable = t.transport().vtable.*;
+    unattachable_transport_vtable.attach_backend = Refuse.backend;
+    unattachable_discovery_vtable = d.toDiscovery().vtable.*;
+    unattachable_discovery_vtable.attach_runtime = Refuse.runtime;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -151,18 +161,18 @@ test "a factory's selected runtime overrides the default" {
     try following.delete(implicit);
 }
 
-test "a transport or discovery plugin with threads of its own fails creation" {
+test "a transport or discovery plugin that cannot attach to the runtime fails creation" {
     const prev_log_level = quietRefusals();
     defer std.testing.log_level = prev_log_level;
     var delivery = try IntraProcessDelivery.init(alloc);
     defer delivery.deinit();
-    try presentAsThreaded(&delivery);
+    try presentAsUnattachable(&delivery);
     var m: Manual = undefined;
     m.init();
     defer m.runtime.deinit();
 
-    for ([_][2]bool{ .{ true, false }, .{ false, true } }) |threaded| {
-        var node = try Node.initWith(&delivery, threaded[0], threaded[1]);
+    for ([_][2]bool{ .{ true, false }, .{ false, true } }) |unattachable| {
+        var node = try Node.initWith(&delivery, unattachable[0], unattachable[1]);
         defer node.deinit();
         try node.factory.selectRuntime(&m.runtime);
         try testing.expectEqual(nil_participant.ptr, node.create().ptr);

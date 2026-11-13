@@ -198,9 +198,8 @@ scenarios.
 timers forward. `sleep_ns` waits for the logical clock to advance, waking periodically so
 timer threads can observe shutdown flags.
 
-`DomainParticipantFactoryImpl` selects the clock by name via `ClockRegistry`
-(`timer_clock_name` config field; default: `"monotonic"`). See `src/util/clock_registry.zig`
-and `docs/architecture.md`.
+Participants' timers read their runtime's clock: a test drives them through a manual
+runtime (`test/support/manual_runtime.zig`). See `docs/architecture.md`.
 
 ---
 

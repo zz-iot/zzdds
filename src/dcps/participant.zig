@@ -1083,8 +1083,8 @@ pub const DomainParticipantImpl = struct {
     /// discovery plugin when it starts serving this participant.
     discovery_tracer: trace_mod.Tracer,
 
-    /// Monotonic clock used for internal interval timers (deadline, liveliness).
-    /// Resolved from the factory's ClockRegistry at participant creation time.
+    /// The clock internal interval timers (deadline, liveliness) read: its
+    /// runtime's.
     timer_clock: time_mod.Clock,
 
     mu: Mutex,

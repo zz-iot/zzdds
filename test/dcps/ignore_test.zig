@@ -37,7 +37,6 @@ const CapturingDisc = struct {
     callbacks: ?*const Callbacks = null,
 
     const vtable = Discovery.Vtable{
-        .shared_runtime_ready = true,
         .start = start,
         .stop = stop,
         .prepare_writer = noopAW,
