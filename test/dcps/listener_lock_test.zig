@@ -404,17 +404,24 @@ test "every incompatible reader is notified once, however many there are" {
     for (counts) |c| try testing.expectEqual(@as(usize, 1), c.calls);
 }
 
-/// The policies the last call's status counts, in the order it lists them.
+/// The policies the last call's status counts, in the order it lists them,
+/// and its total.
 const IncompatPolicies = struct {
     ids: [8]DDS.QosPolicyId_t = undefined,
+    counts: [8]i32 = undefined,
     n_ids: usize = 0,
+    total_count: i32 = 0,
     calls: usize = 0,
     fn cb(p: *IncompatPolicies, _: DDS.DataReader, status: DDS.RequestedIncompatibleQosStatus) void {
         p.calls += 1;
-        // Borrowed for the call: keep the ids only.
+        p.total_count = status.total_count;
+        // Borrowed for the call: keep the ids and counts only.
         const policies = if (status.policies._buffer) |b| b[0..status.policies._length] else &.{};
         p.n_ids = @min(policies.len, p.ids.len);
-        for (policies[0..p.n_ids], p.ids[0..p.n_ids]) |pc, *id| id.* = pc.policy_id;
+        for (policies[0..p.n_ids], p.ids[0..p.n_ids], p.counts[0..p.n_ids]) |pc, *id, *count| {
+            id.* = pc.policy_id;
+            count.* = pc.count;
+        }
     }
 };
 
@@ -450,6 +457,10 @@ test "a reader incompatible with several writers is told each policy" {
     // However the calls fall (on the shared runtime they coalesce into one,
     // docs/design/concurrency/listeners.md#status-ordering-requirements), the
     // status counts each policy (DDS 1.4 §2.2.4.1), in policy-id order.
+    // Each writer counts once, though in-process discovery delivers both
+    // again once the reader exists.
     try testing.expect(probe.calls >= 1);
     try testing.expectEqualSlices(DDS.QosPolicyId_t, &.{ DDS.DURABILITY_QOS_POLICY_ID, DDS.RELIABILITY_QOS_POLICY_ID }, probe.ids[0..probe.n_ids]);
+    try testing.expectEqualSlices(i32, &.{ 1, 1 }, probe.counts[0..probe.n_ids]);
+    try testing.expectEqual(@as(i32, 2), probe.total_count);
 }

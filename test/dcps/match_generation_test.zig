@@ -586,6 +586,101 @@ test "a writer refreshed with a longer deadline than its reader requests is unma
     try testing.expectEqual(@as(i32, 1), requestedIncompatible(r));
 }
 
+// REQUESTED/OFFERED_INCOMPATIBLE_QOS count incompatible remote endpoints
+// discovered (DDS 1.4 §2.2.4.1), not their announcements: a known one counts
+// again only when it becomes incompatible, or is discovered again after its
+// loss.
+
+test "a writer announced again, still incompatible, is not counted again" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var qos = DDS.DataReaderQos{};
+    qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
+    const r = h.reader(qos, null);
+    const w = endpointGuid(0x75, 1, WRITER_KIND);
+
+    h.announceWriter(w, .{ .deadline_s = 2 });
+    try testing.expectEqual(@as(i32, 1), requestedIncompatible(r));
+    h.announceWriter(w, .{ .deadline_s = 2 });
+    try testing.expectEqual(@as(i32, 1), requestedIncompatible(r));
+    h.announceWriter(w, .{ .deadline_s = 3 });
+    try testing.expectEqual(@as(i32, 1), requestedIncompatible(r));
+    try testing.expectEqual(@as(i32, 0), subMatched(r).current_count);
+}
+
+test "a writer already discovered when its reader is created is counted once" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const w = endpointGuid(0x76, 1, WRITER_KIND);
+    h.announceWriter(w, .{ .deadline_s = 2 });
+
+    // In-process discovery delivers the writer again once the reader exists.
+    var qos = DDS.DataReaderQos{};
+    qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
+    const r = h.reader(qos, null);
+    try testing.expectEqual(@as(i32, 1), requestedIncompatible(r));
+    h.announceWriter(w, .{ .deadline_s = 2 });
+    try testing.expectEqual(@as(i32, 1), requestedIncompatible(r));
+}
+
+test "a writer discovered again after its loss is counted again" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var qos = DDS.DataReaderQos{};
+    qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
+    const r = h.reader(qos, null);
+    const w = endpointGuid(0x77, 1, WRITER_KIND);
+
+    h.announceWriter(w, .{ .deadline_s = 2 });
+    h.loseWriter(w);
+    h.announceWriter(w, .{ .deadline_s = 2 });
+    try testing.expectEqual(@as(i32, 2), requestedIncompatible(r));
+    h.loseParticipant(w.prefix);
+    h.announceWriter(w, .{ .deadline_s = 2 });
+    try testing.expectEqual(@as(i32, 3), requestedIncompatible(r));
+}
+
+test "a reader announced again, still incompatible, is not counted again" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var qos = DDS.DataWriterQos{};
+    qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    qos.deadline.period = .{ .sec = 2, .nanosec = 0 };
+    const w = h.writer(qos, null);
+    const rd = endpointGuid(0x78, 1, READER_KIND);
+
+    h.announceReaderWith(rd, .{ .deadline_s = 1 });
+    try testing.expectEqual(@as(i32, 1), offeredIncompatible(w));
+    h.announceReaderWith(rd, .{ .deadline_s = 1 });
+    try testing.expectEqual(@as(i32, 1), offeredIncompatible(w));
+    h.announceReaderWith(rd, .{ .deadline_s = 0 });
+    try testing.expectEqual(@as(i32, 1), offeredIncompatible(w));
+    try testing.expectEqual(@as(i32, 0), pubMatched(w).current_count);
+}
+
+test "a reader discovered again after its loss is counted again" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var qos = DDS.DataWriterQos{};
+    qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    qos.deadline.period = .{ .sec = 2, .nanosec = 0 };
+    const w = h.writer(qos, null);
+    const rd = endpointGuid(0x79, 1, READER_KIND);
+
+    h.announceReaderWith(rd, .{ .deadline_s = 1 });
+    h.loseReader(rd);
+    h.announceReaderWith(rd, .{ .deadline_s = 1 });
+    try testing.expectEqual(@as(i32, 2), offeredIncompatible(w));
+    h.loseParticipant(rd.prefix);
+    h.announceReaderWith(rd, .{ .deadline_s = 1 });
+    try testing.expectEqual(@as(i32, 3), offeredIncompatible(w));
+}
+
 test "a writer refreshed into a partition its reader is not in is unmatched" {
     var h: Harness = undefined;
     try h.init();
@@ -687,6 +782,83 @@ test "an incompatible writer discovered between a reader's enabling and its anno
     try testing.expectEqual(@as(u32, 2), Window.calls);
     try testing.expectEqual(@as(i32, 0), subMatched(r).current_count);
     try testing.expectEqual(@as(i32, 1), requestedIncompatible(r));
+}
+
+// set_qos prepares the endpoint's new QoS before announcing it. A remote
+// announcement in between is checked against the new QoS, and removes the
+// match the local announcement would have: it counts there.
+
+test "a matched writer announced between its reader's QoS change and announcement is counted once" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const w = endpointGuid(0x7A, 1, WRITER_KIND);
+    const Window = struct {
+        const Cbs = @FieldType(dcps.SubscriberImpl, "cbs");
+        var harness: *Harness = undefined;
+        var original: @FieldType(Cbs, "prepare_reader_qos") = undefined;
+        var writer: Guid = undefined;
+
+        fn prepareReaderQos(ctx: *anyopaque, handle: DDS.InstanceHandle_t, qos: *const DDS.DataReaderQos) anyerror!void {
+            try original(ctx, handle, qos);
+            harness.announceWriter(writer, .{ .deadline_s = 3 });
+        }
+    };
+    var qos = DDS.DataReaderQos{};
+    qos.deadline.period = .{ .sec = 5, .nanosec = 0 };
+    const r = h.reader(qos, null);
+    h.announceWriter(w, .{ .deadline_s = 2 });
+    try testing.expectEqual(@as(i32, 1), subMatched(r).current_count);
+
+    const sub_impl: *dcps.SubscriberImpl = @ptrCast(@alignCast(h.sub.ptr));
+    Window.harness = &h;
+    Window.writer = w;
+    Window.original = sub_impl.cbs.prepare_reader_qos;
+    sub_impl.cbs.prepare_reader_qos = Window.prepareReaderQos;
+    defer sub_impl.cbs.prepare_reader_qos = Window.original;
+    qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
+    const dr = r.toDDSDataReader();
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.set_qos(dr.ptr, &qos));
+
+    try testing.expectEqual(@as(i32, 0), subMatched(r).current_count);
+    try testing.expectEqual(@as(i32, 1), requestedIncompatible(r));
+}
+
+test "a matched reader announced unchanged between its writer's QoS change and announcement is counted once" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const rd = endpointGuid(0x7B, 1, READER_KIND);
+    const Window = struct {
+        const Cbs = @FieldType(dcps.PublisherImpl, "cbs");
+        var harness: *Harness = undefined;
+        var original: @FieldType(Cbs, "prepare_writer_qos") = undefined;
+        var reader: Guid = undefined;
+
+        fn prepareWriterQos(ctx: *anyopaque, handle: DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, qos: *const DDS.DataWriterQos) anyerror!void {
+            try original(ctx, handle, publisher_handle, qos);
+            harness.announceReaderWith(reader, .{ .deadline_s = 3 });
+        }
+    };
+    var qos = DDS.DataWriterQos{};
+    qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    qos.deadline.period = .{ .sec = 2, .nanosec = 0 };
+    const w = h.writer(qos, null);
+    h.announceReaderWith(rd, .{ .deadline_s = 3 });
+    try testing.expectEqual(@as(i32, 1), pubMatched(w).current_count);
+
+    const pub_impl: *dcps.PublisherImpl = @ptrCast(@alignCast(h.pub_.ptr));
+    Window.harness = &h;
+    Window.reader = rd;
+    Window.original = pub_impl.cbs.prepare_writer_qos;
+    pub_impl.cbs.prepare_writer_qos = Window.prepareWriterQos;
+    defer pub_impl.cbs.prepare_writer_qos = Window.original;
+    qos.deadline.period = .{ .sec = 4, .nanosec = 0 };
+    const dw = w.toDDSDataWriter();
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.set_qos(dw.ptr, &qos));
+
+    try testing.expectEqual(@as(i32, 0), pubMatched(w).current_count);
+    try testing.expectEqual(@as(i32, 1), offeredIncompatible(w));
 }
 
 test "a reader refreshed with a shorter deadline than its writer offers is unmatched, and counted once as incompatible" {

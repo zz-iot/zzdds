@@ -345,39 +345,6 @@ Forward-looking only: known gaps, planned features, and open design questions.
   callbacks themselves no longer run under any zzdds lock (2026-10-05); bring teardown in
   line by detaching the children under the lock and deiniting them after it is released,
   as `DomainParticipant::delete_contained_entities` already does.
-- **Incompatible-QoS status counts an already-known remote endpoint again.** DDS defines
-  `REQUESTED_INCOMPATIBLE_QOS`/`OFFERED_INCOMPATIBLE_QOS` `total_count` as the number of
-  incompatible remote writers/readers discovered. The participant checks a local endpoint
-  against remote ones in two places: when the local endpoint is announced
-  (`subAnnounceProtoReader`/`pubAnnounceProtoWriter`, against everything already
-  discovered) and whenever a remote endpoint is announced (`onWriterDiscovered`/
-  `onReaderDiscovered`, against every local endpoint). A matched pair is not counted
-  twice because the second check finds it already matched, but nothing records an
-  incompatible pair, so each re-announcement of a known incompatible endpoint counts and
-  notifies again. In-process discovery (`discovery/direct.zig`) triggers this every time a
-  reader is created after its writers, since it re-delivers every existing writer to the
-  new reader's participant; over SEDP it needs a re-announcement of an already-known
-  endpoint (a QoS change, for example).
-  Fix: in `onWriterDiscovered`/`onReaderDiscovered`, skip the incompatibility check when
-  the remote endpoint is already in `discovered_writers`/`discovered_readers` with
-  unchanged QoS (`upsertDiscoveredWriter`/`upsertDiscoveredReader` already do the lookup):
-  every local endpoint existing at that point was already checked against it, either at
-  its own announcement or at the remote endpoint's first. Matching is unaffected. This
-  needs no per-pair state, so no allocation (which could fail) and no growth of
-  `ActiveReader`/`ActiveWriter` (whose map allocation must, for now, fit a 4 KiB block; see
-  "Allocator strategy" below). Forgetting
-  comes with the discovery record: SPDP lease expiry, a participant's goodbye, a failed
-  liveness probe and `removePeer` (all via `onParticipantLost`), and SEDP disposes (via
-  `onWriterLost`/`onReaderLost`) remove it, so a later rediscovery counts as new. Not a
-  timeout, which would recount a still-present endpoint, and not WLP: a writer that
-  loses liveliness stays discovered, and DDS reports that only through
-  `liveliness_changed`. Open question: whether a known endpoint whose QoS changes and is
-  still incompatible counts again; the simplest rule is to count only when the result
-  changes (compatible to incompatible, or a different policy). Tests: reader created
-  after its writers (in-process replay), unchanged re-announcement, rediscovery after
-  participant loss, and a QoS change. `listener_lock_test`'s "a reader incompatible with
-  several writers is told each policy" deliberately checks only the first two
-  notifications until this is fixed.
 
 ### Selective CDR parse (`deserialize_selected`) — deferred follow-ups
 
