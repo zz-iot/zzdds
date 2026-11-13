@@ -30,6 +30,13 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   interval argument: the transport re-polls them on its runtime.
 - `zzdds.runtime.testing.HostedPoll` runs a hosted runtime over the readiness backend,
   for tests that drive a transport without a participant.
+- **Breaking** for Zig: the TCP transport no longer starts an accept thread or a receive
+  thread per connection, and never dials or sends blocking. `listen` and `send` on a
+  `TcpTransport` not attached to a progress backend fail with `error.NoProgressBackend`.
+  A refused dial now fails after `send` returns, when the backend finds the connect
+  refused and closes the connection, and a send while an earlier frame waits on the
+  connection reports `would_block`. A closed connection is freed as soon as it closes,
+  not by the next dial or accept.
 - **The shared runtime is the default.** Participants run on its hosted workers: receive,
   discovery, heartbeats and timers are runtime turns instead of a thread per socket and per
   concern. Listeners run as runtime turns too, so one can run after the call that caused it

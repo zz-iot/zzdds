@@ -22,9 +22,11 @@ pool sizes or the external-loop ABI ([open design item](../concurrency-broker-st
   per multicast socket. Each polled its socket every 50 ms, received into a 64 KiB stack
   buffer and called every handler with a slice borrowed for the call. These threads are
   gone: UDP now receives only on a backend, and listening without one fails.
-* TCP runs an accept thread and one receive thread per connection. `send` dials with a
-  blocking `connect` and writes with a blocking `send` under the connection's send lock,
-  so a send can stall its caller for as long as the peer or the network takes.
+* TCP ran an accept thread and one receive thread per connection. `send` dialed with a
+  blocking `connect` and wrote with a blocking `send` under the connection's send lock,
+  so a send could stall its caller for as long as the peer or the network took. These
+  are gone too: TCP now accepts, reads, dials and sends only on a backend, never
+  blocking, and listening or sending without one fails.
 * Every send is synchronous on the caller's thread (a writer, the heartbeat thread, SPDP).
   Nothing reports output asynchronously, and `MessageBuilder`'s gather list is flattened
   into one buffer before each send.

@@ -1178,9 +1178,8 @@ sources of the same backend, so a reliable pair over loopback TCP also runs thro
 ingress as UDP datagrams do, and a connection whose frame does not fit stops reading until
 it does. Windows runs all of this too, over Winsock: the backend polls with `WSAPoll`,
 whose wake is a loopback UDP socket connected to itself, and sockets on it are made
-nonblocking, since Winsock has no `MSG_DONTWAIT`. UDP receives only on a backend, and
-listening without one fails; TCP without one still calls its handlers from its own
-receive threads. Now specified as the
+nonblocking, since Winsock has no `MSG_DONTWAIT`. UDP and TCP receive only on a backend,
+and listening (or, for TCP, sending) without one fails. Now specified as the
 [ManualDriver/external-loop contract](design/concurrency/runtime.md#manual-runtime-driving-and-external-loop-integration)
 (`drive(budget, max_wait)` plus prepare-to-wait integration) and the cooperative
 measurement profile in the concurrency architecture; implementation follows the
