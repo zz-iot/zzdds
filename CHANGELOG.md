@@ -8,13 +8,28 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-13
+
+- A `set_qos` on a DataReader or DataWriter (or a Subscriber's or Publisher's
+  PRESENTATION) counts each discovered remote endpoint it makes incompatible in
+  `REQUESTED_INCOMPATIBLE_QOS` / `OFFERED_INCOMPATIBLE_QOS`, as the change is made,
+  including one it was not matched with because of PARTITION. It used to count only the
+  matches its announcement removed, so an endpoint in another partition was never
+  counted.
+- A DataReader's or DataWriter's `set_qos` keeps the endpoint alive until it returns. One
+  deleted meanwhile, by a listener running on a runtime worker (such as the
+  incompatible-QoS listener the change itself raises), makes it return
+  `RETCODE_ALREADY_DELETED`; it used to write into the freed endpoint. `set_qos` calls
+  on one endpoint, from a listener its change raised say, take effect one at a time, so
+  `get_qos` reports the QoS the endpoint was last announced and matched with.
+
 ## 2026-11-12
 
 - `REQUESTED_INCOMPATIBLE_QOS` and `OFFERED_INCOMPATIBLE_QOS` count each incompatible
   remote endpoint once, as DDS defines `total_count`, rather than each of its
   announcements. A known endpoint announced again counts only if it was compatible
-  before or its announcement removes a match; one discovered again after its loss
-  (lease expiry, goodbye, failed liveness probe, SEDP dispose) counts again. In-process
+  before; one discovered again after its loss (lease expiry, goodbye, failed liveness
+  probe, SEDP dispose) counts again. In-process
   discovery counted a reader's incompatible writers twice when the reader was created
   after them, and every other incompatible reader on the topic again too.
 - `on_reliable_reader_ready` and `on_reliable_writer_ready` (`DataWriterListenerEx`,

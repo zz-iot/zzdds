@@ -92,7 +92,10 @@ pub const DataWriterImpl = struct {
     /// hand-built impls in tests that skip init()).
     parent_pinned: bool = false,
     proto_writer: proto.ProtocolWriter,
+    /// Replaced by set_qos under `qos_mu`; get_qos reads it under it.
     qos: DDS.DataWriterQos,
+    /// As DataReaderImpl.qos_mu: orders set_qos calls.
+    qos_mu: Mutex = .{},
     /// Entity::enable() state. Seeded by publisher.zig's vtCreateDataWriter
     /// from the owning Publisher's `qos.entity_factory.autoenable_created_entities`.
     /// While false, the outbound SEDP announcement (publisher.zig's
@@ -1084,24 +1087,40 @@ pub const DataWriterImpl = struct {
     /// (docs/design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal).
     fn vtSetQos(ctx: *anyopaque, qos: *const DDS.DataWriterQos) DDS.ReturnCode_t {
         const self = cast(ctx);
-        if (qos_change.writerImmutableChanged(&self.qos, qos)) return DDS.RETCODE_IMMUTABLE_POLICY;
-        if (qos_change.eql(DDS.DataWriterQos, &self.qos, qos)) return DDS.RETCODE_OK;
-        var new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        // As for a reader (DataReaderImpl.vtSetQos): held across preparing,
+        // whose incompatibilities' listener may delete this writer.
+        if (!self.quiesce.acquire()) return DDS.RETCODE_ALREADY_DELETED;
+        defer self.quiesce.release(self, reallyDeinit);
         const parent: ?*publisher_mod.PublisherImpl = if (nil.isNil(self.publisher)) null else @ptrCast(@alignCast(self.publisher.ptr));
-        if (parent) |p| p.prepareDataWriterQos(self.instance_handle, &new_qos) catch {
-            new_qos.deinit(self.alloc);
-            return DDS.RETCODE_OUT_OF_RESOURCES;
-        };
-        self.qos.deinit(self.alloc);
-        self.qos = new_qos;
-        // A shorter deadline may fall due sooner.
-        if (self.timers_changed) |h| h.run(h.ctx);
+        {
+            // As for a reader: prepared and made under `qos_mu`.
+            self.qos_mu.lock();
+            defer self.qos_mu.unlock();
+            if (qos_change.writerImmutableChanged(&self.qos, qos)) return DDS.RETCODE_IMMUTABLE_POLICY;
+            if (qos_change.eql(DDS.DataWriterQos, &self.qos, qos)) return DDS.RETCODE_OK;
+            var new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+            if (parent) |p| p.prepareDataWriterQos(self.instance_handle, &new_qos) catch {
+                new_qos.deinit(self.alloc);
+                return DDS.RETCODE_OUT_OF_RESOURCES;
+            };
+            if (self.quiesce.tearingDown()) {
+                new_qos.deinit(self.alloc);
+                return DDS.RETCODE_ALREADY_DELETED;
+            }
+            self.qos.deinit(self.alloc);
+            self.qos = new_qos;
+            // A shorter deadline may fall due sooner.
+            if (self.timers_changed) |h| h.run(h.ctx);
+        }
+        // As for a reader: announced without `qos_mu`.
         if (parent) |p| if (self.enabled.load(.acquire)) p.announceDataWriter(self.instance_handle);
         return DDS.RETCODE_OK;
     }
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.DataWriterQos) DDS.ReturnCode_t {
         const self = cast(ctx);
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
         qos.* = self.qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }

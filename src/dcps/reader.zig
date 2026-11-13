@@ -313,7 +313,12 @@ pub const DataReaderImpl = struct {
     /// See DataWriterImpl.parent_pinned.
     parent_pinned: bool = false,
     proto_reader: proto.ProtocolReader,
+    /// Replaced by set_qos under `qos_mu`; get_qos reads it under it.
     qos: DDS.DataReaderQos,
+    /// Orders set_qos calls: each prepares and makes its change before the
+    /// next starts, so `qos` is what was prepared last even when a listener
+    /// the change raises calls set_qos meanwhile. Not held while announcing.
+    qos_mu: Mutex = .{},
     /// Entity::enable() state. Seeded by subscriber.zig's vtCreateDataReader
     /// from the owning Subscriber's `qos.entity_factory.autoenable_created_entities`.
     /// While false, the outbound SEDP announcement (subscriber.zig's
@@ -3258,24 +3263,45 @@ pub const DataReaderImpl = struct {
     /// (docs/design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal).
     fn vtSetQos(ctx: *anyopaque, qos: *const DDS.DataReaderQos) DDS.ReturnCode_t {
         const self = cast(ctx);
-        if (qos_change.readerImmutableChanged(&self.qos, qos)) return DDS.RETCODE_IMMUTABLE_POLICY;
-        if (qos_change.eql(DDS.DataReaderQos, &self.qos, qos)) return DDS.RETCODE_OK;
-        var new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        // Preparing raises the incompatibilities the change causes, whose
+        // listener may delete this reader before the change is made: held
+        // until it is, as a deletion meanwhile frees it only on release.
+        if (!self.quiesce.acquire()) return DDS.RETCODE_ALREADY_DELETED;
+        defer self.quiesce.release(self, reallyDeinit);
         const parent: ?*subscriber_mod.SubscriberImpl = if (nil.isNil(self.subscriber)) null else @ptrCast(@alignCast(self.subscriber.ptr));
-        if (parent) |p| p.prepareDataReaderQos(self.instance_handle, &new_qos) catch {
-            new_qos.deinit(self.alloc);
-            return DDS.RETCODE_OUT_OF_RESOURCES;
-        };
-        self.qos.deinit(self.alloc);
-        self.qos = new_qos;
-        // A shorter deadline may fall due sooner.
-        self.timersChanged();
+        {
+            // Prepared and made under `qos_mu`, so `qos` is what was
+            // prepared last. Released before the quiesce reference, whose
+            // release may free it.
+            self.qos_mu.lock();
+            defer self.qos_mu.unlock();
+            if (qos_change.readerImmutableChanged(&self.qos, qos)) return DDS.RETCODE_IMMUTABLE_POLICY;
+            if (qos_change.eql(DDS.DataReaderQos, &self.qos, qos)) return DDS.RETCODE_OK;
+            var new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+            if (parent) |p| p.prepareDataReaderQos(self.instance_handle, &new_qos) catch {
+                new_qos.deinit(self.alloc);
+                return DDS.RETCODE_OUT_OF_RESOURCES;
+            };
+            // Deleted meanwhile: its deletion retracted what was prepared.
+            if (self.quiesce.tearingDown()) {
+                new_qos.deinit(self.alloc);
+                return DDS.RETCODE_ALREADY_DELETED;
+            }
+            self.qos.deinit(self.alloc);
+            self.qos = new_qos;
+            // A shorter deadline may fall due sooner.
+            self.timersChanged();
+        }
+        // Announced without `qos_mu`: a change made while this is announced
+        // is announced after it (DomainParticipantImpl.beginAnnouncingLocked).
         if (parent) |p| if (self.enabled.load(.acquire)) p.announceDataReader(self.instance_handle);
         return DDS.RETCODE_OK;
     }
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.DataReaderQos) DDS.ReturnCode_t {
         const self = cast(ctx);
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
         qos.* = self.qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }

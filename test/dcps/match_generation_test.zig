@@ -359,6 +359,13 @@ fn incompatibleReaderQos() DDS.DataReaderQos {
     return qos;
 }
 
+/// Waits up to `max_ms` for `flag`, set by another thread that may instead
+/// have to wait for this one: a bound, not a guess at how long it takes.
+fn awaitFlag(flag: *const std.atomic.Value(bool), max_ms: u32) void {
+    var waited_ms: u32 = 0;
+    while (!flag.load(.acquire) and waited_ms < max_ms) : (waited_ms += 1) zzdds.util.time.sleepNs(std.time.ns_per_ms);
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 test "a writer lost before its match is installed is not matched, and is held for again" {
@@ -858,6 +865,299 @@ test "a matched reader announced unchanged between its writer's QoS change and a
     try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.set_qos(dw.ptr, &qos));
 
     try testing.expectEqual(@as(i32, 0), pubMatched(w).current_count);
+    try testing.expectEqual(@as(i32, 1), offeredIncompatible(w));
+}
+
+// A local QoS change counts each remote endpoint it makes incompatible,
+// matched or not: partitions decide matching, not compatibility.
+
+test "a reader's QoS change counts a writer in another partition it makes incompatible" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var qos = DDS.DataReaderQos{};
+    qos.deadline.period = .{ .sec = 5, .nanosec = 0 };
+    const r = h.reader(qos, null);
+    h.announceWriter(endpointGuid(0x7C, 1, WRITER_KIND), .{ .deadline_s = 2, .partitions = &.{"elsewhere"} });
+    try testing.expectEqual(@as(i32, 0), subMatched(r).current_count);
+    try testing.expectEqual(@as(i32, 0), requestedIncompatible(r));
+
+    const dr = r.toDDSDataReader();
+    qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.set_qos(dr.ptr, &qos));
+    try testing.expectEqual(@as(i32, 1), requestedIncompatible(r));
+    // Still incompatible: not counted again.
+    qos.deadline.period = .{ .sec = 0, .nanosec = 500_000_000 };
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.set_qos(dr.ptr, &qos));
+    try testing.expectEqual(@as(i32, 1), requestedIncompatible(r));
+}
+
+test "a writer's QoS change counts a reader in another partition it makes incompatible" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var qos = DDS.DataWriterQos{};
+    qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    qos.deadline.period = .{ .sec = 2, .nanosec = 0 };
+    const w = h.writer(qos, null);
+    h.announceReaderWith(endpointGuid(0x7D, 1, READER_KIND), .{ .deadline_s = 3, .partitions = &.{"elsewhere"} });
+    try testing.expectEqual(@as(i32, 0), pubMatched(w).current_count);
+    try testing.expectEqual(@as(i32, 0), offeredIncompatible(w));
+
+    const dw = w.toDDSDataWriter();
+    qos.deadline.period = .{ .sec = 4, .nanosec = 0 };
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.set_qos(dw.ptr, &qos));
+    try testing.expectEqual(@as(i32, 1), offeredIncompatible(w));
+    qos.deadline.period = .{ .sec = 5, .nanosec = 0 };
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.set_qos(dw.ptr, &qos));
+    try testing.expectEqual(@as(i32, 1), offeredIncompatible(w));
+}
+
+test "a reader's QoS changes count a matched writer each time they make it incompatible" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var qos = DDS.DataReaderQos{};
+    qos.deadline.period = .{ .sec = 5, .nanosec = 0 };
+    const r = h.reader(qos, null);
+    h.announceWriter(endpointGuid(0x7E, 1, WRITER_KIND), .{ .deadline_s = 2 });
+    try testing.expectEqual(@as(i32, 1), subMatched(r).current_count);
+
+    const dr = r.toDDSDataReader();
+    const deadlines = [_]i32{ 1, 5, 1 };
+    const matched = [_]i32{ 0, 1, 0 };
+    const counted = [_]i32{ 1, 1, 2 };
+    for (deadlines, matched, counted) |d, m, c| {
+        qos.deadline.period = .{ .sec = d, .nanosec = 0 };
+        try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.set_qos(dr.ptr, &qos));
+        try testing.expectEqual(m, subMatched(r).current_count);
+        try testing.expectEqual(c, requestedIncompatible(r));
+    }
+}
+
+// The incompatibility a set_qos causes is raised as it is prepared, so its
+// listener can run, and delete the endpoint, before set_qos returns.
+
+/// Deletes its reader from on_requested_incompatible_qos.
+const DeleteReaderOnIncompat = struct {
+    sub: DDS.Subscriber,
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+    calls: u32 = 0,
+    fn cb(self: *DeleteReaderOnIncompat, dr: DDS.DataReader, _: DDS.RequestedIncompatibleQosStatus) void {
+        self.calls += 1;
+        self.rc = self.sub.vtable.delete_datareader(self.sub.ptr, dr);
+    }
+};
+
+/// Deletes its writer from on_offered_incompatible_qos.
+const DeleteWriterOnIncompat = struct {
+    pub_: DDS.Publisher,
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+    calls: u32 = 0,
+    fn cb(self: *DeleteWriterOnIncompat, dw: DDS.DataWriter, _: DDS.OfferedIncompatibleQosStatus) void {
+        self.calls += 1;
+        self.rc = self.pub_.vtable.delete_datawriter(self.pub_.ptr, dw);
+    }
+};
+
+test "a reader deleted by the incompatibility its set_qos causes is not used after it" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    // Runs the listeners queued while set_qos is paused after preparing.
+    const Window = struct {
+        const Cbs = @FieldType(dcps.SubscriberImpl, "cbs");
+        var harness: *Harness = undefined;
+        var original: @FieldType(Cbs, "prepare_reader_qos") = undefined;
+
+        fn prepareReaderQos(ctx: *anyopaque, handle: DDS.InstanceHandle_t, qos: *const DDS.DataReaderQos) anyerror!void {
+            try original(ctx, handle, qos);
+            harness.settle();
+        }
+    };
+    var del: DeleteReaderOnIncompat = .{ .sub = h.sub };
+    var qos = DDS.DataReaderQos{};
+    qos.deadline.period = .{ .sec = 5, .nanosec = 0 };
+    const r = h.reader(qos, DDS.dataReaderListener(&del, .{ .on_requested_incompatible_qos = DeleteReaderOnIncompat.cb }));
+    h.announceWriter(endpointGuid(0x7F, 1, WRITER_KIND), .{ .deadline_s = 2 });
+    h.settle();
+    try testing.expectEqual(@as(u32, 0), del.calls);
+
+    const sub_impl: *dcps.SubscriberImpl = @ptrCast(@alignCast(h.sub.ptr));
+    Window.harness = &h;
+    Window.original = sub_impl.cbs.prepare_reader_qos;
+    sub_impl.cbs.prepare_reader_qos = Window.prepareReaderQos;
+    defer sub_impl.cbs.prepare_reader_qos = Window.original;
+    qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
+    const dr = r.toDDSDataReader();
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, dr.vtable.set_qos(dr.ptr, &qos));
+    try testing.expectEqual(@as(u32, 1), del.calls);
+    try testing.expectEqual(DDS.RETCODE_OK, del.rc);
+}
+
+test "a writer deleted by the incompatibility its set_qos causes is not used after it" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const Window = struct {
+        const Cbs = @FieldType(dcps.PublisherImpl, "cbs");
+        var harness: *Harness = undefined;
+        var original: @FieldType(Cbs, "prepare_writer_qos") = undefined;
+
+        fn prepareWriterQos(ctx: *anyopaque, handle: DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, qos: *const DDS.DataWriterQos) anyerror!void {
+            try original(ctx, handle, publisher_handle, qos);
+            harness.settle();
+        }
+    };
+    var del: DeleteWriterOnIncompat = .{ .pub_ = h.pub_ };
+    var qos = DDS.DataWriterQos{};
+    qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    qos.deadline.period = .{ .sec = 2, .nanosec = 0 };
+    const w = h.writer(qos, DDS.dataWriterListener(&del, .{ .on_offered_incompatible_qos = DeleteWriterOnIncompat.cb }));
+    h.announceReaderWith(endpointGuid(0x80, 1, READER_KIND), .{ .deadline_s = 3 });
+    h.settle();
+    try testing.expectEqual(@as(u32, 0), del.calls);
+
+    const pub_impl: *dcps.PublisherImpl = @ptrCast(@alignCast(h.pub_.ptr));
+    Window.harness = &h;
+    Window.original = pub_impl.cbs.prepare_writer_qos;
+    pub_impl.cbs.prepare_writer_qos = Window.prepareWriterQos;
+    defer pub_impl.cbs.prepare_writer_qos = Window.original;
+    qos.deadline.period = .{ .sec = 4, .nanosec = 0 };
+    const dw = w.toDDSDataWriter();
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, dw.vtable.set_qos(dw.ptr, &qos));
+    try testing.expectEqual(@as(u32, 1), del.calls);
+    try testing.expectEqual(DDS.RETCODE_OK, del.rc);
+}
+
+/// Changes its reader's DEADLINE from on_requested_incompatible_qos, as a
+/// hosted worker would run it: on a thread of its own.
+const ChangeReaderOnIncompat = struct {
+    deadline_s: i32,
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+    done: std.atomic.Value(bool) = .init(false),
+    fn cb(self: *ChangeReaderOnIncompat, dr: DDS.DataReader, _: DDS.RequestedIncompatibleQosStatus) void {
+        var qos: DDS.DataReaderQos = undefined;
+        _ = dr.vtable.get_qos(dr.ptr, &qos);
+        defer qos.deinit(testing.allocator);
+        qos.deadline.period = .{ .sec = self.deadline_s, .nanosec = 0 };
+        self.rc = dr.vtable.set_qos(dr.ptr, &qos);
+        self.done.store(true, .release);
+    }
+};
+
+test "a reader's set_qos its own change's listener makes meanwhile takes effect after it" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    // Runs the listener on another thread while set_qos is paused after
+    // preparing, and gives its set_qos time to finish there first; set_qos
+    // must make it wait instead.
+    const Window = struct {
+        const Cbs = @FieldType(dcps.SubscriberImpl, "cbs");
+        var harness: *Harness = undefined;
+        var original: @FieldType(Cbs, "prepare_reader_qos") = undefined;
+        var change: *ChangeReaderOnIncompat = undefined;
+        var thread: ?std.Thread = null;
+
+        fn prepareReaderQos(ctx: *anyopaque, handle: DDS.InstanceHandle_t, qos: *const DDS.DataReaderQos) anyerror!void {
+            try original(ctx, handle, qos);
+            if (thread != null) return;
+            thread = try std.Thread.spawn(.{}, Harness.settle, .{harness});
+            awaitFlag(&change.done, 200);
+        }
+    };
+    var change: ChangeReaderOnIncompat = .{ .deadline_s = 3 };
+    var qos = DDS.DataReaderQos{};
+    qos.deadline.period = .{ .sec = 5, .nanosec = 0 };
+    const r = h.reader(qos, DDS.dataReaderListener(&change, .{ .on_requested_incompatible_qos = ChangeReaderOnIncompat.cb }));
+    h.announceWriter(endpointGuid(0x81, 1, WRITER_KIND), .{ .deadline_s = 2 });
+    h.settle();
+    try testing.expectEqual(@as(i32, 1), subMatched(r).current_count);
+
+    const sub_impl: *dcps.SubscriberImpl = @ptrCast(@alignCast(h.sub.ptr));
+    Window.harness = &h;
+    Window.change = &change;
+    Window.original = sub_impl.cbs.prepare_reader_qos;
+    sub_impl.cbs.prepare_reader_qos = Window.prepareReaderQos;
+    defer sub_impl.cbs.prepare_reader_qos = Window.original;
+    qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
+    const dr = r.toDDSDataReader();
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.set_qos(dr.ptr, &qos));
+    Window.thread.?.join();
+    h.settle();
+
+    // The listener's change (3) came last, and is both the reader's QoS
+    // and what it matched with.
+    try testing.expectEqual(DDS.RETCODE_OK, change.rc);
+    var got: DDS.DataReaderQos = undefined;
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.get_qos(dr.ptr, &got));
+    defer got.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3), got.deadline.period.sec);
+    try testing.expectEqual(@as(i32, 1), subMatched(r).current_count);
+    try testing.expectEqual(@as(i32, 1), requestedIncompatible(r));
+}
+
+/// As ChangeReaderOnIncompat, for a writer.
+const ChangeWriterOnIncompat = struct {
+    deadline_s: i32,
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+    done: std.atomic.Value(bool) = .init(false),
+    fn cb(self: *ChangeWriterOnIncompat, dw: DDS.DataWriter, _: DDS.OfferedIncompatibleQosStatus) void {
+        var qos: DDS.DataWriterQos = undefined;
+        _ = dw.vtable.get_qos(dw.ptr, &qos);
+        defer qos.deinit(testing.allocator);
+        qos.deadline.period = .{ .sec = self.deadline_s, .nanosec = 0 };
+        self.rc = dw.vtable.set_qos(dw.ptr, &qos);
+        self.done.store(true, .release);
+    }
+};
+
+test "a writer's set_qos its own change's listener makes meanwhile takes effect after it" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const Window = struct {
+        const Cbs = @FieldType(dcps.PublisherImpl, "cbs");
+        var harness: *Harness = undefined;
+        var original: @FieldType(Cbs, "prepare_writer_qos") = undefined;
+        var change: *ChangeWriterOnIncompat = undefined;
+        var thread: ?std.Thread = null;
+
+        fn prepareWriterQos(ctx: *anyopaque, handle: DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, qos: *const DDS.DataWriterQos) anyerror!void {
+            try original(ctx, handle, publisher_handle, qos);
+            if (thread != null) return;
+            thread = try std.Thread.spawn(.{}, Harness.settle, .{harness});
+            awaitFlag(&change.done, 200);
+        }
+    };
+    var change: ChangeWriterOnIncompat = .{ .deadline_s = 2 };
+    var qos = DDS.DataWriterQos{};
+    qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    qos.deadline.period = .{ .sec = 2, .nanosec = 0 };
+    const w = h.writer(qos, DDS.dataWriterListener(&change, .{ .on_offered_incompatible_qos = ChangeWriterOnIncompat.cb }));
+    h.announceReaderWith(endpointGuid(0x82, 1, READER_KIND), .{ .deadline_s = 3 });
+    h.settle();
+    try testing.expectEqual(@as(i32, 1), pubMatched(w).current_count);
+
+    const pub_impl: *dcps.PublisherImpl = @ptrCast(@alignCast(h.pub_.ptr));
+    Window.harness = &h;
+    Window.change = &change;
+    Window.original = pub_impl.cbs.prepare_writer_qos;
+    pub_impl.cbs.prepare_writer_qos = Window.prepareWriterQos;
+    defer pub_impl.cbs.prepare_writer_qos = Window.original;
+    qos.deadline.period = .{ .sec = 4, .nanosec = 0 };
+    const dw = w.toDDSDataWriter();
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.set_qos(dw.ptr, &qos));
+    Window.thread.?.join();
+    h.settle();
+
+    try testing.expectEqual(DDS.RETCODE_OK, change.rc);
+    var got: DDS.DataWriterQos = undefined;
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.get_qos(dw.ptr, &got));
+    defer got.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2), got.deadline.period.sec);
+    try testing.expectEqual(@as(i32, 1), pubMatched(w).current_count);
     try testing.expectEqual(@as(i32, 1), offeredIncompatible(w));
 }
 

@@ -86,6 +86,12 @@ ALLOWLIST = {
     # so the test polls, with a bound, for each thread to reach its step.
     # One shared helper (awaitTrue).
     "test/dcps/listener_replacement_test.zig": (1, "threaded set_listener-waits-for-callback polling"),
+    # set_qos ordering: a listener's set_qos really runs on another thread
+    # (as on a hosted worker) while the outer set_qos is paused after
+    # preparing; with the fix it blocks until the outer one finishes, so the
+    # outer waits for it only up to a bound before continuing. One shared
+    # helper (awaitFlag).
+    "test/dcps/match_generation_test.zig": (1, "threaded set_qos-during-set_qos bounded wait"),
     # TCP transport tests exercise real listener/connection threads.
     "test/transport/tcp_transport_test.zig": (1, "TCP listener thread startup"),
     # Regression test for deinit() reentrancy from the participant's own
