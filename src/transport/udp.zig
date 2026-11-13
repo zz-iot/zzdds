@@ -2816,7 +2816,9 @@ test "vtJoinMulticast error paths: UnsupportedLocatorKind and NoHandlerForPort" 
 
 test "vtJoinMulticast and vtLeaveMulticast IPv4 round-trip" {
     const alloc = std.testing.allocator;
-    // pid 174: use a dedicated high port for multicast to avoid conflicts
+    // pid 174, and a port of its own for the group: below 7400, so no test
+    // domain's ports, and below every OS's ephemeral range, where any socket
+    // on the machine can take one first (see test/support/domain.zig).
     var hp_udp: rt_testing.HostedPoll = undefined;
     try hp_udp.init(std.testing.allocator);
     defer hp_udp.deinit();
@@ -2829,7 +2831,7 @@ test "vtJoinMulticast and vtLeaveMulticast IPv4 round-trip" {
     try udp.transport().attachBackend(hp_udp.backend());
     const t = udp.transport();
 
-    const mc_port: u16 = 55401;
+    const mc_port: u16 = 7390;
     const listen_loc = Locator.udp4(.{ 0, 0, 0, 0 }, mc_port);
     const mc_group = Locator.udp4(.{ 239, 255, 0, 1 }, mc_port);
 
@@ -2855,7 +2857,8 @@ test "two transports join one multicast group on one port, and both receive from
     // SO_REUSEPORT there. Sharing the port is not enough: each must also get
     // every multicast datagram, as SPDP needs.
     const alloc = std.testing.allocator;
-    const mc_port: u16 = 55402;
+    // Below 7400 and the ephemeral ranges, as in the round-trip test above.
+    const mc_port: u16 = 7391;
     const listen_loc = Locator.udp4(.{ 0, 0, 0, 0 }, mc_port);
     const mc_group = Locator.udp4(.{ 239, 255, 0, 1 }, mc_port);
 
