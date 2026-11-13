@@ -3,8 +3,9 @@
 //! and every such call that needs the held lock would deadlock. Each test
 //! here makes a listener do exactly that, on a path that used to hold the
 //! lock (participant message dispatch, protocol reader delivery, discovery
-//! QoS checks, reader loss, notify_datareaders). A regression hangs rather
-//! than fails; the CI test timeout catches it.
+//! QoS checks, reader loss, notify_datareaders, a release hook run by
+//! delete_contained_entities). A regression hangs rather than fails; the CI
+//! test timeout catches it.
 
 const std = @import("std");
 const test_domain = @import("test_domain");
@@ -463,4 +464,53 @@ test "a reader incompatible with several writers is told each policy" {
     try testing.expectEqualSlices(DDS.QosPolicyId_t, &.{ DDS.DURABILITY_QOS_POLICY_ID, DDS.RELIABILITY_QOS_POLICY_ID }, probe.ids[0..probe.n_ids]);
     try testing.expectEqualSlices(i32, &.{ 1, 1 }, probe.counts[0..probe.n_ids]);
     try testing.expectEqual(@as(i32, 2), probe.total_count);
+}
+
+// ── Release hooks: delete_contained_entities and the parent's lock ──────────
+
+/// A listener whose release hook calls into its endpoint's parent, which
+/// takes the parent's lock.
+const ReleaseProbe = struct {
+    sub: ?DDS.Subscriber = null,
+    pub_: ?DDS.Publisher = null,
+    released: usize = 0,
+    /// Whether the parent still listed the endpoint when the hook ran.
+    still_listed: bool = false,
+
+    fn release(ld: ?*anyopaque) callconv(.c) void {
+        const p: *ReleaseProbe = @ptrCast(@alignCast(ld.?));
+        p.released += 1;
+        if (p.sub) |s| p.still_listed = s.lookup_datareader("MatchTopic").ptr != zzdds.dcps.NIL_PTR;
+        if (p.pub_) |s| p.still_listed = s.lookup_datawriter("MatchTopic").ptr != zzdds.dcps.NIL_PTR;
+    }
+};
+
+test "a reader's release hook may call into its subscriber during delete_contained_entities" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var probe: ReleaseProbe = .{ .sub = fx.sub_r };
+    const listener = DDS.DataReaderListener{ .listener_data = &probe, .release_listener_data = ReleaseProbe.release };
+    _ = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, listener, 0);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.sub_r.vtable.delete_contained_entities(fx.sub_r.ptr));
+    fx.settle();
+
+    try testing.expectEqual(@as(usize, 1), probe.released);
+    try testing.expect(!probe.still_listed);
+}
+
+test "a writer's release hook may call into its publisher during delete_contained_entities" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var probe: ReleaseProbe = .{ .pub_ = fx.pub_w };
+    const listener = DDS.DataWriterListener{ .listener_data = &probe, .release_listener_data = ReleaseProbe.release };
+    _ = fx.pub_w.create_datawriter(fx.topic_w, .{}, listener, 0);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.vtable.delete_contained_entities(fx.pub_w.ptr));
+    fx.settle();
+
+    try testing.expectEqual(@as(usize, 1), probe.released);
+    try testing.expect(!probe.still_listed);
 }

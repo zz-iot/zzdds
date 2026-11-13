@@ -337,15 +337,6 @@ Forward-looking only: known gaps, planned features, and open design questions.
      or further investigation) become their own roadmap items, migrated when that code
      is next worked on rather than in one sweep.
 
-- **Listener release hooks can run under a parent's lock during teardown.**
-  `Subscriber::delete_contained_entities` and `Publisher::delete_contained_entities`
-  deinit their readers/writers while holding their own lock, and dropping a reader's or
-  writer's last listener reference calls the application's `release_listener_data` there.
-  A release hook that calls back into the subscriber or publisher deadlocks. Listener
-  callbacks themselves no longer run under any zzdds lock (2026-10-05); bring teardown in
-  line by detaching the children under the lock and deiniting them after it is released,
-  as `DomainParticipant::delete_contained_entities` already does.
-
 ### Selective CDR parse (`deserialize_selected`) — deferred follow-ups
 
 zidl v0.3.12 adds a mask-driven selective parser (`deserialize_selected(want)` /

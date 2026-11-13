@@ -3288,16 +3288,13 @@ pub const DomainParticipantImpl = struct {
                 // writer: it checks every writer discovered by then. A
                 // writer already discovered counts only when it becomes
                 // incompatible: the status counts incompatible writers, not
-                // their announcements. Its loss forgets it. A match removed
-                // here was compatible when made, so it counts even when the
-                // reader's QoS is already incompatible with the writer's
-                // previous announcement: a change prepared but not yet
-                // announced counts only a match its announcement removes.
+                // their announcements. Its loss forgets it. The reader's QoS
+                // here is what it last prepared, announced or not: a change
+                // to it that made the writer incompatible counted there
+                // (recordNewlyIncompatibleLocked).
                 const was_compatible = if (prev_qos) |q| qm_mod.checkDiscovered(q, &local_rd).isCompatible() else true;
-                const removed_before = removed.items.len;
+                if (ar.announced and was_compatible) ar.incompat_pending.record(result.incompatible);
                 if (can_unmatch) unmatchWriterLocked(ar, data.guid, &removed);
-                const unmatched = removed.items.len > removed_before;
-                if (ar.announced and (was_compatible or unmatched)) ar.incompat_pending.record(result.incompatible);
                 continue;
             }
             const part_result = qm_mod.checkPartition(data.partition_names, ar.partition_names);
@@ -3608,12 +3605,10 @@ pub const DomainParticipantImpl = struct {
                 // Not yet announced, its first announcement counts this
                 // reader: it checks every reader discovered by then. As in
                 // onWriterDiscovered, a reader already discovered counts
-                // only when it becomes incompatible, or a match is removed.
+                // only when it becomes incompatible.
                 const was_compatible = if (prev_qos) |q| qm_mod.checkDiscovered(&local_wd, q).isCompatible() else true;
-                const removed_before = removed.items.len;
+                if (aw.announced and was_compatible) aw.incompat_pending.record(result.incompatible);
                 if (can_unmatch) unmatchReaderLocked(aw, data.guid, &removed);
-                const unmatched = removed.items.len > removed_before;
-                if (aw.announced and (was_compatible or unmatched)) aw.incompat_pending.record(result.incompatible);
                 continue;
             }
             const part_result = qm_mod.checkPartition(aw.partition_names, data.partition_names);
@@ -4201,7 +4196,10 @@ pub const DomainParticipantImpl = struct {
     /// disposing of it needs, none, changing nothing. An endpoint announced
     /// already keeps its announcement until announced again
     /// (docs/design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal).
-    /// `publisher_handle` is the writers' Publisher.
+    /// `publisher_handle` is the writers' Publisher. Counts the remote
+    /// endpoints the change makes incompatible with an announced endpoint
+    /// (recordNewlyIncompatibleLocked), and raises them once both locks are
+    /// released.
     fn prepareEndpoints(
         self: *Self,
         comptime kind: EndpointKind,
@@ -4209,6 +4207,11 @@ pub const DomainParticipantImpl = struct {
         publisher_handle: DDS.InstanceHandle_t,
         change: Change(kind),
     ) !void {
+        var incompat = false;
+        defer if (incompat) self.raiseIncompatQos(comptime switch (kind) {
+            .writer => .writers,
+            .reader => .readers,
+        });
         self.prepare_mu.lock();
         defer self.prepare_mu.unlock();
         var staged: std.ArrayListUnmanaged(Staged(kind)) = .empty;
@@ -4296,6 +4299,9 @@ pub const DomainParticipantImpl = struct {
                 .writer => self.active_writers.getPtr(key),
                 .reader => self.active_readers.getPtr(key),
             }) orelse continue;
+            // Counted here, with both what it had and what it gets: its
+            // announcement counts only the first time.
+            if (ep.announced and self.recordNewlyIncompatibleLocked(kind, ep, if (st.qos) |*q| q else &ep.qos, st.presentation)) incompat = true;
             if (st.partition_names) |n| {
                 freePartitionNames(self.alloc, ep.partition_names);
                 ep.partition_names = n;
@@ -4311,6 +4317,66 @@ pub const DomainParticipantImpl = struct {
             // A match decided with what this replaced is not made.
             self.renewLocalGenLocked(st.guid);
         }
+    }
+
+    /// Records on the announced local endpoint `ep` each remote endpoint
+    /// discovered on its topic that changing its QoS and presentation to
+    /// `qos` and `presentation` makes incompatible: compatible with what it
+    /// has, not with what it gets. Matched or not, as partitions decide
+    /// matching, not compatibility. Returns whether it recorded any. Must
+    /// be called with self.mu held.
+    fn recordNewlyIncompatibleLocked(self: *Self, comptime kind: EndpointKind, ep: anytype, qos: *const QosOf(kind), presentation: DDS.PresentationQosPolicy) bool {
+        var any = false;
+        switch (kind) {
+            .reader => {
+                const before = disc_adapter.readerDiscoveredData(ep.qos, ep.presentation);
+                const after = disc_adapter.readerDiscoveredData(qos.*, presentation);
+                for (self.discovered_writers.items) |*dw| {
+                    if (!std.mem.eql(u8, dw.topic_name, ep.topic_name) or !std.mem.eql(u8, dw.type_name, ep.type_name)) continue;
+                    if (self.ignoredRemoteLocked(.writer, dw.guid, dw.topic_name)) continue;
+                    if (!qm_mod.checkDiscovered(&dw.qos, &before).isCompatible()) continue;
+                    const result = qm_mod.checkDiscovered(&dw.qos, &after);
+                    if (result.isCompatible()) continue;
+                    ep.incompat_pending.record(result.incompatible);
+                    any = true;
+                }
+            },
+            .writer => {
+                const before = disc_adapter.writerDiscoveredData(ep.qos, ep.presentation);
+                const after = disc_adapter.writerDiscoveredData(qos.*, presentation);
+                for (self.discovered_readers.items) |*dr| {
+                    if (!std.mem.eql(u8, dr.topic_name, ep.topic_name) or !std.mem.eql(u8, dr.type_name, ep.type_name)) continue;
+                    if (self.ignoredRemoteLocked(.reader, dr.guid, dr.topic_name)) continue;
+                    if (!qm_mod.checkDiscovered(&before, &dr.qos).isCompatible()) continue;
+                    const result = qm_mod.checkDiscovered(&after, &dr.qos);
+                    if (result.isCompatible()) continue;
+                    ep.incompat_pending.record(result.incompatible);
+                    any = true;
+                }
+            },
+        }
+        return any;
+    }
+
+    /// Whether the remote endpoint `guid` on `topic_name` is ignored: by its
+    /// participant, by itself or by its topic. Must be called with self.mu
+    /// held.
+    fn ignoredRemoteLocked(self: *Self, comptime kind: EndpointKind, guid: Guid, topic_name: []const u8) bool {
+        for (self.ignored_prefixes.items) |p| {
+            if (p.eql(guid.prefix)) return true;
+        }
+        const handle = writer_mod.guidToHandle(guid);
+        const handles = switch (kind) {
+            .writer => self.ignored_publication_handles.items,
+            .reader => self.ignored_subscription_handles.items,
+        };
+        for (handles) |h| {
+            if (h == handle) return true;
+        }
+        for (self.ignored_topic_names.items) |n| {
+            if (std.mem.eql(u8, n, topic_name)) return true;
+        }
+        return false;
     }
 
     /// Has discovery prepare the announcements of the writers `handles`
@@ -4394,10 +4460,11 @@ pub const DomainParticipantImpl = struct {
                     if (!result.isCompatible()) {
                         // As for a reader (subAnnounceProtoReader): this is
                         // the only place a reader discovered first is checked
-                        // against this writer. A refresh counts only a match
-                        // it removes: the first announcement counted the rest.
-                        const unmatched = can_unmatch and removed.unmatchReaderLocked(aw, dr.guid);
-                        if (!refresh or unmatched) {
+                        // against this writer. A refresh counts nothing: a
+                        // change that made the reader incompatible counted as
+                        // it was prepared (recordNewlyIncompatibleLocked).
+                        if (can_unmatch) _ = removed.unmatchReaderLocked(aw, dr.guid);
+                        if (!refresh) {
                             aw.incompat_pending.record(result.incompatible);
                             incompat = true;
                         }
@@ -4536,10 +4603,11 @@ pub const DomainParticipantImpl = struct {
                         // this reader, since it only scans readers that already
                         // exist at discovery time -- this retroactive path is the
                         // only place that ever looks at this pairing again).
-                        // A refresh counts only a match it removes: the
-                        // first announcement counted the rest.
-                        const unmatched = can_unmatch and removed.unmatchWriterLocked(ar, dw.guid);
-                        if (!refresh or unmatched) ar.incompat_pending.record(result.incompatible);
+                        // A refresh counts nothing: a change that made the
+                        // writer incompatible counted as it was prepared
+                        // (recordNewlyIncompatibleLocked).
+                        if (can_unmatch) _ = removed.unmatchWriterLocked(ar, dw.guid);
+                        if (!refresh) ar.incompat_pending.record(result.incompatible);
                         continue;
                     }
                     const part_result = qm_mod.checkPartition(dw.partition_names, ar.partition_names);
