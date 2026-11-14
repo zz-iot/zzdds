@@ -22,7 +22,9 @@ The [existing spike](../../examples/spikes/rust/README.md) records a real raw
 loan exchange, a compiler rejection when a borrowed payload escapes its guard,
 and allocator injection through the C ABI. These are historical experimental
 results, not a supported Rust binding or current-main validation. The spike's
-hand-declared ABI and allocator/destruction behavior need fresh review.
+hand-declared ABI and allocator/destruction behavior need fresh review. In
+particular, its separate key-hash free is obsolete: the current reader API
+returns all three sequences through `return_loan_raw`.
 
 In particular, a borrow tied to a loan guard proves only one lifetime relation.
 It does not prove that another handle cannot delete the reader/participant,
@@ -47,8 +49,10 @@ arbitrary generated Rust values.
 Native deletion through aliases, parent `delete_contained_entities`, callback
 teardown and shutdown must be blocked or deferred while loans are outstanding.
 A forgotten guard may leak/pin resources but must not allow use-after-free;
-safety cannot depend on Drop always running. Specify ownership of the independent
-key-hash sequence as well as the payload/sample-info loan. Offer an explicit
+safety cannot depend on Drop always running. Release `cdr_payloads`, `key_hashes`
+and `sample_infos` together through `return_loan_raw`, which retains the reader
+allocator context; do not free key hashes through a generic sequence-free call.
+Offer an explicit
 return operation that can report errors; Drop remains a non-panicking fallback
 with a defined failure policy. Do not describe raw loan access as an end-to-end
 zero-copy guarantee or a typed borrowed deserializer.
@@ -82,7 +86,8 @@ lifetimes. DDS allocator injection remains a separate resource-lifetime issue.
    cleanup tests. Do not imply TypeObject support from successful serialization.
 4. **Safe raw loan API.** Revalidate the old spike against current headers; test
    escape/double-return rejection, parent deletion, early-return/unwind cleanup,
-   forgotten guards and independent hash ownership. Integrate listener and
+   forgotten guards and joint payload/hash/info cleanup with a custom allocator.
+   Integrate listener and
    thread access only after their contracts are explicit.
 5. **Distribution and broader coverage.** Relocated Rust consumer checks for
    Linux/macOS/Windows, shared allocator/symbol ownership with the DDS library,
