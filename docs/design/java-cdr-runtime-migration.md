@@ -1,5 +1,11 @@
 # Java CDR runtime SDK migration
 
+Status: complete in [PR #150](https://github.com/zz-iot/zzdds/pull/150).
+The [Release dry run](https://github.com/zz-iot/zzdds/actions/runs/43303145293)
+on merged commit `6f07595` passed all four platform test jobs, self-interop
+and all four package-libs jobs, including relocated Java SDK consumption.
+Publish was skipped; the run made no tag or release.
+
 Java-enabled builds package the pure Java CDR runtime from the same zidl source
 as the generator and native bindings. When present, it is installed as
 `share/java/zidl-cdr-java.jar`; its embedded metadata retains the zidl version
