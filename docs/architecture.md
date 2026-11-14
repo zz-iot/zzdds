@@ -355,7 +355,7 @@ A Zig application can install a sink of its own, an in-memory one in a test or a
 
 ```zig
 var asink = try trace.AsyncRingSink.init(alloc, 4096, file_writer_ptr, .ndjson);
-try asink.startFlushThread();      // or call asink.flush() from your own loop
+try asink.attachRuntime(rt);       // drains on the runtime; or call asink.flush() yourself
 factory.setTraceSink(asink.sink());
 // ... create participants, use them ...
 asink.deinit();  // flushes remaining events before returning

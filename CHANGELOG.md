@@ -8,6 +8,14 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-14
+
+- **Breaking** for Zig: `trace.AsyncRingSink.startFlushThread` is removed, so zzdds starts no
+  thread of its own. `attachRuntime(rt)` replaces it: the sink holds an owner reference to
+  `rt` and drains there, within 5 ms of an event arriving in an empty ring, on a hosted
+  worker or inside a manual runtime's `drive`. An idle ring never wakes the runtime. An
+  unattached sink is still drained by `flush()` and its `deinit`.
+
 ## 2026-11-13
 
 - A `set_qos` on a DataReader or DataWriter (or a Subscriber's or Publisher's
