@@ -16,7 +16,7 @@
 //! the configured sink while the scope and filter still apply:
 //!
 //!   var asink = try trace.AsyncRingSink.init(alloc, 4096, file_writer_ptr, .ndjson);
-//!   try asink.startFlushThread();   // or call asink.flush() from your own loop
+//!   try asink.attachRuntime(rt);   // or call asink.flush() from your own loop
 //!   factory.setTraceSink(asink.sink());
 
 const std = @import("std");
@@ -28,7 +28,8 @@ const sn_mod = @import("rtps/sequence_number.zig");
 const sub_mod = @import("rtps/message/submessage.zig");
 const time_mod = @import("util/time.zig");
 const mutex_mod = @import("util/mutex.zig");
-const sleepNs = time_mod.sleepNs;
+const runtime_mod = @import("runtime/core.zig");
+const CloseLatch = @import("runtime/close_latch.zig").CloseLatch;
 
 pub const GuidPrefix = guid_mod.GuidPrefix;
 pub const EntityId = guid_mod.EntityId;
@@ -501,9 +502,10 @@ pub const SyncSink = struct {
 // ── AsyncRingSink ─────────────────────────────────────────────────────────────
 
 /// MPSC fixed-capacity ring buffer. Producers never block: if the ring is full,
-/// the event is dropped and `dropped` is incremented atomically. An optional
-/// flush thread drains the ring every 5 ms; it emits a synthetic `skipped` event
-/// before the next batch when drops occurred.
+/// the event is dropped and `dropped` is incremented atomically. Attached to a
+/// runtime, it is drained there within 5 ms of an event arriving in an empty
+/// ring; otherwise the application drains it with `flush`. A drain emits a
+/// synthetic `skipped` event before the next batch when drops occurred.
 pub const AsyncRingSink = struct {
     alloc: std.mem.Allocator,
     mu: mutex_mod.Mutex,
@@ -515,14 +517,27 @@ pub const AsyncRingSink = struct {
     dropped: std.atomic.Value(u64),
     writer: *std.Io.Writer,
     format: Format,
-    thread: ?std.Thread,
-    stopping: std.atomic.Value(bool),
-    /// Serializes drains, so that `flush` and the flush thread never write
-    /// to `writer` at once.
+    /// Serializes drains, so that `flush` and a drain on the runtime never
+    /// write to `writer` at once.
     drain_mu: mutex_mod.Mutex = .{},
 
+    /// Set by `attachRuntime`, which holds an owner reference to it until
+    /// `deinit`.
+    runtime: ?*runtime_mod.Runtime = null,
+    /// Only the drain timer's fires run here, with internal credit.
+    drain_ctx: runtime_mod.Context = undefined,
+    drain_latch: CloseLatch = .{},
+    drain_timer: runtime_mod.Timer = undefined,
+    // Guarded by `mu`.
+    /// The drain timer is armed, or its fire has not yet begun draining.
+    drain_scheduled: bool = false,
+    /// Set by `deinit`: nothing arms the timer after.
+    drain_stopping: bool = false,
+
     const Self = @This();
-    const FLUSH_INTERVAL_NS: u64 = 5 * std.time.ns_per_ms;
+    /// How long after an event arrives in an empty ring the runtime drains
+    /// it: events that follow within it go out in the same drain.
+    const DRAIN_DELAY_NS: i64 = 5 * std.time.ns_per_ms;
     const DRAIN_BATCH = 64;
 
     pub fn init(
@@ -543,22 +558,45 @@ pub const AsyncRingSink = struct {
             .dropped = std.atomic.Value(u64).init(0),
             .writer = writer,
             .format = format,
-            .thread = null,
-            .stopping = std.atomic.Value(bool).init(false),
         };
         return self;
     }
 
-    /// Start the background flush thread (optional). If not called, events
-    /// accumulate in the ring until `flush` or `deinit` writes them.
-    pub fn startFlushThread(self: *Self) !void {
-        self.thread = try std.Thread.spawn(.{}, flushLoop, .{self});
+    /// Drains the ring on `rt` from now on (optional): a drain runs within
+    /// 5 ms of an event arriving in an empty ring, on a hosted worker or
+    /// inside a manual runtime's `drive`, and an idle ring never wakes the
+    /// runtime. The drain writes to `writer` in that turn, so a slow writer
+    /// holds a worker. Takes an owner reference to `rt`, released by
+    /// `deinit`: `rt` keeps running while the sink is attached. Call at most
+    /// once, before events are submitted. Without it, events accumulate in
+    /// the ring until `flush` or `deinit` writes them.
+    pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime) error{ AlreadyAttached, Retiring }!void {
+        if (self.runtime != null) return error.AlreadyAttached;
+        if (!rt.tryRetainOwner()) return error.Retiring;
+        self.drain_ctx = runtime_mod.Context.init(rt, 0);
+        self.drain_ctx.on_closed = self.drain_latch.hook();
+        self.drain_timer = runtime_mod.Timer.init(&self.drain_ctx, onDrainTimer);
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.runtime = rt;
+        // Events submitted before attaching are drained now too.
+        if (self.count > 0) self.scheduleDrainLocked();
     }
 
+    /// Must not be called from inside the sink's drain, nor while an event
+    /// is being submitted to it.
     pub fn deinit(self: *Self) void {
-        if (self.thread) |t| {
-            self.stopping.store(true, .release);
-            t.join();
+        if (self.runtime) |rt| {
+            // Under `mu`, so no submission arms the timer after the cancel.
+            self.mu.lock();
+            self.drain_stopping = true;
+            self.mu.unlock();
+            rt.cancelTimer(&self.drain_timer);
+            // A drain running elsewhere finishes first.
+            const closed = self.drain_latch.close(&self.drain_ctx, discardDrain);
+            std.debug.assert(closed);
+            self.drain_ctx.deinit();
+            rt.releaseOwner();
         }
         self.drainAll(); // final flush
         self.drain_mu.deinit();
@@ -576,7 +614,30 @@ pub const AsyncRingSink = struct {
         const idx = (self.head + self.count) % self.slots.len;
         self.slots[idx] = event;
         self.count += 1;
+        if (self.runtime != null) self.scheduleDrainLocked();
     }
+
+    /// Arms the drain unless it is pending already. Once the runtime is
+    /// retiring nothing drains here: what arrives waits for `flush` or
+    /// `deinit`. Caller holds `mu`.
+    fn scheduleDrainLocked(self: *Self) void {
+        if (self.drain_scheduled or self.drain_stopping) return;
+        const rt = self.runtime.?;
+        self.drain_scheduled = rt.armTimer(&self.drain_timer, rt.clock.nowNs() + DRAIN_DELAY_NS);
+    }
+
+    /// Drains the ring. Cleared before draining, so an event submitted
+    /// meanwhile is either written by this drain or arms the next one.
+    fn onDrainTimer(t: *runtime_mod.Timer, _: *runtime_mod.Turn) void {
+        const self: *Self = @fieldParentPtr("drain_timer", t);
+        self.mu.lock();
+        self.drain_scheduled = false;
+        self.mu.unlock();
+        self.drainAll();
+    }
+
+    /// A queued fire is the timer's own embedded request: nothing to free.
+    fn discardDrain(_: *runtime_mod.Request) void {}
 
     /// Copy up to `buf.len` events into `buf`. Returns how many were copied.
     fn dequeueBatch(self: *Self, buf: []TraceEvent) usize {
@@ -592,9 +653,9 @@ pub const AsyncRingSink = struct {
     }
 
     /// Writes the events queued now to the writer, on the caller's thread,
-    /// for an application that drains the ring from its own loop instead of
-    /// a flush thread. Safe alongside the flush thread. Flushing the
-    /// writer's own buffer is the caller's.
+    /// for an application that drains the ring from its own loop. Safe
+    /// alongside a drain on the runtime. Flushing the writer's own buffer is
+    /// the caller's.
     pub fn flush(self: *Self) void {
         self.drainAll();
     }
@@ -615,14 +676,6 @@ pub const AsyncRingSink = struct {
                 formatEvent(self.writer, self.format, ev) catch {};
             }
         }
-    }
-
-    fn flushLoop(self: *Self) void {
-        while (!self.stopping.load(.acquire)) {
-            sleepNs(FLUSH_INTERVAL_NS);
-            self.drainAll();
-        }
-        self.drainAll();
     }
 
     fn submitFn(ctx: *anyopaque, event: TraceEvent) void {
@@ -1060,7 +1113,7 @@ test "SyncSink: submit writes formatted event to writer" {
 
 // ── AsyncRingSink tests ───────────────────────────────────────────────────────
 
-test "AsyncRingSink: events flushed synchronously on deinit (no flush thread)" {
+test "AsyncRingSink: events flushed synchronously on deinit when not attached to a runtime" {
     var buf: [2048]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     const ring = try AsyncRingSink.init(testing.allocator, 8, &w, .text);
@@ -1094,7 +1147,7 @@ test "AsyncRingSink: dropped counter increments when ring is full" {
     try testing.expect(std.mem.indexOf(u8, out, "\"count\":2") != null);
 }
 
-test "AsyncRingSink: flush writes what is queued on the caller's thread, with no flush thread" {
+test "AsyncRingSink: flush writes what is queued on the caller's thread" {
     var buf: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     const ring = try AsyncRingSink.init(testing.allocator, 2, &w, .ndjson);
@@ -1266,19 +1319,119 @@ test "AsyncRingSink: deinit via vtable sink" {
     ring.sink().deinit(); // vtable path → deinitFn → ring.deinit()
 }
 
-// ── AsyncRingSink flush thread ────────────────────────────────────────────────
+// ── AsyncRingSink on a runtime ────────────────────────────────────────────────
 
-test "AsyncRingSink: flush thread drains events" {
+/// A manual runtime over the scripted backend, whose clock moves only when a
+/// drive waits for a deadline. Must not move after `init`.
+const DrainTestRuntime = struct {
+    sb: @import("runtime/backend.zig").ScriptedBackend,
+    runtime: runtime_mod.Runtime,
+
+    fn init(self: *DrainTestRuntime) void {
+        self.sb = .init(1_000);
+        self.runtime = runtime_mod.Runtime.init(self.sb.clock(), self.sb.backend(), .{ .mode = .manual });
+    }
+
+    /// Runs what is ready now, without moving the clock.
+    fn settle(self: *DrainTestRuntime) !void {
+        while ((try self.runtime.drive(64, 0)).immediate_work) {}
+    }
+
+    /// Releases the creator's owner reference and drives to a stop.
+    fn retire(self: *DrainTestRuntime) !void {
+        self.runtime.releaseOwner();
+        while (self.runtime.getState() != .backend_stopped) _ = try self.runtime.drive(64, 0);
+        self.runtime.deinit();
+    }
+};
+
+test "AsyncRingSink: on a runtime, an event is drained there after the drain delay, and an idle ring arms nothing" {
+    var r: DrainTestRuntime = undefined;
+    r.init();
     var buf: [2048]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     const ring = try AsyncRingSink.init(testing.allocator, 16, &w, .text);
-    try ring.startFlushThread();
+    try ring.attachRuntime(&r.runtime);
+
+    // Nothing queued: nothing armed.
+    try testing.expectEqual(@as(u32, 0), r.runtime.armed_timers);
     ring.sink().submit(testDataEvent());
-    // Wait for the flush thread's 5 ms sleep + drain cycle.
-    sleepNs(12 * std.time.ns_per_ms);
+    ring.sink().submit(testDataEvent());
+    try testing.expectEqual(@as(u32, 1), r.runtime.armed_timers);
+    try r.settle();
+    try testing.expectEqual(@as(usize, 0), w.end);
+
+    // At the delay both go out in one drain, and nothing stays armed.
+    const before = r.runtime.clock.nowNs();
+    _ = try r.runtime.drive(64, std.time.ns_per_s);
+    try r.settle();
+    try testing.expectEqual(before + AsyncRingSink.DRAIN_DELAY_NS, r.runtime.clock.nowNs());
+    try testing.expect(std.mem.count(u8, w.buffer[0..w.end], "SEND DATA") == 2);
+    try testing.expectEqual(@as(u32, 0), r.runtime.armed_timers);
+
+    // The sink's owner reference keeps the runtime running until deinit.
+    r.runtime.releaseOwner();
+    try r.settle();
+    try testing.expectEqual(runtime_mod.State.running, r.runtime.getState());
+    r.runtime.retainOwner();
     ring.deinit();
-    const out = w.buffer[0..w.end];
-    try testing.expect(out.len > 0);
+    try r.retire();
+}
+
+test "AsyncRingSink: attaching drains what was queued before, and deinit cancels a pending drain and writes it" {
+    var r: DrainTestRuntime = undefined;
+    r.init();
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const ring = try AsyncRingSink.init(testing.allocator, 16, &w, .text);
+    ring.sink().submit(testDataEvent());
+    try ring.attachRuntime(&r.runtime);
+    try testing.expectEqual(@as(u32, 1), r.runtime.armed_timers);
+    try testing.expectError(error.AlreadyAttached, ring.attachRuntime(&r.runtime));
+
+    // Deinit with the drain still armed: cancelled, and the event written.
+    ring.deinit();
+    try testing.expectEqual(@as(u32, 0), r.runtime.armed_timers);
+    try testing.expect(std.mem.count(u8, w.buffer[0..w.end], "SEND DATA") == 1);
+    try r.retire();
+}
+
+test "AsyncRingSink: a retiring runtime is refused" {
+    var r: DrainTestRuntime = undefined;
+    r.init();
+    r.runtime.releaseOwner();
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const ring = try AsyncRingSink.init(testing.allocator, 4, &w, .text);
+    defer ring.deinit();
+    try testing.expectError(error.Retiring, ring.attachRuntime(&r.runtime));
+    while (r.runtime.getState() != .backend_stopped) _ = try r.runtime.drive(64, 0);
+    r.runtime.deinit();
+}
+
+test "AsyncRingSink: on a hosted runtime a worker drains the ring" {
+    const rt_testing = @import("runtime/testing.zig");
+    if (!rt_testing.HostedPoll.supported) return error.SkipZigTest;
+    var hp: rt_testing.HostedPoll = undefined;
+    try hp.init(testing.allocator);
+    defer hp.deinit();
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const ring = try AsyncRingSink.init(testing.allocator, 16, &w, .text);
+    defer ring.deinit();
+    try ring.attachRuntime(&hp.runtime);
+    ring.sink().submit(testDataEvent());
+
+    // Drained by the worker, not by deinit.
+    const deadline = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
+    while (true) {
+        ring.mu.lock();
+        const left = ring.count;
+        ring.mu.unlock();
+        if (left == 0) break;
+        if (time_mod.nanoTimestamp() >= deadline) return error.NeverDrained;
+        std.Thread.yield() catch {};
+    }
 }
 
 // ── TracerActive ──────────────────────────────────────────────────────────────

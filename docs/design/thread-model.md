@@ -9,12 +9,10 @@ of the earlier threaded implementation went.
 
 ## Current Thread Ownership
 
-zzdds starts no thread of its own for participants, transports, discovery or writers: they
-run as turns and timers on the participant's runtime, whose hosted workers (or the
-application, through `drive()`) make progress. The one remaining thread is optional:
-
-- `trace.AsyncRingSink` owns an optional flush thread when the application starts it;
-  without one, the application drains it with `flush()`.
+zzdds starts no thread of its own: participants, transports, discovery and writers run as
+turns and timers on the participant's runtime, whose hosted workers (or the application,
+through `drive()`) make progress. A Zig application's `trace.AsyncRingSink` drains on the
+runtime it is attached to, or wherever the application calls its `flush()`.
 
 `DomainParticipantImpl.checkTimers()` walks active writers and readers and fires
 deadline/liveliness status updates. It runs as a timer on the participant's runtime, armed
