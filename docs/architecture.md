@@ -291,7 +291,7 @@ default_runtime_policy = "DEFAULT_RUNTIME_IMPLICIT"  # or "DEFAULT_RUNTIME_DISAB
 mode = "RUNTIME_MODE_BUILD_DEFAULT"  # or "RUNTIME_MODE_HOSTED"; the implicit default is
                                      # never manual, so "RUNTIME_MODE_MANUAL" is refused
 hosted_workers = 2                   # worker threads, at least 1
-inline_turns = 8                     # turns a submitting thread may run directly
+inline_turns = 8                     # turns a submitting thread may run directly; 0 queues
 ```
 
 Installing a process config hands these to the default registry: implicit runtimes started

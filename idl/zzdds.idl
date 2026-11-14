@@ -152,7 +152,8 @@ module zzdds {
         @default(RUNTIME_MODE_BUILD_DEFAULT) RuntimeMode mode;
         // Hosted worker threads; at least 1 when hosted.
         @default(2) unsigned long hosted_workers;
-        // Turns a submitting thread may run directly before it must queue.
+        // Turns a submitting thread may run directly before it must queue;
+        // 0 always queues.
         @default(8) unsigned long inline_turns;
     };
 
