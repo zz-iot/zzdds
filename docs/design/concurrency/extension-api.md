@@ -314,6 +314,28 @@ ReadCondition/WaitSet and UDP with fixed storage; no advanced extension is neede
 to exercise its standard operations. The full reference ownership and construction-only
 Config contract remains the integration target for later surfaces.
 
+The binding surface shipped first, in zzdds.idl:
+
+* **Scalar defaults.** ProcessConfig carries `RuntimeConfig default_runtime` (mode,
+  hosted workers, inline-turn budget) and a `DefaultRuntimePolicy` (implicit or disabled)
+  for the core default. The implicit default is always hosted; a manual default must be
+  an explicitly created runtime.
+* **Owner and ref.** `ExecutionRuntimeOwner` is the RuntimeOwner role (`get_runtime`,
+  `release`), and `create_runtime(RuntimeConfig)` returns one. `ExecutionRuntime` is the
+  RuntimeRef role (`get_state`, `get_mode`, `try_acquire_owner`). The names avoid
+  `java.lang.Runtime`.
+* **The ref drives.** The ref carries the simple driver's `drive(max_turns, max_wait,
+  inout DriveResult)`, which fails PRECONDITION_NOT_MET on a hosted runtime. A separate
+  ManualDriver, once thread affinity or the external-loop adapter need its creation-time
+  validation, is additive; the ref's `drive` stays as the simple form.
+* **Factory selection.** `set_default_runtime(ExecutionRuntime)` and
+  `get_default_runtime()` on the zzdds factory carry RuntimeSelection's two kinds, with a
+  nil runtime meaning FOLLOW_DEFAULT. A RuntimeSelection struct holding a reference would
+  need generated managed references.
+* **Deferred:** a per-participant runtime override in DomainParticipantConfig, participant
+  `get_runtime`, installing an explicit core default and observing it, ManualDriver, the
+  external-loop adapter, and RuntimeConfig resource limits and clock selection.
+
 <a id="listener-group-reference-lifecycle"></a>
 ## Listener-group reference lifecycle
 

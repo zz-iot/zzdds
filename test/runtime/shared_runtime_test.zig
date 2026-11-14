@@ -341,6 +341,95 @@ test "creation without a selection starts a hosted default, and a fresh one afte
     try testing.expectEqual(registry.generations, registry.reclaimed);
 }
 
+// ── Process config of the default runtime ─────────────────────────────────────
+
+const process_config = zzdds.process_config;
+const config_io = std.Io.Threaded.global_single_threaded.io();
+const process_config_path = "shared_runtime_process_config_test.toml";
+
+/// Installs a process config read from `toml`, as zzdds_process_configure_from_file does.
+fn configureProcess(toml: []const u8) !void {
+    try std.Io.Dir.cwd().writeFile(config_io, .{ .sub_path = process_config_path, .data = toml });
+    defer std.Io.Dir.cwd().deleteFile(config_io, process_config_path) catch {};
+    try process_config.configureFromFile(alloc, process_config_path);
+}
+
+/// Undoes `configureProcess` and the settings it gave the default registry.
+fn resetProcessConfig() void {
+    process_config.resetForTesting();
+    registry.configureImplicit(.{ .workers = 2, .inline_turns = 8 });
+    resetDefault();
+}
+
+test "the process config's default_runtime sets the implicit runtime's workers and inline turns" {
+    process_config.resetForTesting();
+    defer resetProcessConfig();
+    try configureProcess(
+        \\[default_runtime]
+        \\hosted_workers = 3
+        \\inline_turns = 1
+        \\
+    );
+    var set: Nodes(1) = undefined;
+    try set.init();
+    defer set.deinit();
+    const dp = set.nodes[0].create();
+    const runtime = runtimeOf(dp) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(rt.Mode.hosted, runtime.options.mode);
+    try testing.expectEqual(@as(u32, 1), runtime.options.inline_turns);
+    {
+        registry.mu.lock();
+        defer registry.mu.unlock();
+        try testing.expectEqual(@as(usize, 3), registry.slot.implicit.hosted.workers.len);
+    }
+    try set.nodes[0].delete(dp);
+}
+
+test "the process config's disabled default-runtime policy makes creation without a selection fail" {
+    const prev_log_level = quietRefusals();
+    defer std.testing.log_level = prev_log_level;
+    process_config.resetForTesting();
+    defer resetProcessConfig();
+    try configureProcess(
+        \\default_runtime_policy = "DEFAULT_RUNTIME_DISABLED"
+        \\
+    );
+    var set: Nodes(1) = undefined;
+    try set.init();
+    defer set.deinit();
+    try testing.expectEqual(nil_participant.ptr, set.nodes[0].create().ptr);
+
+    // A selected runtime still works.
+    var m: Manual = undefined;
+    m.init();
+    defer m.runtime.deinit();
+    try set.nodes[0].factory.selectRuntime(&m.runtime);
+    m.runtime.releaseOwner();
+    const dp = set.nodes[0].create();
+    try testing.expect(dp.ptr != nil_participant.ptr);
+    try set.nodes[0].factory.selectRuntime(null);
+    try set.nodes[0].delete(dp);
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+}
+
+test "a process config asking for a manual default runtime, or none of its workers, is refused and changes nothing" {
+    process_config.resetForTesting();
+    defer resetProcessConfig();
+    try testing.expectError(error.ManualDefaultRuntime, configureProcess(
+        \\[default_runtime]
+        \\mode = "RUNTIME_MODE_MANUAL"
+        \\
+    ));
+    try testing.expectError(error.NoHostedWorkers, configureProcess(
+        \\[default_runtime]
+        \\hosted_workers = 0
+        \\
+    ));
+    try testing.expectEqual(@as(u32, 2), registry.workers);
+    // Neither installed anything: a valid one still can be.
+    try configureProcess("");
+}
+
 test "concurrent first creations share one default runtime" {
     defer resetDefault();
     var set: Nodes(4) = undefined;

@@ -139,13 +139,39 @@ module zzdds {
         TraceConfig       trace;
     };
 
-    // Process-wide configuration. Deliberately minimal for now — just what a
-    // newly-created DomainParticipantFactory seeds its own default participant
-    // config from. Room to grow (threading/event-loop behavior, a process-wide
-    // network-monitor interval, etc.) later; adding fields here needs no change
-    // to the resolve/TOML-codegen machinery itself, only to this struct.
+    // How a runtime makes progress: hosted workers, or the application's
+    // drive() calls. BUILD_DEFAULT resolves to hosted in a hosted build.
+    enum RuntimeMode {
+        RUNTIME_MODE_BUILD_DEFAULT,
+        RUNTIME_MODE_HOSTED,
+        RUNTIME_MODE_MANUAL
+    };
+
+    // Execution settings for a runtime: not discovery, transports or QoS.
+    struct RuntimeConfig {
+        @default(RUNTIME_MODE_BUILD_DEFAULT) RuntimeMode mode;
+        // Hosted worker threads; at least 1 when hosted.
+        @default(2) unsigned long hosted_workers;
+        // Turns a submitting thread may run directly before it must queue.
+        @default(8) unsigned long inline_turns;
+    };
+
+    // Whether a participant created without a selected runtime gets the
+    // implicit default runtime, or fails.
+    enum DefaultRuntimePolicy {
+        DEFAULT_RUNTIME_IMPLICIT,
+        DEFAULT_RUNTIME_DISABLED
+    };
+
+    // Process-wide configuration: what a newly-created DomainParticipantFactory
+    // seeds its own default participant config from, and how the implicit
+    // default runtime is built. Adding fields here needs no change to the
+    // resolve/TOML-codegen machinery itself, only to this struct.
     struct ProcessConfig {
         DomainParticipantConfig default_participant_config;
+        // The implicit default runtime's settings; it is always hosted.
+        RuntimeConfig default_runtime;
+        @default(DEFAULT_RUNTIME_IMPLICIT) DefaultRuntimePolicy default_runtime_policy;
     };
 
     struct SerializedSample {
