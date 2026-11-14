@@ -21,6 +21,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   `rt` and drains there, within 5 ms of an event arriving in an empty ring, on a hosted
   worker or inside a manual runtime's `drive`. An idle ring never wakes the runtime. An
   unattached sink is still drained by `flush()` and its `deinit`.
+- A remote participant whose SPDP announcements stop is lost only once three liveness
+  probe attempts (1 s each) have gone unanswered, or its lease runs out, rather than
+  after the first: one lost HEARTBEAT or ACKNACK no longer evicts a live participant.
 
 ## 2026-11-13
 

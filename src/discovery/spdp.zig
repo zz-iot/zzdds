@@ -73,6 +73,13 @@ const MIN_PLAUSIBLE_INTERVAL_NS: i64 = 50_000_000; // 50ms
 /// interval is unknown or very long still is within 5 s.
 const MAX_PROBE_TRIGGER_NS: i64 = 5_000_000_000;
 
+/// How long one liveness-probe attempt waits for an ACKNACK.
+const PROBE_TIMEOUT_NS: i64 = 1_000_000_000;
+
+/// Liveness-probe attempts before a silent participant is lost, unless its
+/// lease runs out first: one lost HEARTBEAT or ACKNACK is not a lost peer.
+pub const PROBE_ATTEMPTS: u8 = 3;
+
 // ── State for one known remote participant ────────────────────────────────────
 
 pub const KnownParticipant = struct {
@@ -86,6 +93,12 @@ pub const KnownParticipant = struct {
     observed_interval_ns: i64,
     /// True while a liveness probe is outstanding for this participant.
     probe_active: bool,
+    /// While a probe is outstanding: when its current attempt fails. A
+    /// failure reported before then belongs to an earlier attempt (each of
+    /// the SEDP writers probing reports its own).
+    probe_deadline_ns: i64 = 0,
+    /// Attempts of the outstanding probe that have failed.
+    probe_failures: u8 = 0,
     /// SPDP builtin writer SN of the most recently processed announcement. Multi-homed
     /// peers commonly resend the *same* SPDP sample redundantly across several local
     /// interfaces within microseconds of each other; a repeated SN identifies that as
@@ -337,7 +350,9 @@ pub const SpdpEndpoints = struct {
 
     /// Called by SEDP when a liveness probe resolves.
     ///   alive=true  → reset the participant's expiry/last-seen; clear probe flag.
-    ///   alive=false → evict the participant and fire on_participant_lost.
+    ///   alive=false → try again, up to PROBE_ATTEMPTS attempts within its
+    ///                 lease; after the last, evict the participant and fire
+    ///                 on_participant_lost.
     pub fn onProbeResult(ctx: *anyopaque, prefix: GuidPrefix, alive: bool) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         // Only a failed probe can remove the participant.
@@ -354,7 +369,26 @@ pub const SpdpEndpoints = struct {
             self.mu.unlock();
             return;
         }
+        if (!alive) {
+            const now_ns = self.clock.nowNs();
+            // Reported for an earlier attempt, by the other SEDP writer.
+            if (now_ns < kp_ptr.probe_deadline_ns) {
+                self.mu.unlock();
+                return;
+            }
+            kp_ptr.probe_failures += 1;
+            if (kp_ptr.probe_failures < PROBE_ATTEMPTS and now_ns < kp_ptr.expires_ns) {
+                kp_ptr.probe_deadline_ns = now_ns + PROBE_TIMEOUT_NS;
+                const deadline_ns = kp_ptr.probe_deadline_ns;
+                log.spdp.debug("spdp: liveness probe {d} of {x} failed; trying again", .{ kp_ptr.probe_failures, prefix.bytes });
+                self.mu.unlock();
+                // Outside `mu`, as in checkLeases: it takes the SEDP writers' locks.
+                if (self.begin_probe_fn) |f| f(self.begin_probe_ctx.?, prefix, deadline_ns);
+                return;
+            }
+        }
         kp_ptr.probe_active = false;
+        kp_ptr.probe_failures = 0;
         if (alive) {
             const now_ns = self.clock.nowNs();
             kp_ptr.expires_ns = now_ns + @as(i64, @intCast(kp_ptr.data.lease_duration_ms)) * std.time.ns_per_ms;
@@ -902,9 +936,11 @@ pub const SpdpEndpoints = struct {
             if (kp.probeDueNs()) |probe_ns| {
                 if (now_ns >= probe_ns) {
                     kp.probe_active = true;
+                    kp.probe_deadline_ns = now_ns + PROBE_TIMEOUT_NS;
+                    kp.probe_failures = 0;
                     to_probe.append(self.alloc, .{
                         .prefix = entry.key_ptr.*,
-                        .deadline_ns = now_ns + 1_000_000_000,
+                        .deadline_ns = kp.probe_deadline_ns,
                     }) catch {
                         kp.probe_active = false; // undo on OOM so we retry next cycle
                     };
