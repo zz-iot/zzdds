@@ -820,6 +820,9 @@ pub const TypeSupport = struct {
     /// Optional immutable wire-library registration. Provider code is pinned until
     /// after every endpoint and its pending protocol work have been destroyed.
     provider_generation: u64 = 0,
+    /// Pure equivalence check for repeated checked registrations, called under
+    /// participant.mu. It must not call DDS APIs or transfer context ownership.
+    same_registration: ?*const fn (*anyopaque, *anyopaque) bool = null,
     minimal_identifier: [15]u8 = @splat(0),
     sample_processor: ?@import("../rtps/reader_sm.zig").SampleProcessor = null,
     /// Opaque context passed as the first argument to all function pointers.
@@ -845,7 +848,7 @@ pub const TypeSupport = struct {
     /// `compute_key_hash_key_only_fn` parameter, `c_abi/typesupport.zig`).
     compute_key_hash_key_only: ?*const fn (ctx: *anyopaque, payload: []const u8) [16]u8 = null,
     /// True when the type has one or more `@key` members. Native registrations
-    /// should use the generated type's `has_key` constant. Pinned providers use it
+    /// should use the generated type's `has_key` constant. Checked registrations use it
     /// for endpoint kinds; legacy registrations retain their previous wire kinds.
     /// A keyed writer emits inline `PID_KEY_HASH` on
     /// every sample (RTPS §8.7.9), including a zero-valued key — otherwise a
@@ -868,6 +871,11 @@ pub const TypeSupport = struct {
     /// Optional cleanup called when the participant deinits this TypeSupport entry.
     /// Use to free any ctx allocation.  null = no cleanup needed (e.g. ctx = undefined).
     deinit: ?*const fn (ctx: *anyopaque) void = null,
+    fn fieldGetter(self: TypeSupport) ?filter_mod.CdrFieldGetter {
+        const func = self.get_field orelse return null;
+        const pin = if (self.sample_processor) |p| (if (p.ctx == self.ctx) p else null) else null;
+        return .{ .ctx = self.ctx, .func = func, .retain = if (pin) |p| p.retain else null, .release = if (pin) |p| p.release else null };
+    }
 };
 
 const ActiveWriter = struct {
@@ -1866,7 +1874,7 @@ pub const DomainParticipantImpl = struct {
             return false;
         };
         if (gop.found_existing) {
-            if (gop.value_ptr.provider_generation != 0) {
+            if (gop.value_ptr.provider_generation != 0 or gop.value_ptr.sample_processor != null) {
                 self.alloc.free(owned_key);
                 cleanup = ts;
                 return false;
@@ -1895,10 +1903,7 @@ pub const DomainParticipantImpl = struct {
                     // CFT/QueryCondition evaluation in between dereferences
                     // freed memory once the deinit below runs.
                     if (ar.refresh_get_field) |rf| {
-                        const new_get_field: ?filter_mod.CdrFieldGetter = if (ts.get_field) |f|
-                            .{ .ctx = ts.ctx, .func = f }
-                        else
-                            null;
+                        const new_get_field = ts.fieldGetter();
                         rf.refresh(rf.ctx, new_get_field);
                     }
                 }
@@ -1913,6 +1918,35 @@ pub const DomainParticipantImpl = struct {
             gop.key_ptr.* = owned_key;
         }
         gop.value_ptr.* = ts;
+        return true;
+    }
+
+    /// Install a checked native/C registration before any topic exists. On
+    /// false (equivalent registration) or error, ownership stays with the caller.
+    /// Checked registrations are immutable and cannot be downgraded by legacy
+    /// replacement. Endpoint processors independently retain their context.
+    pub fn installCheckedTypeSupport(self: *Self, type_name: []const u8, ts: TypeSupport) !bool {
+        if (ts.provider_generation != 0 or ts.sample_processor == null) return error.InvalidTypeSupport;
+        const processor = ts.sample_processor.?;
+        if ((processor.retain == null) != (processor.release == null)) return error.InvalidTypeSupport;
+        if (ts.deinit != null and (processor.retain == null or processor.ctx != ts.ctx)) return error.InvalidTypeSupport;
+        const owned_key = try self.alloc.dupe(u8, type_name);
+        errdefer self.alloc.free(owned_key);
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.type_support_registry.get(type_name)) |old| {
+            if (old.provider_generation == 0 and old.sample_processor != null) {
+                if (old.same_registration) |same| {
+                    if (ts.same_registration == same and same(old.ctx, ts.ctx)) {
+                        self.alloc.free(owned_key);
+                        return false;
+                    }
+                }
+            }
+            return error.TypeAlreadyRegistered;
+        }
+        for (self.topics.items) |topic| if (std.mem.eql(u8, topic.type_name, type_name)) return error.TypeInUse;
+        try self.type_support_registry.put(self.alloc, owned_key, ts);
         return true;
     }
 
@@ -1997,9 +2031,9 @@ pub const DomainParticipantImpl = struct {
         const support = self.type_support_registry.get(type_name);
         const registered_keyed: ?bool = if (support) |s| s.has_key else null;
         // Legacy native callers may leave has_key at its historical default,
-        // even for keyed types (including the pinned dds-rtps adapter). Only a
-        // checked provider registration guarantees explicit endpoint keyedness.
-        const endpoint_keyed = if (support) |s| s.provider_generation == 0 or s.has_key else true;
+        // even for keyed types (including the pinned dds-rtps adapter). A
+        // checked registration guarantees explicit endpoint keyedness.
+        const endpoint_keyed = if (support) |s| (s.provider_generation == 0 and s.sample_processor == null) or s.has_key else true;
         self.mu.unlock();
 
         const guid = Guid{
@@ -2134,7 +2168,7 @@ pub const DomainParticipantImpl = struct {
 
         self.mu.lock();
         const key = self.nextEntityKeyLocked();
-        const is_keyed = if (self.type_support_registry.get(type_name)) |support| support.provider_generation == 0 or support.has_key else true;
+        const is_keyed = if (self.type_support_registry.get(type_name)) |support| (support.provider_generation == 0 and support.sample_processor == null) or support.has_key else true;
         self.mu.unlock();
 
         const guid = Guid{
@@ -4886,7 +4920,7 @@ pub const DomainParticipantImpl = struct {
         // comment for why these must not be two separate lock acquisitions,
         // and why this must not be a return value assigned outside them.
         const current: ?filter_mod.CdrFieldGetter = if (self.type_support_registry.get(type_name)) |ts|
-            if (ts.get_field) |func| .{ .ctx = ts.ctx, .func = func } else null
+            ts.fieldGetter()
         else
             null;
         refresh_fn(notify_ctx, current);

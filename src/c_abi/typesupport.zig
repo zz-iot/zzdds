@@ -324,3 +324,100 @@ pub export fn zzdds_register_type_support_ctx(
 
     return 0;
 }
+
+/// Validate the complete value (or genuine key-only value), then publish its
+/// hash. Unlike legacy hash callbacks, errors remain visible at ingress.
+pub const ZzddsProcessSampleFn = *const fn ([*]const u8, usize, c_int, *[16]u8) callconv(.c) c_int;
+pub const ZzddsProcessSampleCtxFn = *const fn (?*anyopaque, [*]const u8, usize, c_int, *[16]u8) callconv(.c) c_int;
+
+const CheckedTypeSupportAdapter = struct {
+    alloc: std.mem.Allocator,
+    refs: std.atomic.Value(usize) = .init(1),
+    process_fn: ?ZzddsProcessSampleFn = null,
+    process_ctx_fn: ?ZzddsProcessSampleCtxFn = null,
+    field_fn: ?ZzddsGetFieldFromCdrFn = null,
+    field_ctx_fn: ?ZzddsGetFieldFromCdrCtxFn = null,
+    user_ctx: ?*anyopaque = null,
+    user_deinit: ?*const fn (?*anyopaque) callconv(.c) void = null,
+    has_key: bool,
+
+    fn retain(ctx: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+    fn release(ctx: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        if (self.user_deinit) |f| f(self.user_ctx);
+        self.alloc.destroy(self);
+    }
+    fn process(ctx: *anyopaque, payload: []const u8, kind: @import("../rtps/reader_sm.zig").ChangeKind, supplied: [16]u8) anyerror![16]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        // Lifecycle notifications can carry only an inline key hash.
+        if (kind != .alive and payload.len == 0) return if (self.has_key) supplied else @splat(0);
+        var hash: [16]u8 = @splat(0);
+        const key_only: c_int = @intFromBool(kind != .alive);
+        const rc = if (self.process_fn) |f| f(payload.ptr, payload.len, key_only, &hash) else self.process_ctx_fn.?(self.user_ctx, payload.ptr, payload.len, key_only, &hash);
+        if (rc != 0) return error.InvalidSample;
+        return if (self.has_key) hash else @splat(0);
+    }
+    // Legacy key-recovery slots cannot signal failure. The checked processor
+    // always supplies the actual hash, including when inline QoS supplied one.
+    fn unusedHash(_: *anyopaque, _: []const u8) [16]u8 {
+        return @splat(0);
+    }
+    fn getField(ctx: *anyopaque, payload: []const u8, field: []const u8, scratch: []u8) ?filter_mod.FilterValue {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        var out: ZzddsFilterValue = .{};
+        const ok = if (self.field_fn) |f| f(payload.ptr, payload.len, field.ptr, field.len, &out, scratch.ptr, scratch.len) else if (self.field_ctx_fn) |f| f(self.user_ctx, payload.ptr, payload.len, field.ptr, field.len, &out, scratch.ptr, scratch.len) else return null;
+        return if (ok) zzddsFilterValueToZig(out) else null;
+    }
+    fn same(a: *anyopaque, b: *anyopaque) bool {
+        const x: *@This() = @ptrCast(@alignCast(a));
+        const y: *@This() = @ptrCast(@alignCast(b));
+        return x.process_fn == y.process_fn and x.process_ctx_fn == y.process_ctx_fn and x.field_fn == y.field_fn and x.field_ctx_fn == y.field_ctx_fn and x.user_ctx == y.user_ctx and x.user_deinit == y.user_deinit and x.has_key == y.has_key;
+    }
+    fn install(self: *@This(), impl: *DomainParticipantImpl, name: []const u8) c_int {
+        const ts = TypeSupport{
+            .ctx = self,
+            .has_key = self.has_key,
+            .sample_processor = .{ .ctx = self, .process = process, .retain = retain, .release = release },
+            .same_registration = same,
+            .compute_key_hash = unusedHash,
+            .compute_key_hash_key_only = unusedHash,
+            .get_field = if (self.field_fn != null or self.field_ctx_fn != null) getField else null,
+            .deinit = release,
+        };
+        const installed = impl.installCheckedTypeSupport(name, ts) catch {
+            // Context ownership transfers only for a new successful install.
+            self.alloc.destroy(self);
+            return -1;
+        };
+        if (!installed) self.alloc.destroy(self);
+        return 0;
+    }
+};
+
+/// Checked registrations are immutable; install before creating topics.
+/// Identical registrations are idempotent, conflicts/downgrades reject.
+pub export fn zzdds_register_type_support_checked(participant: *anyopaque, type_name: [*:0]const u8, process_fn: ?ZzddsProcessSampleFn, has_key: c_int, field_fn: ?ZzddsGetFieldFromCdrFn) callconv(.c) c_int {
+    if (@intFromPtr(participant) == 0 or process_fn == null or (has_key != 0 and has_key != 1)) return -1;
+    const p = zidl_bindings.unboxAsView(DDS.DomainParticipant, participant);
+    if (nil.isNil(p)) return -1;
+    const impl: *DomainParticipantImpl = @ptrCast(@alignCast(p.ptr));
+    const adapter = impl.alloc.create(CheckedTypeSupportAdapter) catch return -1;
+    adapter.* = .{ .alloc = impl.alloc, .process_fn = process_fn, .field_fn = field_fn, .has_key = has_key != 0 };
+    return adapter.install(impl, std.mem.span(type_name));
+}
+
+/// ctx ownership transfers on a new successful install only. A repeated
+/// identical ctx registration does not transfer or release it a second time.
+pub export fn zzdds_register_type_support_checked_ctx(participant: *anyopaque, type_name: [*:0]const u8, process_fn: ?ZzddsProcessSampleCtxFn, has_key: c_int, field_fn: ?ZzddsGetFieldFromCdrCtxFn, ctx: ?*anyopaque, ctx_deinit: ?*const fn (?*anyopaque) callconv(.c) void) callconv(.c) c_int {
+    if (@intFromPtr(participant) == 0 or process_fn == null or (has_key != 0 and has_key != 1)) return -1;
+    const p = zidl_bindings.unboxAsView(DDS.DomainParticipant, participant);
+    if (nil.isNil(p)) return -1;
+    const impl: *DomainParticipantImpl = @ptrCast(@alignCast(p.ptr));
+    const adapter = impl.alloc.create(CheckedTypeSupportAdapter) catch return -1;
+    adapter.* = .{ .alloc = impl.alloc, .process_ctx_fn = process_fn, .field_ctx_fn = field_fn, .has_key = has_key != 0, .user_ctx = ctx, .user_deinit = ctx_deinit };
+    return adapter.install(impl, std.mem.span(type_name));
+}

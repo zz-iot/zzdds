@@ -24,9 +24,18 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 - A remote participant whose SPDP announcements stop is lost only once three liveness
   probe attempts (1 s each) have gone unanswered, or its lease runs out, rather than
   after the first: one lost HEARTBEAT or ACKNACK no longer evicts a live participant.
+- **Breaking** for Zig: `trace.AsyncRingSink.startFlushThread` is removed, so zzdds starts no
+  thread of its own. `attachRuntime(rt)` replaces it: the sink holds an owner reference to
+  `rt` and drains there, within 5 ms of an event arriving in an empty ring, on a hosted
+  worker or inside a manual runtime's `drive`. An idle ring never wakes the runtime. An
+  unattached sink is still drained by `flush()` and its `deinit`.
 
 ## 2026-11-13
 
+- Add opt-in checked native/C typesupport registration, including ctx callbacks,
+  before-history processing of DATA/fragments/prematch, immutable installation
+  and callback-context retirement pins. Preserve legacy registration contracts.
+  Generated-callback tests cover keyed/keyless values and evolution defaults.
 - A `set_qos` on a DataReader or DataWriter (or a Subscriber's or Publisher's
   PRESENTATION) counts each discovered remote endpoint it makes incompatible in
   `REQUESTED_INCOMPATIBLE_QOS` / `OFFERED_INCOMPATIBLE_QOS`, as the change is made,
