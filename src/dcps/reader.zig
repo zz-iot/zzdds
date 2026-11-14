@@ -786,6 +786,7 @@ pub const DataReaderImpl = struct {
         const pinned = self.parent_pinned;
         const subscriber = self.subscriber;
         const topic_use = self.topic_use;
+        if (self.get_field_fn) |getter| if (getter.release) |release| release(getter.ctx);
         self.alloc.destroy(self);
         topic_use.release();
         if (pinned) subscriber_mod.SubscriberImpl.quiesceReleaseFn(subscriber.ptr);
@@ -2973,7 +2974,10 @@ pub const DataReaderImpl = struct {
         // (on_receive's CFT check, readFiltered/takeFiltered's QueryCondition
         // evaluation) -- take it here too, or a concurrent evaluation can
         // observe a torn/inconsistent write to either field.
+        if (new_get_field) |getter| if (getter.retain) |retain| retain(getter.ctx);
         self.mu.lock();
+        const old = self.get_field_fn;
+        defer if (old) |getter| if (getter.release) |release| release(getter.ctx);
         defer self.mu.unlock();
         self.get_field_fn = new_get_field;
         // Always derive cft_filter from cft_ptr (immutable, set once at

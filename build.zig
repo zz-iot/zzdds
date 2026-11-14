@@ -1928,12 +1928,37 @@ pub fn build(b: *std.Build) void {
         t.root_module.link_libc = true;
         const run = addTestRun(b, t, &dcps_test_domain);
         test_step.dependOn(&run.step);
+        if (std.mem.eql(u8, src, "test/c_abi/typesupport_test.zig") or std.mem.eql(u8, src, "test/dcps/type_support_test.zig")) {
+            b.step(if (std.mem.eql(u8, src, "test/c_abi/typesupport_test.zig")) "test-c-abi-typesupport" else "test-native-typesupport", "Check typesupport registration and checked admission").dependOn(&run.step);
+        }
         if (std.mem.eql(u8, src, "test/dcps/handle_retirement_test.zig")) {
             b.step("test-handle-retirement", "Check logical handle retirement and deferred entity cleanup").dependOn(&run.step);
         }
         emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests" } },
         }).step);
+    }
+
+    {
+        const step = b.step("test-checked-admission-generated", "Check generated native callbacks at legacy ingress (requires local zidl)");
+        if (zidl_source != null) {
+            const gen = b.addRunArtifact(zidl_exe);
+            gen.addArgs(&.{ "-b", "c", "-o" });
+            const dir = gen.addOutputDirectoryArg("checked-admission-c");
+            gen.addFileArg(b.path("test/c_abi/admission.idl"));
+            const m = b.createModule(.{ .root_source_file = b.path("test/c_abi/generated_admission_test.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{
+                .{ .name = "zzdds", .module = zzdds_mod }, .{ .name = "zzdds_generated", .module = generated_dcps_mod }, .{ .name = "zidl_cdr", .module = runtime.codec }, .{ .name = "zidl_bindings", .module = runtime.bindings }, .{ .name = "test_domain", .module = test_domain_mod },
+            } });
+            m.addCSourceFile(.{ .file = dir.path(b, "admission_cdr.c"), .flags = &.{ "-std=c99", "-Wall", "-Wextra", "-Werror" } });
+            m.addIncludePath(dir);
+            m.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+            const library = cdr_lib orelse cdrLibrary(b, zidl_dep, runtime.codec, target, optimize, sanitize_thread);
+            linkCdr(m, library);
+            const t = b.addTest(.{ .name = "checked-admission-generated", .root_module = m });
+            const run = addTestRun(b, t, &dcps_test_domain);
+            step.dependOn(&run.step);
+            test_step.dependOn(&run.step);
+        } else step.dependOn(&b.addFail("Pass -Dzidl-source=/absolute/path/to/zidl with checked sample callbacks").step);
     }
 
     var resource_probe_mod: ?*std.Build.Module = null;

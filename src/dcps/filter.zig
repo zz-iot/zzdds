@@ -45,6 +45,10 @@ pub const FieldAccessor = struct {
 /// identical in pure Zig.
 pub const CdrFieldGetter = struct {
     ctx: *anyopaque,
+    /// Optional independent context pin owned by the DataReader. Getter copies
+    /// used synchronously under that reader's lock borrow this reference.
+    retain: ?*const fn (*anyopaque) void = null,
+    release: ?*const fn (*anyopaque) void = null,
     func: *const fn (ctx: *anyopaque, payload: []const u8, field: []const u8, scratch: []u8) ?FilterValue,
 
     pub fn get(self: CdrFieldGetter, payload: []const u8, field: []const u8, scratch: []u8) ?FilterValue {
