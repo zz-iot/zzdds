@@ -626,14 +626,16 @@ pub const AsyncRingSink = struct {
         self.drain_scheduled = rt.armTimer(&self.drain_timer, rt.clock.nowNs() + DRAIN_DELAY_NS);
     }
 
-    /// Drains the ring. Cleared before draining, so an event submitted
-    /// meanwhile is either written by this drain or arms the next one.
+    /// Drains the events queued when it starts, no more, so producers that
+    /// outpace the writer cannot keep the turn going. Cleared first, so an
+    /// event submitted meanwhile arms the next drain.
     fn onDrainTimer(t: *runtime_mod.Timer, _: *runtime_mod.Turn) void {
         const self: *Self = @fieldParentPtr("drain_timer", t);
         self.mu.lock();
         self.drain_scheduled = false;
+        const backlog = self.count;
         self.mu.unlock();
-        self.drainAll();
+        self.drainUpTo(backlog);
     }
 
     /// A queued fire is the timer's own embedded request: nothing to free.
@@ -661,17 +663,25 @@ pub const AsyncRingSink = struct {
     }
 
     fn drainAll(self: *Self) void {
+        self.drainUpTo(std.math.maxInt(usize));
+    }
+
+    /// Writes up to `limit` events, fewer once the ring is empty.
+    fn drainUpTo(self: *Self, limit: usize) void {
         self.drain_mu.lock();
         defer self.drain_mu.unlock();
         var batch: [DRAIN_BATCH]TraceEvent = undefined;
+        var left = limit;
         while (true) {
             // Emit a skipped marker before the next real batch if drops occurred.
             const dropped = self.dropped.swap(0, .acq_rel);
             if (dropped > 0) {
                 formatEvent(self.writer, self.format, .{ .skipped = .{ .count = dropped } }) catch {};
             }
-            const n = self.dequeueBatch(&batch);
+            if (left == 0) break;
+            const n = self.dequeueBatch(batch[0..@min(batch.len, left)]);
             if (n == 0) break;
+            left -= n;
             for (batch[0..n]) |ev| {
                 formatEvent(self.writer, self.format, ev) catch {};
             }
@@ -1393,6 +1403,51 @@ test "AsyncRingSink: attaching drains what was queued before, and deinit cancels
     ring.deinit();
     try testing.expectEqual(@as(u32, 0), r.runtime.armed_timers);
     try testing.expect(std.mem.count(u8, w.buffer[0..w.end], "SEND DATA") == 1);
+    try r.retire();
+}
+
+/// A writer that submits another event to `ring` on every write: producers
+/// faster than the writer.
+const RefillingWriter = struct {
+    w: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+    ring: *AsyncRingSink = undefined,
+    refill: bool = true,
+    writes: usize = 0,
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *RefillingWriter = @alignCast(@fieldParentPtr("w", w));
+        self.writes += 1;
+        if (self.refill) self.ring.sink().submit(testDataEvent());
+        var n = data[data.len - 1].len * splat;
+        for (data[0 .. data.len - 1]) |bytes| n += bytes.len;
+        return n;
+    }
+};
+
+test "AsyncRingSink: a drain on the runtime writes only what was queued when it began, though producers refill the ring" {
+    var r: DrainTestRuntime = undefined;
+    r.init();
+    var rw: RefillingWriter = .{};
+    const ring = try AsyncRingSink.init(testing.allocator, 16, &rw.w, .text);
+    rw.ring = ring;
+    try ring.attachRuntime(&r.runtime);
+    ring.sink().submit(testDataEvent());
+
+    // The drain's turn ends with the refills queued and the next drain armed.
+    _ = try r.runtime.drive(64, std.time.ns_per_s);
+    try r.settle();
+    try testing.expect(rw.writes > 0);
+    ring.mu.lock();
+    const left = ring.count;
+    const scheduled = ring.drain_scheduled;
+    ring.mu.unlock();
+    try testing.expect(left > 0);
+    try testing.expect(scheduled);
+    try testing.expectEqual(@as(u32, 1), r.runtime.armed_timers);
+
+    // Stop refilling before deinit's final drain, which empties the ring.
+    rw.refill = false;
+    ring.deinit();
     try r.retire();
 }
 
