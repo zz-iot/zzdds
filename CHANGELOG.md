@@ -8,6 +8,12 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-14
+
+- A remote participant whose SPDP announcements stop is lost only once three liveness
+  probe attempts (1 s each) have gone unanswered, or its lease runs out, rather than
+  after the first: one lost HEARTBEAT or ACKNACK no longer evicts a live participant.
+
 ## 2026-11-13
 
 - A `set_qos` on a DataReader or DataWriter (or a Subscriber's or Publisher's

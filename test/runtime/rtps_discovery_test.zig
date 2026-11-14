@@ -391,15 +391,16 @@ test "a participant that falls silent with a long lease is lost by the liveness 
     try p.driveTo(p.now() + 5 * SEC);
 
     // A probe starts after three announcement intervals of silence, 1.5 s
-    // from `b`'s last announcement, and evicts `b` once its one second has
-    // passed unanswered on the runtime clock, at the next heartbeat: long
-    // before the 100 s lease ends, and not as soon as the probe starts.
+    // from `b`'s last announcement, and evicts `b` once all three of its
+    // one-second attempts have passed unanswered on the runtime clock, each
+    // reported at the next heartbeat (200 ms): long before the 100 s lease
+    // ends, and not as soon as the first attempt fails.
     p.b.gate.silent = true;
     const silent_at = p.now();
     try testing.expect(try p.driveUntil(silent_at + 10 * SEC, &p, Pair.aLostB));
     const lost_at = p.now();
-    try testing.expect(lost_at >= silent_at + 1_900 * MS);
-    try testing.expect(lost_at <= silent_at + 3 * SEC);
+    try testing.expect(lost_at >= silent_at + 3_900 * MS);
+    try testing.expect(lost_at <= silent_at + 5_500 * MS);
 }
 
 test "a participant that answers a liveness probe is probed again once it falls silent" {

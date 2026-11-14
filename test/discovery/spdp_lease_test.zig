@@ -549,7 +549,7 @@ test "SPDP: onProbeResult alive refreshes expiry and clears probe" {
     try testing.expectEqual(@as(u32, 0), tr.lost);
 }
 
-test "SPDP: onProbeResult dead evicts participant" {
+test "SPDP: a participant is lost when the last attempt of its liveness probe fails" {
     const alloc = testing.allocator;
 
     const net = try MockNetwork.init(alloc);
@@ -585,13 +585,30 @@ test "SPDP: onProbeResult dead evicts participant" {
     clock.set(1001 * std.time.ns_per_ms);
     spdp.processSpdpPayload(peer, 2, payload, .{ .bytes = .{ 0x00, 0x00 } });
 
-    // T=4001ms: probe fires (silence=3000ms=3×1s).
+    // T=4001ms: probe fires (silence=3000ms=3×1s); its attempt fails at 5001ms.
     clock.set(4001 * std.time.ns_per_ms);
     _ = spdp.checkLeases();
     try testing.expectEqual(@as(u32, 1), pt.count);
 
-    // Probe result: alive=false → participant evicted.
+    // Each failed attempt but the last starts another, failing 1s later.
+    comptime std.debug.assert(spdp_mod.PROBE_ATTEMPTS == 3);
+    clock.set(5001 * std.time.ns_per_ms);
     spdp_mod.SpdpEndpoints.onProbeResult(spdp, peer, false);
+    try testing.expectEqual(@as(u32, 2), pt.count);
+    try testing.expectEqual(@as(u32, 0), tr.lost);
+    // The other SEDP writer's report of the same attempt: not another.
+    clock.set(5100 * std.time.ns_per_ms);
+    spdp_mod.SpdpEndpoints.onProbeResult(spdp, peer, false);
+    try testing.expectEqual(@as(u32, 2), pt.count);
+    clock.set(6001 * std.time.ns_per_ms);
+    spdp_mod.SpdpEndpoints.onProbeResult(spdp, peer, false);
+    try testing.expectEqual(@as(u32, 3), pt.count);
+    try testing.expectEqual(@as(u32, 0), tr.lost);
+
+    // The last attempt fails: participant evicted.
+    clock.set(7001 * std.time.ns_per_ms);
+    spdp_mod.SpdpEndpoints.onProbeResult(spdp, peer, false);
+    try testing.expectEqual(@as(u32, 3), pt.count);
     try testing.expectEqual(@as(u32, 1), tr.lost);
     try testing.expect(tr.lost_guid.?.prefix.eql(peer));
 
@@ -920,6 +937,8 @@ test "SPDP: every way of losing a participant reports it to SEDP, then to DCPS, 
     spdp.processSpdpPayload(peer, 3, payload, .{ .bytes = .{ 0x00, 0x00 } });
     _ = log.take();
     spdp.known.getPtr(peer).?.probe_active = true;
+    // Its last attempt.
+    spdp.known.getPtr(peer).?.probe_failures = spdp_mod.PROBE_ATTEMPTS - 1;
     SpdpEndpoints.onProbeResult(spdp, peer, false);
     try testing.expectEqualStrings("SD", log.take());
 
@@ -963,6 +982,97 @@ test "SPDP: a failed probe that a re-announcement already answered loses nothing
 
     try testing.expectEqual(@as(u32, 0), tr.lost);
     try testing.expect(spdp.known.contains(peer));
+}
+
+/// Counts the liveness probes SPDP starts.
+const ProbeCounter = struct {
+    count: u32 = 0,
+    fn start(ctx: *anyopaque, _: GuidPrefix, _: i64) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+    }
+};
+
+test "SPDP: a failed probe attempt is not tried again once the participant's lease has run out" {
+    const alloc = testing.allocator;
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const mt = try MockTransport.init(alloc, net, &.{});
+    defer mt.deinit();
+    const spdp = try SpdpEndpoints.init(alloc, mt.transport(), 0, 3000);
+    defer spdp.deinit();
+    var clock = ManualClock.init(std.time.ns_per_ms);
+    spdp.setClock(clock.clock());
+    var tr = Tracker{};
+    const c = tr.cbs();
+    spdp.callbacks = &c;
+    var pc = ProbeCounter{};
+    spdp.setBeginProbeFn(&pc, ProbeCounter.start);
+
+    // A 4.5s lease, last renewed at 1001ms: it runs out at 5501ms.
+    const peer = prefix(0xE3);
+    const payload = try buildPayload(alloc, peer, 4_500);
+    defer alloc.free(payload);
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    clock.set(1001 * std.time.ns_per_ms);
+    spdp.processSpdpPayload(peer, 2, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    clock.set(4001 * std.time.ns_per_ms);
+    _ = spdp.checkLeases();
+    try testing.expectEqual(@as(u32, 1), pc.count);
+
+    // Its first attempt fails after the lease has run out.
+    clock.set(5600 * std.time.ns_per_ms);
+    SpdpEndpoints.onProbeResult(spdp, peer, false);
+    try testing.expectEqual(@as(u32, 1), pc.count);
+    try testing.expectEqual(@as(u32, 1), tr.lost);
+}
+
+test "SPDP: a probe answered after a failed attempt keeps the participant, and the next probe has every attempt" {
+    const alloc = testing.allocator;
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const mt = try MockTransport.init(alloc, net, &.{});
+    defer mt.deinit();
+    const spdp = try SpdpEndpoints.init(alloc, mt.transport(), 0, 3000);
+    defer spdp.deinit();
+    var clock = ManualClock.init(std.time.ns_per_ms);
+    spdp.setClock(clock.clock());
+    var tr = Tracker{};
+    const c = tr.cbs();
+    spdp.callbacks = &c;
+    var pc = ProbeCounter{};
+    spdp.setBeginProbeFn(&pc, ProbeCounter.start);
+
+    const peer = prefix(0xE4);
+    const payload = try buildPayload(alloc, peer, 600_000);
+    defer alloc.free(payload);
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    clock.set(1001 * std.time.ns_per_ms);
+    spdp.processSpdpPayload(peer, 2, payload, .{ .bytes = .{ 0x00, 0x00 } });
+
+    // Probed at 4001ms; its first attempt fails, the second is answered.
+    clock.set(4001 * std.time.ns_per_ms);
+    _ = spdp.checkLeases();
+    clock.set(5001 * std.time.ns_per_ms);
+    SpdpEndpoints.onProbeResult(spdp, peer, false);
+    clock.set(5500 * std.time.ns_per_ms);
+    SpdpEndpoints.onProbeResult(spdp, peer, true);
+    try testing.expectEqual(@as(u32, 2), pc.count);
+    try testing.expect(!spdp.known.get(peer).?.probe_active);
+
+    // Silent again: the next probe (at 5500 + 3s) fails only after all its
+    // attempts.
+    clock.set(8500 * std.time.ns_per_ms);
+    _ = spdp.checkLeases();
+    try testing.expectEqual(@as(u32, 3), pc.count);
+    var t_ms: i64 = 9500;
+    for (0..spdp_mod.PROBE_ATTEMPTS) |_| {
+        try testing.expectEqual(@as(u32, 0), tr.lost);
+        clock.set(t_ms * std.time.ns_per_ms);
+        SpdpEndpoints.onProbeResult(spdp, peer, false);
+        t_ms += 1000;
+    }
+    try testing.expectEqual(@as(u32, 1), tr.lost);
 }
 
 test "SPDP: checkLeases returns when the next check is due -- the earliest lease expiry or probe start -- and null once no participant remains" {

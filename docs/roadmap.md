@@ -146,8 +146,6 @@ Forward-looking only: known gaps, planned features, and open design questions.
   discovery state, and add a `zzdds_write_raw_kind_w_handle` variant that takes a
   pre-registered handle to skip the MD5 key-hash recompute on the write hot path.
 - **`PID_GROUP_DATA` (0x002D)** is defined but not serialized in SEDP announcements.
-- **SPDP liveness probe has no retry** — a participant that goes silent while a probe is in
-  flight is evicted on the first probe deadline.
 - **TCP transport has no multicast** (`vtJoinMulticast` → `error.UnsupportedOperation`), and
   there is no "TCP for discovery too" mode — SPDP/SEDP stay on UDP even when the user-data
   transport is TCP.
