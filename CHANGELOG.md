@@ -10,6 +10,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-14
 
+- The process config (`zzdds.toml`, or `zzdds_process_configure_from_file`) gains a
+  `[default_runtime]` table and a `default_runtime_policy`. The table sets the implicit default
+  runtime's `hosted_workers` (previously fixed at 2) and `inline_turns`. Its `mode` cannot be
+  manual, and such a config, or one with no workers, is refused with `BAD_PARAMETER`.
+  `DEFAULT_RUNTIME_DISABLED` makes participant creation without a selected runtime fail. The
+  C, C++ and Java `ProcessConfig` types gain the matching fields.
 - **Breaking** for Zig: `trace.AsyncRingSink.startFlushThread` is removed, so zzdds starts no
   thread of its own. `attachRuntime(rt)` replaces it: the sink holds an owner reference to
   `rt` and drains there, within 5 ms of an event arriving in an empty ring, on a hosted

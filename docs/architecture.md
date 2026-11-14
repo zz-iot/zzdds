@@ -279,10 +279,25 @@ filter_mode = "TRACE_EXCLUDE"  # or "TRACE_INCLUDE"
 filter_participants = [] # GUID prefixes, 24 hex digits each
 ```
 
-`ProcessConfig` (also in `idl/zzdds.idl`) is deliberately minimal today — just
-`{ default_participant_config: DomainParticipantConfig }`, read from `./zzdds.toml` by
-`resolveProcessConfig`. Adding more process-wide fields later (a network-monitor interval,
-say) is just adding a member to that IDL struct — no codegen or parser changes needed.
+`ProcessConfig` (also in `idl/zzdds.idl`) holds `default_participant_config`, read from
+`./zzdds.toml` by `resolveProcessConfig`, and the settings of the implicit default runtime,
+which a participant gets when its factory selects no runtime:
+
+```toml
+default_runtime_policy = "DEFAULT_RUNTIME_IMPLICIT"  # or "DEFAULT_RUNTIME_DISABLED": creation
+                                                     # without a selected runtime fails
+
+[default_runtime]
+mode = "RUNTIME_MODE_BUILD_DEFAULT"  # or "RUNTIME_MODE_HOSTED"; the implicit default is
+                                     # never manual, so "RUNTIME_MODE_MANUAL" is refused
+hosted_workers = 2                   # worker threads, at least 1
+inline_turns = 8                     # turns a submitting thread may run directly; 0 queues
+```
+
+Installing a process config hands these to the default registry: implicit runtimes started
+afterwards use them, and the disabled policy applies only if nothing configured the default
+first. Adding more process-wide fields later is just adding a member to that IDL struct —
+no codegen or parser changes needed.
 
 ---
 

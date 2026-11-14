@@ -763,6 +763,20 @@ test "a reliable pair over loopback UDP runs on a manual runtime driven by drive
 }
 
 test "a reliable pair over loopback UDP runs on the default runtime, whose hosted workers service the sockets" {
+    try exchangeOnDefaultRuntime();
+}
+
+test "a default runtime that never runs submitted work inline still services its sockets" {
+    // Configured as `[default_runtime] inline_turns = 0` sets it. The hosted
+    // workers' I/O service has its own budget.
+    const registry = &rt.default_registry.global;
+    registry.configureImplicit(.{ .workers = 2, .inline_turns = 0 });
+    defer registry.configureImplicit(.{ .workers = 2, .inline_turns = 8 });
+    try exchangeOnDefaultRuntime();
+}
+
+/// A reliable pair on the default runtime exchanges samples_n samples in order.
+fn exchangeOnDefaultRuntime() !void {
     if (!rt.poll_backend.supported) return error.SkipZigTest;
     const registry = &rt.default_registry.global;
     defer {
