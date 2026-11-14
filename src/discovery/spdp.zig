@@ -73,6 +73,13 @@ const MIN_PLAUSIBLE_INTERVAL_NS: i64 = 50_000_000; // 50ms
 /// interval is unknown or very long still is within 5 s.
 const MAX_PROBE_TRIGGER_NS: i64 = 5_000_000_000;
 
+/// How long one liveness-probe attempt waits for an ACKNACK.
+const PROBE_TIMEOUT_NS: i64 = 1_000_000_000;
+
+/// Liveness-probe attempts before a silent participant is lost, unless its
+/// lease runs out first: one lost HEARTBEAT or ACKNACK is not a lost peer.
+pub const PROBE_ATTEMPTS: u8 = 3;
+
 // ── State for one known remote participant ────────────────────────────────────
 
 pub const KnownParticipant = struct {
@@ -86,6 +93,12 @@ pub const KnownParticipant = struct {
     observed_interval_ns: i64,
     /// True while a liveness probe is outstanding for this participant.
     probe_active: bool,
+    /// While a probe is outstanding: when its current attempt fails. A
+    /// failure reported before then belongs to an earlier attempt (each of
+    /// the SEDP writers probing reports its own).
+    probe_deadline_ns: i64 = 0,
+    /// Attempts of the outstanding probe that have failed.
+    probe_failures: u8 = 0,
     /// SPDP builtin writer SN of the most recently processed announcement. Multi-homed
     /// peers commonly resend the *same* SPDP sample redundantly across several local
     /// interfaces within microseconds of each other; a repeated SN identifies that as
@@ -175,8 +188,16 @@ pub const SpdpEndpoints = struct {
     // Set in start()
     callbacks: ?*const Callbacks,
     spdp_multicast_port: u16,
-    /// Stash local name for re-announcement.
+    /// Guarded by `announce_mu`. The local participant's announcement, its
+    /// slices owned, for encoding it again with new locators
+    /// (updateLocators). Null before `start`.
+    local: ?ParticipantAnnouncement = null,
+    /// Guarded by `announce_mu`. `local`, encoded: what each announcement
+    /// sends.
     local_payload: ?[]u8, // PL-CDR bytes, owned
+    /// Orders replacing the announcement with writing it to the writer.
+    /// Taken before `mu`, and before the writer's own locks.
+    announce_mu: Mutex = .{},
 
     // Pluggable clock (default: realtime; swap for ManualClock in tests).
     clock: time_mod.Clock,
@@ -268,6 +289,7 @@ pub const SpdpEndpoints = struct {
         self.mu.unlock();
         if (w_opt) |w| w.deinit();
         if (self.local_payload) |p| self.alloc.free(p);
+        if (self.local) |*l| freeLocal(self.alloc, l);
         var it = self.known.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit();
         self.known.deinit();
@@ -337,7 +359,9 @@ pub const SpdpEndpoints = struct {
 
     /// Called by SEDP when a liveness probe resolves.
     ///   alive=true  → reset the participant's expiry/last-seen; clear probe flag.
-    ///   alive=false → evict the participant and fire on_participant_lost.
+    ///   alive=false → try again, up to PROBE_ATTEMPTS attempts within its
+    ///                 lease; after the last, evict the participant and fire
+    ///                 on_participant_lost.
     pub fn onProbeResult(ctx: *anyopaque, prefix: GuidPrefix, alive: bool) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         // Only a failed probe can remove the participant.
@@ -354,7 +378,26 @@ pub const SpdpEndpoints = struct {
             self.mu.unlock();
             return;
         }
+        if (!alive) {
+            const now_ns = self.clock.nowNs();
+            // Reported for an earlier attempt, by the other SEDP writer.
+            if (now_ns < kp_ptr.probe_deadline_ns) {
+                self.mu.unlock();
+                return;
+            }
+            kp_ptr.probe_failures += 1;
+            if (kp_ptr.probe_failures < PROBE_ATTEMPTS and now_ns < kp_ptr.expires_ns) {
+                kp_ptr.probe_deadline_ns = now_ns + PROBE_TIMEOUT_NS;
+                const deadline_ns = kp_ptr.probe_deadline_ns;
+                log.spdp.debug("spdp: liveness probe {d} of {x} failed; trying again", .{ kp_ptr.probe_failures, prefix.bytes });
+                self.mu.unlock();
+                // Outside `mu`, as in checkLeases: it takes the SEDP writers' locks.
+                if (self.begin_probe_fn) |f| f(self.begin_probe_ctx.?, prefix, deadline_ns);
+                return;
+            }
+        }
         kp_ptr.probe_active = false;
+        kp_ptr.probe_failures = 0;
         if (alive) {
             const now_ns = self.clock.nowNs();
             kp_ptr.expires_ns = now_ns + @as(i64, @intCast(kp_ptr.data.lease_duration_ms)) * std.time.ns_per_ms;
@@ -433,9 +476,21 @@ pub const SpdpEndpoints = struct {
         errdefer if (!writer_published) new_writer.deinit();
         new_writer.setTracer(self.tracer);
 
-        // Encode the participant announcement to PL-CDR.
-        const payload = try encodeSpdpParticipant(self.alloc, local);
-        self.local_payload = payload;
+        // Encode the participant announcement to PL-CDR, keeping it to
+        // encode again with new locators.
+        const payload = blk: {
+            var owned = try dupeLocal(self.alloc, local);
+            errdefer freeLocal(self.alloc, &owned);
+            const p = try encodeSpdpParticipant(self.alloc, &owned);
+            // Owned by `self` from here, freed by deinit.
+            self.announce_mu.lock();
+            defer self.announce_mu.unlock();
+            if (self.local_payload) |old| self.alloc.free(old);
+            if (self.local) |*l| freeLocal(self.alloc, l);
+            self.local_payload = p;
+            self.local = owned;
+            break :blk p;
+        };
 
         // Store the announcement in the writer cache (SN = 1).
         _ = try new_writer.write(
@@ -498,6 +553,14 @@ pub const SpdpEndpoints = struct {
     /// a peer's own SPDP dedup logic could (reasonably) mistake for redundant
     /// delivery of one announcement rather than a genuine new one.
     fn reannounce(self: *Self) void {
+        self.announce_mu.lock();
+        defer self.announce_mu.unlock();
+        self.writeAnnouncementLocked();
+    }
+
+    /// Writes `local_payload` with a fresh sequence number, and sends it.
+    /// With `announce_mu` held.
+    fn writeAnnouncementLocked(self: *Self) void {
         self.mu.lock();
         const w_opt = self.writer;
         self.mu.unlock();
@@ -511,6 +574,40 @@ pub const SpdpEndpoints = struct {
             payload,
         ) catch return;
         w.sendAll();
+    }
+
+    /// Announces the local participant with these unicast locators from now
+    /// on (an interface was added or removed), at once, and at the fast
+    /// announcement rate for a while, so peers learn them quickly despite a
+    /// lost datagram. Fails changing nothing; a no-op before `start`.
+    pub fn updateLocators(self: *Self, metatraffic_unicast: []const Locator, default_unicast: []const Locator) !void {
+        self.announce_mu.lock();
+        defer self.announce_mu.unlock();
+        const old = self.local orelse return;
+        const meta = try self.alloc.dupe(Locator, metatraffic_unicast);
+        errdefer self.alloc.free(meta);
+        const def = try self.alloc.dupe(Locator, default_unicast);
+        errdefer self.alloc.free(def);
+        var next = old;
+        next.metatraffic_unicast_locators = meta;
+        next.default_unicast_locators = def;
+        const payload = try encodeSpdpParticipant(self.alloc, &next);
+
+        self.alloc.free(old.metatraffic_unicast_locators);
+        self.alloc.free(old.default_unicast_locators);
+        if (self.local_payload) |p| self.alloc.free(p);
+        self.local = next;
+        self.local_payload = payload;
+        log.spdp.info("spdp: announcing new locators: {d} metatraffic and {d} default unicast", .{ meta.len, def.len });
+
+        self.writeAnnouncementLocked();
+        const until_ns = self.clock.nowNs() + 2 * @as(i64, self.announcement_period_ms) * std.time.ns_per_ms;
+        self.fast_announce_until_ns.store(until_ns, .release);
+        if (self.runtime) |rt| {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (!self.timers_stopping) _ = rt.armTimerNoLater(&self.announce_timer, self.nextAnnounceNs(self.last_announce_ns));
+        }
     }
 
     pub fn stop(self: *Self) void {
@@ -653,6 +750,9 @@ pub const SpdpEndpoints = struct {
         // under the lock below; sent after releasing it (same discipline as
         // was_probing/begin_probe_fn — no network I/O while holding self.mu).
         var retransmit_locators: []Locator = &.{};
+        // A known participant announcing different locators (its host
+        // gained or lost an interface).
+        var locators_changed = false;
         {
             self.lifecycle_mu.lock();
             defer self.lifecycle_mu.unlock();
@@ -704,6 +804,7 @@ pub const SpdpEndpoints = struct {
                 }
                 // Capture whether a probe was active before we overwrite the entry.
                 was_probing = gop.value_ptr.probe_active;
+                locators_changed = !same_sn and !participantLocatorsEql(&gop.value_ptr.data, &kp.data);
                 // Carry sedp_seen forward — a fresh decode always starts false.
                 kp.sedp_seen = gop.value_ptr.sedp_seen;
                 if (is_genuine_reannounce and !kp.sedp_seen) {
@@ -717,9 +818,27 @@ pub const SpdpEndpoints = struct {
             gop.value_ptr.* = kp;
             self.armLeaseLocked(kp.checkDueNs());
 
+            if (locators_changed) {
+                log.spdp.info("spdp: participant {x} announced new locators", .{guid_prefix.bytes});
+                // SEDP's and WLP's built-in proxies for it are matched
+                // afresh, with the new locators: each side then replays its
+                // endpoints to the other, which reach DCPS again as
+                // refreshes, so their matches move to the new locators too.
+                // Not a loss: DCPS is not told, and keeps the endpoints.
+                if (self.on_participant_lost_sedp) |cb| cb(self.sedp_ctx.?, guid_prefix);
+                if (self.on_participant_discovered_sedp) |cb| cb(self.sedp_ctx.?, &kp.data);
+                // Announced to its new unicast locators too. The old ones
+                // stay, as they do for a lost participant.
+                if (self.writer) |w| {
+                    for (kp.data.metatraffic_unicast_locators) |loc| {
+                        w.addReaderLocator(.{ .locator = loc }) catch {};
+                    }
+                }
+            }
+
             // Fire callbacks and unicast reply only for genuinely new participants.
-            // Re-announcements from known participants refresh expires_ns and locator
-            // data silently; no DCPS notification or SEDP proxy establishment is needed.
+            // Re-announcements from known participants refresh expires_ns silently;
+            // only new locators (above) reach SEDP, and nothing reaches DCPS.
             // Use &kp.data (stack-local) not &gop.value_ptr.data (heap) so the pointer
             // stays valid even if the hashmap rehashes inside a nested callback.
             if (is_new) {
@@ -902,9 +1021,11 @@ pub const SpdpEndpoints = struct {
             if (kp.probeDueNs()) |probe_ns| {
                 if (now_ns >= probe_ns) {
                     kp.probe_active = true;
+                    kp.probe_deadline_ns = now_ns + PROBE_TIMEOUT_NS;
+                    kp.probe_failures = 0;
                     to_probe.append(self.alloc, .{
                         .prefix = entry.key_ptr.*,
-                        .deadline_ns = now_ns + 1_000_000_000,
+                        .deadline_ns = kp.probe_deadline_ns,
                     }) catch {
                         kp.probe_active = false; // undo on OOM so we retry next cycle
                     };
@@ -956,9 +1077,15 @@ pub const SpdpEndpoints = struct {
         // only by narrow tests) -- production wiring goes through
         // combined.zig's SpdpSedpDiscovery instead.
         .wlp_tick = noopWlpTick,
+        .update_locators = vtUpdateLocators,
     };
 
     fn noopWlpTick(_: *anyopaque, _: i64, _: iface.WlpTickInfo) void {}
+
+    fn vtUpdateLocators(ctx: *anyopaque, metatraffic_unicast: []const Locator, default_unicast: []const Locator) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.updateLocators(metatraffic_unicast, default_unicast);
+    }
 
     pub fn toDiscovery(self: *Self) Discovery {
         return .{ .ctx = self, .vtable = &vtable };
@@ -994,6 +1121,58 @@ pub const SpdpEndpoints = struct {
 
 /// Encode SPDPdiscoveredParticipantData as PL-CDR little-endian.
 /// Returns a heap-allocated slice owned by the caller.
+/// Whether two announcements of a participant carry the same locators, in
+/// the same order.
+fn participantLocatorsEql(a: *const ParticipantData, b: *const ParticipantData) bool {
+    return locatorsEql(a.metatraffic_unicast_locators, b.metatraffic_unicast_locators) and
+        locatorsEql(a.metatraffic_multicast_locators, b.metatraffic_multicast_locators) and
+        locatorsEql(a.default_unicast_locators, b.default_unicast_locators) and
+        locatorsEql(a.default_multicast_locators, b.default_multicast_locators) and
+        locatorsEql(a.default_unicast_locators_for_data, b.default_unicast_locators_for_data) and
+        locatorsEql(a.default_multicast_locators_for_data, b.default_multicast_locators_for_data);
+}
+
+fn locatorsEql(a: []const Locator, b: []const Locator) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (!x.eql(y)) return false;
+    }
+    return true;
+}
+
+/// A copy of what `encodeSpdpParticipant` encodes of `ann`, its name and
+/// locators owned (free with `freeLocal`).
+fn dupeLocal(alloc: std.mem.Allocator, ann: *const ParticipantAnnouncement) !ParticipantAnnouncement {
+    const name = try alloc.dupe(u8, ann.name);
+    errdefer alloc.free(name);
+    const meta_uc = try alloc.dupe(Locator, ann.metatraffic_unicast_locators);
+    errdefer alloc.free(meta_uc);
+    const meta_mc = try alloc.dupe(Locator, ann.metatraffic_multicast_locators);
+    errdefer alloc.free(meta_mc);
+    const def_uc = try alloc.dupe(Locator, ann.default_unicast_locators);
+    errdefer alloc.free(def_uc);
+    const def_mc = try alloc.dupe(Locator, ann.default_multicast_locators);
+    return .{
+        .guid = ann.guid,
+        .domain_id = ann.domain_id,
+        .name = name,
+        .metatraffic_unicast_locators = meta_uc,
+        .metatraffic_multicast_locators = meta_mc,
+        .default_unicast_locators = def_uc,
+        .default_multicast_locators = def_mc,
+        .lease_duration_ms = ann.lease_duration_ms,
+        .builtin_endpoint_set = ann.builtin_endpoint_set,
+    };
+}
+
+fn freeLocal(alloc: std.mem.Allocator, ann: *ParticipantAnnouncement) void {
+    alloc.free(ann.name);
+    alloc.free(ann.metatraffic_unicast_locators);
+    alloc.free(ann.metatraffic_multicast_locators);
+    alloc.free(ann.default_unicast_locators);
+    alloc.free(ann.default_multicast_locators);
+}
+
 pub fn encodeSpdpParticipant(alloc: std.mem.Allocator, ann: *const ParticipantAnnouncement) ![]u8 {
     const lease = time_mod.RtpsDuration.fromDuration(.{
         .sec = @intCast(ann.lease_duration_ms / 1000),

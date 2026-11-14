@@ -10,6 +10,20 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-14
 
+- A participant announces its new unicast locators as soon as its host gains or loses an
+  interface address, and peers move to them. It used to keep announcing the locators it
+  started with, so after DHCP renumbering, a VPN or Wi-Fi roaming, remote hosts kept
+  sending to an address it no longer had and never learned the new one. On the peer,
+  SPDP matches SEDP's and WLP's built-in endpoints for it afresh, so they replay its
+  endpoints, whose existing matches then move to the new locators too. The UDP transport
+  logs each change of interface addresses.
+- **Breaking** for discovery plugins written in Zig: `Discovery.Vtable` has an optional
+  `update_locators`, which participants call with their new locators. A plugin that
+  leaves it null keeps announcing the locators it started with.
+
+- A remote participant whose SPDP announcements stop is lost only once three liveness
+  probe attempts (1 s each) have gone unanswered, or its lease runs out, rather than
+  after the first: one lost HEARTBEAT or ACKNACK no longer evicts a live participant.
 - **Breaking** for Zig: `trace.AsyncRingSink.startFlushThread` is removed, so zzdds starts no
   thread of its own. `attachRuntime(rt)` replaces it: the sink holds an owner reference to
   `rt` and drains there, within 5 ms of an event arriving in an empty ring, on a hosted
