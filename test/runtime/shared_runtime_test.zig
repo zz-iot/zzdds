@@ -430,6 +430,50 @@ test "a process config asking for a manual default runtime, or none of its worke
     try configureProcess("");
 }
 
+test "the C ABI refuses an invalid default runtime with BAD_PARAMETER and a second config with PRECONDITION_NOT_MET" {
+    const prev_log_level = quietRefusals();
+    defer std.testing.log_level = prev_log_level;
+    const ext = zzdds.c_abi.extensions;
+    process_config.resetForTesting();
+    defer resetProcessConfig();
+    // In memory: the caller keeps its config.
+    var cfg: process_config.ProcessConfig = .{};
+    cfg.default_runtime.mode = .RUNTIME_MODE_MANUAL;
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, ext.zzdds_process_configure(&cfg));
+    cfg.default_runtime = .{ .hosted_workers = 0 };
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, ext.zzdds_process_configure(&cfg));
+    // From a file.
+    try std.Io.Dir.cwd().writeFile(config_io, .{ .sub_path = process_config_path, .data = "[default_runtime]\nmode = \"RUNTIME_MODE_MANUAL\"\n" });
+    defer std.Io.Dir.cwd().deleteFile(config_io, process_config_path) catch {};
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, ext.zzdds_process_configure_from_file(process_config_path, null));
+    // Nothing was installed, so a valid one is; a second is not.
+    cfg.default_runtime = .{ .hosted_workers = 3 };
+    try testing.expectEqual(DDS.RETCODE_OK, ext.zzdds_process_configure(&cfg));
+    try testing.expectEqual(@as(u32, 3), registry.workers);
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, ext.zzdds_process_configure(&cfg));
+    try std.Io.Dir.cwd().writeFile(config_io, .{ .sub_path = process_config_path, .data = "" });
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, ext.zzdds_process_configure_from_file(process_config_path, null));
+}
+
+test "the process config's disabled policy leaves a default the application installed" {
+    const prev_log_level = quietRefusals();
+    defer std.testing.log_level = prev_log_level;
+    process_config.resetForTesting();
+    defer resetProcessConfig();
+    var m: Manual = undefined;
+    m.init();
+    defer m.runtime.deinit();
+    try registry.install(&m.runtime);
+    try configureProcess(
+        \\default_runtime_policy = "DEFAULT_RUNTIME_DISABLED"
+        \\
+    );
+    try testing.expectEqual(&m.runtime, registry.helping() orelse return error.TestUnexpectedResult);
+    resetDefault();
+    m.runtime.releaseOwner();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+}
+
 test "concurrent first creations share one default runtime" {
     defer resetDefault();
     var set: Nodes(4) = undefined;

@@ -21,6 +21,7 @@ comptime {
     zidl_bindings.exportHandleRetireHook("zzdds_handle_retire");
 }
 const process_config = @import("../config/process.zig");
+const log_mod = @import("../log.zig");
 const DomainParticipantFactoryImpl = @import("../dcps/factory.zig").DomainParticipantFactoryImpl;
 const participant_mod = @import("../dcps/participant.zig");
 const DomainParticipantImpl = participant_mod.DomainParticipantImpl;
@@ -861,7 +862,8 @@ pub export fn zzdds_process_configure_from_file(
 ) callconv(.c) DDS.ReturnCode_t {
     const alloc = if (allocator) |a| zidl_bindings.toAllocator(a) else std.heap.c_allocator;
     process_config.configureFromFile(alloc, std.mem.span(path)) catch |err| {
-        std.log.err("zzdds_process_configure_from_file: {}", .{err});
+        // The return code reports the failure; this says which.
+        log_mod.dcps.warn("zzdds_process_configure_from_file: {s}", .{@errorName(err)});
         return switch (err) {
             error.AlreadyConfigured => DDS.RETCODE_PRECONDITION_NOT_MET,
             error.ManualDefaultRuntime, error.NoHostedWorkers => DDS.RETCODE_BAD_PARAMETER,
