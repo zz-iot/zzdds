@@ -30,6 +30,7 @@ pub const Discovery = iface.Discovery;
 pub const Callbacks = iface.Callbacks;
 pub const Guid = iface.Guid;
 pub const Transport = tr.Transport;
+const Locator = tr.Locator;
 pub const ParticipantAnnouncement = iface.ParticipantAnnouncement;
 pub const WriterAnnouncement = iface.WriterAnnouncement;
 pub const ReaderAnnouncement = iface.ReaderAnnouncement;
@@ -288,7 +289,21 @@ pub const SpdpSedpDiscovery = struct {
         .deinit = vtDeinit,
         .wlp_tick = vtWlpTick,
         .attach_runtime = vtAttachRuntime,
+        .update_locators = vtUpdateLocators,
     };
+
+    /// Only SPDP's announcement carries locators. This participant's own
+    /// SEDP and WLP proxies keep the ones it started with: they include
+    /// loopback, which always reaches it.
+    fn vtUpdateLocators(ctx: *anyopaque, metatraffic_unicast: []const Locator, default_unicast: []const Locator) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (self.phase != .started) return;
+        }
+        return self.spdp.updateLocators(metatraffic_unicast, default_unicast);
+    }
 
     fn vtAttachRuntime(ctx: *anyopaque, rt: *runtime_mod.Runtime) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));

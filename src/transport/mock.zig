@@ -330,6 +330,18 @@ pub const MockTransport = struct {
         try out.appendSlice(alloc, self.unicast_locs.items);
     }
 
+    /// Replaces the locators unicast_locators() reports, as an interface
+    /// change would, and calls the locator change handler. Called with this
+    /// transport's lock held, as UdpTransport calls it, so a handler that
+    /// calls back into the transport deadlocks here too.
+    pub fn setUnicastLocators(self: *MockTransport, locators: []const Locator) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.unicast_locs.clearRetainingCapacity();
+        try self.unicast_locs.appendSlice(self.alloc, locators);
+        if (self.locator_change_handler) |h| h.on_change(h.ctx);
+    }
+
     fn vtSetLocatorChangeHandler(ctx: *anyopaque, handler: ?LocatorChangeHandler) void {
         const self: *MockTransport = @ptrCast(@alignCast(ctx));
         self.mu.lock();

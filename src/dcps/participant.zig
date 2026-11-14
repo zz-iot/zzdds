@@ -1117,7 +1117,13 @@ pub const DomainParticipantImpl = struct {
     timers: runtime_mod.Context = undefined,
     timers_latch: CloseLatch = .{},
     check_timer: runtime_mod.Timer = undefined,
-    /// Set by deinit under `check_mu`; nothing arms `check_timer` after.
+    /// Announces changed unicast locators (onLocatorsTimer), armed by the
+    /// discovery transport's change handler.
+    locators_timer: runtime_mod.Timer = undefined,
+    /// Whether `start` registered that handler.
+    locator_handler_set: bool = false,
+    /// Set by deinit under `check_mu`; nothing arms `check_timer` or
+    /// `locators_timer` after.
     check_mu: Mutex = .{},
     check_stopping: bool = false,
     /// The contexts where this participant's readers and
@@ -1271,6 +1277,7 @@ pub const DomainParticipantImpl = struct {
         self.timers = runtime_mod.Context.init(rt, 0);
         self.timers.on_closed = self.timers_latch.hook();
         self.check_timer = runtime_mod.Timer.init(&self.timers, onCheckTimer);
+        self.locators_timer = runtime_mod.Timer.init(&self.timers, onLocatorsTimer);
         self.listener_group = listener_lane.Group.init(rt);
         // The builtin readers were made before the runtime was known.
         if (self.builtin_sub) |bs| bs.attachGroup(&self.listener_group);
@@ -1446,47 +1453,11 @@ pub const DomainParticipantImpl = struct {
             // On a runtime, frames go through ingress as datagrams do.
             try self.transport.listen(&ephemeral, self.userDataHandler());
             self.data_listening = true;
-            var tcp_locs: std.ArrayListUnmanaged(Locator) = .empty;
-            defer tcp_locs.deinit(self.alloc);
-            try self.transport.unicastLocators(&tcp_locs, self.alloc);
-            for (tcp_locs.items) |loc| {
-                try data_locators.append(self.alloc, loc);
-                if (self.data_listen_port == 0) {
-                    self.data_listen_port = switch (loc) {
-                        .tcp_v4 => |t| t.port,
-                        .tcp_v6 => |t| t.port,
-                        else => 0,
-                    };
-                }
-            }
             // No multicast over TCP; mc_locs stays empty.
-        } else if (udp_cfg.data_unicast_port) |dp| {
-            for (meta_locators.items) |loc| {
-                switch (loc) {
-                    .udp_v4 => |u| try data_locators.append(self.alloc, Locator.udp4(u.addr, dp)),
-                    .udp_v6 => |u| try data_locators.append(self.alloc, Locator{ .udp_v6 = .{ .addr = u.addr, .port = dp } }),
-                    else => {},
-                }
-            }
-            self.data_listen_port = dp;
-        } else {
-            const port_delta: u16 = udp_cfg.data_unicast_offset - udp_cfg.meta_unicast_offset;
-            for (meta_locators.items) |loc| {
-                switch (loc) {
-                    .udp_v4 => |u| {
-                        const dp = u.port + port_delta;
-                        try data_locators.append(self.alloc, Locator.udp4(u.addr, dp));
-                        if (self.data_listen_port == 0) self.data_listen_port = dp;
-                    },
-                    .udp_v6 => |u| {
-                        const dp = u.port + port_delta;
-                        try data_locators.append(self.alloc, Locator{ .udp_v6 = .{ .addr = u.addr, .port = dp } });
-                        if (self.data_listen_port == 0) self.data_listen_port = dp;
-                    },
-                    else => {},
-                }
-            }
         }
+        try self.appendDataLocators(meta_locators.items, &data_locators);
+        const port_override: ?u16 = if (self.config.transport.tcp.enabled) null else udp_cfg.data_unicast_port;
+        self.data_listen_port = port_override orelse firstPort(data_locators.items);
 
         // SPDP metatraffic multicast locator derived from config. Always
         // computed regardless of config.transport.tcp.enabled — this is
@@ -1544,6 +1515,9 @@ pub const DomainParticipantImpl = struct {
         };
         try self.discovery.start(&ann, &self.disc_callbacks);
         self.discovery_started = true;
+        // Announced again when an interface is added or removed.
+        self.discovery_transport.setLocatorChangeHandler(.{ .ctx = self, .on_change = onLocatorsChanged });
+        self.locator_handler_set = true;
 
         // Listen on the data unicast port for user DataWriter traffic. When TCP
         // user-data is enabled this already happened above (binding was needed
@@ -1618,8 +1592,80 @@ pub const DomainParticipantImpl = struct {
         // become due (armCheck).
     }
 
+    /// This participant's user-data unicast locators, given its metatraffic
+    /// ones `meta`: its TCP transport's own, or `meta`'s addresses on the
+    /// data port (the data_unicast_port override, or the RTPS offset from
+    /// the metatraffic port).
+    fn appendDataLocators(self: *Self, meta: []const Locator, out: *std.ArrayListUnmanaged(Locator)) !void {
+        if (self.config.transport.tcp.enabled) {
+            var tcp_locs: std.ArrayListUnmanaged(Locator) = .empty;
+            defer tcp_locs.deinit(self.alloc);
+            try self.transport.unicastLocators(&tcp_locs, self.alloc);
+            try out.appendSlice(self.alloc, tcp_locs.items);
+            return;
+        }
+        const udp_cfg = &self.config.transport.udp;
+        for (meta) |loc| {
+            const meta_port = switch (loc) {
+                .udp_v4 => |u| u.port,
+                .udp_v6 => |u| u.port,
+                else => continue,
+            };
+            const dp = udp_cfg.data_unicast_port orelse meta_port + (udp_cfg.data_unicast_offset - udp_cfg.meta_unicast_offset);
+            try out.append(self.alloc, switch (loc) {
+                .udp_v4 => |u| Locator.udp4(u.addr, dp),
+                .udp_v6 => |u| .{ .udp_v6 = .{ .addr = u.addr, .port = dp } },
+                else => unreachable,
+            });
+        }
+    }
+
+    /// The port of the first of `locators` that has one, else 0.
+    fn firstPort(locators: []const Locator) u16 {
+        for (locators) |loc| switch (loc) {
+            .udp_v4 => |u| return u.port,
+            .udp_v6 => |u| return u.port,
+            .tcp_v4 => |t| return t.port,
+            .tcp_v6 => |t| return t.port,
+            else => {},
+        };
+        return 0;
+    }
+
+    /// The discovery transport's unicast locators changed. Called with the
+    /// transport's own lock held, so it only arms `locators_timer`, which
+    /// announces them (onLocatorsTimer).
+    fn onLocatorsChanged(ctx: *anyopaque) void {
+        const self = cast(ctx);
+        const rt = self.runtime orelse return;
+        self.check_mu.lock();
+        defer self.check_mu.unlock();
+        if (!self.check_stopping) _ = rt.armTimerNoLater(&self.locators_timer, rt.clock.nowNs());
+    }
+
+    /// Has discovery announce this participant's current unicast locators.
+    fn onLocatorsTimer(t: *runtime_mod.Timer, _: *runtime_mod.Turn) void {
+        const self: *Self = @fieldParentPtr("locators_timer", t);
+        var meta: std.ArrayListUnmanaged(Locator) = .empty;
+        defer meta.deinit(self.alloc);
+        var data: std.ArrayListUnmanaged(Locator) = .empty;
+        defer data.deinit(self.alloc);
+        // On failure, the next change announces them.
+        self.discovery_transport.unicastLocators(&meta, self.alloc) catch |err| return logLocatorsFailed(err);
+        self.appendDataLocators(meta.items, &data) catch |err| return logLocatorsFailed(err);
+        self.discovery.updateLocators(meta.items, data.items) catch |err| return logLocatorsFailed(err);
+    }
+
+    fn logLocatorsFailed(err: anyerror) void {
+        log_mod.dcps.warn("participant: could not announce changed locators ({s})", .{@errorName(err)});
+    }
+
     /// Stops discovery and the receives `start` began, those it got to.
     fn stopReceiving(self: *Self) void {
+        // Before discovery stops: the transport calls it under its lock, so
+        // once this returns, it is not running.
+        if (self.locator_handler_set) self.discovery_transport.setLocatorChangeHandler(null);
+        self.locator_handler_set = false;
         if (self.discovery_started) self.discovery.stop();
         self.discovery_started = false;
         if (self.data_listening and self.data_listen_port != 0) {
@@ -5053,6 +5099,7 @@ pub const DomainParticipantImpl = struct {
         self.check_stopping = true;
         self.check_mu.unlock();
         self.runtime.?.cancelTimer(&self.check_timer);
+        self.runtime.?.cancelTimer(&self.locators_timer);
         return self.timers_latch.close(&self.timers, discardCheck);
     }
 

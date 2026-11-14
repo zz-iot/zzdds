@@ -1205,6 +1205,7 @@ pub const UdpTransport = struct {
                 var tmp = removed;
                 tmp.deinit(self.alloc);
             }
+            log.transport.info("transport: interface addresses changed: {d} added, {d} removed", .{ added.items.len, removed.items.len });
 
             for (added.items) |ia| {
                 if (ia.kind == LocatorKind.udp_v4 and !self.config.ipv4_enabled) continue;

@@ -1119,3 +1119,143 @@ test "SPDP: checkLeases returns when the next check is due -- the earliest lease
     try testing.expectEqual(@as(?i64, null), spdp.checkLeases());
     try testing.expectEqual(@as(u32, 2), tr.lost);
 }
+
+// ── Locator changes ───────────────────────────────────────────────────────────
+
+/// Counts what SPDP reports to SEDP.
+const SedpTracker = struct {
+    discovered: u32 = 0,
+    lost: u32 = 0,
+    fn onDiscovered(ctx: *anyopaque, _: *const ParticipantData) void {
+        const self: *SedpTracker = @ptrCast(@alignCast(ctx));
+        self.discovered += 1;
+    }
+    fn onLost(ctx: *anyopaque, _: GuidPrefix) void {
+        const self: *SedpTracker = @ptrCast(@alignCast(ctx));
+        self.lost += 1;
+    }
+};
+
+/// The SPDP announcement of participant `p`, received at `meta`.
+fn encodeAnnouncement(alloc: std.mem.Allocator, p: GuidPrefix, meta: Locator) ![]u8 {
+    const metas = [_]Locator{meta};
+    return spdp_mod.encodeSpdpParticipant(alloc, &.{
+        .guid = .{ .prefix = p, .entity_id = iface.EntityIds.participant },
+        .domain_id = 0,
+        .name = "",
+        .metatraffic_unicast_locators = &metas,
+        .metatraffic_multicast_locators = &.{},
+        .default_unicast_locators = &.{},
+        .default_multicast_locators = &.{},
+        .lease_duration_ms = 60_000,
+        .builtin_endpoint_set = 0,
+    });
+}
+
+test "SPDP: a known participant announcing new locators has SEDP match it afresh, and only then" {
+    const alloc = testing.allocator;
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const mt = try MockTransport.init(alloc, net, &.{});
+    defer mt.deinit();
+    const spdp = try SpdpEndpoints.init(alloc, mt.transport(), 0, 3000);
+    defer spdp.deinit();
+    var clock = ManualClock.init(std.time.ns_per_ms);
+    spdp.setClock(clock.clock());
+    var tr = Tracker{};
+    const c = tr.cbs();
+    spdp.callbacks = &c;
+    var st = SedpTracker{};
+    spdp.setSedp(&st, SedpTracker.onDiscovered, SedpTracker.onLost);
+
+    const peer = prefix(0xA1);
+    const old_loc = Locator.udp4(.{ 127, 0, 0, 0xA1 }, 7410);
+    const new_loc = Locator.udp4(.{ 127, 0, 1, 0xA1 }, 7410);
+    const at_old = try encodeAnnouncement(alloc, peer, old_loc);
+    defer alloc.free(at_old);
+    const at_new = try encodeAnnouncement(alloc, peer, new_loc);
+    defer alloc.free(at_new);
+
+    spdp.processSpdpPayload(peer, 1, at_old, .{ .bytes = .{ 0x00, 0x00 } });
+    try testing.expectEqual(SedpTracker{ .discovered = 1 }, st);
+    // The same locators again: nothing for SEDP.
+    clock.set(101 * std.time.ns_per_ms);
+    spdp.processSpdpPayload(peer, 2, at_old, .{ .bytes = .{ 0x00, 0x00 } });
+    try testing.expectEqual(SedpTracker{ .discovered = 1 }, st);
+
+    // New ones: SEDP drops its proxies and matches it again.
+    clock.set(201 * std.time.ns_per_ms);
+    spdp.processSpdpPayload(peer, 3, at_new, .{ .bytes = .{ 0x00, 0x00 } });
+    try testing.expectEqual(SedpTracker{ .discovered = 2, .lost = 1 }, st);
+    try testing.expectEqualSlices(Locator, &.{new_loc}, spdp.known.get(peer).?.data.metatraffic_unicast_locators);
+
+    // Its duplicate, and later announcements with them: nothing more.
+    spdp.processSpdpPayload(peer, 3, at_new, .{ .bytes = .{ 0x00, 0x00 } });
+    clock.set(301 * std.time.ns_per_ms);
+    spdp.processSpdpPayload(peer, 4, at_new, .{ .bytes = .{ 0x00, 0x00 } });
+    try testing.expectEqual(SedpTracker{ .discovered = 2, .lost = 1 }, st);
+
+    // DCPS heard of it once, and never lost it.
+    try testing.expectEqual(@as(u32, 1), tr.discovered);
+    try testing.expectEqual(@as(u32, 0), tr.lost);
+}
+
+test "SPDP: new locators are announced at once, and a peer learns them" {
+    const alloc = testing.allocator;
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const group = [_]Locator{Locator.udp4(.{ 239, 255, 0, 1 }, 7400)};
+
+    const Side = struct {
+        mt: *MockTransport,
+        spdp: *SpdpEndpoints,
+        tr: Tracker = .{},
+        cbs: Callbacks = undefined,
+    };
+    var sides: [2]Side = undefined;
+    for (&sides, [_]u8{ 0xB1, 0xB2 }) |*s, p| {
+        s.* = .{
+            .mt = try MockTransport.init(alloc, net, &.{Locator.udp4(.{ 127, 0, 0, p }, 7410)}),
+            .spdp = try SpdpEndpoints.init(alloc, s.mt.transport(), 0, 3000),
+        };
+        s.cbs = s.tr.cbs();
+    }
+    defer for (&sides) |*s| {
+        s.spdp.stop();
+        s.spdp.deinit();
+        s.mt.deinit();
+    };
+    // B first: an announcement sent before a peer joins the group is lost,
+    // and A sends its first as it starts.
+    const prefixes = [_]u8{ 0xB1, 0xB2 };
+    for ([_]usize{ 1, 0 }) |i| {
+        const s = &sides[i];
+        const p = prefixes[i];
+        const meta = [_]Locator{Locator.udp4(.{ 127, 0, 0, p }, 7410)};
+        const data = [_]Locator{Locator.udp4(.{ 127, 0, 0, p }, 7411)};
+        try s.spdp.start(&.{
+            .guid = .{ .prefix = prefix(p), .entity_id = iface.EntityIds.participant },
+            .domain_id = 0,
+            .name = "",
+            .metatraffic_unicast_locators = &meta,
+            .metatraffic_multicast_locators = &group,
+            .default_unicast_locators = &data,
+            .default_multicast_locators = &.{},
+            .lease_duration_ms = 60_000,
+            .builtin_endpoint_set = 0,
+        }, &s.cbs);
+    }
+    net.deliverAll();
+    const b = sides[1].spdp;
+    try testing.expect(b.known.contains(prefix(0xB1)));
+
+    // A's host moved: one call announces it, with no timer.
+    const new_meta = Locator.udp4(.{ 127, 0, 1, 0xB1 }, 7410);
+    const new_data = Locator.udp4(.{ 127, 0, 1, 0xB1 }, 7411);
+    try sides[0].spdp.updateLocators(&.{new_meta}, &.{new_data});
+    net.deliverAll();
+    const seen = b.known.get(prefix(0xB1)).?.data;
+    try testing.expectEqualSlices(Locator, &.{new_meta}, seen.metatraffic_unicast_locators);
+    try testing.expectEqualSlices(Locator, &.{new_data}, seen.default_unicast_locators);
+    try testing.expectEqual(@as(u32, 1), sides[1].tr.discovered);
+}
