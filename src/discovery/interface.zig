@@ -467,6 +467,13 @@ pub const Discovery = struct {
         /// fails the participant's creation. A plugin must start no thread of
         /// its own. Null for a plugin with no work of its own.
         attach_runtime: ?*const fn (ctx: *anyopaque, rt: *Runtime) anyerror!void = null,
+
+        /// After a successful `start`, before `stop`: the participant's
+        /// unicast locators changed (an interface was added or removed), and
+        /// its announcement should carry these from now on, sent at once.
+        /// Fails changing nothing; the participant tries again at the next
+        /// change. Null for a plugin whose announcement carries no locators.
+        update_locators: ?*const fn (ctx: *anyopaque, metatraffic_unicast: []const Locator, default_unicast: []const Locator) anyerror!void = null,
     };
 
     // Forwarding helpers
@@ -529,6 +536,10 @@ pub const Discovery = struct {
 
     pub fn attachRuntime(self: Discovery, rt: *Runtime) anyerror!void {
         if (self.vtable.attach_runtime) |f| try f(self.ctx, rt);
+    }
+
+    pub fn updateLocators(self: Discovery, metatraffic_unicast: []const Locator, default_unicast: []const Locator) anyerror!void {
+        if (self.vtable.update_locators) |f| try f(self.ctx, metatraffic_unicast, default_unicast);
     }
 };
 

@@ -152,11 +152,14 @@ const SnapshotR = struct {
     typ: []u8,
     user_data: []u8,
     qos: dwire.DiscoveredReaderData, // owned clone
+    /// Where the reader receives: its own locators, or its participant's.
+    unicast: []Locator = &.{},
     alloc: std.mem.Allocator,
     fn deinit(self: *@This()) void {
         self.alloc.free(self.topic);
         self.alloc.free(self.typ);
         self.alloc.free(self.user_data);
+        self.alloc.free(self.unicast);
         self.qos.deinit(self.alloc);
     }
 };
@@ -235,6 +238,7 @@ const Recorder = struct {
             .typ = self.alloc.dupe(u8, d.type_name) catch return,
             .user_data = user_data,
             .qos = qos,
+            .unicast = self.alloc.dupe(Locator, d.unicast_locators) catch return,
         };
         self.readers_found.append(self.alloc, s) catch {};
     }
@@ -313,8 +317,12 @@ const Participant = struct {
     /// onParticipantDiscovered dups the locators internally so stack-local
     /// arrays here are safe.
     fn discoverPeer(self: *Participant, p: u8) void {
+        self.discoverPeerAt(p, Locator.udp4(.{ 127, 0, 0, p }, dataPort(p)));
+    }
+
+    /// `discoverPeer`, with `data_loc` as the peer's default unicast locator.
+    fn discoverPeerAt(self: *Participant, p: u8, data_loc: Locator) void {
         const meta_loc = Locator.udp4(.{ 127, 0, 0, p }, metaPort(p));
-        const data_loc = Locator.udp4(.{ 127, 0, 0, p }, dataPort(p));
         const meta_locs = [_]Locator{meta_loc};
         const data_locs = [_]Locator{data_loc};
         const data = ParticipantData{
@@ -324,6 +332,8 @@ const Participant = struct {
             .metatraffic_unicast_locators = &meta_locs,
             .metatraffic_multicast_locators = &.{},
             .default_unicast_locators = &data_locs,
+            // As SPDP fills it in, with no separate data transport.
+            .default_unicast_locators_for_data = &data_locs,
             .default_multicast_locators = &.{},
             .lease_duration_ms = 10_000,
             .builtin_endpoint_set = ALL_SEDP_ENDPOINTS,
@@ -926,6 +936,51 @@ test "SEDP: peers that lose and rediscover each other exchange their endpoints a
     }
     try testing.expectEqual(@as(usize, 2), b.rec.writers_found.items.len);
     try testing.expectEqual(@as(usize, 2), a.rec.readers_found.items.len);
+}
+
+test "SEDP: a peer matched afresh with new default locators has its endpoints delivered again at them" {
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+
+    var local = try Participant.init(net, 0x1D);
+    var remote = try Participant.init(net, 0x1E);
+    defer local.deinit();
+    defer remote.deinit();
+    local.discoverPeer(0x1E);
+    remote.discoverPeer(0x1D);
+
+    const reader_guid = makeGuid(0x1E, 0x20);
+    try announceReaderNow(remote.sedp, &.{
+        .guid = reader_guid,
+        .participant_guid = makeGuid(0x1E, 0x01),
+        .topic_name = "Moved",
+        .type_name = "MovedT",
+        .qos = .{},
+        .type_info_cdr = &.{},
+    });
+    net.deliverAll();
+    try testing.expectEqual(@as(usize, 1), local.rec.readers_found.items.len);
+    const old_loc = Locator.udp4(.{ 127, 0, 0, 0x1E }, dataPort(0x1E));
+    try testing.expectEqualSlices(Locator, &.{old_loc}, local.rec.readers_found.items[0].unicast);
+
+    // The peer's host gained an address, and its SPDP announcement says so:
+    // SPDP has SEDP match it afresh (spdp.zig's processSpdpPayload).
+    const new_loc = Locator.udp4(.{ 127, 0, 1, 0x1E }, dataPort(0x1E));
+    SedpEndpoints.onParticipantLost(local.sedp, prefix(0x1E));
+    local.discoverPeerAt(0x1E, new_loc);
+
+    // The peer's next heartbeat has local ask for its announcements again,
+    // which then carry the new default locator.
+    var round: usize = 0;
+    while (local.rec.readers_found.items.len < 2 and round < 2) : (round += 1) {
+        remote.sedp.sub_writer.?.sendHeartbeat(false, false);
+        net.deliverAll();
+        net.deliverAll();
+    }
+    try testing.expectEqual(@as(usize, 2), local.rec.readers_found.items.len);
+    try testing.expect(local.rec.readers_found.items[1].guid.eql(reader_guid));
+    try testing.expectEqualSlices(Locator, &.{new_loc}, local.rec.readers_found.items[1].unicast);
+    try testing.expectEqual(@as(usize, 0), local.rec.readers_lost.items.len);
 }
 
 // ── Announcement reservations ─────────────────────────────────────────────────

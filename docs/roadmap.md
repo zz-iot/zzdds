@@ -22,21 +22,6 @@ Forward-looking only: known gaps, planned features, and open design questions.
 
 ### Discovery / RTPS / transport
 
-- **Interface changes never reach the SPDP announcement.** The interface monitor
-  (`transport/monitor/polling.zig`, every `interface_poll_interval_ms`, default 5 s)
-  notices added and removed addresses, and `UdpTransport.onIfaceChange` adds or retires
-  per-interface sockets and multicast joins and rebuilds its locator list. But SPDP
-  encodes the participant announcement once, in `start()` (`spdp.zig`, `local_payload`),
-  and resends those bytes for the participant's lifetime; no production code registers a
-  `locator_change_handler` with the UDP transport. A participant whose host gains an
-  address never advertises it, and one that loses an address keeps advertising a locator
-  whose socket is closed. Same-host peers are unaffected (127.0.0.1 is always advertised,
-  is the preferred locator tier, and SPDP multicast is also sent and joined on loopback);
-  multi-host deployments with DHCP renumbering, VPNs or Wi-Fi roaming are not. Fix:
-  register a handler that re-encodes and re-sends the SPDP announcement (and check that
-  peers update existing proxies' locators when a known participant's announcement
-  changes). `onIfaceChange` also logs nothing, so a change is invisible in process logs.
-
 - **Standard RTPS domain tags and domain identity admission** — required prerequisite
   for broker discovery, replacing the proposed broker realm. Add DomainConfig.tag
   (empty default), PID_DOMAIN_TAG (0x4014, string<256>) and PID_DOMAIN_ID decoding/
