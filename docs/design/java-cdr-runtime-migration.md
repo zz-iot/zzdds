@@ -12,7 +12,7 @@ as the generator and native bindings. When present, it is installed as
 and runtime API level. This JAR contains serialization helpers, not JNI code.
 The existing zzdds JNI library still provides DDS operations.
 
-The SDK pins zidl `v0.3.30-zig.0.17.0`, which includes the shared Java runtime
+The SDK pins zidl `v0.3.31-zig.0.17.0`, which includes the shared Java runtime
 API 2. Generator, native binding support, and Java runtime come from that tagged
 source archive. Older zidl sources remain supported: they generate inline
 codecs and install no runtime JAR. Development builds can replace all zidl

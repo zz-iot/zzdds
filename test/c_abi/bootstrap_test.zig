@@ -1895,12 +1895,13 @@ test "readerSetListenerEx: real C-ABI set_listener_ex delegates to DataReaderImp
 const DestroyFromListener = struct {
     boxed: *anyopaque,
     dp: DDS.DomainParticipant,
+    armed: std.Io.Event = .unset,
     done: std.Io.Event = .unset,
     rc: DDS.ReturnCode_t = -1,
 
     fn onMissed(_: *anyopaque, _: *const DDS.OfferedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
         const self: *DestroyFromListener = @ptrCast(@alignCast(ld.?));
-        if (self.done.isSet()) return;
+        if (!self.armed.isSet() or self.done.isSet()) return;
         const ext = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, self.boxed);
         const f = ext.vtable.as_DomainParticipantFactory(ext.ptr);
         self.rc = self.dp.delete_contained_entities();
@@ -1923,6 +1924,10 @@ test "support factory: the last factory can be destroyed from a listener that de
     const dw = publisher.create_datawriter(topic, q, .{ .listener_data = &ctx, .on_offered_deadline_missed = DestroyFromListener.onMissed }, DDS.OFFERED_DEADLINE_MISSED_STATUS);
     try testing.expect(dw.ptr != zzdds.dcps.NIL_PTR);
     writeRawViaOp(dw, KEY_HASH, &PAYLOAD);
+    // Under Valgrind the first deadline can fire before create_datawriter's
+    // announcement returns. This test destroys the factory from a listener
+    // after setup, so explicitly order that destruction after the API calls.
+    ctx.armed.set(testing.io);
     try ctx.done.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
     try testing.expectEqual(DDS.RETCODE_OK, ctx.rc);
 }

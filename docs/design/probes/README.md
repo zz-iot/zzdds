@@ -22,8 +22,9 @@ against its zidl-rt runtime, and runs the Python checks. It is not part of `zig 
 | `broker_wire_codec.zig` | 24 tests: zidl's generated codec reproduces every vector, consumes exactly, rejects the old grammar | One generator (zidl); bootstrap unknown-member handling only |
 
 The eight mutable sets comprise four active bootstrap types, three retired legacy types
-and one test-only evolution type. Unknown, missing and duplicate-member tests characterize
-remaining production validation requirements; passing generated decoding does not waive them.
+and one test-only evolution type. The generated decoder rejects unknown must-understand
+and duplicate members; ordinary evolution still defaults omitted members. Broker admission
+must separately enforce its required-member policy and semantic validation.
 
 The generators are the independent half of the comparison: each re-derives its committed
 `.hex` files and fails if they differ (`--write` regenerates them). XCDR2 sequences of

@@ -144,19 +144,21 @@ const CTypeSupportAdapter = struct {
 ///
 /// Returns 0 on success, -1 if the internal allocation failed.
 pub export fn zzdds_register_type_support(
-    participant: *anyopaque,
+    participant: ?*anyopaque,
     type_name: [*:0]const u8,
     compute_key_hash_fn: ?ZzddsComputeKeyHashFn,
     compute_key_hash_key_only_fn: ?ZzddsComputeKeyHashFn,
     get_field_fn: ?ZzddsGetFieldFromCdrFn,
 ) callconv(.c) c_int {
+    // The ABI parameter must be nullable: a non-null Zig pointer lets the
+    // optimizer assume this check cannot fail in optimized builds.
     // zidl_bindings.unboxAs dereferences its argument unconditionally -- a literal
     // NULL passed by a C caller (a normal, expected "no object" value in C,
     // not UB) must be caught before unboxing, not after; nil.isNil only
     // catches an *already-unboxed* entity's ptr == NIL_PTR sentinel, which a
     // raw NULL C pointer would never reach without crashing first.
-    if (@intFromPtr(participant) == 0) return -1;
-    const p = zidl_bindings.unboxAsView(DDS.DomainParticipant, participant);
+    const handle = participant orelse return -1;
+    const p = zidl_bindings.unboxAsView(DDS.DomainParticipant, handle);
     if (nil.isNil(p)) return -1;
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(p.ptr));
     const name = std.mem.span(type_name);
@@ -287,7 +289,7 @@ const CtxTypeSupportAdapter = struct {
 ///
 /// Returns 0 on success, -1 if the internal allocation failed.
 pub export fn zzdds_register_type_support_ctx(
-    participant: *anyopaque,
+    participant: ?*anyopaque,
     type_name: [*:0]const u8,
     compute_key_hash_fn: ?ZzddsComputeKeyHashCtxFn,
     compute_key_hash_key_only_fn: ?ZzddsComputeKeyHashCtxFn,
@@ -295,8 +297,8 @@ pub export fn zzdds_register_type_support_ctx(
     ctx: ?*anyopaque,
     ctx_deinit: ?*const fn (?*anyopaque) callconv(.c) void,
 ) callconv(.c) c_int {
-    if (@intFromPtr(participant) == 0) return -1;
-    const p = zidl_bindings.unboxAsView(DDS.DomainParticipant, participant);
+    const handle = participant orelse return -1;
+    const p = zidl_bindings.unboxAsView(DDS.DomainParticipant, handle);
     if (nil.isNil(p)) return -1;
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(p.ptr));
     const name = std.mem.span(type_name);
@@ -400,9 +402,10 @@ const CheckedTypeSupportAdapter = struct {
 
 /// Checked registrations are immutable; install before creating topics.
 /// Identical registrations are idempotent, conflicts/downgrades reject.
-pub export fn zzdds_register_type_support_checked(participant: *anyopaque, type_name: [*:0]const u8, process_fn: ?ZzddsProcessSampleFn, has_key: c_int, field_fn: ?ZzddsGetFieldFromCdrFn) callconv(.c) c_int {
-    if (@intFromPtr(participant) == 0 or process_fn == null or (has_key != 0 and has_key != 1)) return -1;
-    const p = zidl_bindings.unboxAsView(DDS.DomainParticipant, participant);
+pub export fn zzdds_register_type_support_checked(participant: ?*anyopaque, type_name: [*:0]const u8, process_fn: ?ZzddsProcessSampleFn, has_key: c_int, field_fn: ?ZzddsGetFieldFromCdrFn) callconv(.c) c_int {
+    const handle = participant orelse return -1;
+    if (process_fn == null or (has_key != 0 and has_key != 1)) return -1;
+    const p = zidl_bindings.unboxAsView(DDS.DomainParticipant, handle);
     if (nil.isNil(p)) return -1;
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(p.ptr));
     const adapter = impl.alloc.create(CheckedTypeSupportAdapter) catch return -1;
@@ -412,9 +415,10 @@ pub export fn zzdds_register_type_support_checked(participant: *anyopaque, type_
 
 /// ctx ownership transfers on a new successful install only. A repeated
 /// identical ctx registration does not transfer or release it a second time.
-pub export fn zzdds_register_type_support_checked_ctx(participant: *anyopaque, type_name: [*:0]const u8, process_fn: ?ZzddsProcessSampleCtxFn, has_key: c_int, field_fn: ?ZzddsGetFieldFromCdrCtxFn, ctx: ?*anyopaque, ctx_deinit: ?*const fn (?*anyopaque) callconv(.c) void) callconv(.c) c_int {
-    if (@intFromPtr(participant) == 0 or process_fn == null or (has_key != 0 and has_key != 1)) return -1;
-    const p = zidl_bindings.unboxAsView(DDS.DomainParticipant, participant);
+pub export fn zzdds_register_type_support_checked_ctx(participant: ?*anyopaque, type_name: [*:0]const u8, process_fn: ?ZzddsProcessSampleCtxFn, has_key: c_int, field_fn: ?ZzddsGetFieldFromCdrCtxFn, ctx: ?*anyopaque, ctx_deinit: ?*const fn (?*anyopaque) callconv(.c) void) callconv(.c) c_int {
+    const handle = participant orelse return -1;
+    if (process_fn == null or (has_key != 0 and has_key != 1)) return -1;
+    const p = zidl_bindings.unboxAsView(DDS.DomainParticipant, handle);
     if (nil.isNil(p)) return -1;
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(p.ptr));
     const adapter = impl.alloc.create(CheckedTypeSupportAdapter) catch return -1;

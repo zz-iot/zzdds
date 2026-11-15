@@ -10,8 +10,8 @@ Protocol end markers retain their existing handling.
 
 This is additive and opt-in. Existing `zzdds_register_type_support(_ctx)` and
 native hash-only registration stay compatible and do not become validation APIs.
-Generated C/C++ values can supply `<Type>_process_sample_from_cdr` from the zidl
-hardening stack. That callback uses ordinary decoding/evolution defaults, not an
+Generated C/C++ values can supply `<Type>_process_sample_from_cdr` from zidl
+0.3.31 and later. That callback uses ordinary decoding/evolution defaults, not an
 all-required-field validation policy. Checked endpoint kinds use explicit keyedness metadata. Keyless ALIVE samples must still decode;
 a successful all-zero hash is valid and never used as an error sentinel.
 
@@ -51,12 +51,12 @@ Tests:
   rejection/retry before sequence accounting, DATA_FRAG/prematch, immutable
   registration and cleanup pins; checks automatic installation on an actual
   legacy DataReader too.
-- `test-checked-admission-generated -Dzidl-source=/absolute/local/zidl`: compiles
+- `test-checked-admission-generated`: compiles
   actual generated C callbacks and exercises keyed/keyless rejection on real
   readers, genuine key-only shapes, MU checks and ordinary evolution defaults.
 - Existing experimental `test-typesupport-library` remains separate and uses its
   restricted wire-validator ABI. Its registration path is unchanged.
 
-The local generated fixture requires a generator with checked callbacks. Normal
-builds keep their published dependency pin; existing generated Java/Zig
-registration glue is not automatically migrated to this C API.
+The generated fixture runs as part of `zig build test` using the published zidl
+dependency. Existing generated Java/Zig registration glue is not automatically
+migrated to this C API.

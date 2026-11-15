@@ -18,20 +18,6 @@ const IntraProcessDelivery = zzdds.intraprocess.IntraProcessDelivery;
 const noop_security = zzdds.noop_security.noop_security_plugins;
 const nil = zzdds.dcps;
 
-/// Constructs a genuinely NULL *anyopaque -- what a real C caller passing
-/// NULL for a handle parameter actually produces at the `.c` calling
-/// convention boundary. `@ptrFromInt(0)` alone is rejected by Zig's own
-/// pointer-safety checks (comptime and runtime) since `*anyopaque` is a
-/// non-optional, non-allowzero type; `@setRuntimeSafety(false)` opts out of
-/// that check specifically to construct the exact input the ABI boundary
-/// itself does not (and cannot) enforce against.
-fn makeNullHandle() *anyopaque {
-    @setRuntimeSafety(false);
-    var addr: usize = 0;
-    addr += 0;
-    return @ptrFromInt(addr);
-}
-
 // ── C-style compute_key_hash_from_cdr stub ───────────────────────────────────
 //
 // Simulates what `zidl -b c` generates: copies payload bytes [4..8] (after
@@ -218,10 +204,10 @@ test "c_abi TypeSupport: NULL participant handle returns error instead of crashi
     // Regression test: zidl_bindings.unboxAs dereferences its argument
     // unconditionally, so a literal NULL passed by a C caller (a normal,
     // expected "no object" value in C, not UB) must be caught before
-    // unboxing, not after -- @ptrFromInt(0) constructs the same bit pattern
-    // a real C caller's NULL would produce at the ABI boundary.
+    // unboxing, not after. The nullable ABI parameter preserves this check
+    // in optimized builds too.
     const rc = c_abi_ts.zzdds_register_type_support(
-        makeNullHandle(),
+        null,
         "TestType",
         stubComputeKeyHashFromCdr,
         null,
@@ -351,7 +337,7 @@ test "c_abi TypeSupport: ctx_deinit fires on replace and on participant deinit" 
 test "c_abi TypeSupport: ctx_deinit variant NULL participant handle returns error instead of crashing" {
     var tag: u8 = 0;
     const rc = c_abi_ts.zzdds_register_type_support_ctx(
-        makeNullHandle(),
+        null,
         "TestType",
         stubComputeKeyHashCtx,
         null,
@@ -668,4 +654,9 @@ test "checked field getter contexts retain independent DataReader ownership" {
     try testing.expectEqual(@as(i64, 42), getter.get(&.{}, "field", &scratch).?.int);
     getter.release.?(getter.ctx);
     try testing.expectEqual(@as(usize, 1), state.destroyed);
+}
+
+test "checked C registration rejects NULL participant handles" {
+    try testing.expectEqual(@as(c_int, -1), c_abi_ts.zzdds_register_type_support_checked(null, "NullChecked", checkedSample, 0, null));
+    try testing.expectEqual(@as(c_int, -1), c_abi_ts.zzdds_register_type_support_checked_ctx(null, "NullCheckedCtx", CheckedContext.process, 0, null, null, null));
 }
