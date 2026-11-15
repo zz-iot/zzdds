@@ -3279,6 +3279,7 @@ pub const DataReaderImpl = struct {
             // release may free it.
             self.qos_mu.lock();
             defer self.qos_mu.unlock();
+            if (!qos_change.consistent(DDS.DataReaderQos, qos)) return DDS.RETCODE_INCONSISTENT_POLICY;
             if (qos_change.readerImmutableChanged(&self.qos, qos)) return DDS.RETCODE_IMMUTABLE_POLICY;
             if (qos_change.eql(DDS.DataReaderQos, &self.qos, qos)) return DDS.RETCODE_OK;
             var new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;

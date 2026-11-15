@@ -11,6 +11,7 @@ const ZZDDS = @import("zzdds_ext_generated").zzdds;
 const nil = @import("nil.zig");
 const waitset = @import("waitset.zig");
 const filter_mod = @import("filter.zig");
+const qos_change = @import("qos_change.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const listener_box_mod = @import("../util/listener_box.zig");
 const listener_lane = @import("listener_lane.zig");
@@ -275,6 +276,7 @@ pub const TopicImpl = struct {
 
     fn vtSetQos(ctx: *anyopaque, qos: *const DDS.TopicQos) DDS.ReturnCode_t {
         const self = cast(ctx);
+        if (!qos_change.consistent(DDS.TopicQos, qos)) return DDS.RETCODE_INCONSISTENT_POLICY;
         const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         self.qos.deinit(self.alloc);
         self.qos = new_qos;

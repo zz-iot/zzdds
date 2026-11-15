@@ -432,6 +432,7 @@ pub const SubscriberImpl = struct {
     ) DDS.DataReader {
         // See publisher.zig's identical comment on create_datawriter: not
         // gated on this Subscriber's own enabled state, for the same reason.
+        if (!qos_change.consistent(DDS.DataReaderQos, qos)) return nil.nil_datareader;
         // First, before `a_topic` is read: it may not be this participant's.
         const topic_use = self.cbs.retain_topic(self.cbs.ctx, a_topic.ptr) orelse return nil.nil_datareader;
         const topic_name = a_topic.get_name();
@@ -1403,6 +1404,7 @@ pub const SubscriberImpl = struct {
     // (integration-tests/zig/enable-defer).
     fn vtSetDefaultDrQos(ctx: *anyopaque, qos: *const DDS.DataReaderQos) DDS.ReturnCode_t {
         const self = cast(ctx);
+        if (!qos_change.consistent(DDS.DataReaderQos, qos)) return DDS.RETCODE_INCONSISTENT_POLICY;
         const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         self.default_dr_qos.deinit(self.alloc);
         self.default_dr_qos = new_qos;

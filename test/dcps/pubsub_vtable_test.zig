@@ -698,3 +698,52 @@ test "Subscriber: set_default_datareader_qos with user_data — clone survives r
     try testing.expectEqual(@as(u32, 1), got.user_data.value._length);
     got.deinit(alloc);
 }
+
+test "QoS whose policies are inconsistent creates no Topic, DataWriter or DataReader, and set_qos and set_default_*_qos return INCONSISTENT_POLICY" {
+    var h = try Harness.init(0xB5);
+    defer h.deinit();
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
+
+    // A KEEP_LAST history deeper than its per-instance limit.
+    var bad_topic = DDS.TopicQos{};
+    bad_topic.history.depth = 3;
+    bad_topic.resource_limits.max_samples_per_instance = 2;
+    try testing.expectEqual(nil.nil_topic.ptr, dp.create_topic("Inconsistent", "T", bad_topic, null, 0).ptr);
+    try testing.expectEqual(DDS.RETCODE_INCONSISTENT_POLICY, dp.vtable.set_default_topic_qos(dp.ptr, &bad_topic));
+    const topic = dp.create_topic("Inconsistent", "T", .{}, null, 0);
+    try testing.expect(topic.ptr != nil.nil_topic.ptr);
+    try testing.expectEqual(DDS.RETCODE_INCONSISTENT_POLICY, topic.vtable.set_qos(topic.ptr, &bad_topic));
+
+    // A per-instance limit above max_samples, in the durability service.
+    var bad_dw = DDS.DataWriterQos{};
+    bad_dw.durability_service.max_samples = 1;
+    bad_dw.durability_service.max_samples_per_instance = 2;
+    try testing.expectEqual(nil.nil_datawriter.ptr, pub_.create_datawriter(topic, bad_dw, null, 0).ptr);
+    try testing.expectEqual(DDS.RETCODE_INCONSISTENT_POLICY, pub_.vtable.set_default_datawriter_qos(pub_.ptr, &bad_dw));
+    const dw = pub_.create_datawriter(topic, .{}, null, 0);
+    try testing.expect(dw.ptr != nil.nil_datawriter.ptr);
+    // Inconsistent before immutable.
+    try testing.expectEqual(DDS.RETCODE_INCONSISTENT_POLICY, dw.vtable.set_qos(dw.ptr, &bad_dw));
+
+    // A DEADLINE shorter than the TIME_BASED_FILTER's separation: both
+    // mutable, so only their consistency stops the change.
+    var bad_dr = DDS.DataReaderQos{};
+    bad_dr.deadline.period = .{ .sec = 1, .nanosec = 0 };
+    bad_dr.time_based_filter.minimum_separation = .{ .sec = 2, .nanosec = 0 };
+    const desc = @as(*dcps.TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
+    try testing.expectEqual(nil.nil_datareader.ptr, sub.create_datareader(desc, bad_dr, null, 0).ptr);
+    try testing.expectEqual(DDS.RETCODE_INCONSISTENT_POLICY, sub.vtable.set_default_datareader_qos(sub.ptr, &bad_dr));
+    const dr = sub.create_datareader(desc, .{}, null, 0);
+    try testing.expect(dr.ptr != nil.nil_datareader.ptr);
+    try testing.expectEqual(DDS.RETCODE_INCONSISTENT_POLICY, dr.vtable.set_qos(dr.ptr, &bad_dr));
+    var got = DDS.DataReaderQos{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.get_qos(dr.ptr, &got));
+    try testing.expectEqual(@as(i32, 0), got.deadline.period.sec);
+    got.deinit(alloc);
+    bad_dr.deadline.period = .{ .sec = 2, .nanosec = 0 };
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.set_qos(dr.ptr, &bad_dr));
+}

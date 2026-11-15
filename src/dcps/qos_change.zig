@@ -101,6 +101,42 @@ fn immutableChanged(comptime T: type, comptime names: anytype, old: *const T, ne
     return false;
 }
 
+/// A DataWriter's, DataReader's or Topic's `qos` keeps the consistency rules
+/// between its policies (DDS 1.4 §2.2.3): a KEEP_LAST HISTORY no deeper
+/// than RESOURCE_LIMITS' max_samples_per_instance, which max_samples is no
+/// smaller than; the same within DURABILITY_SERVICE; and a DEADLINE period
+/// no shorter than the TIME_BASED_FILTER's minimum separation. Otherwise
+/// creation fails and `set_qos` returns INCONSISTENT_POLICY.
+pub fn consistent(comptime T: type, qos: *const T) bool {
+    if (@hasField(T, "history") and @hasField(T, "resource_limits")) {
+        const rl = qos.resource_limits;
+        if (!limitsConsistent(qos.history.kind, qos.history.depth, rl.max_samples, rl.max_samples_per_instance)) return false;
+    }
+    if (@hasField(T, "durability_service")) {
+        const ds = qos.durability_service;
+        if (!limitsConsistent(ds.history_kind, ds.history_depth, ds.max_samples, ds.max_samples_per_instance)) return false;
+    }
+    if (@hasField(T, "deadline") and @hasField(T, "time_based_filter")) {
+        const period = qos.deadline.period;
+        // {0, 0} is the unset policy: no deadline, as INFINITE.
+        const no_deadline = (period.sec == 0 and period.nanosec == 0) or
+            (period.sec == DDS.DURATION_INFINITE_SEC and period.nanosec == DDS.DURATION_INFINITE_NSEC);
+        if (!no_deadline and durationNs(period) < durationNs(qos.time_based_filter.minimum_separation)) return false;
+    }
+    return true;
+}
+
+/// Limits of zero or less are unlimited, and a depth of zero or less is 1.
+fn limitsConsistent(kind: DDS.HistoryQosPolicyKind, depth: i32, max_samples: i32, max_per_instance: i32) bool {
+    if (max_per_instance <= 0) return true;
+    if (kind == .KEEP_LAST_HISTORY_QOS and @max(depth, 1) > max_per_instance) return false;
+    return max_samples <= 0 or max_samples >= max_per_instance;
+}
+
+fn durationNs(d: DDS.Duration_t) i128 {
+    return @as(i128, d.sec) * std.time.ns_per_s + d.nanosec;
+}
+
 test "QoS values compare by content, sequences and strings included" {
     var a: DDS.PublisherQos = .{};
     var b: DDS.PublisherQos = .{};
@@ -123,4 +159,52 @@ test "a writer's mutable policies change freely, its immutable ones do not" {
     try std.testing.expect(!writerImmutableChanged(&old, &new));
     new.history.depth = 7;
     try std.testing.expect(writerImmutableChanged(&old, &new));
+}
+
+test "a KEEP_LAST history deeper than its per-instance limit, or a per-instance limit above max_samples, is inconsistent; unlimited ones never are" {
+    var q: DDS.DataReaderQos = .{};
+    try std.testing.expect(consistent(DDS.DataReaderQos, &q));
+    q.resource_limits.max_samples_per_instance = 4;
+    q.history.depth = 4;
+    try std.testing.expect(consistent(DDS.DataReaderQos, &q));
+    q.history.depth = 5;
+    try std.testing.expect(!consistent(DDS.DataReaderQos, &q));
+    q.history.kind = .KEEP_ALL_HISTORY_QOS;
+    try std.testing.expect(consistent(DDS.DataReaderQos, &q));
+    q.resource_limits.max_samples = 3;
+    try std.testing.expect(!consistent(DDS.DataReaderQos, &q));
+    q.resource_limits.max_samples = DDS.LENGTH_UNLIMITED;
+    try std.testing.expect(consistent(DDS.DataReaderQos, &q));
+    q.resource_limits.max_samples_per_instance = DDS.LENGTH_UNLIMITED;
+    q.resource_limits.max_samples = 1;
+    q.history = .{ .kind = .KEEP_LAST_HISTORY_QOS, .depth = 50 };
+    try std.testing.expect(consistent(DDS.DataReaderQos, &q));
+}
+
+test "a writer's or Topic's DURABILITY_SERVICE keeps the same rules within itself" {
+    var w: DDS.DataWriterQos = .{};
+    w.durability_service.max_samples_per_instance = 2;
+    w.durability_service.history_depth = 3;
+    try std.testing.expect(!consistent(DDS.DataWriterQos, &w));
+    w.durability_service.history_depth = 2;
+    w.durability_service.max_samples = 1;
+    try std.testing.expect(!consistent(DDS.DataWriterQos, &w));
+    w.durability_service.max_samples = 2;
+    try std.testing.expect(consistent(DDS.DataWriterQos, &w));
+    var t: DDS.TopicQos = .{};
+    t.durability_service.max_samples_per_instance = 1;
+    t.durability_service.history_depth = 2;
+    try std.testing.expect(!consistent(DDS.TopicQos, &t));
+}
+
+test "a reader's DEADLINE shorter than its TIME_BASED_FILTER is inconsistent, and no DEADLINE never is" {
+    var q: DDS.DataReaderQos = .{};
+    q.time_based_filter.minimum_separation = .{ .sec = 1, .nanosec = 0 };
+    try std.testing.expect(consistent(DDS.DataReaderQos, &q));
+    q.deadline.period = .{ .sec = DDS.DURATION_INFINITE_SEC, .nanosec = DDS.DURATION_INFINITE_NSEC };
+    try std.testing.expect(consistent(DDS.DataReaderQos, &q));
+    q.deadline.period = .{ .sec = 1, .nanosec = 0 };
+    try std.testing.expect(consistent(DDS.DataReaderQos, &q));
+    q.deadline.period = .{ .sec = 0, .nanosec = 999_999_999 };
+    try std.testing.expect(!consistent(DDS.DataReaderQos, &q));
 }

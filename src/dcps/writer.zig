@@ -1096,6 +1096,7 @@ pub const DataWriterImpl = struct {
             // As for a reader: prepared and made under `qos_mu`.
             self.qos_mu.lock();
             defer self.qos_mu.unlock();
+            if (!qos_change.consistent(DDS.DataWriterQos, qos)) return DDS.RETCODE_INCONSISTENT_POLICY;
             if (qos_change.writerImmutableChanged(&self.qos, qos)) return DDS.RETCODE_IMMUTABLE_POLICY;
             if (qos_change.eql(DDS.DataWriterQos, &self.qos, qos)) return DDS.RETCODE_OK;
             var new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;

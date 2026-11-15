@@ -29,6 +29,7 @@ const publisher_mod = @import("publisher.zig");
 const subscriber_mod = @import("subscriber.zig");
 const topic_mod = @import("topic.zig");
 const filter_mod = @import("filter.zig");
+const qos_change = @import("qos_change.zig");
 const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const adapters = @import("../rtps/protocol_adapters.zig");
@@ -5483,6 +5484,7 @@ pub const DomainParticipantImpl = struct {
         // See vtCreatePublisher's identical comment on why create_topic is
         // not gated by the participant's own enabled state.
         const self = cast(ctx);
+        if (!qos_change.consistent(DDS.TopicQos, qos)) return nil.nil_topic;
         const handle = nextHandle(ctx);
         const tn_s = std.mem.span(topic_name);
         const tt_s = std.mem.span(type_name);
@@ -6047,6 +6049,7 @@ pub const DomainParticipantImpl = struct {
 
     fn vtSetDefaultTopicQos(ctx: *anyopaque, qos: *const DDS.TopicQos) DDS.ReturnCode_t {
         const self = cast(ctx);
+        if (!qos_change.consistent(DDS.TopicQos, qos)) return DDS.RETCODE_INCONSISTENT_POLICY;
         const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         self.default_topic_qos.deinit(self.alloc);
         self.default_topic_qos = new_qos;

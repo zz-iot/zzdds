@@ -458,6 +458,7 @@ pub const PublisherImpl = struct {
     /// until `finishDataWriter` has registered its matched notify. Separate
     /// so tests can deliver discovery between the two steps.
     pub fn createProtoWriter(self: *Self, a_topic: DDS.Topic, qos: *const DDS.DataWriterQos) !ProtoWriterParts {
+        if (!qos_change.consistent(DDS.DataWriterQos, qos)) return error.InconsistentPolicy;
         // First, before `a_topic` is read: it may not be this participant's.
         const topic_use = self.cbs.retain_topic(self.cbs.ctx, a_topic.ptr) orelse return error.TopicOfAnotherParticipant;
         errdefer topic_use.abandon();
@@ -1062,6 +1063,7 @@ pub const PublisherImpl = struct {
     // just makes the failure quieter.
     fn vtSetDefaultDwQos(ctx: *anyopaque, qos: *const DDS.DataWriterQos) DDS.ReturnCode_t {
         const self = cast(ctx);
+        if (!qos_change.consistent(DDS.DataWriterQos, qos)) return DDS.RETCODE_INCONSISTENT_POLICY;
         const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         self.default_dw_qos.deinit(self.alloc);
         self.default_dw_qos = new_qos;

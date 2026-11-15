@@ -195,12 +195,9 @@ Forward-looking only: known gaps, planned features, and open design questions.
   gives each datagram to one socket. Related sharp edge: unicast sockets are bound with
   `SO_REUSEADDR`, so two transports given the same fixed `participant_id` or port
   overrides both bind, and one of them silently stops receiving; that should fail loudly.
-- **`set_qos` checks no consistency between policies.** A writer's or reader's immutable
-  policies cannot change (IMMUTABLE_POLICY, before `enable` too, as the protocol endpoint
-  is made with them), and a change to the mutable ones, or to a Publisher's or
-  Subscriber's partitions, is announced. Neither `set_qos` nor creation returns
-  INCONSISTENT_POLICY: a reader's DEADLINE shorter than its TIME_BASED_FILTER, say, is
-  accepted. A Topic's or participant's QoS change is not announced either.
+- **A Topic's or participant's QoS change is not announced.** A writer's or reader's
+  change to its mutable policies, or a Publisher's or Subscriber's to its partitions or
+  GROUP_DATA, is announced again; a Topic's or participant's `set_qos` is not.
 - **In-process discovery can miss a peer when out of memory.** `DirectDiscovery`
   commits an announcement into the bus without allocating, but telling the other
   participants copies it for each of them, and a copy that fails is skipped; nothing
