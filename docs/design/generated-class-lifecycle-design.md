@@ -158,6 +158,15 @@ compiler-checked, never in generated code or an annotation string. The plain
 `zzdds_create_waitset()`/`zzdds_create_guardcondition()` forms are unchanged, already-minimal
 one-liners delegating to the `_with_allocator` form with a null allocator.
 
+**Update (2026-11-15): generated now.** zidl's `@constructor`/`@destructor` annotations
+(zidl `docs/design/standalone-construction.md`) declare `WaitSet`'s and
+`GuardCondition`'s construction in `dcps.idl`, so every binding's constructor is
+generated: `DDS_WaitSet_create[_with_allocator]` in C, `DDS::WaitSet::create()` in C++,
+`DDS.WaitSet.create()` in Java. The boundary above still holds: the generated
+`exportCAbiConstructors` takes zzdds's constructors at comptime, from `extensions.zig`, so
+no generated code names a concrete impl type. The hand-written `zzdds_create_*` /
+`zzdds_destroy_*` functions remain, deprecated, until their callers move.
+
 ## `DomainParticipantFactory` and the other no-parent-op types
 
 The factory is the root, and stays a deliberate exception, not a generalization target.

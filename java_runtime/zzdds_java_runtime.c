@@ -418,89 +418,62 @@ static jint JNICALL zzdds_java_waitset_attach_condition(JNIEnv *env, jobject sel
     return rc;
 }
 
-static pthread_once_t zzdds_java_waitset_natives_once = PTHREAD_ONCE_INIT;
-
-/* Deliberately does NOT take a JNIEnv from its caller -- an earlier version
- * stashed the calling thread's env in a plain (unsynchronized) global
- * before calling pthread_once, but pthread_once only guarantees the
- * *callback* runs exactly once, not that it's the SAME thread that stashed
- * the winning value: if two threads both reach createWaitSet for the first
- * time concurrently, each writes its own env to that global before either
- * calls pthread_once, so whichever thread's once callback actually runs
- * could easily end up reading the OTHER thread's JNIEnv -- a JNIEnv is only
- * valid on the thread that owns it, so using one from a different thread is
- * undefined behavior (can crash or corrupt the JVM). Fixed (Greptile PR #62
- * P1: "shared JNI environment crosses threads") by having the once callback
- * fetch a JNIEnv valid for whichever thread actually ends up running it,
- * via zidl_java_get_env() (JNI's JavaVM* is itself thread-safe to call from
- * any thread), instead of trusting a value some other thread may have
- * written. */
-static void zzdds_java_waitset_natives_once_fn(void) {
-    JNIEnv *env = zidl_java_get_env();
-    if (env == NULL) return;
+/* zidl's generated JNI_OnLoad calls this (--java-jni-onload-hook in
+ * build.zig) with the loading thread's JNIEnv, before any Java code can
+ * reach a WaitSet: it routes WaitSetImpl's attach through
+ * zzdds_java_waitset_attach_condition above. A failure leaves the generated
+ * attach, without the keep-alive, rather than failing the library load. */
+jint zzdds_java_on_load(JavaVM *vm, JNIEnv *env) {
+    (void)vm;
     jclass cls = (*env)->FindClass(env, "io/zzdds/dcps/WaitSetImpl");
-    if (cls == NULL) { (*env)->ExceptionClear(env); return; }
+    if (cls == NULL) { (*env)->ExceptionClear(env); return 0; }
     JNINativeMethod methods[] = {
         { (char *)"n_attach_condition", (char *)"(JLio/zzdds/dcps/Dcps$DDS$Condition;)I",
           (void *)zzdds_java_waitset_attach_condition },
     };
-    (*env)->RegisterNatives(env, cls, methods, 1);
+    if ((*env)->RegisterNatives(env, cls, methods, 1) != 0) (*env)->ExceptionClear(env);
     (*env)->DeleteLocalRef(env, cls);
+    return 0;
 }
 
-/* Called from createWaitSet below, which always runs before any app could
- * possibly have a WaitSet to attach a condition to -- pthread_once
- * guarantees the actual registration happens exactly once regardless of how
- * many threads call createWaitSet concurrently. */
-static void zzdds_java_ensure_waitset_natives_registered(void) {
-    pthread_once(&zzdds_java_waitset_natives_once, zzdds_java_waitset_natives_once_fn);
+/* The deprecated ZzddsRuntime entry points, now through the generated
+ * constructor and destroy(): `impl` is the generated *Impl class. */
+static jobject zzdds_java_call_create(JNIEnv *env, const char *impl, const char *sig) {
+    jclass cls = (*env)->FindClass(env, impl);
+    if (cls == NULL) return NULL;
+    jmethodID mid = (*env)->GetStaticMethodID(env, cls, "create", sig);
+    jobject obj = mid != NULL ? (*env)->CallStaticObjectMethod(env, cls, mid) : NULL;
+    (*env)->DeleteLocalRef(env, cls);
+    return obj;
+}
+
+static void zzdds_java_call_destroy(JNIEnv *env, jobject obj, zzdds_java_class_cache *cache, const char *impl, const char *param_name) {
+    if (obj == NULL) return; /* idempotent destroy -- see this file's own top-of-section comment */
+    if (!zzdds_java_require_instance_of(env, obj, cache, impl, param_name)) return;
+    jmethodID mid = (*env)->GetMethodID(env, cache->cls, "destroy", "()I");
+    if (mid != NULL) (void)(*env)->CallIntMethod(env, obj, mid);
 }
 
 JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createWaitSet(JNIEnv *env, jclass self_cls) {
     (void)self_cls;
-    zzdds_java_ensure_waitset_natives_registered();
-    DDS_WaitSet ws = zzdds_create_waitset();
-    if (zzdds_waitset_is_nil(ws)) return NULL;
-    static zzdds_java_class_cache cache = {0};
-    if (!zzdds_java_get_or_cache_class(env, &cache, "io/zzdds/dcps/WaitSetImpl")) return NULL;
-    return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)ws);
+    return zzdds_java_call_create(env, "io/zzdds/dcps/WaitSetImpl", "()Lio/zzdds/dcps/WaitSetImpl;");
 }
 
 JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createGuardCondition(JNIEnv *env, jclass self_cls) {
     (void)self_cls;
-    DDS_GuardCondition gc = zzdds_create_guardcondition();
-    if (zzdds_guardcondition_is_nil(gc)) return NULL;
-    static zzdds_java_class_cache cache = {0};
-    if (!zzdds_java_get_or_cache_class(env, &cache, "io/zzdds/dcps/GuardConditionImpl")) return NULL;
-    jobject obj = (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)gc);
-    if (obj == NULL) return NULL;
-    _zidl_family_DDS_Condition_register_external(env, (void *)DDS_GuardCondition_as_DDS_Condition(gc), obj);
-    return obj;
+    return zzdds_java_call_create(env, "io/zzdds/dcps/GuardConditionImpl", "()Lio/zzdds/dcps/GuardConditionImpl;");
 }
 
-/* WaitSet/GuardCondition have no owning factory to delete them through --
- * mirrors zzdds_destroy_factory's role, just with no Java-callable
- * equivalent to reach for otherwise (unlike DomainParticipant, entity
- * interfaces have no deinit() exposed as a Java method at all -- see
- * Dcps.DDS.WaitSet/GuardCondition's generated interface). */
 JNIEXPORT void JNICALL Java_io_zzdds_runtime_ZzddsRuntime_destroyWaitSet(JNIEnv *env, jclass self_cls, jobject waitset) {
     (void)self_cls;
-    if (waitset == NULL) return; /* idempotent destroy -- see this file's own top-of-section comment */
-    static zzdds_java_class_cache type_check_cache = {0};
-    if (!zzdds_java_require_instance_of(env, waitset, &type_check_cache, "io/zzdds/dcps/WaitSetImpl", "waitset")) return;
-    DDS_WaitSet ws = (DDS_WaitSet)zzdds_java_unbox(env, waitset);
-    if (ws == NULL) return;
-    zzdds_destroy_waitset(ws);
+    static zzdds_java_class_cache cache = {0};
+    zzdds_java_call_destroy(env, waitset, &cache, "io/zzdds/dcps/WaitSetImpl", "waitset");
 }
 
 JNIEXPORT void JNICALL Java_io_zzdds_runtime_ZzddsRuntime_destroyGuardCondition(JNIEnv *env, jclass self_cls, jobject guardcondition) {
     (void)self_cls;
-    if (guardcondition == NULL) return; /* idempotent destroy -- see this file's own top-of-section comment */
-    static zzdds_java_class_cache type_check_cache = {0};
-    if (!zzdds_java_require_instance_of(env, guardcondition, &type_check_cache, "io/zzdds/dcps/GuardConditionImpl", "guardcondition")) return;
-    DDS_GuardCondition gc = (DDS_GuardCondition)zzdds_java_unbox(env, guardcondition);
-    if (gc == NULL) return;
-    zzdds_destroy_guardcondition(gc);
+    static zzdds_java_class_cache cache = {0};
+    zzdds_java_call_destroy(env, guardcondition, &cache, "io/zzdds/dcps/GuardConditionImpl", "guardcondition");
 }
 
 /* ── TypeSupport registration: one native trampoline, ctx-carrying ──────

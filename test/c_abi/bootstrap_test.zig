@@ -575,6 +575,83 @@ test "standalone_create: construct failure falls back to the nil sentinel instea
     try testing.expect(extensions.zzdds_guardcondition_is_nil(gc_boxed));
 }
 
+// ── Generated constructors (dcps.idl @constructor/@destructor) ───────────────
+
+/// The generated C constructors, which only a build generating the C ABI
+/// (-Dc-binding) exports; resolved only when a test runs.
+const GeneratedCtors = struct {
+    const H = ?*anyopaque;
+    const A = ?*const zidl_bindings.ZidlAllocator;
+    const available = @hasDecl(DDS.WaitSet, "exportCAbiConstructors");
+    fn get(comptime T: type, comptime name: []const u8) T {
+        return @extern(T, .{ .name = name });
+    }
+    const ws_create = get(*const fn () callconv(.c) H, "DDS_WaitSet_create");
+    const ws_create_with = get(*const fn (A) callconv(.c) H, "DDS_WaitSet_create_with_allocator");
+    const ws_destroy = get(*const fn (*anyopaque) callconv(.c) DDS.ReturnCode_t, "DDS_WaitSet_destroy");
+    const ws_attach = get(*const fn (*anyopaque, H) callconv(.c) DDS.ReturnCode_t, "DDS_WaitSet_attach_condition");
+    const gc_create = get(*const fn () callconv(.c) H, "DDS_GuardCondition_create");
+    const gc_create_with = get(*const fn (A) callconv(.c) H, "DDS_GuardCondition_create_with_allocator");
+    const gc_destroy = get(*const fn (*anyopaque) callconv(.c) DDS.ReturnCode_t, "DDS_GuardCondition_destroy");
+    const gc_as_condition = get(*const fn (*anyopaque) callconv(.c) H, "DDS_GuardCondition_as_DDS_Condition");
+};
+
+fn createAndDestroyThroughCAbi() !void {
+    const C = GeneratedCtors;
+    const ws = C.ws_create().?;
+    const gc = C.gc_create().?;
+    try testing.expectEqual(DDS.RETCODE_OK, C.ws_attach(ws, C.gc_as_condition(gc)));
+    // Destroying an attached condition detaches it from the WaitSet first.
+    try testing.expectEqual(DDS.RETCODE_OK, C.gc_destroy(gc));
+    try testing.expectEqual(DDS.RETCODE_OK, C.ws_destroy(ws));
+}
+
+test "generated constructors: WaitSet and GuardCondition are created and destroyed through the C ABI" {
+    if (comptime GeneratedCtors.available) try createAndDestroyThroughCAbi() else return error.SkipZigTest;
+}
+
+fn allocatorFormsThroughCAbi() !void {
+    const C = GeneratedCtors;
+    var track = TrackingCtx{ .child = testing.allocator };
+    const c_alloc = zidl_bindings.ZidlAllocator{
+        .ctx = &track,
+        .alloc = trackAlloc,
+        .resize = trackResize,
+        .free = trackFree,
+    };
+    const expected = zidl_bindings.toAllocator(&c_alloc);
+
+    const ws_boxed = C.ws_create_with(&c_alloc).?;
+    const ws = zidl_bindings.unboxAs(DDS.WaitSet, ws_boxed);
+    try testing.expectEqual(expected, ws.vtable.get_allocator(ws.ptr));
+    const gc_boxed = C.gc_create_with(&c_alloc).?;
+    const gc = zidl_bindings.unboxAsView(DDS.GuardCondition, gc_boxed);
+    try testing.expectEqual(expected, gc.vtable.get_allocator(gc.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, C.gc_destroy(gc_boxed));
+    try testing.expectEqual(DDS.RETCODE_OK, C.ws_destroy(ws_boxed));
+    try testing.expect(track.alloc_calls.load(.monotonic) > 0);
+    try testing.expectEqual(track.alloc_calls.load(.monotonic), track.free_calls.load(.monotonic));
+
+    const failing_alloc = zidl_bindings.ZidlAllocator{
+        .ctx = undefined,
+        .alloc = alwaysFailAlloc,
+        .resize = alwaysFailResize,
+        .free = alwaysFailFree,
+    };
+    try testing.expect(C.ws_create_with(&failing_alloc) == null);
+    try testing.expect(C.gc_create_with(&failing_alloc) == null);
+}
+
+test "generated constructors: the allocator forms allocate through it, and a failed one returns NULL" {
+    if (comptime GeneratedCtors.available) try allocatorFormsThroughCAbi() else return error.SkipZigTest;
+}
+
+test "generated constructors: the nil sentinel refuses destroy" {
+    const nd = zzdds.dcps;
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, nd.nil_waitset.vtable.destroy(nd.nil_waitset.ptr));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, nd.nil_guardcondition.vtable.destroy(nd.nil_guardcondition.ptr));
+}
+
 fn DDS_DomainParticipantFactory_create_participant_for_test(
     factory: DDS.DomainParticipantFactory,
     domain_id: DDS.DomainId_t,

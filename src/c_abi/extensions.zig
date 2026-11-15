@@ -688,13 +688,30 @@ pub export fn zzdds_destroy_factory(factory: *anyopaque) callconv(.c) void {
     f.vtable.deinit(f.ptr);
 }
 
-/// `WaitSet` and `GuardCondition` are the only two condition-family types
-/// with no factory operation in dcps.idl (per OMG spec, both are
-/// app-instantiated directly, not obtained from an existing entity/reader —
-/// unlike StatusCondition/ReadCondition/QueryCondition, which already have a
-/// full C-ABI path via get_statuscondition()/create_readcondition()). These
-/// four functions are the hand-written bootstrap for that gap, mirroring
-/// zzdds_create_factory()/zzdds_create_factory_with_allocator() exactly.
+// dcps.idl's @constructor operations: zidl generates DDS_WaitSet_create,
+// DDS_GuardCondition_create and their _with_allocator forms around these,
+// and every binding's constructor calls them. Only a build generating the C
+// ABI has them.
+comptime {
+    if (@hasDecl(DDS.WaitSet, "exportCAbiConstructors")) exportConstructors();
+}
+
+fn exportConstructors() void {
+    DDS.WaitSet.exportCAbiConstructors(struct {
+        pub fn create(alloc: std.mem.Allocator) !DDS.WaitSet {
+            return waitSetCtor(alloc);
+        }
+    });
+    DDS.GuardCondition.exportCAbiConstructors(struct {
+        pub fn create(alloc: std.mem.Allocator) !DDS.GuardCondition {
+            return guardConditionCtor(alloc);
+        }
+    });
+}
+
+/// Deprecated forms of the generated DDS_WaitSet_create/DDS_GuardCondition_create
+/// and their destroy operations, kept until their callers move: they return
+/// the nil sentinel on failure where the generated constructors return NULL.
 pub export fn zzdds_create_waitset() callconv(.c) *anyopaque {
     return zzdds_create_waitset_with_allocator(null);
 }

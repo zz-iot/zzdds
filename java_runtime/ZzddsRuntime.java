@@ -26,14 +26,14 @@ public final class ZzddsRuntime {
     public static native Object createFactory();
 
     /**
-     * WaitSet and GuardCondition have no factory operation in dcps.idl (per OMG spec, both
-     * are app-instantiated directly, not obtained from an existing entity/reader) — like
-     * createFactory() above, these bootstrap through a hand-written zzdds_create_waitset()/
-     * zzdds_create_guardcondition() call (see zzdds_c.h), the same way the C/C++ examples
-     * do. Returns null on failure. Since neither has a factory delete operation either,
-     * destroyWaitSet()/destroyGuardCondition() are the only way to release one — call
-     * exactly once, after detaching from every WaitSet (for a GuardCondition) or after
-     * detaching/deleting every attached condition (for a WaitSet).
+     * Deprecated: use {@code Dcps.DDS.WaitSet.create()} and
+     * {@code Dcps.DDS.GuardCondition.create()}, which return an
+     * AutoCloseable object its creator owns, and their {@code destroy()}.
+     * These call the same generated constructor and destroy(): the create
+     * methods return null on failure, and each destroy method releases its
+     * object exactly once, after detaching from every WaitSet (for a
+     * GuardCondition) or after detaching every attached condition (for a
+     * WaitSet).
      */
     public static native Object createWaitSet();
     public static native Object createGuardCondition();

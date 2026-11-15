@@ -111,6 +111,34 @@ void check_conditions() {
     CHECK(ws->detach_condition(gc) == ::DDS::RETCODE_OK);
 }
 
+// The generated factories (dcps.idl's @constructor): the creator's wrapper
+// owns the object, destroy() frees it once, and the WaitSet is the
+// keep-alive zzdds::detail::WaitSetSupport.
+void check_generated_construction() {
+    auto ws = ::DDS::WaitSet::create();
+    CHECK(ws);
+    {
+        // Attached, then dropped: only WaitSetSupport's keep-alive stops the
+        // owner's release from destroying, and so detaching, the condition.
+        auto gc = ::DDS::GuardCondition::create();
+        CHECK(gc);
+        CHECK(ws->attach_condition(gc) == ::DDS::RETCODE_OK);
+    }
+    ::DDS::ConditionSeq attached;
+    CHECK(ws->get_conditions(attached) == ::DDS::RETCODE_OK);
+    CHECK(attached.size() == 1);
+    CHECK(attached[0]->get_trigger_value() == false);
+
+    auto gc2 = ::DDS::GuardCondition::create(static_cast<const ZidlAllocator*>(nullptr));
+    CHECK(gc2);
+    CHECK(gc2->destroy() == ::DDS::RETCODE_OK);
+    CHECK(gc2->destroy() == ::DDS::RETCODE_ALREADY_DELETED);
+
+    CHECK(ws->destroy() == ::DDS::RETCODE_OK);
+    CHECK(ws->destroy() == ::DDS::RETCODE_ALREADY_DELETED);
+    CHECK(ws->attach_condition(gc2) == ::DDS::RETCODE_ALREADY_DELETED);
+}
+
 // One object, two listener interfaces.
 class ReaderWriterListener : public ::DDS::DataReaderListenerBase, public ::DDS::DataWriterListenerBase {};
 
@@ -275,6 +303,7 @@ void check_rejected_registrations(const std::shared_ptr<::DDS::Subscriber> &sub,
 int main() {
     check_identity();
     check_conditions();
+    check_generated_construction();
 
     const char *base = std::getenv("ZZDDS_TEST_DOMAIN_BASE");
     const ::DDS::DomainId_t domain = base ? std::atoi(base) : 101;

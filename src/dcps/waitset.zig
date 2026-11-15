@@ -364,6 +364,7 @@ pub const WaitSetImpl = struct {
     }
 
     const vtable = DDS.WaitSet.Vtable{
+        .destroy = vtDestroy,
         .wait = vtWait,
         .attach_condition = vtAttach,
         .detach_condition = vtDetach,
@@ -691,6 +692,12 @@ pub const WaitSetImpl = struct {
         self.deinit();
     }
 
+    /// dcps.idl's @destructor: a WaitSet can always be destroyed.
+    fn vtDestroy(ctx: *anyopaque) DDS.ReturnCode_t {
+        vtDeinit(ctx);
+        return DDS.RETCODE_OK;
+    }
+
     /// Called from condition notification paths to unblock vtWait.
     fn wakeNotify(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
@@ -929,6 +936,7 @@ pub const GuardConditionImpl = struct {
     }
 
     pub const vtable = DDS.GuardCondition.Vtable{
+        .destroy = vtDestroy,
         .get_trigger_value = vtGetTrigger,
         .set_trigger_value = vtSetTrigger,
         .deinit = vtDeinit,
@@ -979,6 +987,12 @@ pub const GuardConditionImpl = struct {
 
     fn vtDeinit(ctx: *anyopaque) void {
         cast(ctx).deinit();
+    }
+
+    /// dcps.idl's @destructor: a GuardCondition can always be destroyed.
+    fn vtDestroy(ctx: *anyopaque) DDS.ReturnCode_t {
+        cast(ctx).deinit();
+        return DDS.RETCODE_OK;
     }
 
     fn cast(ctx: *anyopaque) *Self {
