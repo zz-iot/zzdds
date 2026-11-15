@@ -63,10 +63,6 @@ Forward-looking only: known gaps, planned features, and open design questions.
 - **GUID generation platform coverage** — the fallback paths only keep unsupported targets
   building. For each supported OS, provide real entropy, PID, and monotonic-clock
   implementations.
-- **Participant teardown can take several seconds** under live reliability timers.
-  `beginProbe`'s hardcoded 1-second deadline per in-flight probe is a still-open root cause
-  (PR #48 only fixed `UdpTransport` socket teardown). Worth a dedicated look so teardown is
-  fast in all cases.
 - **LocatorSelector is Phase 1 only** (per-proxy ranking). Deferred, not precluded:
   cross-proxy multicast fan-out grouping (send once for N readers sharing a multicast
   group; needs a writer-level view across the matched-proxy set; migration target
