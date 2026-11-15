@@ -61,6 +61,11 @@ pub const DomainParticipantFactoryImpl = struct {
     attached_users: u32 = 0,
 
     fac_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    // Owner, each runtime user, and in-flight participant create/delete calls.
+    lifetime: @import("../util/entity_quiesce.zig").EntityQuiesce = .{},
+    /// Runs after the final participant and this factory have been reclaimed.
+    /// The participant's runtime reference still protects plugin cleanup.
+    on_destroy: ?runtime_mod.Hook = null,
 
     const Self = @This();
 
@@ -90,12 +95,26 @@ pub const DomainParticipantFactoryImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.lifetime.close();
+        self.fac_c_abi.retire();
+        self.mu.lock();
+        var participants = self.participants;
+        self.participants = .empty;
+        self.mu.unlock();
+        for (participants.items) |p| p.deinit();
+        participants.deinit(self.alloc);
+        self.lifetime.beginTeardown(self, destroy);
+    }
+
+    fn destroy(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const hook = self.on_destroy;
+        const rt = self.runtime;
         self.fac_c_abi.free(self.alloc);
-        for (self.participants.items) |p| p.deinit();
-        self.participants.deinit(self.alloc);
-        if (self.runtime) |rt| rt.releaseOwner();
         self.default_dp_qos.deinit(self.alloc);
         self.alloc.destroy(self);
+        if (hook) |h| h.run(h.ctx);
+        if (rt) |r| r.releaseOwner();
     }
 
     /// Sends the wire trace of participants created from now on to `sink`
@@ -125,6 +144,9 @@ pub const DomainParticipantFactoryImpl = struct {
     /// one, for a new participant, and attaches the transport and discovery
     /// to it; null (with a diagnostic) when creation must fail.
     fn acquireRuntimeFor(self: *Self) ?*runtime_mod.Runtime {
+        if (!self.lifetime.acquire()) return null;
+        var transferred = false;
+        defer if (!transferred) self.lifetime.release(self, destroy);
         self.mu.lock();
         const selected = self.runtime;
         const retained = if (selected) |rt| rt.tryRetainOwner() else false;
@@ -146,6 +168,7 @@ pub const DomainParticipantFactoryImpl = struct {
         self.attached_runtime = rt;
         self.attached_users += 1;
         self.mu.unlock();
+        transferred = true;
         return rt;
     }
 
@@ -169,15 +192,20 @@ pub const DomainParticipantFactoryImpl = struct {
     /// A participant from `acquireRuntimeFor` is freed.
     fn releaseRuntimeUse(self: *Self) void {
         self.mu.lock();
-        defer self.mu.unlock();
         self.attached_users -= 1;
         if (self.attached_users == 0) self.attached_runtime = null;
+        self.mu.unlock();
+        self.lifetime.release(self, destroy);
+    }
+
+    fn participantDestroyed(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.releaseRuntimeUse();
     }
 
     /// Frees `p`, made by this factory, and its use of the runtime.
-    fn freeParticipant(self: *Self, p: *participant_mod.DomainParticipantImpl) void {
+    fn freeParticipant(_: *Self, p: *participant_mod.DomainParticipantImpl) void {
         p.deinit();
-        self.releaseRuntimeUse();
     }
 
     pub fn toDDSFactory(self: *Self) DDS.DomainParticipantFactory {
@@ -242,6 +270,9 @@ pub const DomainParticipantFactoryImpl = struct {
         config: config_mod.Config,
         config_deinit_allocator: ?std.mem.Allocator,
     ) ?*participant_mod.DomainParticipantImpl {
+        if (!self.lifetime.acquire()) return null;
+        defer self.lifetime.release(self, destroy);
+
         // Allocate a handle for this participant.
         self.mu.lock();
         const handle = self.next_handle;
@@ -273,18 +304,18 @@ pub const DomainParticipantFactoryImpl = struct {
             // Timed QoS runs on the runtime's clock.
             rt.clock,
         ) catch {
-            rt.releaseOwner();
             self.releaseRuntimeUse();
+            rt.releaseOwner();
             return null;
         };
-        // The participant takes the owner reference; its deinit releases it.
+        // Only actual reclamation releases this factory's participant pin.
+        p.on_destroy = .{ .ctx = self, .run = participantDestroyed };
         p.attachRuntime(rt);
         // The participant's own TCP transport, for user data, runs on the
         // runtime too.
         if (p.owned_tcp_transport) |t| t.transport().attachBackend(rt.backend) catch |err| {
             log_mod.dcps.warn("create_participant: the TCP transport cannot run on this runtime ({s})", .{@errorName(err)});
             p.deinit();
-            self.releaseRuntimeUse();
             return null;
         };
         // config_deinit_allocator is set AFTER participants.append so that p.deinit()
@@ -311,6 +342,11 @@ pub const DomainParticipantFactoryImpl = struct {
         }
 
         self.mu.lock();
+        if (self.lifetime.tearingDown()) {
+            self.mu.unlock();
+            p.deinit();
+            return null;
+        }
         self.participants.append(self.alloc, p) catch {
             self.mu.unlock();
             self.freeParticipant(p);
@@ -324,6 +360,8 @@ pub const DomainParticipantFactoryImpl = struct {
 
     fn vtDeleteParticipant(ctx: *anyopaque, a_participant: DDS.DomainParticipant) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.lifetime.acquire()) return DDS.RETCODE_ALREADY_DELETED;
+        defer self.lifetime.release(self, destroy);
         self.mu.lock();
         var found_idx: ?usize = null;
         var found_p: ?*participant_mod.DomainParticipantImpl = null;
