@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const test_domain = @import("test_domain");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -1020,4 +1021,75 @@ test "deinit: reentrant delete_participant from a timer-driven listener does not
     // in zzdds. The remaining work normally finishes in well under a
     // millisecond.
     time_mod.sleepNs(100 * std.time.ns_per_ms);
+}
+
+// ── Locator changes ───────────────────────────────────────────────────────────
+
+/// Discovery that records the locators a participant last had it announce.
+const LocatorDisc = struct {
+    meta: std.ArrayListUnmanaged(Locator) = .empty,
+    data: std.ArrayListUnmanaged(Locator) = .empty,
+    updates: u32 = 0,
+
+    const vtable = blk: {
+        var v = noop_vtable;
+        v.update_locators = update;
+        break :blk v;
+    };
+
+    fn update(ctx: *anyopaque, meta: []const Locator, data: []const Locator) anyerror!void {
+        const self: *LocatorDisc = @ptrCast(@alignCast(ctx));
+        self.updates += 1;
+        self.meta.clearRetainingCapacity();
+        try self.meta.appendSlice(testing.allocator, meta);
+        self.data.clearRetainingCapacity();
+        try self.data.appendSlice(testing.allocator, data);
+    }
+
+    fn discovery(self: *LocatorDisc) iface.Discovery {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    fn deinit(self: *LocatorDisc) void {
+        self.meta.deinit(testing.allocator);
+        self.data.deinit(testing.allocator);
+    }
+};
+
+test "participant: an interface change has discovery announce its new locators, on the runtime" {
+    var mr: ManualRuntime = undefined;
+    mr.init();
+    defer mr.deinit();
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+    const meta_port: u16 = 7410;
+    const t = try MockTransport.init(testing.allocator, net, &.{Locator.udp4(.{ 127, 0, 0, 0x61 }, meta_port)});
+    defer t.deinit();
+    var ld: LocatorDisc = .{};
+    defer ld.deinit();
+    const factory = try DomainParticipantFactoryImpl.init(testing.allocator, t.transport(), ld.discovery(), noop_security, .spec_random, .{});
+    defer factory.deinit();
+    const dp = factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
+    try testing.expect(dp.ptr != dcps.NIL_PTR);
+    mr.settle();
+    try testing.expectEqual(@as(u32, 0), ld.updates);
+
+    // The transport reports the change with its own lock held, as UDP does:
+    // the participant announces it from the runtime, not from there.
+    const moved = Locator.udp4(.{ 127, 0, 1, 0x61 }, meta_port);
+    try t.setUnicastLocators(&.{moved});
+    try testing.expectEqual(@as(u32, 0), ld.updates);
+    mr.settle();
+    try testing.expectEqual(@as(u32, 1), ld.updates);
+    try testing.expectEqualSlices(Locator, &.{moved}, ld.meta.items);
+    // Its data locators follow: the same address, on the data port.
+    const udp = (config_mod.Config{}).transport.udp;
+    const data_port = meta_port + (udp.data_unicast_offset - udp.meta_unicast_offset);
+    try testing.expectEqualSlices(Locator, &.{Locator.udp4(.{ 127, 0, 1, 0x61 }, data_port)}, ld.data.items);
+
+    // Deleted, it no longer hears of changes.
+    try testing.expectEqual(DDS.RETCODE_OK, factory.toDDSFactory().delete_participant(dp));
+    try t.setUnicastLocators(&.{Locator.udp4(.{ 127, 0, 2, 0x61 }, meta_port)});
+    mr.settle();
+    try testing.expectEqual(@as(u32, 1), ld.updates);
 }
