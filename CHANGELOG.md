@@ -8,6 +8,13 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-15
+
+- SEDP announces each endpoint's Publisher or Subscriber GROUP_DATA as `PID_GROUP_DATA`
+  (0x002D), and a peer's shows up in the DCPSPublication and DCPSSubscription built-in topics.
+  A Publisher's or Subscriber's `set_qos` that changes it announces its endpoints again. The
+  PID used to be defined but never sent, and a peer's was never reported.
+
 ## 2026-11-14
 
 - The process config (`zzdds.toml`, or `zzdds_process_configure_from_file`) gains a

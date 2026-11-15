@@ -736,8 +736,8 @@ test "an incompatible reader discovered between a writer's enabling and its anno
         var original: @FieldType(Cbs, "prepare_writers") = undefined;
         var calls: u32 = 0;
 
-        fn prepareWriters(ctx: *anyopaque, handles: []const DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void {
-            try original(ctx, handles, publisher_handle, partition_names, presentation);
+        fn prepareWriters(ctx: *anyopaque, handles: []const DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, group_data: []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void {
+            try original(ctx, handles, publisher_handle, partition_names, group_data, presentation);
             calls += 1;
             if (calls == 2) harness.announceReaderWith(endpointGuid(0x75, 1, READER_KIND), .{ .deadline_s = 1 });
         }
@@ -768,8 +768,8 @@ test "an incompatible writer discovered between a reader's enabling and its anno
         var original: @FieldType(Cbs, "prepare_readers") = undefined;
         var calls: u32 = 0;
 
-        fn prepareReaders(ctx: *anyopaque, handles: []const DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void {
-            try original(ctx, handles, partition_names, presentation);
+        fn prepareReaders(ctx: *anyopaque, handles: []const DDS.InstanceHandle_t, partition_names: []const []const u8, group_data: []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void {
+            try original(ctx, handles, partition_names, group_data, presentation);
             calls += 1;
             if (calls == 2) harness.announceWriter(endpointGuid(0x76, 1, WRITER_KIND), .{ .deadline_s = 2 });
         }

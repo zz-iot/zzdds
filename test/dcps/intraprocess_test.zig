@@ -478,6 +478,72 @@ test "intraprocess: same-participant writer and reader — no self-delivery" {
     try testing.expectEqual(@as(usize, 0), samples.len);
 }
 
+/// The GROUP_DATA of the last DCPSPublication or DCPSSubscription sample
+/// `dr` holds (`T` its type), owned, after taking them all; null with none.
+fn lastBuiltinGroupData(comptime T: type, alloc: std.mem.Allocator, dr: *DataReaderImpl) !?[]u8 {
+    var last: ?[]u8 = null;
+    errdefer if (last) |l| alloc.free(l);
+    while (dr.takeRaw()) |sample| {
+        defer alloc.free(sample.data);
+        if (!sample.info.valid_data) continue;
+        var cdr = try zzdds.zidl_cdr.CdrReader.init(sample.data);
+        var v: T = .{};
+        try T.deserializeInto(&v, &cdr, alloc);
+        defer v.deinit(alloc);
+        const g = v.group_data.value;
+        const bytes: []const u8 = if (g._buffer) |buf| buf[0..g._length] else &.{};
+        if (last) |l| alloc.free(l);
+        last = null;
+        last = try alloc.dupe(u8, bytes);
+    }
+    return last;
+}
+
+fn octets(bytes: []const u8) @FieldType(DDS.GroupDataQosPolicy, "value") {
+    return .{ ._buffer = @constCast(bytes.ptr), ._length = @intCast(bytes.len), ._maximum = @intCast(bytes.len), ._release = false };
+}
+
+test "intraprocess: a remote participant's DCPSPublication and DCPSSubscription carry the Publisher's and Subscriber's GROUP_DATA, and its change" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, "IPTopic", "IPType");
+    defer fx.deinit();
+    const ParticipantImpl = zzdds.dcps.DomainParticipantImpl;
+    const pub_seen = @as(*ParticipantImpl, @ptrCast(@alignCast(fx.dp_r.ptr))).builtin_sub.?.pub_dr;
+    const sub_seen = @as(*ParticipantImpl, @ptrCast(@alignCast(fx.dp_w.ptr))).builtin_sub.?.sub_dr;
+
+    var pub_qos = DDS.PublisherQos{};
+    pub_qos.group_data.value = octets("pub-1");
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.set_qos(pub_qos));
+    var sub_qos = DDS.SubscriberQos{};
+    sub_qos.group_data.value = octets(&.{ 0, 0xff, 's' });
+    try testing.expectEqual(DDS.RETCODE_OK, fx.sub_r.set_qos(sub_qos));
+    _ = fx.makeWriterReader(.{}, .{});
+
+    const first_pub = (try lastBuiltinGroupData(DDS.PublicationBuiltinTopicData, alloc, pub_seen)) orelse return error.NoSample;
+    defer alloc.free(first_pub);
+    try testing.expectEqualSlices(u8, "pub-1", first_pub);
+    const first_sub = (try lastBuiltinGroupData(DDS.SubscriptionBuiltinTopicData, alloc, sub_seen)) orelse return error.NoSample;
+    defer alloc.free(first_sub);
+    try testing.expectEqualSlices(u8, &.{ 0, 0xff, 's' }, first_sub);
+
+    // A change is announced again; one that changes nothing is not.
+    pub_qos.group_data.value = octets("pub-2");
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.set_qos(pub_qos));
+    sub_qos.group_data.value = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, fx.sub_r.set_qos(sub_qos));
+    fx.settle();
+    const next_pub = (try lastBuiltinGroupData(DDS.PublicationBuiltinTopicData, alloc, pub_seen)) orelse return error.NoSample;
+    defer alloc.free(next_pub);
+    try testing.expectEqualSlices(u8, "pub-2", next_pub);
+    const next_sub = (try lastBuiltinGroupData(DDS.SubscriptionBuiltinTopicData, alloc, sub_seen)) orelse return error.NoSample;
+    defer alloc.free(next_sub);
+    try testing.expectEqual(@as(usize, 0), next_sub.len);
+
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.set_qos(pub_qos));
+    fx.settle();
+    try testing.expectEqual(@as(?[]u8, null), try lastBuiltinGroupData(DDS.PublicationBuiltinTopicData, alloc, pub_seen));
+}
+
 // Regression for a real gap found via zzdds-examples' `catchup` review
 // (Greptile flagged: a listener callback that's still draining its take()
 // loop can race an independent completion path that deletes the reader,

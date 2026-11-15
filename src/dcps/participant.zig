@@ -271,7 +271,7 @@ const BuiltinSubscriberState = struct {
                 fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, DDS.InstanceHandle_t, bool) void) void {}
             }.f,
             .prepare_readers = struct {
-                fn f(_: *anyopaque, _: []const DDS.InstanceHandle_t, _: []const []const u8, _: DDS.PresentationQosPolicy) anyerror!void {}
+                fn f(_: *anyopaque, _: []const DDS.InstanceHandle_t, _: []const []const u8, _: []const u8, _: DDS.PresentationQosPolicy) anyerror!void {}
             }.f,
             .prepare_reader_qos = struct {
                 fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *const DDS.DataReaderQos) anyerror!void {}
@@ -487,6 +487,15 @@ fn pushBuiltinPublicationCdr(
                 ._release = false,
             };
         } },
+        .group_data = .{ .value = blk: {
+            const _gd = disc.discGroupData(data.qos);
+            break :blk .{
+                ._maximum = @intCast(_gd.len),
+                ._length = @intCast(_gd.len),
+                ._buffer = @constCast(_gd.ptr),
+                ._release = false,
+            };
+        } },
     };
     DDS.PublicationBuiltinTopicData.serialize(&w, v) catch return;
     var key_hash: [16]u8 = undefined;
@@ -519,6 +528,15 @@ fn pushBuiltinSubscriptionCdr(
                 ._maximum = @intCast(_ud.len),
                 ._length = @intCast(_ud.len),
                 ._buffer = @constCast(_ud.ptr),
+                ._release = false,
+            };
+        } },
+        .group_data = .{ .value = blk: {
+            const _gd = disc.discGroupData(data.qos);
+            break :blk .{
+                ._maximum = @intCast(_gd.len),
+                ._length = @intCast(_gd.len),
+                ._buffer = @constCast(_gd.ptr),
                 ._release = false,
             };
         } },
@@ -891,9 +909,10 @@ const ActiveWriter = struct {
     // bug dupePartitionNames already exists to avoid for partition_names.
     qos: DDS.DataWriterQos,
     partition_names: []const []const u8 = &.{}, // heap-owned copy via dupePartitionNames
+    group_data: []const u8 = &.{}, // the Publisher's GROUP_DATA, heap-owned via dupeGroupData
     presentation: DDS.PresentationQosPolicy = .{},
     /// Discovery holds an announcement prepared with `qos`,
-    /// `partition_names` and `presentation`.
+    /// `partition_names`, `group_data` and `presentation`.
     prepared: bool = false,
     /// Its announcement was committed: another is a refresh.
     announced: bool = false,
@@ -915,9 +934,10 @@ const ActiveReader = struct {
     // must be zzdds-owned, cloned by subCreateProtoReader.
     qos: DDS.DataReaderQos,
     partition_names: []const []const u8 = &.{}, // heap-owned copy via dupePartitionNames
+    group_data: []const u8 = &.{}, // the Subscriber's GROUP_DATA, heap-owned via dupeGroupData
     presentation: DDS.PresentationQosPolicy = .{},
     /// Discovery holds an announcement prepared with `qos`,
-    /// `partition_names` and `presentation`.
+    /// `partition_names`, `group_data` and `presentation`.
     prepared: bool = false,
     /// Its announcement was committed: another is a refresh.
     announced: bool = false,
@@ -1774,6 +1794,7 @@ pub const DomainParticipantImpl = struct {
         while (wit.next()) |aw| {
             aw.proto.deinit();
             freePartitionNames(self.alloc, aw.partition_names);
+            freeGroupData(self.alloc, aw.group_data);
             aw.qos.data_representation.value.deinit(self.alloc);
             freeUserData(self.alloc, aw.qos.user_data);
         }
@@ -1782,6 +1803,7 @@ pub const DomainParticipantImpl = struct {
         while (rit.next()) |ar| {
             ar.proto.deinit();
             freePartitionNames(self.alloc, ar.partition_names);
+            freeGroupData(self.alloc, ar.group_data);
             ar.qos.data_representation.value.deinit(self.alloc);
             freeUserData(self.alloc, ar.qos.user_data);
         }
@@ -2123,6 +2145,7 @@ pub const DomainParticipantImpl = struct {
         var found_guid: ?Guid = null;
         var found_proto: ?proto.ProtocolWriter = null;
         var found_parts: []const []const u8 = &.{};
+        var found_group_data: []const u8 = &.{};
         var found_repr: DDS.DataRepresentationIdSeq = .{};
         var found_user_data: DDS.UserDataQosPolicy = .{};
 
@@ -2133,6 +2156,7 @@ pub const DomainParticipantImpl = struct {
                 found_guid = aw.guid;
                 found_proto = aw.proto;
                 found_parts = aw.partition_names;
+                found_group_data = aw.group_data;
                 found_repr = aw.qos.data_representation.value;
                 found_user_data = aw.qos.user_data;
                 break;
@@ -2147,6 +2171,7 @@ pub const DomainParticipantImpl = struct {
         self.mu.unlock();
 
         freePartitionNames(self.alloc, found_parts);
+        freeGroupData(self.alloc, found_group_data);
         found_repr.deinit(self.alloc);
         freeUserData(self.alloc, found_user_data);
         if (found_guid) |g| if (!handed_off) self.retractDeleted(.writer, g);
@@ -2246,6 +2271,7 @@ pub const DomainParticipantImpl = struct {
         var found_guid: ?Guid = null;
         var found_proto: ?proto.ProtocolReader = null;
         var found_parts: []const []const u8 = &.{};
+        var found_group_data: []const u8 = &.{};
         var found_repr: DDS.DataRepresentationIdSeq = .{};
         var found_user_data: DDS.UserDataQosPolicy = .{};
 
@@ -2256,6 +2282,7 @@ pub const DomainParticipantImpl = struct {
                 found_guid = ar.guid;
                 found_proto = ar.proto;
                 found_parts = ar.partition_names;
+                found_group_data = ar.group_data;
                 found_repr = ar.qos.data_representation.value;
                 found_user_data = ar.qos.user_data;
                 break;
@@ -2270,6 +2297,7 @@ pub const DomainParticipantImpl = struct {
         self.mu.unlock();
 
         freePartitionNames(self.alloc, found_parts);
+        freeGroupData(self.alloc, found_group_data);
         found_repr.deinit(self.alloc);
         freeUserData(self.alloc, found_user_data);
         if (found_guid) |g| if (!handed_off) self.retractDeleted(.reader, g);
@@ -4023,6 +4051,17 @@ pub const DomainParticipantImpl = struct {
         if (names.len > 0) alloc.free(names);
     }
 
+    /// A copy of a Publisher's or Subscriber's GROUP_DATA bytes; free with
+    /// `freeGroupData`.
+    fn dupeGroupData(alloc: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+        if (bytes.len == 0) return &.{};
+        return alloc.dupe(u8, bytes);
+    }
+
+    fn freeGroupData(alloc: std.mem.Allocator, bytes: []const u8) void {
+        if (bytes.len > 0) alloc.free(bytes);
+    }
+
     /// The matches a local endpoint's refresh removes, each with its remote
     /// endpoint, for firing their callbacks once `mu` is released.
     fn Removals(comptime Job: type) type {
@@ -4219,6 +4258,7 @@ pub const DomainParticipantImpl = struct {
         return struct {
             qos: ?*const QosOf(kind) = null,
             partition_names: ?[]const []const u8 = null,
+            group_data: ?[]const u8 = null,
             presentation: ?DDS.PresentationQosPolicy = null,
         };
     }
@@ -4230,12 +4270,14 @@ pub const DomainParticipantImpl = struct {
             guid: Guid,
             ann: AnnouncementOf(kind),
             partition_names: ?[]const []const u8,
+            group_data: ?[]const u8,
             presentation: DDS.PresentationQosPolicy,
             qos: ?QosOf(kind),
 
             fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
                 self.ann.deinit(alloc);
                 if (self.partition_names) |n| freePartitionNames(alloc, n);
+                if (self.group_data) |g| freeGroupData(alloc, g);
                 if (self.qos) |*q| freeOwnedQos(alloc, q);
             }
         };
@@ -4313,11 +4355,14 @@ pub const DomainParticipantImpl = struct {
                 }) orelse continue;
                 const presentation = change.presentation orelse ep.presentation;
                 if (ep.prepared and change.qos == null and std.meta.eql(ep.presentation, presentation) and
-                    (change.partition_names == null or partitionNamesEql(ep.partition_names, change.partition_names.?))) continue;
+                    (change.partition_names == null or partitionNamesEql(ep.partition_names, change.partition_names.?)) and
+                    (change.group_data == null or std.mem.eql(u8, ep.group_data, change.group_data.?))) continue;
                 if (staged.items.len == 0) try self.reserveAnnouncingLocked();
                 try self.ensureLocalGenLocked(ep.guid);
                 const names: ?[]const []const u8 = if (change.partition_names) |n| try dupePartitionNamesOrFail(self.alloc, n) else null;
                 errdefer if (names) |n| freePartitionNames(self.alloc, n);
+                const group_data: ?[]const u8 = if (change.group_data) |g| try dupeGroupData(self.alloc, g) else null;
+                errdefer if (group_data) |g| freeGroupData(self.alloc, g);
                 var qos: ?QosOf(kind) = if (change.qos) |q| try ownQos(self.alloc, q.*) else null;
                 errdefer if (qos) |*q| freeOwnedQos(self.alloc, q);
                 const borrowed: AnnouncementOf(kind) = switch (kind) {
@@ -4330,6 +4375,7 @@ pub const DomainParticipantImpl = struct {
                         .qos = if (qos) |q| q else ep.qos,
                         .presentation = presentation,
                         .partition_names = names orelse ep.partition_names,
+                        .group_data = group_data orelse ep.group_data,
                         .type_object = &.{},
                         .type_info_cdr = self.type_info_registry.get(ep.type_name) orelse &.{},
                     },
@@ -4341,6 +4387,7 @@ pub const DomainParticipantImpl = struct {
                         .qos = if (qos) |q| q else ep.qos,
                         .presentation = presentation,
                         .partition_names = names orelse ep.partition_names,
+                        .group_data = group_data orelse ep.group_data,
                         .type_info_cdr = self.type_info_registry.get(ep.type_name) orelse &.{},
                     },
                 };
@@ -4348,6 +4395,7 @@ pub const DomainParticipantImpl = struct {
                     .guid = ep.guid,
                     .ann = try borrowed.clone(self.alloc),
                     .partition_names = names,
+                    .group_data = group_data,
                     .presentation = presentation,
                     .qos = qos,
                 });
@@ -4386,6 +4434,11 @@ pub const DomainParticipantImpl = struct {
                 freePartitionNames(self.alloc, ep.partition_names);
                 ep.partition_names = n;
                 st.partition_names = null;
+            }
+            if (st.group_data) |g| {
+                freeGroupData(self.alloc, ep.group_data);
+                ep.group_data = g;
+                st.group_data = null;
             }
             if (st.qos) |q| {
                 freeOwnedQos(self.alloc, &ep.qos);
@@ -4462,8 +4515,8 @@ pub const DomainParticipantImpl = struct {
     /// Has discovery prepare the announcements of the writers `handles`
     /// with their Publisher's `partition_names` and `presentation`: see
     /// `prepareEndpoints`.
-    fn pubPrepareProtoWriters(ctx: *anyopaque, handles: []const DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void {
-        return cast(ctx).prepareEndpoints(.writer, handles, publisher_handle, .{ .partition_names = partition_names, .presentation = presentation });
+    fn pubPrepareProtoWriters(ctx: *anyopaque, handles: []const DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, group_data: []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void {
+        return cast(ctx).prepareEndpoints(.writer, handles, publisher_handle, .{ .partition_names = partition_names, .group_data = group_data, .presentation = presentation });
     }
 
     /// Has discovery prepare the writer `handle`'s announcement with `qos`:
@@ -4618,8 +4671,8 @@ pub const DomainParticipantImpl = struct {
     };
 
     /// `pubPrepareProtoWriters`, for readers and their Subscriber.
-    fn subPrepareProtoReaders(ctx: *anyopaque, handles: []const DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void {
-        return cast(ctx).prepareEndpoints(.reader, handles, DDS.HANDLE_NIL, .{ .partition_names = partition_names, .presentation = presentation });
+    fn subPrepareProtoReaders(ctx: *anyopaque, handles: []const DDS.InstanceHandle_t, partition_names: []const []const u8, group_data: []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void {
+        return cast(ctx).prepareEndpoints(.reader, handles, DDS.HANDLE_NIL, .{ .partition_names = partition_names, .group_data = group_data, .presentation = presentation });
     }
 
     /// `pubPrepareProtoWriterQos`, for a reader.

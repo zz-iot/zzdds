@@ -527,7 +527,7 @@ test "create_datareader: an announcement that cannot be prepared leaves the Topi
     const sub = fx.dp.create_subscriber(.{}, null, 0);
     const sub_impl: *zzdds.dcps.SubscriberImpl = @ptrCast(@alignCast(sub.ptr));
     const Fail = struct {
-        fn prepare(_: *anyopaque, _: []const DDS.InstanceHandle_t, _: []const []const u8, _: DDS.PresentationQosPolicy) anyerror!void {
+        fn prepare(_: *anyopaque, _: []const DDS.InstanceHandle_t, _: []const []const u8, _: []const u8, _: DDS.PresentationQosPolicy) anyerror!void {
             return error.OutOfMemory;
         }
     };
@@ -569,7 +569,7 @@ test "create_datawriter: an announcement that cannot be prepared leaves the Topi
     const pub_ = fx.dp.create_publisher(.{}, null, 0);
     const pub_impl: *zzdds.dcps.PublisherImpl = @ptrCast(@alignCast(pub_.ptr));
     const Fail = struct {
-        fn prepare(_: *anyopaque, _: []const DDS.InstanceHandle_t, _: DDS.InstanceHandle_t, _: []const []const u8, _: DDS.PresentationQosPolicy) anyerror!void {
+        fn prepare(_: *anyopaque, _: []const DDS.InstanceHandle_t, _: DDS.InstanceHandle_t, _: []const []const u8, _: []const u8, _: DDS.PresentationQosPolicy) anyerror!void {
             return error.OutOfMemory;
         }
     };

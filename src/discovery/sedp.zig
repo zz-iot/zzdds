@@ -93,6 +93,7 @@ pub fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement
     if (ann.group_guid) |gg| out.groupGuid = guidBytes(gg);
     out.topicName = ann.topic_name;
     out.typeName = ann.type_name;
+    adapter.setGroupData(&out, ann.group_data);
 
     // PID_PARTITION: NUL-terminate the names for the generated seq<string>.
     var part_ptrs: std.ArrayList([*:0]const u8) = .empty;
@@ -138,6 +139,7 @@ pub fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement
     out.readerGuid = guidBytes(ann.guid);
     out.topicName = ann.topic_name;
     out.typeName = ann.type_name;
+    adapter.setGroupData(&out, ann.group_data);
     // Readers have historically never advertised PID_DESTINATION_ORDER; the
     // adapter fills it for local QoS matching only. Keep it off the wire.
     out.destinationOrder = null;
