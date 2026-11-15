@@ -1715,3 +1715,74 @@ test "zzdds_cft_match_sample: real filter evaluation through the C ABI" {
     const non_matching = Sample{ .x = 6 };
     try std.testing.expect(!zzdds_cft_match_sample(cft_handle, @constCast(&non_matching), Sample.get));
 }
+
+// Local investigation: observes frees without dereferencing retired storage.
+test "characterization: C factory stack is freed before deferred participant cleanup" {
+    const testing = std.testing;
+    const runtime = @import("../runtime/root.zig");
+    if (!runtime.testing.ManualPoll.supported) return error.SkipZigTest;
+    var mr: runtime.testing.ManualPoll = undefined;
+    try mr.init(testing.allocator);
+    defer mr.deinit();
+    try runtime.default_registry.global.install(&mr.runtime);
+    defer runtime.default_registry.global.clear();
+    const Watch = struct {
+        child: std.mem.Allocator = testing.allocator,
+        participant: usize = 0,
+        discovery: usize = 0,
+        stack: usize = 0,
+        participant_freed: bool = false,
+        discovery_freed: bool = false,
+        stack_freed: bool = false,
+        fn allocate(ctx: ?*anyopaque, n: usize, alignment: usize) callconv(.c) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            return self.child.rawAlloc(n, std.mem.Alignment.fromByteUnits(alignment), @returnAddress());
+        }
+        fn resize(ctx: ?*anyopaque, ptr: ?[*]u8, old: usize, n: usize, alignment: usize) callconv(.c) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            return self.child.rawResize(ptr.?[0..old], std.mem.Alignment.fromByteUnits(alignment), n, @returnAddress());
+        }
+        fn free(ctx: ?*anyopaque, ptr: ?[*]u8, n: usize, alignment: usize) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const addr = @intFromPtr(ptr);
+            if (addr == self.participant) self.participant_freed = true;
+            if (addr == self.discovery) self.discovery_freed = true;
+            if (addr == self.stack) self.stack_freed = true;
+            self.child.rawFree(ptr.?[0..n], std.mem.Alignment.fromByteUnits(alignment), @returnAddress());
+        }
+    };
+    for ([_]bool{ true, false }) |delete_participant_first| {
+        var watch: Watch = .{};
+        const allocator: zidl_bindings.ZidlAllocator = .{ .ctx = &watch, .alloc = Watch.allocate, .resize = Watch.resize, .free = Watch.free };
+        const factory = try createFactory(&allocator);
+        const dp = factory.create_participant_ex(211, .{}, null, 0, ZZDDS.DomainParticipantConfig.default());
+        try testing.expect(!nil.isNil(dp));
+        const owner: *FactoryOwner = @ptrCast(@alignCast(factory.ptr));
+        const stack = owner.stacks.items[0];
+        const p: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+        watch.participant = @intFromPtr(p);
+        watch.discovery = @intFromPtr(stack.discovery);
+        watch.stack = @intFromPtr(stack);
+        var traversal: listener_lane.Traversal = .{};
+        traversal.begin(&p.listener_group);
+        try testing.expect(traversal.counted);
+        const dds = factory.vtable.as_DomainParticipantFactory(factory.ptr);
+        const rc = if (delete_participant_first) dds.delete_participant(dp) else DDS.RETCODE_OK;
+        factory.vtable.deinit(factory.ptr);
+        // Capture before ending the traversal: deletion has returned, but its
+        // participant teardown cannot run until that traversal finishes.
+        const participant_freed_early = watch.participant_freed;
+        const discovery_freed_early = watch.discovery_freed;
+        const stack_freed_early = watch.stack_freed;
+        traversal.end();
+        while (true) {
+            const result = try mr.runtime.drive(64, 0);
+            if (result.turns == 0) break;
+        }
+        try testing.expectEqual(DDS.RETCODE_OK, rc);
+        try testing.expect(!participant_freed_early);
+        try testing.expect(discovery_freed_early);
+        try testing.expect(stack_freed_early);
+        try testing.expect(watch.participant_freed);
+    }
+}
