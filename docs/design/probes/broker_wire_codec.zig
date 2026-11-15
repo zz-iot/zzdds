@@ -99,7 +99,7 @@ test "old body decoder skips new optional field and rejects new required field" 
     try testing.expectError(error.UnknownMustUnderstand, @import("wire").BrokerCodecProbe.Evolution.deserializeInto(&out, &rr, testing.allocator));
 }
 
-test "characterization: missing and duplicate members need admission validation" {
+test "evolution defaults missing members and rejects duplicate members" {
     const missing = try syncBytes(null, true, false);
     defer testing.allocator.free(missing);
     var r = try fixtureReader(missing);
@@ -109,10 +109,9 @@ test "characterization: missing and duplicate members need admission validation"
     const duplicate = try syncBytes(null, false, true);
     defer testing.allocator.free(duplicate);
     var rr = try fixtureReader(duplicate);
-    try @import("wire").BrokerCodecProbe.Evolution.deserializeInto(&out, &rr, testing.allocator);
-    try testing.expectEqual(@as(u64, 99), out.view_generation);
-    // These accepted malformed shapes are a documented production blocker, not
-    // the intended future broker policy. Update this characterization when fixed.
+    try testing.expectError(error.DuplicateMember, @import("wire").BrokerCodecProbe.Evolution.deserializeInto(&out, &rr, testing.allocator));
+    // Ordinary evolution still supplies defaults for omitted members. Broker
+    // admission must enforce its required-member policy separately.
 }
 
 test "bounded sequence representation footprint is explicit" {
