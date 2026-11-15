@@ -375,8 +375,12 @@ pub const Mode = enum { manual, hosted };
 pub const Options = struct {
     mode: Mode,
     /// Turns an executor may run directly on a submitting thread before it
-    /// must queue instead.
+    /// must queue instead. Zero always queues.
     inline_turns: u32 = 8,
+    /// Ready sources one backend service handles, and internal turns a
+    /// helping wait runs, before checking again: at least 1, or neither
+    /// makes progress.
+    service_budget: u32 = 8,
 };
 
 pub const SubmitError = error{
@@ -454,6 +458,7 @@ pub const Runtime = struct {
 
     /// The creator holds the first operational-owner reference.
     pub fn init(clock: Clock, backend: ProgressBackend, options: Options) Runtime {
+        std.debug.assert(options.service_budget > 0);
         return .{ .clock = clock, .backend = backend, .options = options };
     }
 
@@ -983,9 +988,9 @@ pub const Runtime = struct {
         while (true) {
             if (done(ctx)) return true;
             self.fireDueTimers(self.clock.nowNs());
-            _ = self.backend.service(self.options.inline_turns);
+            _ = self.backend.service(self.options.service_budget);
             var turns: u32 = 0;
-            while (turns < self.options.inline_turns and self.runNextInternal()) turns += 1;
+            while (turns < self.options.service_budget and self.runNextInternal()) turns += 1;
             if (turns > 0) {
                 // Checked between batches too: a busy runtime always has more.
                 if (deadline_ns) |d| if (self.clock.nowNs() >= d) return done(ctx);
@@ -1020,7 +1025,7 @@ pub const Runtime = struct {
         while (true) {
             const now = self.clock.nowNs();
             self.fireDueTimers(now);
-            _ = self.backend.service(self.options.inline_turns);
+            _ = self.backend.service(self.options.service_budget);
             if (self.runNext()) continue;
             self.tryStop();
             if (self.state.load(.acquire) == .backend_stopped) return;

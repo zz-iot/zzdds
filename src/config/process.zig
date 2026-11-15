@@ -16,6 +16,8 @@
 const std = @import("std");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const resolve = @import("resolve.zig");
+const default_registry = @import("../runtime/default_registry.zig");
+const log = @import("../log.zig");
 
 pub const ProcessConfig = resolve.ProcessConfig;
 
@@ -48,11 +50,36 @@ var state_alloc: std.mem.Allocator = std.heap.c_allocator;
 pub fn configure(alloc: std.mem.Allocator, cfg: ProcessConfig) !void {
     var owned = cfg;
     defer owned.deinit(alloc);
+    try validateRuntime(&owned);
     mu.lock();
     defer mu.unlock();
     if (state != null) return error.AlreadyConfigured;
     state = try owned.clone(alloc);
     state_alloc = alloc;
+    applyRuntime(&state.?);
+}
+
+pub const RuntimeConfigError = error{
+    /// The implicit default runtime is always hosted.
+    ManualDefaultRuntime,
+    /// A hosted runtime needs at least one worker.
+    NoHostedWorkers,
+};
+
+fn validateRuntime(cfg: *const ProcessConfig) RuntimeConfigError!void {
+    const rc = cfg.default_runtime;
+    if (rc.mode == .RUNTIME_MODE_MANUAL) return error.ManualDefaultRuntime;
+    if (rc.hosted_workers == 0) return error.NoHostedWorkers;
+}
+
+/// Hands the installed config's runtime settings to the default registry:
+/// the implicit runtimes started from now on use them, and the disabled
+/// policy disables a slot nothing has configured yet. Caller holds `mu`.
+fn applyRuntime(cfg: *const ProcessConfig) void {
+    const rc = cfg.default_runtime;
+    default_registry.global.configureImplicit(.{ .workers = rc.hosted_workers, .inline_turns = rc.inline_turns });
+    if (cfg.default_runtime_policy == .DEFAULT_RUNTIME_DISABLED and !default_registry.global.disableIfUnconfigured())
+        log.dcps.warn("process config: the default runtime is already configured, so default_runtime_policy = DEFAULT_RUNTIME_DISABLED is ignored", .{});
 }
 
 /// Resolve `path` and install it as the process-wide config in one step,
@@ -82,8 +109,14 @@ pub fn getForNewFactory(alloc: std.mem.Allocator) !ProcessConfig {
     mu.lock();
     defer mu.unlock();
     if (state == null) {
-        state = try resolve.resolveProcessConfig(std.heap.c_allocator);
+        var resolved = try resolve.resolveProcessConfig(std.heap.c_allocator);
+        validateRuntime(&resolved) catch |err| {
+            resolved.deinit(std.heap.c_allocator);
+            return err;
+        };
+        state = resolved;
         state_alloc = std.heap.c_allocator;
+        applyRuntime(&state.?);
     }
     return state.?.clone(alloc);
 }

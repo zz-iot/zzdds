@@ -189,9 +189,15 @@ DDS_ReturnCode_t zzdds_waitset_attach_condition_with_release(
  * own persistent storage will live in that allocator for the rest of the
  * process's lifetime instead.
  *
+ * Its `[default_runtime]` table sets the implicit default runtime's hosted
+ * workers and inline-turn budget, and `default_runtime_policy =
+ * "DEFAULT_RUNTIME_DISABLED"` makes participant creation without a selected
+ * runtime fail.
+ *
  * Returns DDS_RETCODE_PRECONDITION_NOT_MET if a process-wide config is
- * already installed, DDS_RETCODE_ERROR if `path` doesn't exist or fails to
- * parse.
+ * already installed, DDS_RETCODE_BAD_PARAMETER if `[default_runtime]` asks
+ * for a manual default runtime or no hosted workers, DDS_RETCODE_ERROR if
+ * `path` doesn't exist or fails to parse.
  */
 DDS_ReturnCode_t zzdds_process_configure_from_file(
     const char *path,

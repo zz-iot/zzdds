@@ -21,6 +21,7 @@ comptime {
     zidl_bindings.exportHandleRetireHook("zzdds_handle_retire");
 }
 const process_config = @import("../config/process.zig");
+const log_mod = @import("../log.zig");
 const DomainParticipantFactoryImpl = @import("../dcps/factory.zig").DomainParticipantFactoryImpl;
 const participant_mod = @import("../dcps/participant.zig");
 const DomainParticipantImpl = participant_mod.DomainParticipantImpl;
@@ -827,7 +828,11 @@ pub export fn zzdds_waitset_attach_condition_with_release(
 /// the actual supported entry point for that).
 pub export fn zzdds_process_configure(config: *const ZZDDS.ProcessConfig) callconv(.c) DDS.ReturnCode_t {
     const cloned = config.clone(std.heap.c_allocator) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-    process_config.configure(std.heap.c_allocator, cloned) catch return DDS.RETCODE_PRECONDITION_NOT_MET;
+    process_config.configure(std.heap.c_allocator, cloned) catch |err| return switch (err) {
+        error.ManualDefaultRuntime, error.NoHostedWorkers => DDS.RETCODE_BAD_PARAMETER,
+        error.OutOfMemory => DDS.RETCODE_OUT_OF_RESOURCES,
+        else => DDS.RETCODE_PRECONDITION_NOT_MET,
+    };
     return DDS.RETCODE_OK;
 }
 
@@ -846,19 +851,22 @@ pub export fn zzdds_process_configure(config: *const ZZDDS.ProcessConfig) callco
 /// returns RETCODE_PRECONDITION_NOT_MET if a process-wide config is already
 /// installed (whether from an earlier call to this function, to
 /// zzdds_process_configure, or from a factory already having resolved the
-/// ambient default), RETCODE_ERROR if `path` doesn't exist or fails to parse
-/// (a missing/malformed file is treated as a real error here, not silently
-/// ignored — a caller who named a specific path almost certainly wants to
-/// know if it didn't work).
+/// ambient default), RETCODE_BAD_PARAMETER if its `[default_runtime]` table
+/// asks for a manual default runtime or no hosted workers, RETCODE_ERROR if
+/// `path` doesn't exist or fails to parse (a missing/malformed file is treated
+/// as a real error here, not silently ignored — a caller who named a specific
+/// path almost certainly wants to know if it didn't work).
 pub export fn zzdds_process_configure_from_file(
     path: [*:0]const u8,
     allocator: ?*const zidl_bindings.ZidlAllocator,
 ) callconv(.c) DDS.ReturnCode_t {
     const alloc = if (allocator) |a| zidl_bindings.toAllocator(a) else std.heap.c_allocator;
     process_config.configureFromFile(alloc, std.mem.span(path)) catch |err| {
-        std.log.err("zzdds_process_configure_from_file: {}", .{err});
+        // The return code reports the failure; this says which.
+        log_mod.dcps.warn("zzdds_process_configure_from_file: {s}", .{@errorName(err)});
         return switch (err) {
             error.AlreadyConfigured => DDS.RETCODE_PRECONDITION_NOT_MET,
+            error.ManualDefaultRuntime, error.NoHostedWorkers => DDS.RETCODE_BAD_PARAMETER,
             else => DDS.RETCODE_ERROR,
         };
     };
@@ -1254,10 +1262,11 @@ fn createFactory(allocator: ?*const zidl_bindings.ZidlAllocator) !ZZDDS.DomainPa
     errdefer alloc.destroy(owner);
     // Lazily resolves+commits the process-wide config on the very first factory
     // in the process, if the app never called zzdds_process_configure itself.
-    // ProcessConfig has exactly one field today, so taking it by value here and
-    // never separately deinit-ing proc_cfg is a full, non-leaking ownership
-    // transfer into owner.default_config — if ProcessConfig ever grows more
-    // fields, whichever of them aren't moved into `owner` will need freeing here.
+    // Its default_runtime settings went to the default registry when it was
+    // installed. Taking it by value here and never separately deinit-ing
+    // proc_cfg is a full, non-leaking ownership transfer into
+    // owner.default_config: the other fields (default_runtime and its policy)
+    // own no memory. A field added that does must be freed here.
     const proc_cfg = try process_config.getForNewFactory(alloc);
     owner.* = .{ .alloc = alloc, .default_config = proc_cfg.default_participant_config, .on_debug_gpa = on_debug_gpa };
     return .{ .ptr = owner, .vtable = &factory_vtable };

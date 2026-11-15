@@ -65,6 +65,8 @@ pub const Registry = struct {
     alloc: std.mem.Allocator = std.heap.smp_allocator,
     /// Hosted workers for each implicit runtime.
     workers: u32 = 2,
+    /// Each implicit runtime's direct-execution budget per submitting thread.
+    inline_turns: u32 = 8,
 
     const Slot = union(enum) {
         unconfigured,
@@ -122,6 +124,32 @@ pub const Registry = struct {
     /// Creation without a selected runtime fails until `install` or `clear`.
     pub fn disable(self: *Registry) void {
         self.set(.disabled);
+    }
+
+    /// Startup settings for the implicit runtimes started from now on; one
+    /// already running keeps its own.
+    pub const ImplicitOptions = struct {
+        workers: u32,
+        inline_turns: u32,
+    };
+
+    pub fn configureImplicit(self: *Registry, options: ImplicitOptions) void {
+        std.debug.assert(options.workers > 0);
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.workers = options.workers;
+        self.inline_turns = options.inline_turns;
+    }
+
+    /// `disable`, unless the slot was configured already: an installed
+    /// runtime, an earlier disable or an implicit runtime in use. Returns
+    /// whether it disabled the slot.
+    pub fn disableIfUnconfigured(self: *Registry) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.slot != .unconfigured) return false;
+        self.slot = .disabled;
+        return true;
     }
 
     /// The installed runtime when a wait may help it: one in manual mode.
@@ -205,7 +233,7 @@ pub const Registry = struct {
             }
         else
             Backend.init(g.threaded.io());
-        g.runtime = Runtime.init(g.backend.clock(), g.backend.backend(), .{ .mode = .hosted });
+        g.runtime = Runtime.init(g.backend.clock(), g.backend.backend(), .{ .mode = .hosted, .inline_turns = self.inline_turns });
         g.hosted = Hosted.init(self.alloc, g.threaded.io(), &g.runtime, self.workers) catch {
             g.runtime.releaseOwner();
             g.runtime.deinit();
