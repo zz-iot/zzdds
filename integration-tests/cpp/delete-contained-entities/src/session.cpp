@@ -210,9 +210,9 @@ int main(int argc, char **argv) {
     }
     std::printf("Create reader for topic: SessionIn_cft\n");
 
-    auto ws = zzdds::create_waitset();
+    auto ws = ::DDS::WaitSet::create();
     if (!ws) {
-        std::fprintf(stderr, "FAIL: create_waitset() failed\n");
+        std::fprintf(stderr, "FAIL: WaitSet::create() failed\n");
         return 1;
     }
     auto in_rc = in_dr->create_readcondition(::DDS::ANY_SAMPLE_STATE, ::DDS::ANY_VIEW_STATE, ::DDS::ANY_INSTANCE_STATE);

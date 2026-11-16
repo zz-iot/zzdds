@@ -26,10 +26,8 @@
 // handle crossing, with no identity cache at all -- worse than C++'s
 // per-concrete-type cache, not the same shape. Fixed by giving
 // zidl_java_box_<c_name> a shared native (JNI weak-global-ref) cache per
-// @shared_c_abi_box family, plus a registration hook
-// (ZzddsRuntime.createGuardCondition() calls it directly) for GuardCondition,
-// which -- like C++'s GuardConditionSupport -- constructs its Java object by
-// hand rather than through any generated box helper. See zidl's
+// @shared_c_abi_box family, which GuardCondition.create() boxes its new
+// object through like every other family member. See zidl's
 // `zidl/docs/design/binding-c-abi-identity.md` and its "Java backend:
 // native weak-global-ref box cache" follow-up for the fuller writeup.
 // Confirmed by testing directly against the fixed zzdds, not just reasoned
@@ -137,9 +135,9 @@ public class Publisher {
 
         // ── WaitSet setup: StatusCondition + GuardCondition together ──
 
-        Dcps.DDS.WaitSet ws = (Dcps.DDS.WaitSet) io.zzdds.runtime.ZzddsRuntime.createWaitSet();
+        Dcps.DDS.WaitSet ws = Dcps.DDS.WaitSet.create();
         if (ws == null) {
-            System.err.println("FAIL: createWaitSet() failed");
+            System.err.println("FAIL: WaitSet.create() failed");
             System.exit(1);
         }
 
@@ -153,9 +151,9 @@ public class Publisher {
             System.exit(1);
         }
 
-        Dcps.DDS.GuardCondition gc = (Dcps.DDS.GuardCondition) io.zzdds.runtime.ZzddsRuntime.createGuardCondition();
+        Dcps.DDS.GuardCondition gc = Dcps.DDS.GuardCondition.create();
         if (gc == null) {
-            System.err.println("FAIL: createGuardCondition() failed");
+            System.err.println("FAIL: GuardCondition.create() failed");
             System.exit(1);
         }
         if (ws.attach_condition(gc) != 0) {
@@ -247,8 +245,8 @@ public class Publisher {
         System.out.println("Publisher: StatusCondition remained attached through delete_datawriter (safe).");
         pub.delete_datawriter(dw);
 
-        io.zzdds.runtime.ZzddsRuntime.destroyGuardCondition(gc);
-        io.zzdds.runtime.ZzddsRuntime.destroyWaitSet(ws);
+        gc.close();
+        ws.close();
 
         System.out.println("Publisher: done.");
     }

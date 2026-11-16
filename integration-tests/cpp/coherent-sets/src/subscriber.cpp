@@ -114,9 +114,9 @@ int main(int argc, char **argv) {
     PositionDataReader position_reader(position_dr->native_handle());
     VelocityDataReader velocity_reader(velocity_dr->native_handle());
 
-    auto ws = zzdds::create_waitset();
+    auto ws = ::DDS::WaitSet::create();
     if (!ws) {
-        std::fprintf(stderr, "FAIL: create_waitset() failed\n");
+        std::fprintf(stderr, "FAIL: WaitSet::create() failed\n");
         return 1;
     }
 

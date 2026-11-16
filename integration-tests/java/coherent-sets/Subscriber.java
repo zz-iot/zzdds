@@ -99,9 +99,9 @@ public class Subscriber {
         PositionDataReader positionReader = new PositionDataReader(positionDr);
         VelocityDataReader velocityReader = new VelocityDataReader(velocityDr);
 
-        Dcps.DDS.WaitSet ws = (Dcps.DDS.WaitSet) io.zzdds.runtime.ZzddsRuntime.createWaitSet();
+        Dcps.DDS.WaitSet ws = Dcps.DDS.WaitSet.create();
         if (ws == null) {
-            System.err.println("FAIL: createWaitSet() failed");
+            System.err.println("FAIL: WaitSet.create() failed");
             System.exit(1);
         }
 
@@ -203,5 +203,6 @@ public class Subscriber {
         velocityDr.delete_readcondition(velocityRc);
         sub.delete_datareader(positionDr);
         sub.delete_datareader(velocityDr);
+        ws.close();
     }
 }

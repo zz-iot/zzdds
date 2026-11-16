@@ -988,30 +988,6 @@ private:
 
 } // namespace detail
 
-/** Deprecated: use DDS::WaitSet::create(). */
-inline std::shared_ptr<::DDS::WaitSet> create_waitset()
-{
-    return ::DDS::WaitSet::create();
-}
-
-/** Deprecated: use DDS::WaitSet::create(allocator). */
-inline std::shared_ptr<::DDS::WaitSet> create_waitset(const ZidlAllocator* allocator)
-{
-    return ::DDS::WaitSet::create(allocator);
-}
-
-/** Deprecated: use DDS::GuardCondition::create(). */
-inline std::shared_ptr<::DDS::GuardCondition> create_guardcondition()
-{
-    return ::DDS::GuardCondition::create();
-}
-
-/** Deprecated: use DDS::GuardCondition::create(allocator). */
-inline std::shared_ptr<::DDS::GuardCondition> create_guardcondition(const ZidlAllocator* allocator)
-{
-    return ::DDS::GuardCondition::create(allocator);
-}
-
 /**
  * Resolve `path` as a zzdds TOML config file and install the result as the
  * process-wide configuration, entirely through `allocator` (nullptr for the

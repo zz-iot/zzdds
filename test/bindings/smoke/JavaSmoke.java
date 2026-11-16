@@ -184,8 +184,28 @@ public class JavaSmoke {
         check(collected(rej.exRejected[0]), "a listener set_listener_ex() rejected is released");
     }
 
+    // WaitSet and GuardCondition come from their generated constructors, and
+    // wait() hands back the same GuardCondition object that was attached.
+    static void checkGeneratedConstruction() {
+        int ok = Dcps.DDS.RETCODE_OK.value;
+        Dcps.DDS.WaitSet ws = Dcps.DDS.WaitSet.create();
+        Dcps.DDS.GuardCondition gc = Dcps.DDS.GuardCondition.create();
+        check(ws != null && gc != null, "WaitSet.create()/GuardCondition.create() returned non-null");
+        check(ws.attach_condition(gc) == ok, "attach_condition() of a created GuardCondition");
+        check(gc.set_trigger_value(true) == ok, "set_trigger_value(true)");
+        Dcps.DDS.Duration_t timeout = new Dcps.DDS.Duration_t();
+        timeout.set_sec(1);
+        java.util.ArrayList<Dcps.DDS.Condition> active = new java.util.ArrayList<>();
+        check(ws.wait(active, timeout) == ok, "wait() on a triggered GuardCondition");
+        check(active.size() == 1 && active.get(0) == gc, "wait() returns the GuardCondition object that was attached");
+        check(gc.destroy() == ok, "GuardCondition.destroy()");
+        check(gc.destroy() == Dcps.DDS.RETCODE_ALREADY_DELETED.value, "a second destroy() is refused");
+        ws.close();
+    }
+
     public static void main(String[] args) throws Exception {
         System.out.println("Java binding smoke test:");
+        checkGeneratedConstruction();
 
         Dcps.DDS.DomainParticipantFactory factory =
             (Dcps.DDS.DomainParticipantFactory) io.zzdds.runtime.ZzddsRuntime.createFactory();

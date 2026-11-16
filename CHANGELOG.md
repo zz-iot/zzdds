@@ -17,11 +17,14 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   creator's wrapper owns the object: dropping the C++ wrapper, or closing the Java one,
   destroys the object, and `destroy()` does so explicitly, once. A Java wrapper that is
   never closed does not yet release its object when collected. C++ WaitSets keep attached conditions alive as before.
-- Deprecated: `zzdds_create_waitset`/`zzdds_create_guardcondition` (and `_with_allocator`),
-  `zzdds_waitset_is_nil`/`zzdds_guardcondition_is_nil`, `zzdds_destroy_waitset`/
-  `zzdds_destroy_guardcondition`, C++ `zzdds::create_waitset`/`create_guardcondition`, and
-  Java `ZzddsRuntime.createWaitSet`/`createGuardCondition`/`destroyWaitSet`/
-  `destroyGuardCondition`. They still work, through the generated path.
+- Removed C++ `zzdds::create_waitset`/`create_guardcondition` and Java
+  `ZzddsRuntime.createWaitSet`/`createGuardCondition`/`destroyWaitSet`/
+  `destroyGuardCondition`: use the generated `create()` and `destroy()`/`close()`. The examples
+  and integration tests use the generated constructors in every language.
+- Deprecated: the C functions `zzdds_create_waitset`/`zzdds_create_guardcondition` (and
+  `_with_allocator`), `zzdds_waitset_is_nil`/`zzdds_guardcondition_is_nil` and
+  `zzdds_destroy_waitset`/`zzdds_destroy_guardcondition`. They remain only until rmw_zzdds
+  calls the generated functions.
 
 ## 2026-11-15
 

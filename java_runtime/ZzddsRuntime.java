@@ -26,21 +26,6 @@ public final class ZzddsRuntime {
     public static native Object createFactory();
 
     /**
-     * Deprecated: use {@code Dcps.DDS.WaitSet.create()} and
-     * {@code Dcps.DDS.GuardCondition.create()}, which return an
-     * AutoCloseable object its creator owns, and their {@code destroy()}.
-     * These call the same generated constructor and destroy(): the create
-     * methods return null on failure, and each destroy method releases its
-     * object exactly once, after detaching from every WaitSet (for a
-     * GuardCondition) or after detaching every attached condition (for a
-     * WaitSet).
-     */
-    public static native Object createWaitSet();
-    public static native Object createGuardCondition();
-    public static native void destroyWaitSet(Object waitset);
-    public static native void destroyGuardCondition(Object guardcondition);
-
-    /**
      * Registers `typeClass`'s TypeSupport with zzdds under `typeName`.
      * `typeClass` must declare a `static byte[] computeKeyHashFromCdr(byte[])`
      * method (zidl generates this on every topic struct, keyed or keyless) —

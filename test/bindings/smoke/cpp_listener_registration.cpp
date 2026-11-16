@@ -94,14 +94,14 @@ public:
 };
 
 void check_conditions() {
-    auto ws = zzdds::create_waitset();
+    auto ws = ::DDS::WaitSet::create();
     CHECK(ws);
     auto foreign = std::make_shared<ForeignCondition>();
     CHECK(ws->attach_condition(foreign) == ::DDS::RETCODE_BAD_PARAMETER);
     CHECK(ws->detach_condition(foreign) != ::DDS::RETCODE_OK);
 
     // A guard condition registered by zzdds_cpp.hpp comes back as itself.
-    auto gc = zzdds::create_guardcondition();
+    auto gc = ::DDS::GuardCondition::create();
     CHECK(gc);
     CHECK(ws->attach_condition(gc) == ::DDS::RETCODE_OK);
     ::DDS::ConditionSeq attached;

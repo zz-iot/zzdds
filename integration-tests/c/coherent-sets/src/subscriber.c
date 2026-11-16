@@ -124,8 +124,8 @@ int main(int argc, char **argv) {
     VelocityDataReader velocity_reader;
     VelocityDataReader_init(&velocity_reader, velocity_dr);
 
-    DDS_WaitSet ws = zzdds_create_waitset();
-    if (zzdds_waitset_is_nil(ws)) {
+    DDS_WaitSet ws = DDS_WaitSet_create();
+    if (!ws) {
         fprintf(stderr, "FAIL: create_waitset() failed\n");
         return 1;
     }
@@ -255,7 +255,7 @@ int main(int argc, char **argv) {
     DDS_DataReader_delete_readcondition(velocity_dr, velocity_rc);
     DDS_Subscriber_delete_datareader(sub, position_dr);
     DDS_Subscriber_delete_datareader(sub, velocity_dr);
-    zzdds_destroy_waitset(ws);
+    DDS_WaitSet_destroy(ws);
 
     zzdds_destroy_factory(factory);
     return 0;

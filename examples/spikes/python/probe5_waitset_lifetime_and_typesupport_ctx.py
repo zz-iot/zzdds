@@ -9,7 +9,7 @@ controlled, ctx must survive until the hook fires)?
 
 --waitset          WaitSet is app-instantiated with no owning factory,
                     confirmed identical to GuardCondition's shape
-                    (zzdds_create_waitset, no factory). Spawns a background
+                    (DDS_WaitSet_create, no factory). Spawns a background
                     thread blocked inside a real DDS_WaitSet_wait() call,
                     then drops the only Python reference to a GC-triggered-
                     destroy wrapper around the SAME WaitSet the background
@@ -46,12 +46,10 @@ DDS_RETCODE_OK = 0
 def load_and_declare():
     zzdds = ctypes.CDLL(ZZDDS_LIB)
 
-    zzdds.zzdds_create_waitset.restype = c_void_p
-    zzdds.zzdds_create_waitset.argtypes = []
-    zzdds.zzdds_destroy_waitset.restype = None
-    zzdds.zzdds_destroy_waitset.argtypes = [c_void_p]
-    zzdds.zzdds_waitset_is_nil.restype = ctypes.c_bool
-    zzdds.zzdds_waitset_is_nil.argtypes = [c_void_p]
+    zzdds.DDS_WaitSet_create.restype = c_void_p
+    zzdds.DDS_WaitSet_create.argtypes = []
+    zzdds.DDS_WaitSet_destroy.restype = ctypes.c_int
+    zzdds.DDS_WaitSet_destroy.argtypes = [c_void_p]
 
     class DDS_Duration_t(ctypes.Structure):
         _fields_ = [("sec", ctypes.c_int32), ("nanosec", ctypes.c_uint32)]
@@ -92,16 +90,16 @@ class WaitSetWrapper:
     def __del__(self):
         if self._handle:
             print(f"[wrapper] __del__ destroying waitset handle={self._handle:#x}", flush=True)
-            self._zzdds.zzdds_destroy_waitset(self._handle)
+            self._zzdds.DDS_WaitSet_destroy(self._handle)
             self._handle = None
 
 
 def run_waitset():
     zzdds, DDS_Duration_t, DDS_ConditionSeq, _, _ = load_and_declare()
 
-    ws_handle = zzdds.zzdds_create_waitset()
-    if zzdds.zzdds_waitset_is_nil(ws_handle):
-        sys.exit("FAIL: zzdds_create_waitset() returned nil")
+    ws_handle = zzdds.DDS_WaitSet_create()
+    if not ws_handle:
+        sys.exit("FAIL: DDS_WaitSet_create() returned NULL")
     wrapper = WaitSetWrapper(zzdds, ws_handle)
 
     result = {"wait_rc": None, "entered": False, "returned": False}

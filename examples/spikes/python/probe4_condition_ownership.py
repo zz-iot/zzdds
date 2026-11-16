@@ -35,7 +35,7 @@ Two demonstrations:
 
 Both modes create a standalone WaitSet + GuardCondition directly -- neither
 needs a participant, topic, or any domain traffic (see zzdds's own
-zzdds_create_waitset/zzdds_create_guardcondition doc comments: both are
+DDS_WaitSet_create/DDS_GuardCondition_create in dcps.h: both are
 app-instantiated with no owning factory).
 """
 import ctypes
@@ -73,18 +73,14 @@ def load_and_declare():
         sys.exit(f"FAIL: libzzdds.so not found at {ZZDDS_LIB}")
     zzdds = ctypes.CDLL(ZZDDS_LIB)
 
-    zzdds.zzdds_create_waitset.restype = c_void_p
-    zzdds.zzdds_create_waitset.argtypes = []
-    zzdds.zzdds_create_guardcondition.restype = c_void_p
-    zzdds.zzdds_create_guardcondition.argtypes = []
-    zzdds.zzdds_destroy_waitset.restype = None
-    zzdds.zzdds_destroy_waitset.argtypes = [c_void_p]
-    zzdds.zzdds_destroy_guardcondition.restype = None
-    zzdds.zzdds_destroy_guardcondition.argtypes = [c_void_p]
-    zzdds.zzdds_waitset_is_nil.restype = ctypes.c_bool
-    zzdds.zzdds_waitset_is_nil.argtypes = [c_void_p]
-    zzdds.zzdds_guardcondition_is_nil.restype = ctypes.c_bool
-    zzdds.zzdds_guardcondition_is_nil.argtypes = [c_void_p]
+    zzdds.DDS_WaitSet_create.restype = c_void_p
+    zzdds.DDS_WaitSet_create.argtypes = []
+    zzdds.DDS_GuardCondition_create.restype = c_void_p
+    zzdds.DDS_GuardCondition_create.argtypes = []
+    zzdds.DDS_WaitSet_destroy.restype = ctypes.c_int
+    zzdds.DDS_WaitSet_destroy.argtypes = [c_void_p]
+    zzdds.DDS_GuardCondition_destroy.restype = ctypes.c_int
+    zzdds.DDS_GuardCondition_destroy.argtypes = [c_void_p]
 
     zzdds.DDS_GuardCondition_as_DDS_Condition.restype = c_void_p
     zzdds.DDS_GuardCondition_as_DDS_Condition.argtypes = [c_void_p]
@@ -118,7 +114,7 @@ class GuardConditionWrapper:
     def __del__(self):
         if self._handle:
             print(f"[wrapper] __del__ destroying guardcondition handle={self._handle:#x}", flush=True)
-            self._zzdds.zzdds_destroy_guardcondition(self._handle)
+            self._zzdds.DDS_GuardCondition_destroy(self._handle)
             self._handle = None
 
 
@@ -135,13 +131,13 @@ def attached_count(zzdds, waitset):
 def run_vanish():
     zzdds = load_and_declare()
 
-    waitset = zzdds.zzdds_create_waitset()
-    if zzdds.zzdds_waitset_is_nil(waitset):
-        sys.exit("FAIL: zzdds_create_waitset() returned nil")
+    waitset = zzdds.DDS_WaitSet_create()
+    if not waitset:
+        sys.exit("FAIL: DDS_WaitSet_create() returned NULL")
 
-    gc_handle = zzdds.zzdds_create_guardcondition()
-    if zzdds.zzdds_guardcondition_is_nil(gc_handle):
-        sys.exit("FAIL: zzdds_create_guardcondition() returned nil")
+    gc_handle = zzdds.DDS_GuardCondition_create()
+    if not gc_handle:
+        sys.exit("FAIL: DDS_GuardCondition_create() returned NULL")
 
     wrapper = GuardConditionWrapper(zzdds, gc_handle)
     cond = zzdds.DDS_GuardCondition_as_DDS_Condition(wrapper._handle)
@@ -164,7 +160,7 @@ def run_vanish():
     after = attached_count(zzdds, waitset)
     print(f"[main] after drop+collect, get_conditions() reports {after} condition(s)")
 
-    zzdds.zzdds_destroy_waitset(waitset)
+    zzdds.DDS_WaitSet_destroy(waitset)
 
     if after == 0:
         print("[main] CONFIRMED: the condition silently vanished from the waitset -- "
@@ -179,13 +175,13 @@ def run_vanish():
 def run_crash():
     zzdds = load_and_declare()
 
-    waitset = zzdds.zzdds_create_waitset()
-    if zzdds.zzdds_waitset_is_nil(waitset):
-        sys.exit("FAIL: zzdds_create_waitset() returned nil")
+    waitset = zzdds.DDS_WaitSet_create()
+    if not waitset:
+        sys.exit("FAIL: DDS_WaitSet_create() returned NULL")
 
-    gc_handle = zzdds.zzdds_create_guardcondition()
-    if zzdds.zzdds_guardcondition_is_nil(gc_handle):
-        sys.exit("FAIL: zzdds_create_guardcondition() returned nil")
+    gc_handle = zzdds.DDS_GuardCondition_create()
+    if not gc_handle:
+        sys.exit("FAIL: DDS_GuardCondition_create() returned NULL")
 
     wrapper = GuardConditionWrapper(zzdds, gc_handle)
     cond = zzdds.DDS_GuardCondition_as_DDS_Condition(wrapper._handle)
@@ -207,7 +203,7 @@ def run_crash():
     zzdds.DDS_GuardCondition_set_trigger_value(escaped_handle, True)
 
     print("[main] survived the use-after-free call (see README before trusting this)", flush=True)
-    zzdds.zzdds_destroy_waitset(waitset)
+    zzdds.DDS_WaitSet_destroy(waitset)
     print("PASS (crash mode did not crash -- see README)")
 
 

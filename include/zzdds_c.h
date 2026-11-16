@@ -87,8 +87,10 @@ bool zzdds_factory_is_nil(zzdds_DomainParticipantFactory factory);
 void zzdds_destroy_factory(zzdds_DomainParticipantFactory factory);
 
 /**
- * Deprecated: dcps.h declares the generated constructors and destructors
- * of these standalone objects, which every binding uses:
+ * Deprecated, kept only for rmw_zzdds until it moves to the generated
+ * functions; do not use in new code. dcps.h declares the generated
+ * constructors and destructors of these standalone objects, which every
+ * binding and example uses:
  *
  *     DDS_WaitSet DDS_WaitSet_create(void);
  *     DDS_WaitSet DDS_WaitSet_create_with_allocator(const ZidlAllocator *allocator);

@@ -710,8 +710,11 @@ fn exportConstructors() void {
 }
 
 /// Deprecated forms of the generated DDS_WaitSet_create/DDS_GuardCondition_create
-/// and their destroy operations, kept until their callers move: they return
-/// the nil sentinel on failure where the generated constructors return NULL.
+/// and their destroy operations, kept only for rmw_zzdds (rmw_wait.cpp): remove
+/// them, with zzdds_waitset_is_nil/zzdds_guardcondition_is_nil and
+/// zzdds_destroy_waitset/zzdds_destroy_guardcondition, once it calls the
+/// generated functions. They return the nil sentinel on failure where the
+/// generated constructors return NULL.
 pub export fn zzdds_create_waitset() callconv(.c) *anyopaque {
     return zzdds_create_waitset_with_allocator(null);
 }
@@ -759,11 +762,9 @@ pub export fn zzdds_create_guardcondition_with_allocator(allocator: ?*const zidl
     );
 }
 
-/// Mirrors zzdds_factory_is_nil -- lets a caller (e.g. the C++ binding's
-/// create_waitset()/create_guardcondition() wrappers, which need to know
-/// whether to return an empty shared_ptr) tell a real WaitSet/GuardCondition
-/// apart from the boxed nil sentinel zzdds_create_waitset[_with_allocator]
-/// returns on allocation failure.
+/// Deprecated, with zzdds_create_waitset: mirrors zzdds_factory_is_nil, telling
+/// a real WaitSet/GuardCondition apart from the boxed nil sentinel
+/// zzdds_create_waitset[_with_allocator] returns on allocation failure.
 pub export fn zzdds_waitset_is_nil(waitset: *anyopaque) callconv(.c) bool {
     const w = zidl_bindings.unboxAs(DDS.WaitSet, waitset);
     return w.ptr == nil.NIL_PTR;
@@ -774,8 +775,8 @@ pub export fn zzdds_guardcondition_is_nil(guardcondition: *anyopaque) callconv(.
     return g.ptr == nil.NIL_PTR;
 }
 
-/// WaitSet/GuardCondition have no owning factory to delete them through
-/// (see zzdds_create_waitset's doc comment) — mirrors zzdds_destroy_factory.
+/// Deprecated, with zzdds_create_waitset: use the generated
+/// DDS_WaitSet_destroy/DDS_GuardCondition_destroy. Mirrors zzdds_destroy_factory.
 pub export fn zzdds_destroy_waitset(waitset: *anyopaque) callconv(.c) void {
     const w = zidl_bindings.unboxAs(DDS.WaitSet, waitset);
     if (w.ptr == nil.NIL_PTR) return;

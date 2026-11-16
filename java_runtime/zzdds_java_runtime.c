@@ -15,19 +15,6 @@
 #include "dcps.h"
 #include "zzdds_c.h"
 
-/* Defined (non-static, on purpose) in the generated dcps_jni.c, compiled
- * into the same libzzdds_jni.so -- see that function's own doc comment.
- * GuardCondition has no factory operation in dcps.idl (app-instantiated
- * directly per spec), so createGuardCondition() below constructs its Java
- * object by hand rather than through the generated zidl_java_box_DDS_
- * GuardCondition, and needs to register it into Condition's shared
- * box-identity cache itself -- otherwise WaitSet.wait()'s generic
- * zidl_java_box_DDS_Condition would still construct an unrelated second
- * object for the same handle, even with the shared cache in place on the
- * generated side. See zidl/docs/design/binding-c-abi-identity.md and
- * zidl/CHANGELOG.md (v0.3.5) for the fuller writeup. */
-extern void _zidl_family_DDS_Condition_register_external(JNIEnv *env, void *handle, jobject obj);
-
 /* GetFieldID fails (leaving a pending NoSuchFieldError) for any object
  * whose class has no `ptr_` field at all -- e.g. a caller passing some
  * unrelated Java object where a zzdds entity wrapper was expected. Calling
@@ -69,7 +56,6 @@ static void *zzdds_java_unbox(JNIEnv *env, jobject obj) {
  * site in this file with the same risk profile -- see CHANGELOG.md
  * (2026-08-20) for the full audit. Deliberately NOT applied to the
  * handful of call sites where null already has real, documented meaning:
- * destroyWaitSet/destroyGuardCondition's idempotent-destroy convention,
  * cftMatchSample's cft==NULL "no filter" convention, and
  * zzdds_java_waitset_attach_condition's explicit cond==NULL pass-through.
  */
@@ -257,17 +243,6 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createFactory(JNIEn
     return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)df);
 }
 
-/* ── WaitSet / GuardCondition bootstrap ──────────────────────────────────
- *
- * Same reasoning as createFactory() above: neither has a factory operation
- * in dcps.idl (per OMG spec, both are app-instantiated directly), so both
- * bootstrap through the same hand-written zzdds_create_waitset()/
- * zzdds_create_guardcondition() the C/C++ examples use. Unlike
- * DomainParticipantFactory, neither is a zzdds-extended type, so the boxed
- * handle these return is already the right DDS_WaitSet/DDS_GuardCondition
- * shape -- no _as_DDS_ upcast step needed before boxing into the generated
- * WaitSetImpl/GuardConditionImpl Java class.
- */
 /* ── WaitSet condition-attachment keepalive ──────────────────────────────
  *
  * Mirrors zzdds_cpp.hpp's WaitSetSupport::attach_condition -- see that
@@ -434,46 +409,6 @@ jint zzdds_java_on_load(JavaVM *vm, JNIEnv *env) {
     if ((*env)->RegisterNatives(env, cls, methods, 1) != 0) (*env)->ExceptionClear(env);
     (*env)->DeleteLocalRef(env, cls);
     return 0;
-}
-
-/* The deprecated ZzddsRuntime entry points, now through the generated
- * constructor and destroy(): `impl` is the generated *Impl class. */
-static jobject zzdds_java_call_create(JNIEnv *env, const char *impl, const char *sig) {
-    jclass cls = (*env)->FindClass(env, impl);
-    if (cls == NULL) return NULL;
-    jmethodID mid = (*env)->GetStaticMethodID(env, cls, "create", sig);
-    jobject obj = mid != NULL ? (*env)->CallStaticObjectMethod(env, cls, mid) : NULL;
-    (*env)->DeleteLocalRef(env, cls);
-    return obj;
-}
-
-static void zzdds_java_call_destroy(JNIEnv *env, jobject obj, zzdds_java_class_cache *cache, const char *impl, const char *param_name) {
-    if (obj == NULL) return; /* idempotent destroy -- see this file's own top-of-section comment */
-    if (!zzdds_java_require_instance_of(env, obj, cache, impl, param_name)) return;
-    jmethodID mid = (*env)->GetMethodID(env, cache->cls, "destroy", "()I");
-    if (mid != NULL) (void)(*env)->CallIntMethod(env, obj, mid);
-}
-
-JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createWaitSet(JNIEnv *env, jclass self_cls) {
-    (void)self_cls;
-    return zzdds_java_call_create(env, "io/zzdds/dcps/WaitSetImpl", "()Lio/zzdds/dcps/WaitSetImpl;");
-}
-
-JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createGuardCondition(JNIEnv *env, jclass self_cls) {
-    (void)self_cls;
-    return zzdds_java_call_create(env, "io/zzdds/dcps/GuardConditionImpl", "()Lio/zzdds/dcps/GuardConditionImpl;");
-}
-
-JNIEXPORT void JNICALL Java_io_zzdds_runtime_ZzddsRuntime_destroyWaitSet(JNIEnv *env, jclass self_cls, jobject waitset) {
-    (void)self_cls;
-    static zzdds_java_class_cache cache = {0};
-    zzdds_java_call_destroy(env, waitset, &cache, "io/zzdds/dcps/WaitSetImpl", "waitset");
-}
-
-JNIEXPORT void JNICALL Java_io_zzdds_runtime_ZzddsRuntime_destroyGuardCondition(JNIEnv *env, jclass self_cls, jobject guardcondition) {
-    (void)self_cls;
-    static zzdds_java_class_cache cache = {0};
-    zzdds_java_call_destroy(env, guardcondition, &cache, "io/zzdds/dcps/GuardConditionImpl", "guardcondition");
 }
 
 /* ── TypeSupport registration: one native trampoline, ctx-carrying ──────
