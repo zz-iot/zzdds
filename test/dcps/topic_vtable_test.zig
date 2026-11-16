@@ -492,6 +492,7 @@ test "create_contentfilteredtopic: a ContentFilteredTopic as the related Topic i
 
 fn failProtoReader(
     _: *anyopaque,
+    _: ?*zzdds.dcps.TopicImpl,
     _: []const u8,
     _: []const u8,
     _: DDS.DataReaderQos,
@@ -546,6 +547,7 @@ test "create_datawriter: a protocol writer that cannot be created leaves the Top
     const Fail = struct {
         fn create(
             _: *anyopaque,
+            _: ?*zzdds.dcps.TopicImpl,
             _: []const u8,
             _: []const u8,
             _: DDS.DataWriterQos,

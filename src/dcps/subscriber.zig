@@ -46,9 +46,12 @@ pub const ParticipantCbs = struct {
     /// ContentFilteredTopic; null when it is not this participant's.
     retain_topic: *const fn (ctx: *anyopaque, topic: *anyopaque) ?topic_mod.TopicUse,
 
-    /// Allocate and start an RTPS ProtocolReader for a topic.
+    /// Allocate and start an RTPS ProtocolReader for a topic. `topic` is
+    /// the Topic whose TOPIC_DATA it announces, retained by the reader for
+    /// its life.
     create_proto_reader: *const fn (
         ctx: *anyopaque,
+        topic: ?*topic_mod.TopicImpl,
         topic_name: []const u8,
         type_name: []const u8,
         qos: DDS.DataReaderQos,
@@ -442,6 +445,7 @@ pub const SubscriberImpl = struct {
         var guid: proto.Guid = undefined;
         const pr = self.cbs.create_proto_reader(
             self.cbs.ctx,
+            topic_use.topicImpl(),
             topic_name,
             type_name,
             qos.*,

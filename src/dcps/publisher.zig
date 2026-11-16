@@ -50,9 +50,11 @@ pub const ParticipantCbs = struct {
 
     /// Allocate and start an RTPS ProtocolWriter for a topic.
     /// Called on create_datawriter; the returned ProtocolWriter is owned by
-    /// the DataWriterImpl.
+    /// the DataWriterImpl. `topic` is the Topic whose TOPIC_DATA it
+    /// announces, retained by the writer for its life.
     create_proto_writer: *const fn (
         ctx: *anyopaque,
+        topic: ?*topic_mod.TopicImpl,
         topic_name: []const u8,
         type_name: []const u8,
         qos: DDS.DataWriterQos,
@@ -465,6 +467,7 @@ pub const PublisherImpl = struct {
         var parts: ProtoWriterParts = .{ .pw = undefined, .publication_handle = DDS.HANDLE_NIL, .guid = undefined, .topic_use = topic_use };
         parts.pw = try self.cbs.create_proto_writer(
             self.cbs.ctx,
+            topic_use.topicImpl(),
             a_topic.get_name(),
             a_topic.get_type_name(),
             qos.*,

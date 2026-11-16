@@ -8,6 +8,14 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-16
+
+- SEDP announces each endpoint's Topic TOPIC_DATA as `PID_TOPIC_DATA` (0x002E), and a peer's
+  shows up in the DCPSPublication and DCPSSubscription built-in topics. A reader on a
+  ContentFilteredTopic announces its related Topic's. A Topic's `set_qos` that changes it
+  announces the Topic's DataWriters and DataReaders again. It used to be neither sent nor
+  reported.
+
 ## 2026-11-15
 
 - SEDP announces each endpoint's Publisher or Subscriber GROUP_DATA as `PID_GROUP_DATA`

@@ -526,6 +526,7 @@ fn makeWriterData(
     data_locs: []const Locator,
 ) WriterData {
     disc_adapter.setGroupData(qos, ann.group_data);
+    disc_adapter.setTopicData(qos, ann.topic_data);
     return .{
         .guid = ann.guid,
         .participant_guid = ann.participant_guid,
@@ -546,6 +547,7 @@ fn makeReaderData(
     data_locs: []const Locator,
 ) ReaderData {
     disc_adapter.setGroupData(qos, ann.group_data);
+    disc_adapter.setTopicData(qos, ann.topic_data);
     return .{
         .guid = ann.guid,
         .participant_guid = ann.participant_guid,

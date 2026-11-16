@@ -24,6 +24,23 @@ const extensions_mod = @import("../c_abi/extensions.zig");
 // functions cast it to the correct participant type before returning a DDS handle.
 // The participant is owned externally; TopicImpl borrows it.
 
+/// A copy of a Topic's TOPIC_DATA bytes, owned, and their generation.
+pub const TopicData = struct {
+    bytes: []const u8 = &.{},
+    gen: u32 = 0,
+};
+
+/// What a Topic's participant does with its DataWriters and DataReaders
+/// when its TOPIC_DATA changes.
+pub const Endpoints = struct {
+    /// Prepares their announcements again with the Topic's TOPIC_DATA as it
+    /// is now. On failure some may be prepared with it; preparing them
+    /// again with the TOPIC_DATA restored undoes that.
+    prepare: *const fn (participant: *anyopaque, topic: *TopicImpl) anyerror!void,
+    /// Announces again those announced already.
+    announce: *const fn (participant: *anyopaque, topic: *TopicImpl) void,
+};
+
 pub const TopicImpl = struct {
     alloc: std.mem.Allocator,
     topic_name: [:0]u8, // owned, null-terminated for C API compatibility
@@ -51,7 +68,20 @@ pub const TopicImpl = struct {
     /// announcement while disabled), this flag only gates this Topic's own
     /// operations.
     enabled: std.atomic.Value(bool) = .init(true),
+    /// Guarded by `qos_mu`.
     qos: DDS.TopicQos,
+    /// A leaf: nothing else is locked while it is held, so the participant
+    /// reads TOPIC_DATA under its own locks (topicData).
+    qos_mu: Mutex = .{},
+    /// Guarded by `qos_mu`. Changes with TOPIC_DATA, so an endpoint can tell
+    /// whether what it announces is current without keeping a copy.
+    topic_data_gen: u32 = 0,
+    /// Orders `set_qos` calls, so one changing TOPIC_DATA has its
+    /// endpoints' announcements prepared before the next takes effect.
+    set_qos_mu: Mutex = .{},
+    /// How a change of TOPIC_DATA reaches the announcements of this Topic's
+    /// DataWriters and DataReaders. Set by vtCreateTopic (participant.zig).
+    endpoints: ?Endpoints = null,
     listener_box: *ListenerBox(DDS.TopicListener),
     /// Replaced registrations whose callbacks may still be running.
     retired_listeners: listener_box_mod.Retired(DDS.TopicListener) = .{},
@@ -277,14 +307,62 @@ pub const TopicImpl = struct {
     fn vtSetQos(ctx: *anyopaque, qos: *const DDS.TopicQos) DDS.ReturnCode_t {
         const self = cast(ctx);
         if (!qos_change.consistent(DDS.TopicQos, qos)) return DDS.RETCODE_INCONSISTENT_POLICY;
-        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        self.qos.deinit(self.alloc);
-        self.qos = new_qos;
+        var new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        defer new_qos.deinit(self.alloc);
+        const endpoints = self.endpoints orelse {
+            self.swapQos(&new_qos);
+            return DDS.RETCODE_OK;
+        };
+        var changed = false;
+        {
+            self.set_qos_mu.lock();
+            defer self.set_qos_mu.unlock();
+            changed = !qos_change.eql(DDS.TopicDataQosPolicy, &self.qos.topic_data, &new_qos.topic_data);
+            self.swapQos(&new_qos);
+            if (changed) endpoints.prepare(self.participant_ptr, self) catch {
+                // Back to the TOPIC_DATA they announce, prepared again for
+                // those prepared with the new one already.
+                self.swapQos(&new_qos);
+                endpoints.prepare(self.participant_ptr, self) catch {};
+                return DDS.RETCODE_OUT_OF_RESOURCES;
+            };
+        }
+        // Commits what is prepared last, so a later set_qos announcing
+        // first leaves this one nothing to change.
+        if (changed) endpoints.announce(self.participant_ptr, self);
         return DDS.RETCODE_OK;
+    }
+
+    /// Exchanges `qos` with this Topic's.
+    fn swapQos(self: *Self, qos: *DDS.TopicQos) void {
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
+        if (!qos_change.eql(DDS.TopicDataQosPolicy, &self.qos.topic_data, &qos.topic_data)) self.topic_data_gen +%= 1;
+        std.mem.swap(DDS.TopicQos, &self.qos, qos);
+    }
+
+    /// The generation of this Topic's TOPIC_DATA. Takes only `qos_mu`, as
+    /// `topicData` does.
+    pub fn topicDataGen(self: *Self) u32 {
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
+        return self.topic_data_gen;
+    }
+
+    /// A copy of this Topic's TOPIC_DATA, with its generation. Takes only
+    /// `qos_mu`, so callers may hold their own locks.
+    pub fn topicData(self: *Self, alloc: std.mem.Allocator) !TopicData {
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
+        const v = &self.qos.topic_data.value;
+        const bytes: []const u8 = if (v._buffer) |b| b[0..v._length] else &.{};
+        return .{ .bytes = if (bytes.len > 0) try alloc.dupe(u8, bytes) else &.{}, .gen = self.topic_data_gen };
     }
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.TopicQos) DDS.ReturnCode_t {
         const self = cast(ctx);
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
         qos.* = self.qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
@@ -427,6 +505,16 @@ pub const TopicUse = union(enum) {
             .topic => |t| t.release(),
             .cft => |c| c.release(),
         }
+    }
+
+    /// The Topic whose TOPIC_DATA the endpoint announces: its own, or its
+    /// ContentFilteredTopic's related Topic.
+    pub fn topicImpl(self: TopicUse) ?*TopicImpl {
+        return switch (self) {
+            .none => null,
+            .topic => |t| t,
+            .cft => |c| c.related_impl,
+        };
     }
 
     /// For an endpoint that was never created.

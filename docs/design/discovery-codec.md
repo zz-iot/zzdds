@@ -355,8 +355,7 @@ versus `sedp.zig` today:
   read). `SPDPdiscoveredParticipantData.defaultUnicastLocatorList` is `@id(0x002F)` —
   `0x002F` is the *endpoint* unicast PID; SPDP default unicast is `PID_DEFAULT_UNICAST_LOCATOR`
   `0x0031`.
-* **Lower priority / not emitted today anyway:** `PID_TOPIC_DATA` (0x002E),
-  `PID_DURABILITY_SERVICE` (0x001E),
+* **Lower priority / not emitted today anyway:** `PID_DURABILITY_SERVICE` (0x001E),
   `PID_TIME_BASED_FILTER` (0x0004), `PID_RESOURCE_LIMITS` (0x0041),
   `PID_TRANSPORT_PRIORITY` (0x0049). These now round-trip via retention (§3.3) whether or
   not they get modelled fields; modelling them is independent follow-up.

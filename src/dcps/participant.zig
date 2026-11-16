@@ -256,7 +256,7 @@ const BuiltinSubscriberState = struct {
                 }
             }.f,
             .create_proto_reader = struct {
-                fn f(_: *anyopaque, _: []const u8, _: []const u8, _: DDS.DataReaderQos, _: DDS.PresentationQosPolicy, handle: *DDS.InstanceHandle_t, guid: *Guid) anyerror!proto.ProtocolReader {
+                fn f(_: *anyopaque, _: ?*topic_mod.TopicImpl, _: []const u8, _: []const u8, _: DDS.DataReaderQos, _: DDS.PresentationQosPolicy, handle: *DDS.InstanceHandle_t, guid: *Guid) anyerror!proto.ProtocolReader {
                     handle.* = DDS.HANDLE_NIL;
                     guid.* = std.mem.zeroes(Guid);
                     return noopProtocolReader();
@@ -497,6 +497,15 @@ fn pushBuiltinPublicationCdr(
                 ._release = false,
             };
         } },
+        .topic_data = .{ .value = blk: {
+            const _td = disc.discTopicData(data.qos);
+            break :blk .{
+                ._maximum = @intCast(_td.len),
+                ._length = @intCast(_td.len),
+                ._buffer = @constCast(_td.ptr),
+                ._release = false,
+            };
+        } },
     };
     DDS.PublicationBuiltinTopicData.serialize(&w, v) catch return;
     var key_hash: [16]u8 = undefined;
@@ -538,6 +547,15 @@ fn pushBuiltinSubscriptionCdr(
                 ._maximum = @intCast(_gd.len),
                 ._length = @intCast(_gd.len),
                 ._buffer = @constCast(_gd.ptr),
+                ._release = false,
+            };
+        } },
+        .topic_data = .{ .value = blk: {
+            const _td = disc.discTopicData(data.qos);
+            break :blk .{
+                ._maximum = @intCast(_td.len),
+                ._length = @intCast(_td.len),
+                ._buffer = @constCast(_td.ptr),
                 ._release = false,
             };
         } },
@@ -910,10 +928,17 @@ const ActiveWriter = struct {
     // bug dupePartitionNames already exists to avoid for partition_names.
     qos: DDS.DataWriterQos,
     partition_names: []const []const u8 = &.{}, // heap-owned copy via dupePartitionNames
-    group_data: []const u8 = &.{}, // the Publisher's GROUP_DATA, heap-owned via dupeGroupData
+    group_data: []const u8 = &.{}, // the Publisher's GROUP_DATA, heap-owned via dupeOctets
+    /// The Topic whose TOPIC_DATA it announces, retained by the DataWriter
+    /// until after it leaves `active_writers`.
+    topic: ?*topic_mod.TopicImpl = null,
+    /// The generation of `topic`'s TOPIC_DATA it was prepared with.
+    topic_data_gen: u32 = 0,
+    /// Its Publisher, set as it is first prepared.
+    publisher_handle: DDS.InstanceHandle_t = DDS.HANDLE_NIL,
     presentation: DDS.PresentationQosPolicy = .{},
     /// Discovery holds an announcement prepared with `qos`,
-    /// `partition_names`, `group_data` and `presentation`.
+    /// `partition_names`, `group_data`, `topic_data_gen` and `presentation`.
     prepared: bool = false,
     /// Its announcement was committed: another is a refresh.
     announced: bool = false,
@@ -935,10 +960,13 @@ const ActiveReader = struct {
     // must be zzdds-owned, cloned by subCreateProtoReader.
     qos: DDS.DataReaderQos,
     partition_names: []const []const u8 = &.{}, // heap-owned copy via dupePartitionNames
-    group_data: []const u8 = &.{}, // the Subscriber's GROUP_DATA, heap-owned via dupeGroupData
+    group_data: []const u8 = &.{}, // the Subscriber's GROUP_DATA, heap-owned via dupeOctets
+    /// See ActiveWriter.topic.
+    topic: ?*topic_mod.TopicImpl = null,
+    topic_data_gen: u32 = 0, // see ActiveWriter.topic_data_gen
     presentation: DDS.PresentationQosPolicy = .{},
     /// Discovery holds an announcement prepared with `qos`,
-    /// `partition_names`, `group_data` and `presentation`.
+    /// `partition_names`, `group_data`, `topic_data_gen` and `presentation`.
     prepared: bool = false,
     /// Its announcement was committed: another is a refresh.
     announced: bool = false,
@@ -1795,7 +1823,7 @@ pub const DomainParticipantImpl = struct {
         while (wit.next()) |aw| {
             aw.proto.deinit();
             freePartitionNames(self.alloc, aw.partition_names);
-            freeGroupData(self.alloc, aw.group_data);
+            freeOctets(self.alloc, aw.group_data);
             aw.qos.data_representation.value.deinit(self.alloc);
             freeUserData(self.alloc, aw.qos.user_data);
         }
@@ -1804,7 +1832,7 @@ pub const DomainParticipantImpl = struct {
         while (rit.next()) |ar| {
             ar.proto.deinit();
             freePartitionNames(self.alloc, ar.partition_names);
-            freeGroupData(self.alloc, ar.group_data);
+            freeOctets(self.alloc, ar.group_data);
             ar.qos.data_representation.value.deinit(self.alloc);
             freeUserData(self.alloc, ar.qos.user_data);
         }
@@ -2040,6 +2068,7 @@ pub const DomainParticipantImpl = struct {
 
     fn pubCreateProtoWriter(
         ctx: *anyopaque,
+        topic: ?*topic_mod.TopicImpl,
         topic_name: []const u8,
         type_name: []const u8,
         qos: DDS.DataWriterQos,
@@ -2131,6 +2160,7 @@ pub const DomainParticipantImpl = struct {
                 .handle = publication_handle.*,
                 .guid = guid,
                 .proto = pw,
+                .topic = topic,
                 .topic_name = topic_name,
                 .type_name = type_name,
                 .qos = owned_qos,
@@ -2172,7 +2202,7 @@ pub const DomainParticipantImpl = struct {
         self.mu.unlock();
 
         freePartitionNames(self.alloc, found_parts);
-        freeGroupData(self.alloc, found_group_data);
+        freeOctets(self.alloc, found_group_data);
         found_repr.deinit(self.alloc);
         freeUserData(self.alloc, found_user_data);
         if (found_guid) |g| if (!handed_off) self.retractDeleted(.writer, g);
@@ -2183,6 +2213,7 @@ pub const DomainParticipantImpl = struct {
 
     fn subCreateProtoReader(
         ctx: *anyopaque,
+        topic: ?*topic_mod.TopicImpl,
         topic_name: []const u8,
         type_name: []const u8,
         qos: DDS.DataReaderQos,
@@ -2248,6 +2279,7 @@ pub const DomainParticipantImpl = struct {
                 .handle = subscription_handle.*,
                 .guid = guid,
                 .proto = pr,
+                .topic = topic,
                 .topic_name = topic_name,
                 .type_name = type_name,
                 .qos = owned_qos,
@@ -2298,7 +2330,7 @@ pub const DomainParticipantImpl = struct {
         self.mu.unlock();
 
         freePartitionNames(self.alloc, found_parts);
-        freeGroupData(self.alloc, found_group_data);
+        freeOctets(self.alloc, found_group_data);
         found_repr.deinit(self.alloc);
         freeUserData(self.alloc, found_user_data);
         if (found_guid) |g| if (!handed_off) self.retractDeleted(.reader, g);
@@ -4052,14 +4084,13 @@ pub const DomainParticipantImpl = struct {
         if (names.len > 0) alloc.free(names);
     }
 
-    /// A copy of a Publisher's or Subscriber's GROUP_DATA bytes; free with
-    /// `freeGroupData`.
-    fn dupeGroupData(alloc: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    /// A copy of GROUP_DATA or TOPIC_DATA bytes; free with `freeOctets`.
+    fn dupeOctets(alloc: std.mem.Allocator, bytes: []const u8) ![]const u8 {
         if (bytes.len == 0) return &.{};
         return alloc.dupe(u8, bytes);
     }
 
-    fn freeGroupData(alloc: std.mem.Allocator, bytes: []const u8) void {
+    fn freeOctets(alloc: std.mem.Allocator, bytes: []const u8) void {
         if (bytes.len > 0) alloc.free(bytes);
     }
 
@@ -4272,13 +4303,14 @@ pub const DomainParticipantImpl = struct {
             ann: AnnouncementOf(kind),
             partition_names: ?[]const []const u8,
             group_data: ?[]const u8,
+            topic_data_gen: u32,
             presentation: DDS.PresentationQosPolicy,
             qos: ?QosOf(kind),
 
             fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
                 self.ann.deinit(alloc);
                 if (self.partition_names) |n| freePartitionNames(alloc, n);
-                if (self.group_data) |g| freeGroupData(alloc, g);
+                if (self.group_data) |g| freeOctets(alloc, g);
                 if (self.qos) |*q| freeOwnedQos(alloc, q);
             }
         };
@@ -4354,29 +4386,36 @@ pub const DomainParticipantImpl = struct {
                     .writer => self.findActiveWriterLocked(h),
                     .reader => self.findActiveReaderLocked(h),
                 }) orelse continue;
+                if (kind == .writer and publisher_handle != DDS.HANDLE_NIL) ep.publisher_handle = publisher_handle;
                 const presentation = change.presentation orelse ep.presentation;
-                if (ep.prepared and change.qos == null and std.meta.eql(ep.presentation, presentation) and
+                const topic_data_same = if (ep.topic) |t| t.topicDataGen() == ep.topic_data_gen else true;
+                if (ep.prepared and change.qos == null and topic_data_same and std.meta.eql(ep.presentation, presentation) and
                     (change.partition_names == null or partitionNamesEql(ep.partition_names, change.partition_names.?)) and
                     (change.group_data == null or std.mem.eql(u8, ep.group_data, change.group_data.?))) continue;
                 if (staged.items.len == 0) try self.reserveAnnouncingLocked();
                 try self.ensureLocalGenLocked(ep.guid);
                 const names: ?[]const []const u8 = if (change.partition_names) |n| try dupePartitionNamesOrFail(self.alloc, n) else null;
                 errdefer if (names) |n| freePartitionNames(self.alloc, n);
-                const group_data: ?[]const u8 = if (change.group_data) |g| try dupeGroupData(self.alloc, g) else null;
-                errdefer if (group_data) |g| freeGroupData(self.alloc, g);
+                const group_data: ?[]const u8 = if (change.group_data) |g| try dupeOctets(self.alloc, g) else null;
+                errdefer if (group_data) |g| freeOctets(self.alloc, g);
                 var qos: ?QosOf(kind) = if (change.qos) |q| try ownQos(self.alloc, q.*) else null;
                 errdefer if (qos) |*q| freeOwnedQos(self.alloc, q);
+                // The Topic's TOPIC_DATA as it is now; the announcement
+                // takes a copy.
+                const topic_data: topic_mod.TopicData = if (ep.topic) |t| try t.topicData(self.alloc) else .{};
+                defer freeOctets(self.alloc, topic_data.bytes);
                 const borrowed: AnnouncementOf(kind) = switch (kind) {
                     .writer => .{
                         .guid = ep.guid,
                         .participant_guid = self.guid,
-                        .group_guid = self.groupGuid(presentation, publisher_handle),
+                        .group_guid = self.groupGuid(presentation, ep.publisher_handle),
                         .topic_name = ep.topic_name,
                         .type_name = ep.type_name,
                         .qos = if (qos) |q| q else ep.qos,
                         .presentation = presentation,
                         .partition_names = names orelse ep.partition_names,
                         .group_data = group_data orelse ep.group_data,
+                        .topic_data = topic_data.bytes,
                         .type_object = &.{},
                         .type_info_cdr = self.type_info_registry.get(ep.type_name) orelse &.{},
                     },
@@ -4389,6 +4428,7 @@ pub const DomainParticipantImpl = struct {
                         .presentation = presentation,
                         .partition_names = names orelse ep.partition_names,
                         .group_data = group_data orelse ep.group_data,
+                        .topic_data = topic_data.bytes,
                         .type_info_cdr = self.type_info_registry.get(ep.type_name) orelse &.{},
                     },
                 };
@@ -4397,6 +4437,7 @@ pub const DomainParticipantImpl = struct {
                     .ann = try borrowed.clone(self.alloc),
                     .partition_names = names,
                     .group_data = group_data,
+                    .topic_data_gen = topic_data.gen,
                     .presentation = presentation,
                     .qos = qos,
                 });
@@ -4437,10 +4478,11 @@ pub const DomainParticipantImpl = struct {
                 st.partition_names = null;
             }
             if (st.group_data) |g| {
-                freeGroupData(self.alloc, ep.group_data);
+                freeOctets(self.alloc, ep.group_data);
                 ep.group_data = g;
                 st.group_data = null;
             }
+            ep.topic_data_gen = st.topic_data_gen;
             if (st.qos) |q| {
                 freeOwnedQos(self.alloc, &ep.qos);
                 ep.qos = q;
@@ -4670,6 +4712,54 @@ pub const DomainParticipantImpl = struct {
         unicast_locs: []const Locator,
         multicast_locs: []const Locator,
     };
+
+    /// Prepares the announcements of `topic`'s DataWriters and DataReaders
+    /// again, with its TOPIC_DATA as it is now (topic_mod.Endpoints).
+    fn prepareTopicEndpoints(ctx: *anyopaque, topic: *topic_mod.TopicImpl) anyerror!void {
+        const self = cast(ctx);
+        var writers: std.ArrayListUnmanaged(DDS.InstanceHandle_t) = .empty;
+        defer writers.deinit(self.alloc);
+        var readers: std.ArrayListUnmanaged(DDS.InstanceHandle_t) = .empty;
+        defer readers.deinit(self.alloc);
+        try self.topicEndpoints(topic, &writers, &readers, .all);
+        try self.prepareEndpoints(.writer, writers.items, DDS.HANDLE_NIL, .{});
+        try self.prepareEndpoints(.reader, readers.items, DDS.HANDLE_NIL, .{});
+    }
+
+    /// Announces again `topic`'s DataWriters and DataReaders announced
+    /// already; the others announce what is prepared as they are enabled.
+    fn announceTopicEndpoints(ctx: *anyopaque, topic: *topic_mod.TopicImpl) void {
+        const self = cast(ctx);
+        var writers: std.ArrayListUnmanaged(DDS.InstanceHandle_t) = .empty;
+        defer writers.deinit(self.alloc);
+        var readers: std.ArrayListUnmanaged(DDS.InstanceHandle_t) = .empty;
+        defer readers.deinit(self.alloc);
+        // Out of memory, they announce it as they are next announced.
+        self.topicEndpoints(topic, &writers, &readers, .announced) catch return;
+        for (writers.items) |h| pubAnnounceProtoWriter(self, h);
+        for (readers.items) |h| subAnnounceProtoReader(self, h);
+    }
+
+    /// The handles of `topic`'s DataWriters and DataReaders, or of those
+    /// announced already.
+    fn topicEndpoints(
+        self: *Self,
+        topic: *topic_mod.TopicImpl,
+        writers: *std.ArrayListUnmanaged(DDS.InstanceHandle_t),
+        readers: *std.ArrayListUnmanaged(DDS.InstanceHandle_t),
+        which: enum { all, announced },
+    ) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var wit = self.active_writers.valueIterator();
+        while (wit.next()) |aw| {
+            if (aw.topic == topic and (which == .all or aw.announced)) try writers.append(self.alloc, aw.handle);
+        }
+        var rit = self.active_readers.valueIterator();
+        while (rit.next()) |ar| {
+            if (ar.topic == topic and (which == .all or ar.announced)) try readers.append(self.alloc, ar.handle);
+        }
+    }
 
     /// `pubPrepareProtoWriters`, for readers and their Subscriber.
     fn subPrepareProtoReaders(ctx: *anyopaque, handles: []const DDS.InstanceHandle_t, partition_names: []const []const u8, group_data: []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void {
@@ -5500,6 +5590,7 @@ pub const DomainParticipantImpl = struct {
             mask,
             handle,
         ) catch return nil.nil_topic;
+        t.endpoints = .{ .prepare = prepareTopicEndpoints, .announce = announceTopicEndpoints };
         // Gated on the participant's own enabled state too -- see
         // vtCreatePublisher's identical comment (PR #91 Greptile finding).
         t.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);

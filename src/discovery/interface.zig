@@ -81,6 +81,13 @@ pub fn discGroupData(q: anytype) []const u8 {
     return b[0..g._length];
 }
 
+/// TOPIC_DATA bytes (the endpoint's Topic's), as `discGroupData`.
+pub fn discTopicData(q: anytype) []const u8 {
+    const t = q.topicData orelse return &.{};
+    const b = t._buffer orelse return &.{};
+    return b[0..t._length];
+}
+
 /// Information about the local participant broadcast to remote peers.
 pub const ParticipantAnnouncement = struct {
     guid: Guid,
@@ -149,6 +156,8 @@ pub const WriterAnnouncement = struct {
     /// The parent Publisher's GROUP_DATA bytes. Empty = none. Borrowed as
     /// `partition_names` is.
     group_data: []const u8 = &.{},
+    /// The Topic's TOPIC_DATA bytes, as `group_data`.
+    topic_data: []const u8 = &.{},
     /// TypeObject bytes (zidl-generated), or empty slice if not available.
     type_object: []const u8,
     /// CDR-encoded XTypes TypeInformation blob (PID_TYPE_INFORMATION = 0x0075).
@@ -168,6 +177,8 @@ pub const WriterAnnouncement = struct {
         errdefer freeNames(alloc, out.partition_names);
         out.group_data = try alloc.dupe(u8, self.group_data);
         errdefer alloc.free(out.group_data);
+        out.topic_data = try alloc.dupe(u8, self.topic_data);
+        errdefer alloc.free(out.topic_data);
         out.type_object = try alloc.dupe(u8, self.type_object);
         errdefer alloc.free(out.type_object);
         out.type_info_cdr = try alloc.dupe(u8, self.type_info_cdr);
@@ -182,6 +193,7 @@ pub const WriterAnnouncement = struct {
         alloc.free(self.type_name);
         freeNames(alloc, self.partition_names);
         alloc.free(self.group_data);
+        alloc.free(self.topic_data);
         alloc.free(self.type_object);
         alloc.free(self.type_info_cdr);
         deinitEndpointQos(alloc, &self.qos);
@@ -199,6 +211,8 @@ pub const ReaderAnnouncement = struct {
     partition_names: []const []const u8 = &.{},
     /// The parent Subscriber's GROUP_DATA bytes, as `WriterAnnouncement`'s.
     group_data: []const u8 = &.{},
+    /// The Topic's TOPIC_DATA bytes, as `WriterAnnouncement`'s.
+    topic_data: []const u8 = &.{},
     /// CDR-encoded XTypes TypeInformation blob (PID_TYPE_INFORMATION = 0x0075).
     /// Empty slice if not available; SEDP will omit the PID in that case.
     type_info_cdr: []const u8,
@@ -214,6 +228,8 @@ pub const ReaderAnnouncement = struct {
         errdefer freeNames(alloc, out.partition_names);
         out.group_data = try alloc.dupe(u8, self.group_data);
         errdefer alloc.free(out.group_data);
+        out.topic_data = try alloc.dupe(u8, self.topic_data);
+        errdefer alloc.free(out.topic_data);
         out.type_info_cdr = try alloc.dupe(u8, self.type_info_cdr);
         errdefer alloc.free(out.type_info_cdr);
         out.qos = try cloneEndpointQos(alloc, self.qos);
@@ -226,6 +242,7 @@ pub const ReaderAnnouncement = struct {
         alloc.free(self.type_name);
         freeNames(alloc, self.partition_names);
         alloc.free(self.group_data);
+        alloc.free(self.topic_data);
         alloc.free(self.type_info_cdr);
         deinitEndpointQos(alloc, &self.qos);
     }
