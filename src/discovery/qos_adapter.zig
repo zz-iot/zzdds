@@ -14,6 +14,7 @@
 //!   * `writerGuid` / `readerGuid`, `topicName`, `typeName`
 //!   * `groupGuid` (GROUP-scope publisher only)
 //!   * `partition` (from the Publisher/Subscriber PARTITION names)
+//!   * `groupData` (from the Publisher/Subscriber GROUP_DATA; see `setGroupData`)
 //!   * `unknown_params` (PID_TYPE_INFORMATION blob, writer only)
 
 const std = @import("std");
@@ -214,4 +215,12 @@ pub fn readerDiscoveredData(
         ),
         .dataRepresentation = reprSeq(@FieldType(wire.DiscoveredReaderData, "dataRepresentation"), repr_xcdr2),
     };
+}
+
+/// Sets the GROUP_DATA member of a `DiscoveredWriterData` or
+/// `DiscoveredReaderData` to its Publisher's or Subscriber's `bytes`,
+/// borrowed; left absent when empty.
+pub fn setGroupData(out: anytype, bytes: []const u8) void {
+    const FT = @FieldType(@TypeOf(out.*), "groupData");
+    out.groupData = if (bytes.len > 0) octetSeq(FT, bytes) else null;
 }

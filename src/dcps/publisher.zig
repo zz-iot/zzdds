@@ -86,13 +86,14 @@ pub const ParticipantCbs = struct {
     ) void,
 
     /// Have discovery prepare the announcements of the writers identified
-    /// by handles, with this Publisher's partitions and presentation:
+    /// by handles, with this Publisher's partitions, GROUP_DATA and
+    /// presentation:
     /// reserve what announcing each and later disposing of it needs. Skips
     /// a writer that has one with them prepared already. All or none:
     /// fails changing nothing. Called for a writer at creation, before it
-    /// joins this Publisher, and for all of them when the partitions or
-    /// presentation change.
-    prepare_writers: *const fn (ctx: *anyopaque, handles: []const DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void,
+    /// joins this Publisher, and for all of them when the partitions,
+    /// GROUP_DATA or presentation change.
+    prepare_writers: *const fn (ctx: *anyopaque, handles: []const DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, group_data: []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void,
 
     /// `prepare_writers`, for the writer identified by handle and its new
     /// QoS, before the change takes effect.
@@ -457,6 +458,7 @@ pub const PublisherImpl = struct {
     /// until `finishDataWriter` has registered its matched notify. Separate
     /// so tests can deliver discovery between the two steps.
     pub fn createProtoWriter(self: *Self, a_topic: DDS.Topic, qos: *const DDS.DataWriterQos) !ProtoWriterParts {
+        if (!qos_change.consistent(DDS.DataWriterQos, qos)) return error.InconsistentPolicy;
         // First, before `a_topic` is read: it may not be this participant's.
         const topic_use = self.cbs.retain_topic(self.cbs.ctx, a_topic.ptr) orelse return error.TopicOfAnotherParticipant;
         errdefer topic_use.abandon();
@@ -612,15 +614,16 @@ pub const PublisherImpl = struct {
     }
 
     /// Prepares the writer's announcement with this Publisher's current
-    /// partitions and presentation (see ParticipantCbs.prepare_writer).
+    /// partitions, GROUP_DATA and presentation (see
+    /// ParticipantCbs.prepare_writers).
     fn prepareDataWriter(self: *Self, publication_handle: DDS.InstanceHandle_t) !void {
         self.qos_mu.lock();
         defer self.qos_mu.unlock();
         try self.prepareDataWritersLocked(&.{publication_handle}, &self.qos);
     }
 
-    /// `prepareDataWriter` for `handles`, with the partitions and
-    /// presentation of `qos`. With `qos_mu` held.
+    /// `prepareDataWriter` for `handles`, with the partitions, GROUP_DATA
+    /// and presentation of `qos`. With `qos_mu` held.
     fn prepareDataWritersLocked(self: *Self, handles: []const DDS.InstanceHandle_t, qos: *const DDS.PublisherQos) !void {
         const pname_seq = &qos.partition.name;
         const pname_count: u32 = if (pname_seq._buffer != null) pname_seq._length else 0;
@@ -629,7 +632,13 @@ pub const PublisherImpl = struct {
         if (pname_seq._buffer) |b| for (pname_slice, 0..) |*s, i| {
             s.* = std.mem.span(b[i]);
         };
-        try self.cbs.prepare_writers(self.cbs.ctx, handles, self.instance_handle, pname_slice, qos.presentation);
+        try self.cbs.prepare_writers(self.cbs.ctx, handles, self.instance_handle, pname_slice, groupDataOf(qos), qos.presentation);
+    }
+
+    /// The GROUP_DATA bytes of `qos`, borrowed.
+    fn groupDataOf(qos: *const DDS.PublisherQos) []const u8 {
+        const g = qos.group_data.value._buffer orelse return &.{};
+        return g[0..qos.group_data.value._length];
     }
 
     /// Has the writer `publication_handle`'s announcement prepared with its
@@ -733,9 +742,10 @@ pub const PublisherImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    /// A change of partitions has every writer's announcement prepared
-    /// again first: should that fail, nothing changes and the call returns
-    /// OUT_OF_RESOURCES. The enabled writers are then announced again
+    /// A change of partitions, GROUP_DATA or presentation has every
+    /// writer's announcement prepared again first: should that fail,
+    /// nothing changes and the call returns OUT_OF_RESOURCES. The enabled
+    /// writers are then announced again
     /// (docs/design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal).
     fn vtSetQos(ctx: *anyopaque, qos: *const DDS.PublisherQos) DDS.ReturnCode_t {
         const self = cast(ctx);
@@ -749,6 +759,7 @@ pub const PublisherImpl = struct {
                 return DDS.RETCODE_IMMUTABLE_POLICY;
             var new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
             if (!qos_change.eql(DDS.PartitionQosPolicy, &self.qos.partition, &qos.partition) or
+                !qos_change.eql(DDS.GroupDataQosPolicy, &self.qos.group_data, &qos.group_data) or
                 !qos_change.eql(DDS.PresentationQosPolicy, &self.qos.presentation, &qos.presentation))
             {
                 self.writerHandles(&handles, .all) catch {
@@ -1052,6 +1063,7 @@ pub const PublisherImpl = struct {
     // just makes the failure quieter.
     fn vtSetDefaultDwQos(ctx: *anyopaque, qos: *const DDS.DataWriterQos) DDS.ReturnCode_t {
         const self = cast(ctx);
+        if (!qos_change.consistent(DDS.DataWriterQos, qos)) return DDS.RETCODE_INCONSISTENT_POLICY;
         const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         self.default_dw_qos.deinit(self.alloc);
         self.default_dw_qos = new_qos;

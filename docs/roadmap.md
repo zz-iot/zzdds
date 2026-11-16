@@ -63,10 +63,6 @@ Forward-looking only: known gaps, planned features, and open design questions.
 - **GUID generation platform coverage** — the fallback paths only keep unsupported targets
   building. For each supported OS, provide real entropy, PID, and monotonic-clock
   implementations.
-- **Participant teardown can take several seconds** under live reliability timers.
-  `beginProbe`'s hardcoded 1-second deadline per in-flight probe is a still-open root cause
-  (PR #48 only fixed `UdpTransport` socket teardown). Worth a dedicated look so teardown is
-  fast in all cases.
 - **LocatorSelector is Phase 1 only** (per-proxy ranking). Deferred, not precluded:
   cross-proxy multicast fan-out grouping (send once for N readers sharing a multicast
   group; needs a writer-level view across the matched-proxy set; migration target
@@ -130,7 +126,6 @@ Forward-looking only: known gaps, planned features, and open design questions.
   implementation would pre-allocate the instance's history-cache entry, pre-warm SEDP
   discovery state, and add a `zzdds_write_raw_kind_w_handle` variant that takes a
   pre-registered handle to skip the MD5 key-hash recompute on the write hot path.
-- **`PID_GROUP_DATA` (0x002D)** is defined but not serialized in SEDP announcements.
 - **TCP transport has no multicast** (`vtJoinMulticast` → `error.UnsupportedOperation`), and
   there is no "TCP for discovery too" mode — SPDP/SEDP stay on UDP even when the user-data
   transport is TCP.
@@ -200,12 +195,9 @@ Forward-looking only: known gaps, planned features, and open design questions.
   gives each datagram to one socket. Related sharp edge: unicast sockets are bound with
   `SO_REUSEADDR`, so two transports given the same fixed `participant_id` or port
   overrides both bind, and one of them silently stops receiving; that should fail loudly.
-- **`set_qos` checks no consistency between policies.** A writer's or reader's immutable
-  policies cannot change (IMMUTABLE_POLICY, before `enable` too, as the protocol endpoint
-  is made with them), and a change to the mutable ones, or to a Publisher's or
-  Subscriber's partitions, is announced. Neither `set_qos` nor creation returns
-  INCONSISTENT_POLICY: a reader's DEADLINE shorter than its TIME_BASED_FILTER, say, is
-  accepted. A Topic's or participant's QoS change is not announced either.
+- **A Topic's or participant's QoS change is not announced.** A writer's or reader's
+  change to its mutable policies, or a Publisher's or Subscriber's to its partitions or
+  GROUP_DATA, is announced again; a Topic's or participant's `set_qos` is not.
 - **In-process discovery can miss a peer when out of memory.** `DirectDiscovery`
   commits an announcement into the bus without allocating, but telling the other
   participants copies it for each of them, and a copy that fails is skipped; nothing

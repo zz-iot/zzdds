@@ -135,6 +135,7 @@ struct DiscoveredWriterData {
     @id(0x002B) @optional Duration_t        lifespan;           // omitted when INFINITE
     @id(0x0073)           sequence<short>   dataRepresentation; // always a 1-element seq ([0]=XCDR1, [2]=XCDR2)
     @id(0x0029) @optional sequence<string>  partition;          // PID_PARTITION; omitted when empty
+    @id(0x002D) @optional sequence<octet>   groupData;          // PID_GROUP_DATA (Publisher/Subscriber); omitted when empty
 };
 
 // ── DiscoveredReaderData (§8.5.4.3, §9.6.2.3) ───────────────────────────────
@@ -165,6 +166,7 @@ struct DiscoveredReaderData {
     @id(0x0027) @optional Duration_t        latencyBudget;      // decode only; never emitted
     @id(0x001B) @optional LivelinessWire    liveliness;         // omitted at AUTOMATIC + INFINITE
     @id(0x0029) @optional sequence<string>  partition;          // PID_PARTITION; omitted when empty
+    @id(0x002D) @optional sequence<octet>   groupData;          // PID_GROUP_DATA (Publisher/Subscriber); omitted when empty
 };
 
 // ── EndpointDisposal ───────────────────────────────────────────────────────

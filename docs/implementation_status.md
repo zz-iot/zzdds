@@ -158,11 +158,6 @@ uses PID/time on supported OSes and PID `0` plus a constant clock seed on unsupp
 Add target-specific entropy, PID, and monotonic-clock support before claiming production
 support for those targets.
 
-**`PID_GROUP_DATA` wire value.** `pid.zig` defines `GROUP_DATA = 0x002D` per RTPS 2.5 Table 9.18.
-The constant is present but not yet serialized in SEDP announcements; when GROUP_DATA serialization
-is added, confirm that peers expect `0x002D` (not the historical `0x0056` used by some older
-implementations).
-
 **`dds-rtps` `CoherentSets_10/11/12/19/20/21` flakiness — mostly a zzdds subscriber bug,
 fixed 2026-10-07.** A zzdds subscriber committed a writer's in-progress coherent set when
 a HEARTBEAT said it had every sample written so far. Vendor writers that send each sample

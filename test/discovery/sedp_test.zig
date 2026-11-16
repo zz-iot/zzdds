@@ -645,6 +645,61 @@ test "SEDP: WriterAnnouncement USER_DATA round-trips as binary octets" {
     try testing.expectEqualSlices(u8, &user_data, remote.rec.writers_found.items[0].user_data);
 }
 
+test "SEDP: a writer's Publisher GROUP_DATA and a reader's Subscriber GROUP_DATA round-trip as binary octets, absent when empty" {
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+
+    var local = try Participant.init(net, 0x33);
+    var remote = try Participant.init(net, 0x34);
+    defer local.deinit();
+    defer remote.deinit();
+    local.discoverPeer(0x34);
+    remote.discoverPeer(0x33);
+
+    const pub_group = [_]u8{ 'p', 'u', 'b', 0, 0xfe };
+    const sub_group = [_]u8{ 0xff, 's', 'u', 'b' };
+    try announceWriterNow(local.sedp, &.{
+        .guid = makeGuid(0x33, 0x10),
+        .participant_guid = makeGuid(0x33, 0x01),
+        .topic_name = "T",
+        .type_name = "TT",
+        .qos = .{},
+        .group_data = &pub_group,
+        .type_object = &.{},
+        .type_info_cdr = &.{},
+    });
+    try announceReaderNow(local.sedp, &.{
+        .guid = makeGuid(0x33, 0x11),
+        .participant_guid = makeGuid(0x33, 0x01),
+        .topic_name = "T",
+        .type_name = "TT",
+        .qos = .{},
+        .group_data = &sub_group,
+        .type_info_cdr = &.{},
+    });
+    try announceWriterNow(local.sedp, &.{
+        .guid = makeGuid(0x33, 0x12),
+        .participant_guid = makeGuid(0x33, 0x01),
+        .topic_name = "T",
+        .type_name = "TT",
+        .qos = .{},
+        .type_object = &.{},
+        .type_info_cdr = &.{},
+    });
+    net.deliverAll();
+
+    try testing.expectEqual(@as(usize, 2), remote.rec.writers_found.items.len);
+    try testing.expectEqual(@as(usize, 1), remote.rec.readers_found.items.len);
+    for (remote.rec.writers_found.items) |*w| {
+        if (w.guid.eql(makeGuid(0x33, 0x10))) {
+            try testing.expectEqualSlices(u8, &pub_group, iface.discGroupData(&w.qos));
+        } else {
+            try testing.expect(w.qos.groupData == null);
+        }
+    }
+    try testing.expectEqualSlices(u8, &sub_group, iface.discGroupData(&remote.rec.readers_found.items[0].qos));
+}
+
 test "SEDP: ReaderAnnouncement with non-default PRESENTATION round-trips correctly" {
     const net = try MockNetwork.init(testing.allocator);
     defer net.deinit();

@@ -8,6 +8,20 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-15
+
+- SEDP announces each endpoint's Publisher or Subscriber GROUP_DATA as `PID_GROUP_DATA`
+  (0x002D), and a peer's shows up in the DCPSPublication and DCPSSubscription built-in topics.
+  A Publisher's or Subscriber's `set_qos` that changes it announces its endpoints again. The
+  PID used to be defined but never sent, and a peer's was never reported.
+- QoS whose policies are inconsistent (DDS 1.4 §2.2.3) is refused.
+  `create_topic`, `create_datawriter` and `create_datareader` create nothing, and `set_qos`
+  and `set_default_*_qos` return `INCONSISTENT_POLICY`. The checks: a KEEP_LAST HISTORY
+  no deeper than RESOURCE_LIMITS' `max_samples_per_instance`, which `max_samples` is no
+  smaller than, the same within DURABILITY_SERVICE, and a reader's DEADLINE period no
+  shorter than its TIME_BASED_FILTER separation. Unlimited limits and an unset DEADLINE
+  always pass. Such QoS, which the spec prohibits, used to be accepted.
+
 ## 2026-11-14
 
 - The process config (`zzdds.toml`, or `zzdds_process_configure_from_file`) gains a

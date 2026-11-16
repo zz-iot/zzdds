@@ -81,13 +81,14 @@ pub const ParticipantCbs = struct {
     ) void,
 
     /// Have discovery prepare the announcements of the readers identified
-    /// by handles, with this Subscriber's partitions and presentation:
+    /// by handles, with this Subscriber's partitions, GROUP_DATA and
+    /// presentation:
     /// reserve what announcing each and later disposing of it needs. Skips
     /// a reader that has one with them prepared already. All or none:
     /// fails changing nothing. Called for a reader at creation, before it
-    /// joins this Subscriber, and for all of them when the partitions or
-    /// presentation change.
-    prepare_readers: *const fn (ctx: *anyopaque, handles: []const DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void,
+    /// joins this Subscriber, and for all of them when the partitions,
+    /// GROUP_DATA or presentation change.
+    prepare_readers: *const fn (ctx: *anyopaque, handles: []const DDS.InstanceHandle_t, partition_names: []const []const u8, group_data: []const u8, presentation: DDS.PresentationQosPolicy) anyerror!void,
 
     /// `prepare_readers`, for the reader identified by handle and its new
     /// QoS, before the change takes effect.
@@ -431,6 +432,7 @@ pub const SubscriberImpl = struct {
     ) DDS.DataReader {
         // See publisher.zig's identical comment on create_datawriter: not
         // gated on this Subscriber's own enabled state, for the same reason.
+        if (!qos_change.consistent(DDS.DataReaderQos, qos)) return nil.nil_datareader;
         // First, before `a_topic` is read: it may not be this participant's.
         const topic_use = self.cbs.retain_topic(self.cbs.ctx, a_topic.ptr) orelse return nil.nil_datareader;
         const topic_name = a_topic.get_name();
@@ -587,8 +589,8 @@ pub const SubscriberImpl = struct {
         try self.prepareDataReadersLocked(&.{subscription_handle}, &self.qos);
     }
 
-    /// `prepareDataReader` for `handles`, with the partitions and
-    /// presentation of `qos`. With `qos_mu` held.
+    /// `prepareDataReader` for `handles`, with the partitions, GROUP_DATA
+    /// and presentation of `qos`. With `qos_mu` held.
     fn prepareDataReadersLocked(self: *Self, handles: []const DDS.InstanceHandle_t, qos: *const DDS.SubscriberQos) !void {
         const pname_seq = &qos.partition.name;
         const pname_count: u32 = if (pname_seq._buffer != null) pname_seq._length else 0;
@@ -597,7 +599,13 @@ pub const SubscriberImpl = struct {
         if (pname_seq._buffer) |b| for (pname_slice, 0..) |*s, i| {
             s.* = std.mem.span(b[i]);
         };
-        try self.cbs.prepare_readers(self.cbs.ctx, handles, pname_slice, qos.presentation);
+        try self.cbs.prepare_readers(self.cbs.ctx, handles, pname_slice, groupDataOf(qos), qos.presentation);
+    }
+
+    /// The GROUP_DATA bytes of `qos`, borrowed.
+    fn groupDataOf(qos: *const DDS.SubscriberQos) []const u8 {
+        const g = qos.group_data.value._buffer orelse return &.{};
+        return g[0..qos.group_data.value._length];
     }
 
     /// Has the reader `subscription_handle`'s announcement prepared with its
@@ -798,6 +806,7 @@ pub const SubscriberImpl = struct {
                 return DDS.RETCODE_IMMUTABLE_POLICY;
             var new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
             if (!qos_change.eql(DDS.PartitionQosPolicy, &self.qos.partition, &qos.partition) or
+                !qos_change.eql(DDS.GroupDataQosPolicy, &self.qos.group_data, &qos.group_data) or
                 !qos_change.eql(DDS.PresentationQosPolicy, &self.qos.presentation, &qos.presentation))
             {
                 self.readerHandles(&handles, .all) catch {
@@ -1395,6 +1404,7 @@ pub const SubscriberImpl = struct {
     // (integration-tests/zig/enable-defer).
     fn vtSetDefaultDrQos(ctx: *anyopaque, qos: *const DDS.DataReaderQos) DDS.ReturnCode_t {
         const self = cast(ctx);
+        if (!qos_change.consistent(DDS.DataReaderQos, qos)) return DDS.RETCODE_INCONSISTENT_POLICY;
         const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         self.default_dr_qos.deinit(self.alloc);
         self.default_dr_qos = new_qos;

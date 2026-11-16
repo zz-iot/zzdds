@@ -518,11 +518,14 @@ pub const DiscoveryBus = struct {
     };
 };
 
+/// The `WriterData` delivering `ann`, with `qos` its adapted QoS, which
+/// takes the announcement's GROUP_DATA (borrowed).
 fn makeWriterData(
     ann: *const WriterAnnouncement,
-    qos: *const disc_iface.DiscoveredWriterData,
+    qos: *disc_iface.DiscoveredWriterData,
     data_locs: []const Locator,
 ) WriterData {
+    disc_adapter.setGroupData(qos, ann.group_data);
     return .{
         .guid = ann.guid,
         .participant_guid = ann.participant_guid,
@@ -536,11 +539,13 @@ fn makeWriterData(
     };
 }
 
+/// As `makeWriterData`, for a reader.
 fn makeReaderData(
     ann: *const ReaderAnnouncement,
-    qos: *const disc_iface.DiscoveredReaderData,
+    qos: *disc_iface.DiscoveredReaderData,
     data_locs: []const Locator,
 ) ReaderData {
+    disc_adapter.setGroupData(qos, ann.group_data);
     return .{
         .guid = ann.guid,
         .participant_guid = ann.participant_guid,
