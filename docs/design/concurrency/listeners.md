@@ -595,8 +595,12 @@ status-observation boundary, not an obligation to deliver every arrival as a cal
 Polling get_status_changes is not the same operation as consuming a plain status via
 its specific getter. Do not generalize the existing plain-status getter discussion
 into a rule that every inspection clears DATA_AVAILABLE. The reader's own reset rule
-follows. zzdds has no DATA_ON_READERS yet; the Subscriber half above applies when it
-is added.
+follows. zzdds keeps the Subscriber flag as one atomic store per change
+(`SubscriberImpl.data_on_readers`): a reader sets it as it sets DATA_AVAILABLE, and
+its read, take or on_data_available claim, or the Subscriber's on_data_on_readers
+claim, resets it, so the latest change wins. A `notify_datareaders` call left to a
+reader's turn, because that reader's listener is running elsewhere, stays a call for
+the reader's own on_data_available: the turn does not route it to on_data_on_readers.
 
 <a id="reader-data-available-reset"></a>
 ### Reader DATA_AVAILABLE reset

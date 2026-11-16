@@ -53,6 +53,11 @@ const Identity = listener_identity.Identity;
 /// The pending kind for reliable-ready events; not a DDS status bit.
 pub const READY: DDS.StatusMask = 1 << 31;
 
+/// The pending kind for a reader's DATA_AVAILABLE through
+/// `notify_datareaders`, left to the reader's turn: its own
+/// on_data_available, never on_data_on_readers. Not a DDS status bit.
+pub const NOTIFY_DATA_AVAILABLE: DDS.StatusMask = 1 << 30;
+
 pub const ReadyEvent = struct { guid: Guid, ready: bool };
 
 /// Listener invocations tracked here on this thread's stack.
@@ -371,7 +376,8 @@ pub const PendingListeners = struct {
     linked: bool = false,
     drop_next: ?*PendingListeners = null,
 
-    /// Every status kind, and a READY entry before and after each.
+    /// Every status kind and NOTIFY_DATA_AVAILABLE, and a READY entry
+    /// before and after each.
     const max_kinds = 2 * 16 + 1;
 
     const State = enum { idle, queued, running, parked };

@@ -686,3 +686,120 @@ test "DATA_AVAILABLE: begin_access raises on_data_available without allocating" 
     try testing.expectEqual(@as(u32, 1), calls);
     _ = sub.end_access();
 }
+
+// ── DATA_ON_READERS ───────────────────────────────────────────────────────────
+
+fn subStatusChanges(sub: DDS.Subscriber) DDS.StatusMask {
+    return sub.get_status_changes();
+}
+
+test "DATA_ON_READERS: on_data_on_readers runs in place of on_data_available, resetting only its own flag, and notify_datareaders from it runs the reader's" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+
+    const Probe = struct {
+        var sub: DDS.Subscriber = undefined;
+        var dr: *DataReaderImpl = undefined;
+        var on_readers: u32 = 0;
+        var on_available: u32 = 0;
+        var notify = true;
+        var own_set_in_callback = true;
+        var reader_set_in_callback = false;
+
+        fn onDataOnReaders(_: *anyopaque, _: ?*anyopaque) callconv(.c) void {
+            on_readers += 1;
+            own_set_in_callback = subStatusChanges(sub) & DDS.DATA_ON_READERS_STATUS != 0;
+            reader_set_in_callback = drStatusChanges(dr) & DDS.DATA_AVAILABLE_STATUS != 0;
+            if (notify) _ = sub.notify_datareaders();
+        }
+
+        fn onDataAvailable(_: *anyopaque, _: ?*anyopaque) callconv(.c) void {
+            on_available += 1;
+        }
+    };
+    Probe.on_readers = 0;
+    Probe.on_available = 0;
+    Probe.notify = true;
+    Probe.sub = fx.sub_;
+    const dw = fx.makeWriter(.{}, null, 0);
+    Probe.dr = fx.makeReader(keepAllReaderQos(), .{ .on_data_available = Probe.onDataAvailable }, DDS.DATA_AVAILABLE_STATUS);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.sub_.set_listener(.{ .on_data_on_readers = Probe.onDataOnReaders }, DDS.DATA_ON_READERS_STATUS));
+
+    try write(dw);
+    fx.settle();
+    try testing.expectEqual(@as(u32, 1), Probe.on_readers);
+    try testing.expect(!Probe.own_set_in_callback);
+    try testing.expect(Probe.reader_set_in_callback);
+    // Only through notify_datareaders, which reset both flags.
+    try testing.expectEqual(@as(u32, 1), Probe.on_available);
+    try testing.expect(subStatusChanges(fx.sub_) & DDS.DATA_ON_READERS_STATUS == 0);
+    try testing.expect(drStatusChanges(Probe.dr) & DDS.DATA_AVAILABLE_STATUS == 0);
+
+    // Without notify_datareaders the reader's flag stays set.
+    Probe.notify = false;
+    try write(dw);
+    fx.settle();
+    try testing.expectEqual(@as(u32, 2), Probe.on_readers);
+    try testing.expectEqual(@as(u32, 1), Probe.on_available);
+    try testing.expect(subStatusChanges(fx.sub_) & DDS.DATA_ON_READERS_STATUS == 0);
+    try testing.expect(drStatusChanges(Probe.dr) & DDS.DATA_AVAILABLE_STATUS != 0);
+
+    // Masked out, on_data_available runs again.
+    try testing.expectEqual(DDS.RETCODE_OK, fx.sub_.set_listener(.{ .on_data_on_readers = Probe.onDataOnReaders }, 0));
+    try write(dw);
+    fx.settle();
+    try testing.expectEqual(@as(u32, 2), Probe.on_readers);
+    try testing.expectEqual(@as(u32, 2), Probe.on_available);
+}
+
+test "DATA_ON_READERS: a participant's on_data_on_readers runs when its Subscriber has none" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+
+    var on_readers: u32 = 0;
+    var on_available: u32 = 0;
+    const dw = fx.makeWriter(.{}, null, 0);
+    _ = fx.makeReader(.{}, .{ .listener_data = &on_available, .on_data_available = countDataAvailable }, DDS.DATA_AVAILABLE_STATUS);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp_r.set_listener(.{ .listener_data = &on_readers, .on_data_on_readers = countDataAvailable }, DDS.DATA_ON_READERS_STATUS));
+
+    try write(dw);
+    fx.settle();
+    try testing.expectEqual(@as(u32, 1), on_readers);
+    try testing.expectEqual(@as(u32, 0), on_available);
+}
+
+test "DATA_ON_READERS: set as data arrives, waking the Subscriber's StatusCondition, and reset by a read or take of any of its readers" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+
+    const dw = fx.makeWriter(.{}, null, 0);
+    const dr_a = fx.makeReader(keepAllReaderQos(), null, 0);
+    const dr_b = fx.makeReader(keepAllReaderQos(), null, 0);
+    const sc = fx.sub_.get_statuscondition();
+    try testing.expectEqual(DDS.RETCODE_OK, sc.set_enabled_statuses(DDS.DATA_ON_READERS_STATUS));
+    try testing.expect(!sc.get_trigger_value());
+    try testing.expect(subStatusChanges(fx.sub_) & DDS.DATA_ON_READERS_STATUS == 0);
+
+    try write(dw);
+    fx.settle();
+    try testing.expect(subStatusChanges(fx.sub_) & DDS.DATA_ON_READERS_STATUS != 0);
+    try testing.expect(sc.get_trigger_value());
+
+    // A take from one reader resets it, though the other's data is unread:
+    // it is not the OR of the readers' DATA_AVAILABLE.
+    const taken = dr_a.takeRaw() orelse return error.TestExpectedNonNull;
+    dr_a.alloc.free(taken.data);
+    try testing.expect(subStatusChanges(fx.sub_) & DDS.DATA_ON_READERS_STATUS == 0);
+    try testing.expect(!sc.get_trigger_value());
+    try testing.expect(drStatusChanges(dr_b) & DDS.DATA_AVAILABLE_STATUS != 0);
+
+    // New data sets it again; a read resets it too.
+    try write(dw);
+    fx.settle();
+    try testing.expect(subStatusChanges(fx.sub_) & DDS.DATA_ON_READERS_STATUS != 0);
+    var out: std.ArrayListUnmanaged(zzdds.dcps.TakenSample) = .empty;
+    defer out.deinit(testing.allocator);
+    defer freeTaken(dr_b, out.items);
+    try readAll(dr_b, &out);
+    try testing.expect(subStatusChanges(fx.sub_) & DDS.DATA_ON_READERS_STATUS == 0);
+}
