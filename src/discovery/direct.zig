@@ -52,6 +52,8 @@ pub const DiscoveryBus = struct {
         /// Used to populate WriterData/ReaderData.unicast_locators on behalf of
         /// this participant's endpoints.
         data_locators: []Locator,
+        /// Heap-owned copy of the participant's USER_DATA.
+        user_data: []u8 = &.{},
         writers: std.ArrayListUnmanaged(WriterAnnouncement),
         readers: std.ArrayListUnmanaged(ReaderAnnouncement),
         /// Endpoints prepared and not yet announced: `writers` and `readers`
@@ -61,6 +63,7 @@ pub const DiscoveryBus = struct {
 
         fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
             alloc.free(self.data_locators);
+            alloc.free(self.user_data);
             for (self.writers.items) |*w| w.deinit(alloc);
             self.writers.deinit(alloc);
             for (self.readers.items) |*r| r.deinit(alloc);
@@ -95,6 +98,8 @@ pub const DiscoveryBus = struct {
         // in participant.zig:start() and freed after the call returns.
         const locs_copy = try self.alloc.dupe(Locator, local.default_unicast_locators);
         errdefer self.alloc.free(locs_copy);
+        const user_data = try self.alloc.dupe(u8, local.user_data);
+        errdefer self.alloc.free(user_data);
 
         // Snapshot existing entries in the same domain before adding the new one.
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -116,6 +121,7 @@ pub const DiscoveryBus = struct {
                 .domain_id = local.domain_id,
                 .callbacks = callbacks.*,
                 .data_locators = locs_copy,
+                .user_data = user_data,
                 .writers = .empty,
                 .readers = .empty,
             });
@@ -129,6 +135,7 @@ pub const DiscoveryBus = struct {
                 .guid = snap.participant_guid,
                 .domain_id = snap.domain_id,
                 .name = "",
+                .user_data = snap.user_data,
                 .metatraffic_unicast_locators = &.{},
                 .metatraffic_multicast_locators = &.{},
                 .default_unicast_locators = snap.data_locators,
@@ -156,6 +163,7 @@ pub const DiscoveryBus = struct {
             .guid = local.guid,
             .domain_id = local.domain_id,
             .name = local.name,
+            .user_data = local.user_data,
             .metatraffic_unicast_locators = &.{},
             .metatraffic_multicast_locators = &.{},
             .default_unicast_locators = locs_copy,
@@ -230,6 +238,51 @@ pub const DiscoveryBus = struct {
     }
 
     const Kind = enum { writers, readers };
+
+    /// Replaces participant `participant_guid`'s USER_DATA with `user_data`
+    /// and tells the other participants, as an update of the participant.
+    /// Fails changing nothing; out of memory telling them, it may miss some.
+    fn busUpdateUserData(self: *DiscoveryBus, participant_guid: Guid, user_data: []const u8) !void {
+        const owned = try self.alloc.dupe(u8, user_data);
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var snapshots: [64]EntrySnapshot = undefined;
+        var snap_count: usize = 0;
+        var pd: ParticipantData = undefined;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            const e = self.findLocked(participant_guid) orelse {
+                self.alloc.free(owned);
+                return;
+            };
+            self.alloc.free(e.user_data);
+            e.user_data = owned;
+            pd = .{
+                .guid = participant_guid,
+                .domain_id = e.domain_id,
+                .name = "",
+                .user_data = arena.allocator().dupe(u8, owned) catch return,
+                .metatraffic_unicast_locators = &.{},
+                .metatraffic_multicast_locators = &.{},
+                .default_unicast_locators = arena.allocator().dupe(Locator, e.data_locators) catch return,
+                .default_multicast_locators = &.{},
+                .lease_duration_ms = std.math.maxInt(u32),
+                .builtin_endpoint_set = 0,
+                .vendor_id = header_mod.VENDOR_ID,
+            };
+            for (self.entries.items) |*peer| {
+                if (peer == e or peer.domain_id != e.domain_id) continue;
+                if (snap_count < snapshots.len) {
+                    snapshots[snap_count] = EntrySnapshot.identity(peer);
+                    snap_count += 1;
+                }
+            }
+        }
+        for (snapshots[0..snap_count]) |snap| {
+            snap.callbacks.on_participant_discovered(snap.callbacks.ctx, &pd);
+        }
+    }
 
     /// Makes room in participant `participant_guid`'s entry for `n` endpoints
     /// of `kind`, announced later without allocating.
@@ -486,6 +539,7 @@ pub const DiscoveryBus = struct {
         domain_id: u32,
         callbacks: Callbacks,
         data_locators: []const Locator = &.{},
+        user_data: []const u8 = &.{},
         writers: []const WriterAnnouncement = &.{},
         readers: []const ReaderAnnouncement = &.{},
 
@@ -503,6 +557,7 @@ pub const DiscoveryBus = struct {
         fn copy(e: *const Entry, arena: std.mem.Allocator, comptime endpoints: Endpoints) !EntrySnapshot {
             var snap = identity(e);
             snap.data_locators = try arena.dupe(Locator, e.data_locators);
+            snap.user_data = try arena.dupe(u8, e.user_data);
             if (endpoints.writers) {
                 const writers = try arena.alloc(WriterAnnouncement, e.writers.items.len);
                 for (writers, e.writers.items) |*w, src| w.* = try src.clone(arena);
@@ -659,6 +714,12 @@ pub const DirectDiscovery = struct {
         var it = map.valueIterator();
         while (it.next()) |p| n += @intFromBool(!p.slot);
         return n;
+    }
+
+    fn vtUpdateUserData(ctx: *anyopaque, user_data: []const u8) anyerror!void {
+        const self: *DirectDiscovery = @ptrCast(@alignCast(ctx));
+        if (!self.started) return;
+        try self.bus.busUpdateUserData(self.participant_guid, user_data);
     }
 
     fn vtStop(ctx: *anyopaque) void {
@@ -826,6 +887,7 @@ const direct_vtable = Discovery.Vtable{
     .announce_reader = DirectDiscovery.vtAnnounceReader,
     .retract_reader = DirectDiscovery.vtRetractReader,
     .deinit = DirectDiscovery.vtDeinit,
+    .update_user_data = DirectDiscovery.vtUpdateUserData,
     // DirectDiscovery bypasses the wire entirely (see the module doc comment
     // at the top of this file) -- WLP has nothing to drive here.
     .wlp_tick = noopWlpTick,

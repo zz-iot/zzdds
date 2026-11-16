@@ -438,7 +438,12 @@ fn pushBuiltinParticipantCdr(
     w.writeEncapHeader() catch return;
     const v = DDS.ParticipantBuiltinTopicData{
         .key = writer_mod.guidToBuiltinKey(data.guid),
-        .user_data = .{},
+        .user_data = .{ .value = .{
+            ._maximum = @intCast(data.user_data.len),
+            ._length = @intCast(data.user_data.len),
+            ._buffer = @constCast(data.user_data.ptr),
+            ._release = false,
+        } },
     };
     DDS.ParticipantBuiltinTopicData.serialize(&w, v) catch return;
     dr.pushCdr(buf.items);
@@ -1116,8 +1121,12 @@ pub const DomainParticipantImpl = struct {
     disc_callbacks: disc.Callbacks,
     /// `discovery.start()` succeeded: deinit stops it. A plugin serves one
     /// participant at a time, so one that never started must not stop
-    /// another's.
+    /// another's. Changed with `user_data_mu` held.
     discovery_started: bool = false,
+    /// Held while `set_qos` changes USER_DATA and announces it, and while
+    /// `discovery_started` changes, so a change either reaches discovery
+    /// or is seen by its start.
+    user_data_mu: Mutex = .{},
 
     /// Port on which we listen for user DataWriter traffic.
     /// 0 = not yet chosen (before start()).
@@ -1556,10 +1565,17 @@ pub const DomainParticipantImpl = struct {
         else
             null;
 
+        const user_data = blk: {
+            self.user_data_mu.lock();
+            defer self.user_data_mu.unlock();
+            break :blk try self.alloc.dupe(u8, userDataBytes(&self.qos.user_data));
+        };
+        defer self.alloc.free(user_data);
         const ann = disc.ParticipantAnnouncement{
             .guid = self.guid,
             .domain_id = self.domain_id,
             .name = part_cfg.name,
+            .user_data = user_data,
             .metatraffic_unicast_locators = meta_locators.items,
             .metatraffic_multicast_locators = mc_locs,
             .default_unicast_locators = data_locators.items,
@@ -1571,7 +1587,16 @@ pub const DomainParticipantImpl = struct {
             .tracer = self.discovery_tracer,
         };
         try self.discovery.start(&ann, &self.disc_callbacks);
-        self.discovery_started = true;
+        {
+            self.user_data_mu.lock();
+            defer self.user_data_mu.unlock();
+            self.discovery_started = true;
+            // Changed while discovery started.
+            const now = userDataBytes(&self.qos.user_data);
+            if (!std.mem.eql(u8, now, user_data)) self.discovery.updateUserData(now) catch |err| {
+                log_mod.dcps.warn("participant: could not announce its USER_DATA ({s})", .{@errorName(err)});
+            };
+        }
         // Announced again when an interface is added or removed.
         self.discovery_transport.setLocatorChangeHandler(.{ .ctx = self, .on_change = onLocatorsChanged });
         self.locator_handler_set = true;
@@ -1723,8 +1748,13 @@ pub const DomainParticipantImpl = struct {
         // once this returns, it is not running.
         if (self.locator_handler_set) self.discovery_transport.setLocatorChangeHandler(null);
         self.locator_handler_set = false;
-        if (self.discovery_started) self.discovery.stop();
-        self.discovery_started = false;
+        const started = blk: {
+            self.user_data_mu.lock();
+            defer self.user_data_mu.unlock();
+            defer self.discovery_started = false;
+            break :blk self.discovery_started;
+        };
+        if (started) self.discovery.stop();
         if (self.data_listening and self.data_listen_port != 0) {
             const loc = Locator.udp4(.{ 0, 0, 0, 0 }, self.data_listen_port);
             self.transport.unlisten(&loc, self.userDataHandler());
@@ -2964,8 +2994,10 @@ pub const DomainParticipantImpl = struct {
                     self.alloc,
                     .{ .guid = data.guid, .handle = handle, .vendor_id = data.vendor_id, .lease_ms = data.lease_duration_ms },
                 ) catch {};
-                if (self.builtin_sub) |bs| push_dr = bs.part_dr;
             }
+            // Discovery reports a known participant again when its
+            // DCPSParticipant data changed.
+            if (self.builtin_sub) |bs| push_dr = bs.part_dr;
         }
         self.mu.unlock();
         if (push_dr) |dr| pushBuiltinParticipantCdr(self.alloc, dr, data);
@@ -5902,10 +5934,25 @@ pub const DomainParticipantImpl = struct {
 
     fn vtSetQos(ctx: *anyopaque, qos: *const DDS.DomainParticipantQos) DDS.ReturnCode_t {
         const self = cast(ctx);
-        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        var new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.user_data_mu.lock();
+        defer self.user_data_mu.unlock();
+        // Announced before it takes effect, so a failure changes nothing.
+        if (self.discovery_started and !qos_change.eql(DDS.UserDataQosPolicy, &self.qos.user_data, &new_qos.user_data)) {
+            self.discovery.updateUserData(userDataBytes(&new_qos.user_data)) catch {
+                new_qos.deinit(self.alloc);
+                return DDS.RETCODE_OUT_OF_RESOURCES;
+            };
+        }
         self.qos.deinit(self.alloc);
         self.qos = new_qos;
         return DDS.RETCODE_OK;
+    }
+
+    /// The bytes of a USER_DATA policy, borrowed.
+    fn userDataBytes(policy: *const DDS.UserDataQosPolicy) []const u8 {
+        const v = &policy.value;
+        return if (v._buffer) |b| b[0..v._length] else &.{};
     }
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.DomainParticipantQos) DDS.ReturnCode_t {

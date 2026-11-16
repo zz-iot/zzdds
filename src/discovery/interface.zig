@@ -94,6 +94,8 @@ pub const ParticipantAnnouncement = struct {
     domain_id: u32,
     /// Human-readable participant name (may be empty).
     name: []const u8,
+    /// The participant's USER_DATA bytes (may be empty).
+    user_data: []const u8 = &.{},
     /// Metatraffic locators: where this participant receives SPDP/SEDP messages.
     metatraffic_unicast_locators: []const Locator,
     metatraffic_multicast_locators: []const Locator,
@@ -316,6 +318,8 @@ pub const ParticipantData = struct {
     guid: Guid,
     domain_id: u32,
     name: []const u8,
+    /// The participant's USER_DATA bytes; empty when it sent none.
+    user_data: []const u8 = &.{},
     metatraffic_unicast_locators: []const Locator,
     metatraffic_multicast_locators: []const Locator,
     default_unicast_locators: []const Locator,
@@ -509,6 +513,13 @@ pub const Discovery = struct {
         /// Fails changing nothing; the participant tries again at the next
         /// change. Null for a plugin whose announcement carries no locators.
         update_locators: ?*const fn (ctx: *anyopaque, metatraffic_unicast: []const Locator, default_unicast: []const Locator) anyerror!void = null,
+
+        /// After a successful `start`, before `stop`: the participant's
+        /// USER_DATA changed, and its announcement should carry `user_data`
+        /// (borrowed for the call) from now on, sent at once, so peers
+        /// report it as an update of the participant. Fails changing
+        /// nothing. Null for a plugin whose announcement carries none.
+        update_user_data: ?*const fn (ctx: *anyopaque, user_data: []const u8) anyerror!void = null,
     };
 
     // Forwarding helpers
@@ -575,6 +586,10 @@ pub const Discovery = struct {
 
     pub fn updateLocators(self: Discovery, metatraffic_unicast: []const Locator, default_unicast: []const Locator) anyerror!void {
         if (self.vtable.update_locators) |f| try f(self.ctx, metatraffic_unicast, default_unicast);
+    }
+
+    pub fn updateUserData(self: Discovery, user_data: []const u8) anyerror!void {
+        if (self.vtable.update_user_data) |f| try f(self.ctx, user_data);
     }
 };
 

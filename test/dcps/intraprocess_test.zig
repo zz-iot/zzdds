@@ -612,6 +612,63 @@ test "intraprocess: a remote participant's DCPSPublication and DCPSSubscription 
     try testing.expectEqualSlices(u8, &.{ 0, 0xee }, cft_sub);
 }
 
+/// The USER_DATA of the last DCPSParticipant sample `dr` holds, owned,
+/// after taking them all; null with none.
+fn lastParticipantUserData(alloc: std.mem.Allocator, dr: *DataReaderImpl) !?[]u8 {
+    var last: ?[]u8 = null;
+    errdefer if (last) |l| alloc.free(l);
+    while (dr.takeRaw()) |sample| {
+        defer alloc.free(sample.data);
+        if (!sample.info.valid_data) continue;
+        var cdr = try zzdds.zidl_cdr.CdrReader.init(sample.data);
+        var v: DDS.ParticipantBuiltinTopicData = .{};
+        try DDS.ParticipantBuiltinTopicData.deserializeInto(&v, &cdr, alloc);
+        defer v.deinit(alloc);
+        const u = v.user_data.value;
+        const bytes: []const u8 = if (u._buffer) |buf| buf[0..u._length] else &.{};
+        if (last) |l| alloc.free(l);
+        last = null;
+        last = try alloc.dupe(u8, bytes);
+    }
+    return last;
+}
+
+fn userOctets(bytes: []const u8) @FieldType(DDS.UserDataQosPolicy, "value") {
+    return .{ ._buffer = @constCast(bytes.ptr), ._length = @intCast(bytes.len), ._maximum = @intCast(bytes.len), ._release = false };
+}
+
+test "intraprocess: a remote participant's DCPSParticipant carries its USER_DATA, and its change" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, "IPTopic", "IPType");
+    defer fx.deinit();
+    const ParticipantImpl = zzdds.dcps.DomainParticipantImpl;
+    const seen = @as(*ParticipantImpl, @ptrCast(@alignCast(fx.dp_r.ptr))).builtin_sub.?.part_dr;
+    // The only other participant.
+    alloc.free((try lastParticipantUserData(alloc, seen)) orelse return error.NoSample);
+
+    var qos = DDS.DomainParticipantQos{};
+    qos.user_data.value = userOctets("user-1");
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp_w.set_qos(qos));
+    fx.settle();
+    const first = (try lastParticipantUserData(alloc, seen)) orelse return error.NoSample;
+    defer alloc.free(first);
+    try testing.expectEqualSlices(u8, "user-1", first);
+
+    // Unchanged, or another policy changed: not announced again.
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp_w.set_qos(qos));
+    qos.entity_factory.autoenable_created_entities = false;
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp_w.set_qos(qos));
+    fx.settle();
+    try testing.expectEqual(@as(?[]u8, null), try lastParticipantUserData(alloc, seen));
+
+    qos.user_data.value = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp_w.set_qos(qos));
+    fx.settle();
+    const cleared = (try lastParticipantUserData(alloc, seen)) orelse return error.NoSample;
+    defer alloc.free(cleared);
+    try testing.expectEqual(@as(usize, 0), cleared.len);
+}
+
 // Regression for a real gap found via zzdds-examples' `catchup` review
 // (Greptile flagged: a listener callback that's still draining its take()
 // loop can race an independent completion path that deletes the reader,

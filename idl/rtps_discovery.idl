@@ -90,7 +90,7 @@ struct SPDPdiscoveredParticipantData {
     @id(0x0031) @optional @pl_repeated sequence<Locator_t> defaultUnicastLocatorList; // PID_DEFAULT_UNICAST_LOCATOR
     @id(0x0048) @optional @pl_repeated sequence<Locator_t> defaultMulticastLocatorList;
     @id(0x0077) @optional unsigned long   builtinEndpointQos;  // decode only; never emitted
-    @id(0x002C) @optional sequence<octet> userData;     // decode only; never emitted
+    @id(0x002C) @optional sequence<octet> userData;     // PID_USER_DATA (the participant's); omitted when empty
     @id(0x0062) @optional string          participantName;     // PID_ENTITY_NAME
 };
 
