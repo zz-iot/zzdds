@@ -172,6 +172,7 @@ const Fixture = struct {
     pub_b: DDS.Publisher,
     sub_b: DDS.Subscriber,
     topic_b: DDS.Topic,
+    factory_a_deleted: bool = false,
 
     fn init(alloc: std.mem.Allocator, rec: *Recorder) !Fixture {
         const mr = try std.heap.page_allocator.create(ManualRuntime);
@@ -231,10 +232,10 @@ const Fixture = struct {
     }
 
     fn deinit(self: *Fixture) void {
-        _ = self.factory_a.toDDSFactory().delete_participant(self.dp_a);
+        if (!self.factory_a_deleted) _ = self.factory_a.toDDSFactory().delete_participant(self.dp_a);
         _ = self.factory_b.toDDSFactory().delete_participant(self.dp_b);
         self.mr.settle();
-        self.factory_a.deinit();
+        if (!self.factory_a_deleted) self.factory_a.deinit();
         self.factory_b.deinit();
         self.d_a.deinit();
         self.d_b.deinit();
@@ -750,4 +751,62 @@ test "an immutable policy does not change, enabled or not, and nothing is announ
     pq.presentation.coherent_access = true;
     try testing.expectEqual(DDS.RETCODE_IMMUTABLE_POLICY, fx.pub_a.vtable.set_qos(fx.pub_a.ptr, &pq));
     try testing.expectEqualSlices(Op, &.{ .announce_writer, .announce_reader }, rec.recorded());
+}
+
+test "participant and factory deletion wait for writer and reader announcement cleanup" {
+    for ([_]bool{ false, true }) |reader| {
+        for ([_]bool{ false, true }) |delete_participant_first| {
+            for ([_]bool{ false, true }) |during_enable| {
+                var rec: Recorder = undefined;
+                var fx = try Fixture.init(testing.allocator, &rec);
+                defer fx.deinit();
+                const Probe = struct {
+                    fixture: *Fixture,
+                    delete_first: bool,
+                    destroyed: bool = false,
+                    destroyed_in_announcement: bool = false,
+                    delete_rc: DDS.ReturnCode_t = DDS.RETCODE_OK,
+                    fn destroy(ctx: *anyopaque) void {
+                        const self: *@This() = @ptrCast(@alignCast(ctx));
+                        self.destroyed = true;
+                    }
+                    fn during(ctx: *anyopaque) void {
+                        const self: *@This() = @ptrCast(@alignCast(ctx));
+                        const f = self.fixture;
+                        if (self.delete_first) {
+                            self.delete_rc = f.dp_a.delete_contained_entities();
+                            if (self.delete_rc == DDS.RETCODE_OK)
+                                self.delete_rc = f.factory_a.toDDSFactory().delete_participant(f.dp_a);
+                        }
+                        f.factory_a_deleted = true;
+                        f.factory_a.deinit();
+                        self.destroyed_in_announcement = self.destroyed;
+                    }
+                };
+                var probe: Probe = .{ .fixture = &fx, .delete_first = delete_participant_first };
+                fx.factory_a.on_destroy = .{ .ctx = &probe, .run = Probe.destroy };
+                rec.before_announce = Probe.during;
+                rec.before_ctx = &probe;
+                // Exercise both creation and a later, standalone announcement.
+                if (reader) {
+                    const sub = if (during_enable) fx.sub_a else fx.dp_a.create_subscriber(.{}, null, 0);
+                    const result = sub.create_datareader(topicDesc(fx.topic_a), .{}, null, 0);
+                    if (during_enable) {
+                        try testing.expectEqual(DDS.RETCODE_OK, result.vtable.enable(result.ptr));
+                    } else if (delete_participant_first) try testing.expect(result.ptr == zzdds.dcps.NIL_PTR);
+                } else {
+                    const pub_ = if (during_enable) fx.pub_a else fx.dp_a.create_publisher(.{}, null, 0);
+                    const result = pub_.create_datawriter(fx.topic_a, .{}, null, 0);
+                    if (during_enable) {
+                        try testing.expectEqual(DDS.RETCODE_OK, result.vtable.enable(result.ptr));
+                    } else if (delete_participant_first) try testing.expect(result.ptr == zzdds.dcps.NIL_PTR);
+                }
+                try testing.expectEqual(DDS.RETCODE_OK, probe.delete_rc);
+                try testing.expect(!probe.destroyed_in_announcement);
+                try testing.expect(!probe.destroyed);
+                fx.settle();
+                try testing.expect(probe.destroyed);
+            }
+        }
+    }
 }

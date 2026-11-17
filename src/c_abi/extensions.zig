@@ -54,6 +54,8 @@ const proto = @import("../protocol/interface.zig");
 
 const FactoryOwner = struct {
     alloc: std.mem.Allocator,
+    // The public owner, each independent stack, and in-flight factory calls.
+    lifetime: @import("../util/entity_quiesce.zig").EntityQuiesce = .{},
     mu: Mutex = .{},
     stacks: std.ArrayListUnmanaged(*ParticipantStack) = .empty,
     default_dp_qos: DDS.DomainParticipantQos = .{},
@@ -76,9 +78,20 @@ const FactoryOwner = struct {
     on_debug_gpa: bool = false,
 
     fn deinit(self: *@This()) void {
+        self.lifetime.close();
+        self.fac_c_abi.retire();
+        self.mu.lock();
+        var stacks = self.stacks;
+        self.stacks = .empty;
+        self.mu.unlock();
+        for (stacks.items) |stack| stack.deinit();
+        stacks.deinit(self.alloc);
+        self.lifetime.beginTeardown(self, destroy);
+    }
+
+    fn destroy(ctx: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
         self.fac_c_abi.free(self.alloc);
-        for (self.stacks.items) |stack| stack.deinit();
-        self.stacks.deinit(self.alloc);
         self.default_dp_qos.deinit(self.alloc);
         self.default_config.deinit(self.alloc);
         const on_debug_gpa = self.on_debug_gpa;
@@ -95,7 +108,14 @@ const FactoryOwner = struct {
         config: config_mod.Config,
         config_deinit_allocator: ?std.mem.Allocator,
     ) !DDS.DomainParticipant {
+        if (!self.lifetime.acquire()) return error.FactoryDeleted;
+        defer self.lifetime.release(self, destroy);
         const stack = try ParticipantStack.init(self.alloc, domain_id, config);
+        if (!self.lifetime.acquire()) {
+            stack.deinit();
+            return error.FactoryDeleted;
+        }
+        stack.owner = self;
         errdefer stack.deinit();
 
         // Clone QoS under the lock so the snapshot owns its heap memory and
@@ -127,6 +147,7 @@ const FactoryOwner = struct {
         defer self.mu.unlock();
         stack.domain_id = domain_id;
         stack.participant = p.toDDSParticipant();
+        if (self.lifetime.tearingDown()) return error.FactoryDeleted;
         try self.stacks.append(self.alloc, stack);
         // config_deinit_allocator is written here under FactoryOwner.mu.
         // DomainParticipantImpl.deinit reads it without holding FactoryOwner.mu,
@@ -136,6 +157,8 @@ const FactoryOwner = struct {
     }
 
     fn deleteParticipant(self: *@This(), participant: DDS.DomainParticipant) DDS.ReturnCode_t {
+        if (!self.lifetime.acquire()) return DDS.RETCODE_ALREADY_DELETED;
+        defer self.lifetime.release(self, destroy);
         if (nil.isNil(participant)) return DDS.RETCODE_BAD_PARAMETER;
         // Find the stack without removing it yet. Calling the inner factory
         // vtable inside FactoryOwner.mu would invert lock order (FactoryOwner.mu
@@ -154,16 +177,20 @@ const FactoryOwner = struct {
         // means the participant still has live entities — do NOT destroy the stack.
         const rc = stack.factory_handle.vtable.delete_participant(stack.factory_handle.ptr, participant);
         if (rc != DDS.RETCODE_OK) return rc;
-        // Inner factory accepted the deletion; now remove and destroy the stack.
+        // A handle-retirement callback may have destroyed the outer factory
+        // during the inner deletion. Its detached list then owns cleanup.
         self.mu.lock();
-        for (self.stacks.items, 0..) |s, i| {
-            if (s.participant.ptr == participant.ptr) {
-                _ = self.stacks.swapRemove(i);
-                break;
+        const removed = removed: {
+            for (self.stacks.items, 0..) |s, i| {
+                if (s == stack) {
+                    _ = self.stacks.swapRemove(i);
+                    break :removed true;
+                }
             }
-        }
+            break :removed false;
+        };
         self.mu.unlock();
-        stack.deinit();
+        if (removed) stack.deinit();
         return DDS.RETCODE_OK;
     }
 
@@ -181,6 +208,7 @@ const FactoryOwner = struct {
 
 const ParticipantStack = struct {
     alloc: std.mem.Allocator,
+    owner: ?*FactoryOwner = null,
     factory: *DomainParticipantFactoryImpl,
     discovery: *SpdpSedpDiscovery,
     udp: *UdpTransport,
@@ -193,14 +221,18 @@ const ParticipantStack = struct {
     participant: DDS.DomainParticipant = nil.nil_participant,
 
     fn deinit(self: *@This()) void {
-        // factory.deinit() sends RTPS BYE announcements via the UDP transport,
-        // so it must run BEFORE udp.deinit() closes the sockets.
-        // UdpTransport owns a deep copy of its config.interfaces strings, so
-        // factory.deinit() freeing the participant config is safe.
+        // Completion may follow a listener, ingress turn or announcement.
+        // The factory's final hook owns this stack from here on.
         self.factory.deinit();
+    }
+
+    fn destroy(ctx: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const owner = self.owner;
         self.discovery.deinit();
         self.udp.deinit();
         self.alloc.destroy(self);
+        if (owner) |o| o.lifetime.release(o, FactoryOwner.destroy);
     }
 
     fn init(alloc: std.mem.Allocator, domain_id: DDS.DomainId_t, config: config_mod.Config) !*@This() {
@@ -235,6 +267,7 @@ const ParticipantStack = struct {
             .udp = udp,
             .factory_handle = factory.toDDSFactory(),
         };
+        factory.on_destroy = .{ .ctx = stack, .run = destroy };
         return stack;
     }
 };
@@ -1303,6 +1336,8 @@ fn factoryCreateParticipant(
 ) DDS.DomainParticipant {
     if (ctx == nil.NIL_PTR) return nil.nil_participant;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
+    if (!owner.lifetime.acquire()) return nil.nil_participant;
+    defer owner.lifetime.release(owner, FactoryOwner.destroy);
 
     owner.mu.lock();
     var cfg_snap = owner.default_config.clone(owner.alloc) catch |err| {
@@ -1337,6 +1372,9 @@ fn factoryCreateParticipantEx(
 ) DDS.DomainParticipant {
     if (ctx == nil.NIL_PTR) return nil.nil_participant;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
+    if (!owner.lifetime.acquire()) return nil.nil_participant;
+    defer owner.lifetime.release(owner, FactoryOwner.destroy);
+
     const runtime_config = config_generated.toRuntimeConfig(owner.alloc, config) catch |err| {
         std.log.err("create_participant_ex: config conversion failed: {}", .{err});
         return nil.nil_participant;
@@ -1732,4 +1770,157 @@ test "zzdds_cft_match_sample: real filter evaluation through the C ABI" {
 
     const non_matching = Sample{ .x = 6 };
     try std.testing.expect(!zzdds_cft_match_sample(cft_handle, @constCast(&non_matching), Sample.get));
+}
+
+const StackLifetimeWatch = struct {
+    child: std.mem.Allocator = std.testing.allocator,
+    participant: usize = 0,
+    owner: usize = 0,
+    owner_freed: bool = false,
+    discovery: usize = 0,
+    stack: usize = 0,
+    participant_freed: bool = false,
+    discovery_freed: bool = false,
+    stack_freed: bool = false,
+    fn allocate(ctx: ?*anyopaque, n: usize, alignment: usize) callconv(.c) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        return self.child.rawAlloc(n, std.mem.Alignment.fromByteUnits(alignment), @returnAddress());
+    }
+    fn resize(ctx: ?*anyopaque, ptr: ?[*]u8, old: usize, n: usize, alignment: usize) callconv(.c) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        return self.child.rawResize(ptr.?[0..old], std.mem.Alignment.fromByteUnits(alignment), n, @returnAddress());
+    }
+    fn free(ctx: ?*anyopaque, ptr: ?[*]u8, n: usize, alignment: usize) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        const addr = @intFromPtr(ptr);
+        if (addr == self.owner) self.owner_freed = true;
+        if (addr == self.participant) self.participant_freed = true;
+        if (addr == self.discovery) self.discovery_freed = true;
+        if (addr == self.stack) self.stack_freed = true;
+        self.child.rawFree(ptr.?[0..n], std.mem.Alignment.fromByteUnits(alignment), @returnAddress());
+    }
+};
+
+// Observe reclamation without dereferencing retired storage.
+test "C factory stack survives until deferred participant cleanup completes" {
+    const testing = std.testing;
+    const runtime = @import("../runtime/root.zig");
+    if (!runtime.testing.ManualPoll.supported) return error.SkipZigTest;
+    var mr: runtime.testing.ManualPoll = undefined;
+    try mr.init(testing.allocator);
+    defer mr.deinit();
+    try runtime.default_registry.global.install(&mr.runtime);
+    defer runtime.default_registry.global.clear();
+    for ([_]bool{ true, false }) |delete_participant_first| {
+        var watch: StackLifetimeWatch = .{};
+        const allocator: zidl_bindings.ZidlAllocator = .{ .ctx = &watch, .alloc = StackLifetimeWatch.allocate, .resize = StackLifetimeWatch.resize, .free = StackLifetimeWatch.free };
+        const factory = try createFactory(&allocator);
+        const dp = factory.create_participant_ex(211, .{}, null, 0, ZZDDS.DomainParticipantConfig.default());
+        try testing.expect(!nil.isNil(dp));
+        const owner: *FactoryOwner = @ptrCast(@alignCast(factory.ptr));
+        const stack = owner.stacks.items[0];
+        const p: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+        watch.owner = @intFromPtr(owner);
+        watch.participant = @intFromPtr(p);
+        watch.discovery = @intFromPtr(stack.discovery);
+        watch.stack = @intFromPtr(stack);
+        // A second deferred participant keeps the outer owner alive after
+        // the watched participant's own stack has finished cleanup.
+        const second = factory.create_participant_ex(212, .{}, null, 0, ZZDDS.DomainParticipantConfig.default());
+        try testing.expect(!nil.isNil(second));
+        const second_impl: *DomainParticipantImpl = @ptrCast(@alignCast(second.ptr));
+        var second_traversal: listener_lane.Traversal = .{};
+        second_traversal.begin(&second_impl.listener_group);
+        try testing.expect(second_traversal.counted);
+        var traversal: listener_lane.Traversal = .{};
+        traversal.begin(&p.listener_group);
+        try testing.expect(traversal.counted);
+        const dds = factory.vtable.as_DomainParticipantFactory(factory.ptr);
+        const rc = if (delete_participant_first) dds.delete_participant(dp) else DDS.RETCODE_OK;
+        const pending_users = if (delete_participant_first) stack.factory.attached_users else 1;
+        factory.vtable.deinit(factory.ptr);
+        // Capture before ending the traversal: deletion has returned, but its
+        // participant teardown cannot run until that traversal finishes.
+        const owner_freed_early = watch.owner_freed;
+        const participant_freed_early = watch.participant_freed;
+        const discovery_freed_early = watch.discovery_freed;
+        const stack_freed_early = watch.stack_freed;
+        traversal.end();
+        while (true) {
+            const result = try mr.runtime.drive(64, 0);
+            if (result.turns == 0) break;
+        }
+        const owner_freed_after_first = watch.owner_freed;
+        second_traversal.end();
+        while (true) {
+            const result = try mr.runtime.drive(64, 0);
+            if (result.turns == 0) break;
+        }
+        try testing.expectEqual(DDS.RETCODE_OK, rc);
+        try testing.expectEqual(@as(u32, 1), pending_users);
+        try testing.expect(!owner_freed_after_first);
+        try testing.expect(!owner_freed_early);
+        try testing.expect(!participant_freed_early);
+        try testing.expect(!discovery_freed_early);
+        try testing.expect(!stack_freed_early);
+        try testing.expect(watch.owner_freed);
+        try testing.expect(watch.participant_freed);
+        try testing.expect(watch.discovery_freed);
+        try testing.expect(watch.stack_freed);
+    }
+}
+
+test "stack cleanup waits for a traversal's enclosing ingress or timer turn" {
+    const testing = std.testing;
+    const runtime = @import("../runtime/root.zig");
+    if (!runtime.testing.ManualPoll.supported) return error.SkipZigTest;
+    var mr: runtime.testing.ManualPoll = undefined;
+    try mr.init(testing.allocator);
+    defer mr.deinit();
+    try runtime.default_registry.global.install(&mr.runtime);
+    defer runtime.default_registry.global.clear();
+    for ([_]bool{ false, true }) |ingress| {
+        for ([_]bool{ false, true }) |help_final| {
+            var watch: StackLifetimeWatch = .{};
+            const allocator: zidl_bindings.ZidlAllocator = .{ .ctx = &watch, .alloc = StackLifetimeWatch.allocate, .resize = StackLifetimeWatch.resize, .free = StackLifetimeWatch.free };
+            const factory = try createFactory(&allocator);
+            watch.owner = @intFromPtr(factory.ptr);
+            const dp = factory.create_participant_ex(213, .{}, null, 0, ZZDDS.DomainParticipantConfig.default());
+            try testing.expect(!nil.isNil(dp));
+            const p: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+            const Probe = struct {
+                request: runtime.Request = .init(run),
+                participant: *DomainParticipantImpl,
+                factory: ZZDDS.DomainParticipantFactory,
+                watch: *StackLifetimeWatch,
+                help_final: bool,
+                helped: bool = true,
+                freed_early: bool = false,
+                fn groupFinished(group: *listener_lane.Group) bool {
+                    return group.rest == null;
+                }
+                fn run(req: *runtime.Request, turn: *runtime.Turn) runtime.Outcome {
+                    const self: *@This() = @fieldParentPtr("request", req);
+                    var traversal: listener_lane.Traversal = .{};
+                    traversal.begin(&self.participant.listener_group);
+                    self.factory.vtable.deinit(self.factory.ptr);
+                    traversal.end();
+                    // Let group completion run before this enclosing turn
+                    // ends, or let it run afterwards: both orders must work.
+                    if (self.help_final) self.helped = turn.runtime.helpUntil(turn.now_ns + std.time.ns_per_s, &self.participant.listener_group, groupFinished);
+                    self.freed_early = self.watch.owner_freed;
+                    return .done;
+                }
+            };
+            var probe: Probe = .{ .participant = p, .factory = factory, .watch = &watch, .help_final = help_final };
+            try mr.runtime.submitInternal(if (ingress) &p.ingress else &p.timers, &probe.request);
+            while (true) {
+                const result = try mr.runtime.drive(64, 0);
+                if (result.turns == 0) break;
+            }
+            try testing.expect(probe.helped);
+            try testing.expect(!probe.freed_early);
+            try testing.expect(watch.owner_freed);
+        }
+    }
 }

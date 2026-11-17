@@ -430,6 +430,11 @@ pub const SubscriberImpl = struct {
         listener: ZZDDS.DataReaderListenerEx,
         mask: DDS.StatusMask,
     ) DDS.DataReader {
+        var traversal: listener_lane.Traversal = .{};
+        traversal.begin(self.cbs.listener_group);
+        defer traversal.end();
+        if (self.cbs.listener_group != null and !traversal.counted) return nil.nil_datareader;
+
         // See publisher.zig's identical comment on create_datawriter: not
         // gated on this Subscriber's own enabled state, for the same reason.
         if (!qos_change.consistent(DDS.DataReaderQos, qos)) return nil.nil_datareader;
