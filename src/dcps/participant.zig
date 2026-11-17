@@ -1229,6 +1229,10 @@ pub const DomainParticipantImpl = struct {
         trace_sink: ?trace_mod.Sink,
         timer_clock: time_mod.Clock,
     ) !*Self {
+        // Owns `listener` from here, installed or not: a failure drops the
+        // box's hold, which releases it.
+        const listener_box = try ListenerBox(DDS.DomainParticipantListener).adopt(alloc, listener);
+        errdefer listener_box.releaseHold(alloc);
         // When TCP user-data is enabled, construct a dedicated TcpTransport for
         // this participant's DataWriter/DataReader traffic. SPDP/SEDP keep using
         // `transport` (renamed discovery_transport below) unconditionally.
@@ -1310,8 +1314,7 @@ pub const DomainParticipantImpl = struct {
         const tracers = trace_mod.tracersFor(&self.config.trace, trace_sink);
         self.tracer = tracers.user;
         self.discovery_tracer = tracers.discovery;
-        self.listener_box = try ListenerBox(DDS.DomainParticipantListener).create(alloc, listener);
-        errdefer alloc.destroy(self.listener_box);
+        self.listener_box = listener_box;
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
@@ -5641,7 +5644,12 @@ pub const DomainParticipantImpl = struct {
         // See vtCreatePublisher's identical comment on why create_topic is
         // not gated by the participant's own enabled state.
         const self = cast(ctx);
-        if (!qos_change.consistent(DDS.TopicQos, qos)) return nil.nil_topic;
+        // The listener is this operation's from here, installed or not
+        // (TopicImpl.init takes it over).
+        if (!qos_change.consistent(DDS.TopicQos, qos)) {
+            listener_box_mod.releaseGivenPtr(a_listener);
+            return nil.nil_topic;
+        }
         const handle = nextHandle(ctx);
         const tn_s = std.mem.span(topic_name);
         const tt_s = std.mem.span(type_name);

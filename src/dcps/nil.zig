@@ -16,6 +16,7 @@ const std = @import("std");
 const DDS = @import("zzdds_generated").DDS;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const zidl_bindings = @import("zidl_bindings");
+const listener_box = @import("../util/listener_box.zig");
 
 pub const NIL_PTR: *anyopaque = zidl_bindings.NIL_PTR;
 
@@ -141,7 +142,8 @@ var nil_participant_vtable = DDS.DomainParticipant.Vtable{
     .get_status_changes = nilGetStatusChanges,
     .get_instance_handle = nilGetHandle,
     .create_publisher = struct {
-        fn f(_: *anyopaque, _: *const DDS.PublisherQos, _: ?*const DDS.PublisherListener, _: DDS.StatusMask) DDS.Publisher {
+        fn f(_: *anyopaque, _: *const DDS.PublisherQos, l: ?*const DDS.PublisherListener, _: DDS.StatusMask) DDS.Publisher {
+            listener_box.releaseGivenPtr(l);
             return nil_publisher;
         }
     }.f,
@@ -151,7 +153,8 @@ var nil_participant_vtable = DDS.DomainParticipant.Vtable{
         }
     }.f,
     .create_subscriber = struct {
-        fn f(_: *anyopaque, _: *const DDS.SubscriberQos, _: ?*const DDS.SubscriberListener, _: DDS.StatusMask) DDS.Subscriber {
+        fn f(_: *anyopaque, _: *const DDS.SubscriberQos, l: ?*const DDS.SubscriberListener, _: DDS.StatusMask) DDS.Subscriber {
+            listener_box.releaseGivenPtr(l);
             return nil_subscriber;
         }
     }.f,
@@ -166,7 +169,8 @@ var nil_participant_vtable = DDS.DomainParticipant.Vtable{
         }
     }.f,
     .create_topic = struct {
-        fn f(_: *anyopaque, _: [*:0]const u8, _: [*:0]const u8, _: *const DDS.TopicQos, _: ?*const DDS.TopicListener, _: DDS.StatusMask) DDS.Topic {
+        fn f(_: *anyopaque, _: [*:0]const u8, _: [*:0]const u8, _: *const DDS.TopicQos, l: ?*const DDS.TopicListener, _: DDS.StatusMask) DDS.Topic {
+            listener_box.releaseGivenPtr(l);
             return nil_topic;
         }
     }.f,
@@ -345,7 +349,8 @@ var nil_publisher_vtable = DDS.Publisher.Vtable{
     .get_status_changes = nilGetStatusChanges,
     .get_instance_handle = nilGetHandle,
     .create_datawriter = struct {
-        fn f(_: *anyopaque, _: DDS.Topic, _: *const DDS.DataWriterQos, _: ?*const DDS.DataWriterListener, _: DDS.StatusMask) DDS.DataWriter {
+        fn f(_: *anyopaque, _: DDS.Topic, _: *const DDS.DataWriterQos, l: ?*const DDS.DataWriterListener, _: DDS.StatusMask) DDS.DataWriter {
+            listener_box.releaseGivenPtr(l);
             return nil_datawriter;
         }
     }.f,
@@ -454,7 +459,8 @@ var nil_subscriber_vtable = DDS.Subscriber.Vtable{
     .get_status_changes = nilGetStatusChanges,
     .get_instance_handle = nilGetHandle,
     .create_datareader = struct {
-        fn f(_: *anyopaque, _: DDS.TopicDescription, _: *const DDS.DataReaderQos, _: ?*const DDS.DataReaderListener, _: DDS.StatusMask) DDS.DataReader {
+        fn f(_: *anyopaque, _: DDS.TopicDescription, _: *const DDS.DataReaderQos, l: ?*const DDS.DataReaderListener, _: DDS.StatusMask) DDS.DataReader {
+            listener_box.releaseGivenPtr(l);
             return nil_datareader;
         }
     }.f,
@@ -1181,7 +1187,8 @@ pub const nil_dp_listener = DDS.noop_DomainParticipantListener;
 
 var nil_factory_vtable = DDS.DomainParticipantFactory.Vtable{
     .create_participant = struct {
-        fn f(_: *anyopaque, _: DDS.DomainId_t, _: *const DDS.DomainParticipantQos, _: ?*const DDS.DomainParticipantListener, _: DDS.StatusMask) DDS.DomainParticipant {
+        fn f(_: *anyopaque, _: DDS.DomainId_t, _: *const DDS.DomainParticipantQos, l: ?*const DDS.DomainParticipantListener, _: DDS.StatusMask) DDS.DomainParticipant {
+            listener_box.releaseGivenPtr(l);
             return nil_participant;
         }
     }.f,

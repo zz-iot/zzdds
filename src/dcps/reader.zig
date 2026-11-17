@@ -580,6 +580,10 @@ pub const DataReaderImpl = struct {
         /// match anything: the match and data callbacks read it.
         subscriber_presentation: DDS.PresentationQosPolicy,
     ) !*Self {
+        // Owns `listener` from here, installed or not: a failure drops the
+        // box's hold, which releases it.
+        const listener_box = try ListenerBox(ZZDDS.DataReaderListenerEx).adopt(alloc, listener);
+        errdefer listener_box.releaseHold(alloc);
         const self = try alloc.create(Self);
         self.* = .{
             .alloc = alloc,
@@ -614,8 +618,7 @@ pub const DataReaderImpl = struct {
         };
         self.listeners.owner.ctx = self;
         errdefer alloc.destroy(self);
-        self.listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listener);
-        errdefer alloc.destroy(self.listener_ex_box);
+        self.listener_ex_box = listener_box;
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);
         // Wire up StatusCondition.

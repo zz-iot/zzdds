@@ -466,6 +466,95 @@ test "a reader incompatible with several writers is told each policy" {
     try testing.expectEqual(@as(i32, 2), probe.total_count);
 }
 
+// ── Release hooks: a create_* owns the listener it is given ─────────────────
+
+/// Counts `release_listener_data` calls on the `u32` passed as `listener_data`.
+fn countRelease(ld: ?*anyopaque) callconv(.c) void {
+    const n: *u32 = @ptrCast(@alignCast(ld.?));
+    n.* += 1;
+}
+
+test "a create_* that fails releases the listener it was given, once" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    var n: u32 = 0;
+
+    // Inconsistent QoS: HISTORY depth over max_samples_per_instance.
+    var topic_qos = DDS.TopicQos{};
+    topic_qos.history = .{ .kind = .KEEP_LAST_HISTORY_QOS, .depth = 5 };
+    topic_qos.resource_limits.max_samples_per_instance = 2;
+    const tl = DDS.TopicListener{ .listener_data = &n, .release_listener_data = countRelease };
+    try testing.expect(fx.dp_w.create_topic("Bad", "MatchType", topic_qos, tl, 0).ptr == zzdds.dcps.NIL_PTR);
+    try testing.expectEqual(@as(u32, 1), n);
+
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.history = .{ .kind = .KEEP_LAST_HISTORY_QOS, .depth = 5 };
+    dw_qos.resource_limits.max_samples_per_instance = 2;
+    const wl = DDS.DataWriterListener{ .listener_data = &n, .release_listener_data = countRelease };
+    try testing.expect(fx.pub_w.create_datawriter(fx.topic_w, dw_qos, wl, 0).ptr == zzdds.dcps.NIL_PTR);
+    try testing.expectEqual(@as(u32, 2), n);
+    // Another participant's Topic.
+    try testing.expect(fx.pub_w.create_datawriter(fx.topic_r, .{}, wl, 0).ptr == zzdds.dcps.NIL_PTR);
+    try testing.expectEqual(@as(u32, 3), n);
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history = .{ .kind = .KEEP_LAST_HISTORY_QOS, .depth = 5 };
+    dr_qos.resource_limits.max_samples_per_instance = 2;
+    const rl = DDS.DataReaderListener{ .listener_data = &n, .release_listener_data = countRelease };
+    try testing.expect(fx.sub_r.create_datareader(topicDesc(fx.topic_r), dr_qos, rl, 0).ptr == zzdds.dcps.NIL_PTR);
+    try testing.expectEqual(@as(u32, 4), n);
+    try testing.expect(fx.sub_r.create_datareader(topicDesc(fx.topic_w), .{}, rl, 0).ptr == zzdds.dcps.NIL_PTR);
+    try testing.expectEqual(@as(u32, 5), n);
+
+    // On a nil entity, as a failed create_* returns.
+    const pl = DDS.PublisherListener{ .listener_data = &n, .release_listener_data = countRelease };
+    const sl = DDS.SubscriberListener{ .listener_data = &n, .release_listener_data = countRelease };
+    const dpl = DDS.DomainParticipantListener{ .listener_data = &n, .release_listener_data = countRelease };
+    _ = zzdds.dcps.nil_participant.create_publisher(.{}, pl, 0);
+    _ = zzdds.dcps.nil_participant.create_subscriber(.{}, sl, 0);
+    _ = zzdds.dcps.nil_participant.create_topic("T", "MatchType", .{}, tl, 0);
+    _ = zzdds.dcps.nil_publisher.create_datawriter(fx.topic_w, .{}, wl, 0);
+    _ = zzdds.dcps.nil_subscriber.create_datareader(topicDesc(fx.topic_r), .{}, rl, 0);
+    _ = zzdds.dcps.nil_factory.create_participant(test_domain.get(), .{}, dpl, 0);
+    try testing.expectEqual(@as(u32, 11), n);
+
+    // One that succeeds keeps it until it is deleted.
+    const dw = fx.pub_w.create_datawriter(fx.topic_w, .{}, wl, 0);
+    try testing.expect(dw.ptr != zzdds.dcps.NIL_PTR);
+    try testing.expectEqual(@as(u32, 11), n);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.delete_datawriter(dw));
+    fx.settle();
+    try testing.expectEqual(@as(u32, 12), n);
+}
+
+test "a Topic whose creation runs out of memory releases its listener once, at any allocation" {
+    const Stub = struct {
+        fn participant(_: *anyopaque) DDS.DomainParticipant {
+            return zzdds.dcps.nil_participant;
+        }
+        fn enabled(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var ctx: u8 = 0;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var n: u32 = 0;
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const listener = DDS.TopicListener{ .listener_data = &n, .release_listener_data = countRelease };
+        const t = zzdds.dcps.TopicImpl.init(failing.allocator(), "T", "MatchType", &ctx, Stub.participant, Stub.enabled, .{}, listener, 0, 1) catch {
+            try testing.expectEqual(@as(u32, 1), n);
+            continue;
+        };
+        try testing.expectEqual(@as(u32, 0), n);
+        t.deleted();
+        try testing.expectEqual(@as(u32, 1), n);
+        try testing.expect(fail_index > 0);
+        break;
+    }
+}
+
 // ── Release hooks: delete_contained_entities and the parent's lock ──────────
 
 /// A listener whose release hook calls into its endpoint's parent, which

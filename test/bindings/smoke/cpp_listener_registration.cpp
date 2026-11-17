@@ -298,6 +298,27 @@ void check_rejected_registrations(const std::shared_ptr<::DDS::Subscriber> &sub,
     CHECK(g_probes_destroyed.load() == g_probes_made.load());
 }
 
+// A create_* that fails owns the listener it was given, as one that succeeds
+// does: the core releases the registration, once, and the binding does not.
+class WriterProbe : public ::DDS::DataWriterListenerBase {};
+
+void check_failed_create_releases(const std::shared_ptr<::DDS::Publisher> &pub,
+                                  const std::shared_ptr<::DDS::Topic> &topic) {
+    std::weak_ptr<WriterProbe> weak;
+    {
+        auto listener = std::make_shared<WriterProbe>();
+        weak = listener;
+        // Inconsistent: a HISTORY depth over max_samples_per_instance.
+        auto qos = ::DDS::DataWriterQos::default_value();
+        qos.history.kind = ::DDS::HistoryQosPolicyKind::KEEP_LAST_HISTORY_QOS;
+        qos.history.depth = 5;
+        qos.resource_limits.max_samples_per_instance = 2;
+        // Fails, returning the wrapper of a nil writer.
+        pub->create_datawriter(topic, qos, listener, 0);
+    }
+    CHECK(weak.expired());
+}
+
 } // namespace
 
 int main() {
@@ -322,6 +343,7 @@ int main() {
     auto pub = dp_w->create_publisher(::DDS::PublisherQos::default_value(), nullptr, 0);
     auto sub = dp_r->create_subscriber(::DDS::SubscriberQos::default_value(), nullptr, 0);
     CHECK(pub && sub);
+    check_failed_create_releases(pub, topic_w);
 
     auto dr = sub->create_datareader(
         std::static_pointer_cast<::zzdds::TopicImpl>(topic_r)->as_topic_description(),

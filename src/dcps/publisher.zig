@@ -229,6 +229,10 @@ pub const PublisherImpl = struct {
         mask: DDS.StatusMask,
         handle: DDS.InstanceHandle_t,
     ) !*Self {
+        // Owns `listener` from here, installed or not: a failure drops the
+        // box's hold, which releases it.
+        const listener_box = try ListenerBox(DDS.PublisherListener).adopt(alloc, listener);
+        errdefer listener_box.releaseHold(alloc);
         const self = try alloc.create(Self);
         self.* = .{
             .alloc = alloc,
@@ -250,8 +254,7 @@ pub const PublisherImpl = struct {
             .group_seq_num_counter = 0,
         };
         errdefer alloc.destroy(self);
-        self.listener_box = try ListenerBox(DDS.PublisherListener).create(alloc, listener);
-        errdefer alloc.destroy(self.listener_box);
+        self.listener_box = listener_box;
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);
         // See config/generated.zig's applyQosDefaults doc comment: this is the
@@ -435,6 +438,10 @@ pub const PublisherImpl = struct {
         listener: ZZDDS.DataWriterListenerEx,
         mask: DDS.StatusMask,
     ) DDS.DataWriter {
+        // `listener` is this operation's, installed or not: released on a
+        // failure before `finishDataWriter` takes it over.
+        var listener_given = true;
+        defer if (listener_given) listener_box_mod.releaseGiven(listener);
         var traversal: listener_lane.Traversal = .{};
         traversal.begin(self.cbs.listener_group);
         defer traversal.end();
@@ -448,6 +455,7 @@ pub const PublisherImpl = struct {
         // qos.entity_factory, regardless of whether the Publisher itself is
         // currently enabled.
         const parts = self.createProtoWriter(a_topic, qos) catch return nil.nil_datawriter;
+        listener_given = false;
         return self.finishDataWriter(a_topic, qos, listener, mask, parts);
     }
 
@@ -506,6 +514,7 @@ pub const PublisherImpl = struct {
         if (self.cbs.listener_group != null and !traversal.counted) {
             self.cbs.destroy_proto_writer(self.cbs.ctx, parts.publication_handle);
             parts.topic_use.abandon();
+            listener_box_mod.releaseGiven(listener);
             return nil.nil_datawriter;
         }
 

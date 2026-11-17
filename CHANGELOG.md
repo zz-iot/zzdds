@@ -10,6 +10,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-17
 
+- A `create_*` that fails releases the listener it was given (`release_listener_data`),
+  once, wherever it fails: inconsistent QoS, another participant's Topic, out of memory, or
+  a nil parent. It used to free the registration without releasing it. The C++ and Java
+  bindings, which read the new entity's listener back to release theirs, no longer do (zidl
+  v0.3.33); that read-back could release a registration twice when a callback of the new
+  entity replaced it first.
 - `WaitSet::detach_condition` returns `PRECONDITION_NOT_MET` for a condition whose entity was
   deleted, as it already did once the entity was freed. Deleting an entity detaches its
   StatusCondition and ReadConditions from every WaitSet at once, as `wait` and `get_conditions`

@@ -22,6 +22,7 @@ const c_abi_handle = @import("../util/c_abi_handle.zig");
 const runtime_mod = @import("../runtime/core.zig");
 const default_registry = @import("../runtime/default_registry.zig");
 const log_mod = @import("../log.zig");
+const listener_box_mod = @import("../util/listener_box.zig");
 
 pub const Transport = participant_mod.Transport;
 pub const Discovery = participant_mod.Discovery;
@@ -270,6 +271,10 @@ pub const DomainParticipantFactoryImpl = struct {
         config: config_mod.Config,
         config_deinit_allocator: ?std.mem.Allocator,
     ) ?*participant_mod.DomainParticipantImpl {
+        // `a_listener` is this operation's, installed or not: released on a
+        // failure before `DomainParticipantImpl.init` takes it over.
+        var listener_given = true;
+        defer if (listener_given) listener_box_mod.releaseGivenPtr(a_listener);
         if (!self.lifetime.acquire()) return null;
         defer self.lifetime.release(self, destroy);
 
@@ -288,6 +293,7 @@ pub const DomainParticipantFactoryImpl = struct {
 
         const rt = self.acquireRuntimeFor() orelse return null;
 
+        listener_given = false;
         const p = participant_mod.DomainParticipantImpl.init(
             self.alloc,
             domain_id,

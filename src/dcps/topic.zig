@@ -128,6 +128,10 @@ pub const TopicImpl = struct {
         mask: DDS.StatusMask,
         instance_handle: DDS.InstanceHandle_t,
     ) !*Self {
+        // Owns `listener` from here, installed or not: a failure drops the
+        // box's hold, which releases it.
+        const listener_box = try ListenerBox(DDS.TopicListener).adopt(alloc, listener);
+        errdefer listener_box.releaseHold(alloc);
         const self = try alloc.create(Self);
         errdefer alloc.destroy(self);
         const tn = try alloc.dupeSentinel(u8, topic_name, 0);
@@ -136,8 +140,6 @@ pub const TopicImpl = struct {
         errdefer alloc.free(tt);
         var qos_clone = try qos.clone(alloc);
         errdefer qos_clone.deinit(alloc);
-        const listener_box = try ListenerBox(DDS.TopicListener).create(alloc, listener);
-        errdefer alloc.destroy(listener_box);
         self.* = .{
             .alloc = alloc,
             .topic_name = tn,

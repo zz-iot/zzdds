@@ -207,7 +207,9 @@ construction on. `FooListenerBase::c_listener` passes it as the registration's
 `@shared_base` ancestor passes the complete object (`dynamic_cast<void*>`) where RTTI is
 available, else its own subobject. Dispatch goes through the listener interface's virtual
 functions, reached through `listener_data`, which is a per-registration `shared_ptr` owning
-the listener until the core calls `release_listener_data`. Separate forwarding objects remain
+the listener until the core calls `release_listener_data`. A `create_*` owns the registration
+it is given, installed or not: one that fails releases it before it returns, so no binding
+releases a registration it passed to one. Separate forwarding objects remain
 distinct unless an adapter explicitly supplies common identity or the application groups
 them. This is not an entity-wrapper identity mechanism.
 
