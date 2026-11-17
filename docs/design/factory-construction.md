@@ -205,21 +205,9 @@ elsewhere, and can come later.
 **New: static operations.** `get_instance` and `delete_instance` have no receiver and confer
 no ownership, which no zidl annotation expresses. A `@constructor` won't do: its result is
 owned, so dropping the last C++ reference to the process-wide factory would delete it.
-Proposed `@static`:
-
-- Allowed on any interface, not only `@standalone` ones: no ownership is involved.
-- No receiver, no vtable slot, not inherited. Parameters are `in`, and it is not `oneway`,
-  as for constructors.
-- An interface it returns is borrowed: boxed through the identity cache, never adopted.
-- C: a free function, `DDS_DomainParticipantFactory_get_instance(void)`.
-- Zig provider: implementations passed at comptime, as `exportCAbiConstructors` does.
-- C++: a static member function.
-- Java: a static interface method with a static JNI native.
-
-zidl#80, which added `@standalone`, was about 2,300 lines including tests. `@static` reuses
-most of its C, Zig and JNI plumbing without the ownership parts. Later it could also replace
-other hand-written statics, such as `ZzddsRuntime.configureFromFile` and
-`zzdds_process_configure`.
+Proposed: `@static`, sketched in the next section. zidl#80, which added `@standalone`, was
+about 2,300 lines including tests. `@static` reuses most of its C, Zig and JNI plumbing
+without the ownership parts.
 
 **Minor: the default allocator.** The generated `create_with_allocator(NULL)` resolves NULL to
 zidl's default allocator before calling zzdds. zzdds's `-Ddebug-allocator` currently routes
@@ -228,6 +216,143 @@ factories created with NULL through its DebugAllocator and checks them for leaks
 code and is unaffected. Either zzdds recognizes zidl's default allocator, or zidl passes the
 raw `ZidlAllocator` pointer to constructors that ask for it. *Recommendation: decide during
 implementation.*
+
+## Sketch: `@static`
+
+### IDL and rules
+
+```idl
+// dcps.idl
+@shared_c_abi_box interface DomainParticipantFactory {
+    @static DomainParticipantFactory get_instance();
+    @static ReturnCode_t delete_instance();
+    DomainParticipant create_participant(/* ... */);
+    // ...
+};
+```
+
+Another IDL compiler sees two ordinary operations, as the specs' own `/*static*/` comments
+do. The builder checks:
+
+| Rule | Why |
+| --- | --- |
+| No receiver, no vtable slot, not inherited | A static belongs to the interface, as a constructor does |
+| Parameters are `in`; not `oneway` | As for constructors |
+| Allowed on any interface, including a shared-box family root | Nothing is owned, so the root's limit for constructors does not apply |
+| Not also `@constructor`, `@destructor` or `@finalizer` | One role per operation |
+| No instance operation of the same name in the family | The C function names, and Java's static and instance methods, would collide |
+
+An interface a static returns is **borrowed**: boxed through the identity cache like any
+operation's result, never adopted as owned. Dropping or closing it releases nothing.
+
+### Per language
+
+**C.** Free functions, using the same convention as instance operations for a nil result:
+
+```c
+DDS_DomainParticipantFactory DDS_DomainParticipantFactory_get_instance(void);
+DDS_ReturnCode_t             DDS_DomainParticipantFactory_delete_instance(void);
+```
+
+**Zig provider.** The interface struct gains `exportCAbiStatics`, which the provider calls from
+a `comptime` block with a type declaring each static. It is separate from
+`exportCAbiConstructors`, because a `@static` can be on an interface that is not
+`@standalone`:
+
+```zig
+comptime {
+    DDS.DomainParticipantFactory.exportCAbiStatics(struct {
+        pub fn get_instance() DDS.DomainParticipantFactory { ... }
+        pub fn delete_instance() DDS.ReturnCode_t { ... }
+    });
+}
+```
+
+The generated exports convert parameters and box a returned interface as instance operations
+do. A static takes no allocator: whatever it creates is the provider's business.
+
+**C++.** Static members on the abstract class, defined in the impl file beside the
+constructors. `get_instance` boxes through the family root's `_getOrCreate` and does not call
+`_zidlAdopt`:
+
+```cpp
+class DomainParticipantFactory {
+public:
+    static std::shared_ptr<DomainParticipantFactory> get_instance();
+    static ReturnCode_t delete_instance();
+    // ...
+};
+
+std::shared_ptr<DomainParticipantFactory> DomainParticipantFactory::get_instance() {
+    DDS_DomainParticipantFactory h = DDS_DomainParticipantFactory_get_instance();
+    if (!h) return nullptr;
+    return ::DDS::DomainParticipantFactoryImpl::_getOrCreate(h);   // borrowed
+}
+```
+
+`zzdds::DomainParticipantFactory::get_instance()` would also compile, since C++ looks static
+members up through base classes, and returns the DDS view.
+
+**Java.** Static interface methods, so `Zzdds.zzdds.DomainParticipantFactory.get_instance()`
+does not exist (Java does not inherit them), and a static JNI native on the impl class. The
+bridge boxes the handle and, unlike a constructor's, releases nothing if boxing fails:
+
+```java
+public interface DomainParticipantFactory {
+    static DomainParticipantFactory get_instance() { return DomainParticipantFactoryImpl.get_instance(); }
+    static int delete_instance() { return DomainParticipantFactoryImpl.delete_instance(); }
+    // ...
+}
+```
+
+```c
+JNIEXPORT jobject JNICALL Java_io_zzdds_dcps_DomainParticipantFactoryImpl_n_1get_1instance(JNIEnv *env, jclass cls) {
+    (void)cls;
+    void *h = (void *)DDS_DomainParticipantFactory_get_instance();
+    return h == NULL ? NULL : zidl_java_box_DDS_DomainParticipantFactory(env, h);
+}
+```
+
+### zzdds's implementation
+
+In `extensions.zig`, beside the constructors:
+
+- **The instance.** A module-level `?*FactoryOwner` guarded by a mutex. `get_instance` creates
+  it on first use with zzdds's default allocator. Like `zzdds_create_factory`, it resolves the
+  process configuration if nothing has yet, so `zzdds_process_configure` must come first.
+  Every call until `delete_instance` returns its DDS view. A concurrent first call creates
+  exactly one.
+- **`delete_instance`.** Under the mutex, it closes the instance only if it has no
+  participants, or returns `PRECONDITION_NOT_MET`, or `OK` when there is no instance. The
+  check and the close must be one step under the `FactoryOwner`'s own lock, so a
+  `create_participant` on another thread cannot slip in between them and be deleted. (The
+  prototype's strict `destroy` has this race, and the real one needs the same fix.)
+  Deleting retires the handle, so C++ and Java wrappers of the old instance return
+  `ALREADY_DELETED`, as XTypes allows ("references ... may become invalid"). The next
+  `get_instance` creates a new instance, with a new wrapper.
+- **Not anyone's to destroy.** The instance's `FactoryOwner` is marked. `destroy` on it,
+  reached through `DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory`, returns
+  `PRECONDITION_NOT_MET`, and `release` does nothing. A narrowed C++ or Java wrapper was
+  never adopted, so dropping or closing it calls neither.
+- **Independent of `create`.** Factories of one's own are separate `FactoryOwner`s. They
+  neither see nor affect the instance.
+- **`-Ddebug-allocator`.** `get_instance` is zzdds's code, so its instance goes through the
+  DebugAllocator and `FactoryLeakCheck` as `zzdds_create_factory()` does today. A program
+  checked for leaks must call `delete_instance`.
+
+### zidl tests
+
+Extend `test/integration/standalone/` with a static pair on a family root, driven from Zig, C++
+and Java:
+
+- Two `get_instance` calls return the same wrapper.
+- Dropping or closing it leaves the instance alive.
+- `delete_instance` refuses while the instance is in use, then retires every wrapper.
+- `get_instance` after that returns a new instance at a possibly reused address.
+- A static on an interface with an instance operation of the same name is rejected.
+
+Other hand-written statics, `ZzddsRuntime.configureFromFile` and `zzdds_process_configure`
+among them, could move to `@static` later.
 
 ## Application code, before and after
 
