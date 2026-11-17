@@ -261,6 +261,10 @@ pub const DataWriterImpl = struct {
         guid: proto.Guid,
         timer_clock: time_mod.Clock,
     ) !*Self {
+        // Owns `listener` from here, installed or not: a failure drops the
+        // box's hold, which releases it.
+        const listener_box = try ListenerBox(ZZDDS.DataWriterListenerEx).adopt(alloc, listener);
+        errdefer listener_box.releaseHold(alloc);
         const now = timer_clock.nowNs();
         const self = try alloc.create(Self);
         self.* = .{
@@ -291,8 +295,7 @@ pub const DataWriterImpl = struct {
         };
         self.listeners.owner.ctx = self;
         errdefer alloc.destroy(self);
-        self.listener_ex_box = try ListenerBox(ZZDDS.DataWriterListenerEx).create(alloc, listener);
-        errdefer alloc.destroy(self.listener_ex_box);
+        self.listener_ex_box = listener_box;
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);
         // Wire up the StatusCondition.

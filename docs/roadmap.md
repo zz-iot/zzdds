@@ -403,12 +403,6 @@ or an optimisation on an already-improved path):
   tests migrated to it. Keep public `TypeSupport`, `filter` (`FilterValue`/`CdrFieldGetter`,
   used by generated `getFieldFromCdr`) and the `nil_*`/`NIL_PTR` sentinels. Verify with
   `zig build test`, the strict examples suite and a `dds-rtps` rebuild.
-- **A failed `create_*` does not release its listener registration.** The core frees the
-  boxed listener without calling `release_listener_data`, so the C++ and Java bindings read
-  the new entity's listener back and release theirs when it is not installed. If a callback
-  of the new entity replaces that listener before the read-back, the registration is
-  released twice. Fix: the core releases the registration on every failed `create_*`, and
-  the bindings drop the read-back.
 - **Java: a few DCPS ops taking a bare `sequence<T>` parameter** (not inside a struct) throw
   `UnsupportedOperationException` (`get_datareaders`, some batch ops). `zzdds.idl`
   vendor-extension / cross-file type refs in zidl's Java backend may be partly stale versus

@@ -243,6 +243,10 @@ pub const SubscriberImpl = struct {
         mask: DDS.StatusMask,
         handle: DDS.InstanceHandle_t,
     ) !*Self {
+        // Owns `listener` from here, installed or not: a failure drops the
+        // box's hold, which releases it.
+        const listener_box = try ListenerBox(DDS.SubscriberListener).adopt(alloc, listener);
+        errdefer listener_box.releaseHold(alloc);
         const self = try alloc.create(Self);
         self.* = .{
             .alloc = alloc,
@@ -260,8 +264,7 @@ pub const SubscriberImpl = struct {
             .mu = .{},
         };
         errdefer alloc.destroy(self);
-        self.listener_box = try ListenerBox(DDS.SubscriberListener).create(alloc, listener);
-        errdefer alloc.destroy(self.listener_box);
+        self.listener_box = listener_box;
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);
         // See config/generated.zig's applyQosDefaults doc comment: this is the
@@ -469,6 +472,10 @@ pub const SubscriberImpl = struct {
         listener: ZZDDS.DataReaderListenerEx,
         mask: DDS.StatusMask,
     ) DDS.DataReader {
+        // `listener` is this operation's, installed or not: released on a
+        // failure before `DataReaderImpl.init` takes it over.
+        var listener_given = true;
+        defer if (listener_given) listener_box_mod.releaseGiven(listener);
         var traversal: listener_lane.Traversal = .{};
         traversal.begin(self.cbs.listener_group);
         defer traversal.end();
@@ -504,6 +511,7 @@ pub const SubscriberImpl = struct {
             topic_use.abandon();
             return nil.nil_datareader;
         };
+        listener_given = false;
         const dr = reader_mod.DataReaderImpl.init(
             self.alloc,
             a_topic,

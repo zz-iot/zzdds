@@ -23,6 +23,20 @@ const listener_identity = @import("listener_identity.zig");
 const Mutex = @import("mutex.zig").Mutex;
 const Condvar = @import("condvar.zig").Condvar;
 
+/// Releases a registration a `create_*` was given and will not install
+/// (`ListenerBox.adopt`), as a listener call like every other release: the
+/// operation owns what it is given, installed or not.
+pub fn releaseGiven(listener: anytype) void {
+    enterCall();
+    defer leaveCall();
+    listener_lifecycle.release(listener);
+}
+
+/// `releaseGiven` for a `create_*`'s optional listener argument.
+pub fn releaseGivenPtr(listener: anytype) void {
+    if (listener) |l| releaseGiven(l.*);
+}
+
 /// What a `get_listener` returns for the installed `listener`: the same
 /// registration, retained for the caller when it asks for that
 /// (`retain_listener_data`). The caller then owns that reference and drops it
@@ -117,6 +131,17 @@ pub fn ListenerBox(comptime T: type) type {
             return self;
         }
 
+        /// `create` for the registration a `create_*` was given, which the
+        /// operation owns whether or not it installs it: when the box cannot
+        /// be allocated, releases it. Every later failure drops the box's
+        /// hold (`releaseHold`), which releases it too.
+        pub fn adopt(alloc: std.mem.Allocator, listener: T) !*Self {
+            return create(alloc, listener) catch |err| {
+                releaseGiven(listener);
+                return err;
+            };
+        }
+
         /// Takes a use: a dispatch through `.listener`, ended with
         /// `releaseRef`. Call while holding the owning entity's listener
         /// lock, with this box installed. Returns `self` for convenience.
@@ -206,9 +231,7 @@ pub fn ListenerBox(comptime T: type) type {
         /// code, and a setter it calls must not wait, for instance for the
         /// use whose end is running it.
         fn releaseContext(listener: T) void {
-            enterCall();
-            defer leaveCall();
-            listener_lifecycle.release(listener);
+            releaseGiven(listener);
         }
 
         fn destroy(self: *Self, alloc: std.mem.Allocator, last: u64) void {
@@ -312,6 +335,16 @@ test "ListenerBox: single installed reference releases immediately" {
         .release_listener_data = countRelease,
     });
     box.releaseHold(testing.allocator);
+    try testing.expectEqual(@as(u32, 1), released.load(.seq_cst));
+}
+
+test "ListenerBox.adopt releases the registration when its box cannot be allocated" {
+    var released: std.atomic.Value(u32) = .init(0);
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, ListenerBox(TestListener).adopt(failing.allocator(), .{
+        .listener_data = &released,
+        .release_listener_data = countRelease,
+    }));
     try testing.expectEqual(@as(u32, 1), released.load(.seq_cst));
 }
 

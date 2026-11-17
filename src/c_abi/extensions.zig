@@ -22,6 +22,7 @@ comptime {
 }
 const process_config = @import("../config/process.zig");
 const log_mod = @import("../log.zig");
+const listener_box_mod = @import("../util/listener_box.zig");
 const DomainParticipantFactoryImpl = @import("../dcps/factory.zig").DomainParticipantFactoryImpl;
 const participant_mod = @import("../dcps/participant.zig");
 const DomainParticipantImpl = participant_mod.DomainParticipantImpl;
@@ -108,6 +109,10 @@ const FactoryOwner = struct {
         config: config_mod.Config,
         config_deinit_allocator: ?std.mem.Allocator,
     ) !DDS.DomainParticipant {
+        // `a_listener` is this operation's, installed or not: released on a
+        // failure before `createParticipantWithConfigOwned` takes it over.
+        var listener_given = true;
+        defer if (listener_given) listener_box_mod.releaseGivenPtr(a_listener);
         if (!self.lifetime.acquire()) return error.FactoryDeleted;
         defer self.lifetime.release(self, destroy);
         const stack = try ParticipantStack.init(self.alloc, domain_id, config);
@@ -140,6 +145,7 @@ const FactoryOwner = struct {
         // so that p.deinit() on any failure path doesn't free the config (the
         // caller's catch block in factoryCreateParticipantEx is the sole cleanup
         // site).
+        listener_given = false;
         const p = stack.factory.createParticipantWithConfigOwned(domain_id, qos, a_listener, mask, config, null) orelse
             return error.ParticipantFailed;
 
@@ -503,7 +509,10 @@ fn publisherCreateDataWriterEx(
     a_listener: ?*const ZZDDS.DataWriterListenerEx,
     mask: DDS.StatusMask,
 ) DDS.DataWriter {
-    if (ctx == nil.NIL_PTR) return nil.nil_datawriter;
+    if (ctx == nil.NIL_PTR) {
+        listener_box_mod.releaseGivenPtr(a_listener);
+        return nil.nil_datawriter;
+    }
     const impl: *PublisherImpl = @ptrCast(@alignCast(ctx));
     return impl.createDataWriter(a_topic, qos, if (a_listener) |l| l.* else ZZDDS.noop_DataWriterListenerEx, mask);
 }
@@ -595,7 +604,10 @@ fn subscriberCreateDataReaderEx(
     a_listener: ?*const ZZDDS.DataReaderListenerEx,
     mask: DDS.StatusMask,
 ) DDS.DataReader {
-    if (ctx == nil.NIL_PTR) return nil.nil_datareader;
+    if (ctx == nil.NIL_PTR) {
+        listener_box_mod.releaseGivenPtr(a_listener);
+        return nil.nil_datareader;
+    }
     const impl: *SubscriberImpl = @ptrCast(@alignCast(ctx));
     return impl.createDataReader(a_topic, qos, if (a_listener) |l| l.* else ZZDDS.noop_DataReaderListenerEx, mask);
 }
@@ -1334,6 +1346,10 @@ fn factoryCreateParticipant(
     a_listener: ?*const DDS.DomainParticipantListener,
     mask: DDS.StatusMask,
 ) DDS.DomainParticipant {
+    // `a_listener` is this operation's, installed or not: released on a
+    // failure before `FactoryOwner.createParticipant` takes it over.
+    var listener_given = true;
+    defer if (listener_given) listener_box_mod.releaseGivenPtr(a_listener);
     if (ctx == nil.NIL_PTR) return nil.nil_participant;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
     if (!owner.lifetime.acquire()) return nil.nil_participant;
@@ -1354,6 +1370,7 @@ fn factoryCreateParticipant(
         std.log.err("create_participant: config conversion failed: {}", .{err});
         return nil.nil_participant;
     };
+    listener_given = false;
     return owner.createParticipant(domain_id, qos, a_listener, mask, runtime_config, owner.alloc) catch |err| {
         var cfg = runtime_config;
         config_generated.deinitRuntimeConfig(owner.alloc, &cfg);
@@ -1370,6 +1387,9 @@ fn factoryCreateParticipantEx(
     mask: DDS.StatusMask,
     config: *const ZZDDS.DomainParticipantConfig,
 ) DDS.DomainParticipant {
+    // As for `factoryCreateParticipant`.
+    var listener_given = true;
+    defer if (listener_given) listener_box_mod.releaseGivenPtr(a_listener);
     if (ctx == nil.NIL_PTR) return nil.nil_participant;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
     if (!owner.lifetime.acquire()) return nil.nil_participant;
@@ -1379,6 +1399,7 @@ fn factoryCreateParticipantEx(
         std.log.err("create_participant_ex: config conversion failed: {}", .{err});
         return nil.nil_participant;
     };
+    listener_given = false;
     return owner.createParticipant(domain_id, qos, a_listener, mask, runtime_config, owner.alloc) catch |err| {
         var cfg = runtime_config;
         config_generated.deinitRuntimeConfig(owner.alloc, &cfg);
