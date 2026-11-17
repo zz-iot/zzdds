@@ -1,7 +1,7 @@
 //! Listener separation on a shared runtime
 //! (docs/design/concurrency/listeners.md#inline-path-and-pending-work): a
-//! reader or writer records which of its statuses changed and queues one
-//! request on its own listener context. Its listener runs as a turn of that
+//! reader, writer or Topic records which of its statuses changed and queues
+//! one request on its own listener context. Its listener runs as a turn of that
 //! context, never on the stack that changed the status, and a wait that
 //! helps with internal work never runs it.
 //!

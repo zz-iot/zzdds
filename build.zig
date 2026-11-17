@@ -1889,6 +1889,7 @@ pub fn build(b: *std.Build) void {
         "test/dcps/listener_replacement_test.zig",
         "test/dcps/listener_fallback_test.zig",
         "test/dcps/status_claim_test.zig",
+        "test/dcps/inconsistent_topic_test.zig",
         "test/dcps/sample_rejected_test.zig",
         "test/dcps/type_support_test.zig",
         "test/dcps/get_field_refresh_test.zig",

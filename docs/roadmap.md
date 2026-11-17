@@ -331,8 +331,6 @@ or an optimisation on an already-improved path):
   accept this later without rework). ~1 day with full-decode of wanted nested structs,
   ~2 days fully selective. Impact of deferring: a nested field reference silently never
   matches (unknown field → `eval` passes the sample) — a pre-existing gap.
-- **`on_inconsistent_topic` has zero firing sites** — the underlying status detection is
-  not wired up.
 - **`SampleInfo` `sample_rank` / `generation_rank` / `absolute_generation_rank`** stay at
   their defaults.
 - **`wait_for_historical_data` on a BEST_EFFORT reader** has no guaranteed history wait.

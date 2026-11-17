@@ -16,6 +16,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   `DDS_WaitSet_create`/`DDS_GuardCondition_create` (and `_with_allocator`), which return NULL
   on failure, and `DDS_WaitSet_destroy`/`DDS_GuardCondition_destroy`. rmw_zzdds, their last
   user, has moved to the generated functions.
+- A Topic's INCONSISTENT_TOPIC status works (DDS 1.4 §2.2.4.1). Each discovered DataWriter
+  or DataReader with the Topic's name and another type name counts once, including those
+  discovered before the Topic was created; announcing it again does not count it again. It
+  wakes the Topic's StatusCondition and calls `on_inconsistent_topic`, the Topic's or else
+  its participant's, with the Topic's handle. A disabled Topic's listener is called once it
+  is enabled. Nothing used to set it.
 - A `create_*` that fails releases the listener it was given (`release_listener_data`),
   once, wherever it fails: inconsistent QoS, another participant's Topic, out of memory, or
   a nil parent. It used to free the registration without releasing it. The C++ and Java
