@@ -202,6 +202,50 @@ test "WaitSet: ReadCondition survives DataReader deletion while still attached" 
     }
 }
 
+// A runtime thread still using a deleted entity keeps it from being freed, and
+// with it the WaitSet's entry for its condition. These pin the entity the same
+// way, so the entry deterministically outlives the deletion.
+
+test "WaitSet: a deleted writer's StatusCondition is no longer attached, while the writer is still pinned" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, "WSLifecycleTopic5", "WSLifecycleType5");
+    defer fx.deinit();
+
+    const pair = fx.makeWriterReader(.{}, .{});
+
+    const ws = try WaitSetImpl.init(alloc);
+    defer ws.deinit();
+
+    const sc = pair.dw.get_statuscondition();
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().attach_condition(statusAsCondition(sc)));
+
+    const native: *DataWriterImpl = @ptrCast(@alignCast(pair.dw.ptr));
+    try testing.expect(native.acquireQuiesce());
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.delete_datawriter(pair.dw));
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, ws.toDDSWaitSet().detach_condition(statusAsCondition(sc)));
+    native.releaseQuiesce();
+}
+
+test "WaitSet: a deleted reader's ReadCondition is no longer attached, while the reader is still pinned" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, "WSLifecycleTopic6", "WSLifecycleType6");
+    defer fx.deinit();
+
+    const pair = fx.makeWriterReader(.{}, .{});
+
+    const ws = try WaitSetImpl.init(alloc);
+    defer ws.deinit();
+
+    const rc = pair.dr.create_readcondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().attach_condition(readAsCondition(rc)));
+
+    const native: *DataReaderImpl = @ptrCast(@alignCast(pair.dr.ptr));
+    try testing.expect(native.acquireQuiesce());
+    try testing.expectEqual(DDS.RETCODE_OK, fx.sub_r.delete_datareader(pair.dr));
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, ws.toDDSWaitSet().detach_condition(readAsCondition(rc)));
+    native.releaseQuiesce();
+}
+
 test "WaitSet: deinit while GuardCondition/StatusCondition/ReadCondition of real entities still attached" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc, "WSLifecycleTopic3", "WSLifecycleType3");
