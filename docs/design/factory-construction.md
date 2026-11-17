@@ -26,6 +26,36 @@ factory to process exit.
 There is no `get_instance()`. DDS defines `DomainParticipantFactory::get_instance()` as a
 static operation, which IDL cannot declare, so `dcps.idl` leaves it out.
 
+## What the specs say
+
+DDS 1.4 §2.2.2.2.2 describes the factory as "a pre-existing singleton object that can be
+accessed by means of the get_instance class operation". Its sole purpose is to create and
+destroy participants, and it has no factory of its own.
+
+- **`get_instance`** (§2.2.2.2.2.3) returns that singleton. It is idempotent: every call
+  returns the same instance, without side effects. It is a static operation "implemented
+  using the syntax of the native language", since IDL cannot express one, and §2.3 says each
+  language mapping should provide it. `TheParticipantFactory` is an alias for it.
+- **No `delete_instance`.** DDS 1.4 has no way to destroy, recreate or create a factory. A
+  process has exactly one, for its whole life. Factories of one's own, and deleting one, are
+  zzdds extensions.
+- **The factory has no `delete_contained_entities`.** Tearing down means deleting each
+  participant, which refuses with `PRECONDITION_NOT_MET` while it still contains entities.
+
+`delete_instance` comes from DDS-XTypes 1.3, which gives `DynamicTypeBuilderFactory`
+(§7.5.2.2.9, §7.5.2.2.11) and `DynamicDataFactory` (§7.5.2.10.3, §7.5.2.10.4) a static pair:
+
+- **`get_instance`** returns an object that "behaves like a singleton, although the caller
+  cannot assume pointer equality". Calling it after `delete_instance` is legal, and the
+  implementation recreates the singleton.
+- **`delete_instance`** reclaims everything previously returned from `get_instance`. "Any
+  references to these objects held by previous callers ... may become invalid at the
+  discretion of the implementation." It fails only with `RETCODE_ERROR`, for
+  implementation-specific reasons, and has no precondition.
+
+So nothing specifies `delete_instance` for the participant factory. Borrowing XTypes' pair
+is a zzdds choice, as is whether it refuses or tears down.
+
 ## Proposal
 
 ```idl
@@ -86,12 +116,51 @@ them, as the WaitSet functions were (#172).
      use as either, but the spec's `DDS::DomainParticipantFactory::get_instance()` would not
      exist. *Recommendation: the DDS interface.* Only four programs use zzdds's factory
      operations, and those could create their own factory instead.
-   - *Whether `delete_instance` cascades.* Strict matches XTypes' `delete_instance` and the
-     rest of DDS, but a program must delete its participants first. Cascading is shorter to
-     write, but then deleting the process-wide factory silently deletes participants other
-     code in the process created. *Recommendation: strict.*
+   - *Whether `delete_instance` cascades.* XTypes' `delete_instance` tears down, invalidating
+     references, but DDS deletes refuse while anything is contained. Strict means a program
+     deletes its participants first, which decision 5 shortens to one call. Cascading is
+     shorter, but deleting the process-wide factory then silently deletes participants other
+     code in the process created. *Recommendation: strict, as DDS deletes are.*
 4. **zidl work first.** Detailed below: one fix and one new feature, released before zzdds
    can move. *Recommendation: both, in one zidl PR.*
+5. **A factory `delete_contained_entities`, and loans in the cascade.** A zzdds operation
+   with the participant's semantics: delete every participant and its contents, or return
+   `PRECONDITION_NOT_MET` and delete nothing while any loan is outstanding. A
+   `get_instance` program then tears down with
+   `factory->delete_contained_entities(); DomainParticipantFactory::delete_instance();`. It
+   also defines `release`: `delete_contained_entities`, then `destroy`. A finalizer cannot
+   fail, though, so `release` still needs an answer for outstanding loans, which today's
+   cascade handles badly in C++ and Java (see "Loans in the cascade" below). Either:
+   - *Force*, as today. The loan's entity stays allocated, but C++ and Java can never return
+     the loan, so it leaks until the process exits.
+   - *Finish later.* `release` deletes everything without a loan at once. An entity with
+     an outstanding loan keeps its handle usable until the last loan is returned, and is then
+     deleted along with whatever contains it.
+
+   *Recommendation: add the operation, and finish later.* A loan being returned is the only
+   event that can complete it, so finishing later loses nothing.
+
+## Loans in the cascade
+
+Checked with throwaway tests on the local branch `probe-cascade-loans` (0e51f46). They tear
+down the factory while a reader holds a read loan or a writer holds a write loan, using the
+in-process fixture and the inner factory's teardown, which `zzdds_destroy_factory` reaches
+through each participant.
+
+- **The cascade itself is safe.** Each loan holds a reference on its reader or writer and on
+  that endpoint's protocol reader or writer, so neither is freed while the loan is
+  outstanding. The loaned bytes stay valid.
+- **Returning the loan afterwards frees everything,** with no leak, in Zig and C: the C
+  export still reaches zzdds, because the handle's storage lives as long as the entity.
+- **C++ and Java cannot return it.** Deletion retires the entity's handle, which retires
+  every wrapper of it. A retired wrapper's `return_loan_raw` returns `ALREADY_DELETED`
+  without calling zzdds (generated C++: `if (_zidl_is_retired()) return 9;`; Java clears its
+  pointer). Read from the generated code; the probes ran in Zig only.
+- **A loan never returned leaks** its reader or writer, protocol endpoint and samples: 23
+  allocations for a read loan and 15 for a write loan in the probes.
+- **Not checked:** publishing a write loan (`publish_loan_raw`) after the cascade, which
+  would try to send through a participant whose transport is being torn down. The probes
+  only cancelled it.
 
 ## What zidl needs
 
