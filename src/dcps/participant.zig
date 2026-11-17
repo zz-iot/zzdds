@@ -5725,6 +5725,14 @@ pub const DomainParticipantImpl = struct {
         // vtCreatePublisher's identical comment (PR #91 Greptile finding).
         t.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
         self.mu.lock();
+        // A local TopicDescription is identified by its name (DDS 1.4
+        // §2.2.2.2.1.12; DDS-XTypes 1.3 §7.6.4.1 states the restriction it
+        // lifts): another reference to a Topic comes from find_topic.
+        if (self.hasDescriptionNamedLocked(tn_s)) {
+            self.mu.unlock();
+            t.deleted();
+            return nil.nil_topic;
+        }
         self.topics.append(self.alloc, t) catch {
             self.mu.unlock();
             t.deleted();
@@ -5809,6 +5817,13 @@ pub const DomainParticipantImpl = struct {
         self.mu.lock();
         for (self.topics.items, 0..) |t, i| {
             if (t.toDDSTopic().ptr == a_topic.ptr) {
+                // Spec §2.2.2.2.1.11: a Topic found again is deleted as many
+                // times as it was created or found; only the last deletes it.
+                if (t.handles > 1) {
+                    t.handles -= 1;
+                    self.mu.unlock();
+                    return DDS.RETCODE_OK;
+                }
                 // Spec §2.2.2.2.1.6: not while a DataWriter, DataReader or
                 // ContentFilteredTopic uses it.
                 if (t.inUse()) {
@@ -5864,9 +5879,21 @@ pub const DomainParticipantImpl = struct {
         self.mu.lock();
         defer self.mu.unlock();
         for (self.topics.items) |t| {
-            if (std.mem.eql(u8, t.topic_name, tn_s)) return t.toDDSTopic();
+            if (std.mem.eql(u8, t.topic_name, tn_s)) {
+                // Deleted as many times as found (§2.2.2.2.1.11).
+                t.handles += 1;
+                return t.toDDSTopic();
+            }
         }
         return nil.nil_topic;
+    }
+
+    /// With `mu` held: whether a Topic or ContentFilteredTopic of this
+    /// participant is named `name`.
+    fn hasDescriptionNamedLocked(self: *Self, name: []const u8) bool {
+        for (self.topics.items) |t| if (std.mem.eql(u8, t.topic_name, name)) return true;
+        for (self.cft_topics.items) |c| if (std.mem.eql(u8, c.name, name)) return true;
+        return false;
     }
 
     fn vtLookupTopicDesc(ctx: *anyopaque, name: [*:0]const u8) DDS.TopicDescription {
@@ -5922,6 +5949,12 @@ pub const DomainParticipantImpl = struct {
             return nil.nil_cft;
         };
         self.mu.lock();
+        // Its name is taken: see vtCreateTopic.
+        if (self.hasDescriptionNamedLocked(name_s)) {
+            self.mu.unlock();
+            cft.deleted();
+            return nil.nil_cft;
+        }
         self.cft_topics.append(self.alloc, cft) catch {
             self.mu.unlock();
             cft.deleted();

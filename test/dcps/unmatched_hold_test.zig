@@ -154,8 +154,12 @@ const Harness = struct {
     }
 
     fn readerWith(h: *Harness, topic_name: [:0]const u8, kind: DDS.ReliabilityQosPolicyKind, durability: DDS.DurabilityQosPolicyKind) *DataReaderImpl {
-        const topic = h.dp.create_topic(topic_name, "T", .{}, null, 0);
-        const desc = @as(*TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
+        // Readers of one name share the participant's Topic of that name.
+        const found = h.dp.vtable.lookup_topicdescription(h.dp.ptr, topic_name);
+        const desc = if (found.ptr != dcps.NIL_PTR) found else blk: {
+            const topic = h.dp.create_topic(topic_name, "T", .{}, null, 0);
+            break :blk @as(*TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
+        };
         var qos = DDS.DataReaderQos{};
         qos.reliability.kind = kind;
         qos.durability.kind = durability;

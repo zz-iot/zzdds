@@ -633,6 +633,15 @@ reader announcements (the GET_TYPES round-trip isn't implemented). This is also 
 long-term fix for the keyed-instance-NIL gap above. Remaining TypeSupport work: the C-ABI /
 non-Zig binding bridge, then TypeLookup integration. `design/thread-model.md`.
 
+Its Topic rules replace two of DDS 1.4's, which zzdds follows until then:
+
+- **INCONSISTENT_TOPIC** is counted per DataWriter and DataReader pair that fails type
+  consistency enforcement (§7.6.3.4.2), on both their Topics. zzdds counts each discovered
+  endpoint with a local Topic's name and another type name, in `recordInconsistentLocked`.
+- **Topics of one name**: a participant may have several, provided their types are subsets
+  of one network topic and their QoS consistent (§7.6.4.1), and `lookup_topicdescription`
+  takes an index (§7.6.4.2). zzdds refuses a name already taken.
+
 ### Configurable allocation for embedded/real-time targets
 
 Full plan, inventory, and phase ordering in

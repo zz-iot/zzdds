@@ -111,6 +111,10 @@ pub const TopicImpl = struct {
     /// Set by the participant: its listener, when this Topic's own does not
     /// take a status.
     participant_fallback: ?ParticipantFallback = null,
+    /// Guarded by the participant's `mu`: one for `create_topic` and one for
+    /// each `find_topic` since. `delete_topic` deletes the Topic with the
+    /// last (DDS 1.4 §2.2.2.2.1.11).
+    handles: u32 = 1,
     /// Guarded by the participant's `mu`: INCONSISTENT_TOPIC changed and is
     /// raised once that is released (participant.zig's
     /// `raiseInconsistentTopics`).
