@@ -45,12 +45,18 @@ pub const CloseLatch = struct {
         return true;
     }
 
-    /// Runs `rest` when the context closes, after the turn this thread is in.
-    /// It may free the latch and the context.
+    /// Runs `rest` when the context closes, or immediately if it already
+    /// closed while another deferred cleanup was pending. It may free the
+    /// latch and the context.
     pub fn finishWith(self: *CloseLatch, rest: Hook) void {
         self.mu.lock();
-        defer self.mu.unlock();
+        if (self.closed) {
+            self.mu.unlock();
+            rest.run(rest.ctx);
+            return;
+        }
         self.rest = rest;
+        self.mu.unlock();
     }
 
     fn onClosed(ctx: *anyopaque) void {
@@ -66,3 +72,21 @@ pub const CloseLatch = struct {
         self.mu.unlock();
     }
 };
+
+test "close completion can be installed before or after the context closes" {
+    const std = @import("std");
+    const Count = struct {
+        fn run(ctx: *anyopaque) void {
+            const count: *usize = @ptrCast(@alignCast(ctx));
+            count.* += 1;
+        }
+    };
+    for ([_]bool{ false, true }) |already_closed| {
+        var latch: CloseLatch = .{};
+        var count: usize = 0;
+        if (already_closed) CloseLatch.onClosed(&latch);
+        latch.finishWith(.{ .ctx = &count, .run = Count.run });
+        if (!already_closed) CloseLatch.onClosed(&latch);
+        try std.testing.expectEqual(@as(usize, 1), count);
+    }
+}

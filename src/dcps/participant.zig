@@ -1196,6 +1196,10 @@ pub const DomainParticipantImpl = struct {
     /// writers run their listeners, apart from the work that changed their
     /// statuses (listener_lane.zig).
     listener_group: listener_lane.Group = undefined,
+    /// Called after storage reclamation, before releasing the runtime owner.
+    on_destroy: ?runtime_mod.Hook = null,
+    // An announcement traversal can be nested inside an ingress/timer turn.
+    deferred_teardown: Deferred = .{},
 
     /// One box for the whole object, shared across every interface view
     /// (DomainParticipant, Entity, and ZZDDS.DomainParticipant — see
@@ -1472,9 +1476,12 @@ pub const DomainParticipantImpl = struct {
         self.ingress.deinit();
         self.timers.deinit();
         self.listener_group.deinit();
-        self.runtime.?.releaseOwner();
+        const rt = self.runtime.?;
+        const hook = self.on_destroy;
         self.ingress_budget.deinit();
         alloc.destroy(self);
+        if (hook) |h| h.run(h.ctx);
+        rt.releaseOwner();
     }
 
     /// Start discovery. Call after init(). The discovery plugin begins
@@ -1791,6 +1798,7 @@ pub const DomainParticipantImpl = struct {
         if (self.status_cond) |sc| sc.c_abi.retire();
         if (self.builtin_sub) |bs| bs.retireHandles();
         if (listeners_deferred) {
+            self.deferred_teardown = .{ .timers = timers_deferred, .ingress = ingress_deferred };
             self.listener_group.finishWith(.{ .ctx = self, .run = teardownHook });
             return;
         }
@@ -1804,7 +1812,20 @@ pub const DomainParticipantImpl = struct {
     };
 
     fn teardownHook(ctx: *anyopaque) void {
-        cast(ctx).teardown(.{});
+        const self = cast(ctx);
+        // The traversal may have ended before its enclosing runtime turn.
+        // Wait for that turn before tearing down the fields it can still use.
+        if (self.deferred_teardown.timers) {
+            self.deferred_teardown.timers = false;
+            self.timers_latch.finishWith(.{ .ctx = self, .run = teardownHook });
+            return;
+        }
+        if (self.deferred_teardown.ingress) {
+            self.deferred_teardown.ingress = false;
+            self.ingress_latch.finishWith(.{ .ctx = self, .run = teardownHook });
+            return;
+        }
+        self.teardown(.{});
     }
 
     /// The rest of `deinit`, once no listener of this participant runs.
@@ -4620,6 +4641,13 @@ pub const DomainParticipantImpl = struct {
     /// own refresh does (onReaderDiscovered).
     fn pubAnnounceProtoWriter(ctx: *anyopaque, handle: DDS.InstanceHandle_t) void {
         const self = cast(ctx);
+        // Announcement callbacks may delete the participant. Keep it alive
+        // through the commit and all temporary-job cleanup, without waiting
+        // for our own callback chain during deletion.
+        var traversal: listener_lane.Traversal = .{};
+        traversal.begin(self.listenerGroup());
+        defer traversal.end();
+        if (!traversal.counted) return;
         var guid_opt: ?Guid = null;
         var jobs: std.ArrayListUnmanaged(AnnounceMatchedReaderJob) = .empty;
         defer jobs.deinit(self.alloc);
@@ -4806,6 +4834,13 @@ pub const DomainParticipantImpl = struct {
     /// `pubAnnounceProtoWriter`, for the reader `handle`.
     fn subAnnounceProtoReader(ctx: *anyopaque, handle: DDS.InstanceHandle_t) void {
         const self = cast(ctx);
+        // Announcement callbacks may delete the participant. Keep it alive
+        // through the commit and all temporary-job cleanup, without waiting
+        // for our own callback chain during deletion.
+        var traversal: listener_lane.Traversal = .{};
+        traversal.begin(self.listenerGroup());
+        defer traversal.end();
+        if (!traversal.counted) return;
         var guid_opt: ?Guid = null;
         var jobs: std.ArrayListUnmanaged(AnnounceMatchedWriterJob) = .empty;
         defer jobs.deinit(self.alloc);

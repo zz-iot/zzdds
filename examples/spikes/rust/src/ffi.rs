@@ -300,15 +300,13 @@ unsafe extern "C" {
         allocator: *const ZidlAllocator,
     ) -> ZzddsDomainParticipantFactory;
 
-    pub fn zzdds_create_waitset_with_allocator(allocator: *const ZidlAllocator) -> DDS_WaitSet;
-    pub fn zzdds_waitset_is_nil(waitset: DDS_WaitSet) -> bool;
-    pub fn zzdds_destroy_waitset(waitset: DDS_WaitSet);
+    pub fn DDS_WaitSet_create_with_allocator(allocator: *const ZidlAllocator) -> DDS_WaitSet;
+    pub fn DDS_WaitSet_destroy(self_: DDS_WaitSet) -> DDS_ReturnCode_t;
 
-    pub fn zzdds_create_guardcondition_with_allocator(
+    pub fn DDS_GuardCondition_create_with_allocator(
         allocator: *const ZidlAllocator,
     ) -> DDS_GuardCondition;
-    pub fn zzdds_guardcondition_is_nil(guardcondition: DDS_GuardCondition) -> bool;
-    pub fn zzdds_destroy_guardcondition(guardcondition: DDS_GuardCondition);
+    pub fn DDS_GuardCondition_destroy(self_: DDS_GuardCondition) -> DDS_ReturnCode_t;
 
     pub fn DDS_GuardCondition_set_trigger_value(self_: DDS_GuardCondition, value: bool) -> DDS_ReturnCode_t;
     pub fn DDS_GuardCondition_as_DDS_Condition(child: DDS_GuardCondition) -> DDS_Condition;

@@ -435,6 +435,11 @@ pub const PublisherImpl = struct {
         listener: ZZDDS.DataWriterListenerEx,
         mask: DDS.StatusMask,
     ) DDS.DataWriter {
+        var traversal: listener_lane.Traversal = .{};
+        traversal.begin(self.cbs.listener_group);
+        defer traversal.end();
+        if (self.cbs.listener_group != null and !traversal.counted) return nil.nil_datawriter;
+
         // NOT gated on this Publisher's own enabled state -- create_datawriter
         // must work on a disabled Publisher (nested disabled trees are how
         // autoenable_created_entities=false is meant to be used: build
@@ -495,6 +500,15 @@ pub const PublisherImpl = struct {
         mask: DDS.StatusMask,
         parts: ProtoWriterParts,
     ) DDS.DataWriter {
+        var traversal: listener_lane.Traversal = .{};
+        traversal.begin(self.cbs.listener_group);
+        defer traversal.end();
+        if (self.cbs.listener_group != null and !traversal.counted) {
+            self.cbs.destroy_proto_writer(self.cbs.ctx, parts.publication_handle);
+            parts.topic_use.abandon();
+            return nil.nil_datawriter;
+        }
+
         const pw = parts.pw;
         const publication_handle = parts.publication_handle;
         const guid = parts.guid;

@@ -141,11 +141,10 @@ pub fn asZzddsDomainParticipant(participant: DDS.DomainParticipant) ?ZZDDS.Domai
 /// directly -- unlike StatusCondition/ReadCondition/QueryCondition, which are
 /// obtained from an existing entity/reader and already have a pure-Zig path
 /// via `entity.get_statuscondition()`/`reader.create_readcondition()`
-/// directly on their generated interface types). This mirrors the C ABI's
-/// `zzdds_create_waitset` (src/c_abi/extensions.zig) -- that shim does this
-/// same construction internally for C/C++/Java callers; this gives Zig
-/// callers the same one-call surface instead of requiring them to reach
-/// `WaitSetImpl.init` themselves.
+/// directly on their generated interface types). The Zig counterpart of the
+/// generated `DDS_WaitSet_create` (constructed by src/c_abi/extensions.zig's
+/// `waitSetCtor`), giving Zig callers the same one-call surface instead of
+/// requiring them to reach `WaitSetImpl.init` themselves.
 pub fn createWaitSet(alloc: std.mem.Allocator) !DDS.WaitSet {
     const ws = try WaitSetImpl.init(alloc);
     return ws.toDDSWaitSet();

@@ -156,9 +156,9 @@ int main(int argc, char **argv) {
 
     // ── WaitSet setup: all four condition types on one WaitSet ──────────────
 
-    auto ws = zzdds::create_waitset();
+    auto ws = ::DDS::WaitSet::create();
     if (!ws) {
-        std::fprintf(stderr, "FAIL: create_waitset() failed\n");
+        std::fprintf(stderr, "FAIL: WaitSet::create() failed\n");
         return 1;
     }
 
@@ -182,9 +182,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    auto gc = zzdds::create_guardcondition();
+    auto gc = ::DDS::GuardCondition::create();
     if (!gc) {
-        std::fprintf(stderr, "FAIL: create_guardcondition() failed\n");
+        std::fprintf(stderr, "FAIL: GuardCondition::create() failed\n");
         return 1;
     }
 
