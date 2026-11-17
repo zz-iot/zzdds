@@ -425,9 +425,6 @@ or an optimisation on an already-improved path):
   zzdds C function returning `bool` (`*_is_nil`, `*_get_trigger_value`, …).
 - **Example: `--publisher-matches` / `--subscriber-matches`** are parsed then silently
   ignored in all four `shape` ports (no reference implementation defines their semantics).
-- **Example: Java listener replacement leaks the old JNI global reference** — a second
-  `set_listener`-style call on an entity doesn't release the previous one
-  (`examples/java/listener-pubsub`).
 - **Examples: review how each binding uses the generated typed API; zidl's output may need
   fixes too.** The examples are meant to show the same calls on the generated
   `{T}DataReader`/`{T}DataWriter` in every binding, but the generated read/take operations
