@@ -195,9 +195,6 @@ Forward-looking only: known gaps, planned features, and open design questions.
   gives each datagram to one socket. Related sharp edge: unicast sockets are bound with
   `SO_REUSEADDR`, so two transports given the same fixed `participant_id` or port
   overrides both bind, and one of them silently stops receiving; that should fail loudly.
-- **A Topic's or participant's QoS change is not announced.** A writer's or reader's
-  change to its mutable policies, or a Publisher's or Subscriber's to its partitions or
-  GROUP_DATA, is announced again; a Topic's or participant's `set_qos` is not.
 - **In-process discovery can miss a peer when out of memory.** `DirectDiscovery`
   commits an announcement into the bus without allocating, but telling the other
   participants copies it for each of them, and a copy that fails is skipped; nothing
@@ -334,8 +331,8 @@ or an optimisation on an already-improved path):
   accept this later without rework). ~1 day with full-decode of wanted nested structs,
   ~2 days fully selective. Impact of deferring: a nested field reference silently never
   matches (unknown field → `eval` passes the sample) — a pre-existing gap.
-- **`on_inconsistent_topic` and `on_data_on_readers` have zero firing sites** — the
-  underlying status detection is not wired up.
+- **`on_inconsistent_topic` has zero firing sites** — the underlying status detection is
+  not wired up.
 - **`SampleInfo` `sample_rank` / `generation_rank` / `absolute_generation_rank`** stay at
   their defaults.
 - **`wait_for_historical_data` on a BEST_EFFORT reader** has no guaranteed history wait.

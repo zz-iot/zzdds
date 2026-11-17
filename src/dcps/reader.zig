@@ -899,7 +899,7 @@ pub const DataReaderImpl = struct {
             self.alloc.free(copy);
             return;
         };
-        self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+        self.markDataAvailableLocked();
         for (self.data_notifiers.items) |n| n.on_data(n.ctx);
         self.mu.unlock();
         self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
@@ -1283,7 +1283,7 @@ pub const DataReaderImpl = struct {
             _ = self.tbf_map.remove(ih);
             _ = self.owner_map.remove(ih);
         }
-        self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+        self.markDataAvailableLocked();
         // Wake any ReadCondition WaitSets while mu is held (safe: wakeNotify
         // only acquires WaitSet.cv_mu, never reader.mu).
         for (self.data_notifiers.items) |n| n.on_data(n.ctx);
@@ -1413,7 +1413,7 @@ pub const DataReaderImpl = struct {
         };
         if (!complete) return false;
         self.coherent_committed_ready = true;
-        self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+        self.markDataAvailableLocked();
         for (self.data_notifiers.items) |n| n.on_data(n.ctx);
         return true;
     }
@@ -1740,7 +1740,7 @@ pub const DataReaderImpl = struct {
             }
         }
         if (had_synthetic) {
-            self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+            self.markDataAvailableLocked();
             for (self.data_notifiers.items) |n| n.on_data(n.ctx);
             self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
             self.no_writers_pending = true;
@@ -1820,7 +1820,7 @@ pub const DataReaderImpl = struct {
             self.pending.appendAssumeCapacity(pc);
         }
         set.samples.deinit(self.alloc);
-        if (self.pending.items.len > start) self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+        if (self.pending.items.len > start) self.markDataAvailableLocked();
         // data_notifiers are fired by the subscriber after releasing all locks.
     }
 
@@ -3433,6 +3433,7 @@ pub const DataReaderImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         switch (kind) {
             DDS.DATA_AVAILABLE_STATUS => _ = self.dispatchDataAvailable(),
+            listener_lane.NOTIFY_DATA_AVAILABLE => _ = self.dispatchReaderDataAvailable(),
             DDS.SAMPLE_REJECTED_STATUS => self.dispatchSampleRejected(),
             DDS.SAMPLE_LOST_STATUS => self.dispatchSampleLost(),
             DDS.SUBSCRIPTION_MATCHED_STATUS => self.dispatchSubscriptionMatched(),
@@ -3492,6 +3493,19 @@ pub const DataReaderImpl = struct {
     /// (`docs/design/concurrency/listeners.md#reader-data-available-reset`).
     fn resetDataAvailableLocked(self: *Self) void {
         self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
+        if (self.subscriberImpl()) |sub| sub.resetDataOnReaders();
+    }
+
+    /// With `mu` held: data arrived. Sets DATA_AVAILABLE, and its
+    /// Subscriber's DATA_ON_READERS.
+    pub fn markDataAvailableLocked(self: *Self) void {
+        self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+        if (self.subscriberImpl()) |sub| sub.markDataOnReaders();
+    }
+
+    fn subscriberImpl(self: *Self) ?*subscriber_mod.SubscriberImpl {
+        if (nil.isNil(self.subscriber)) return null;
+        return @ptrCast(@alignCast(self.subscriber.ptr));
     }
 
     /// Invokes `on_data_available` from the nearest level of the fallback
@@ -3500,7 +3514,17 @@ pub const DataReaderImpl = struct {
     /// since the change has consumed it, and a change during the callback
     /// stays pending. Returns whether a callback ran. The caller holds this
     /// reader's `quiesce`, or is an application call on it.
+    /// A Subscriber or participant listener taking DATA_ON_READERS is
+    /// invoked instead (SubscriberImpl.dispatchDataOnReaders).
     pub fn dispatchDataAvailable(self: *Self) bool {
+        if (self.subscriberImpl()) |sub| if (sub.dispatchDataOnReaders()) |ran| return ran;
+        return self.dispatchReaderDataAvailable();
+    }
+
+    /// `dispatchDataAvailable`'s on_data_available, never on_data_on_readers:
+    /// for `notify_datareaders`, which on_data_on_readers calls, and for its
+    /// call left to this reader's turn (`listener_lane.NOTIFY_DATA_AVAILABLE`).
+    pub fn dispatchReaderDataAvailable(self: *Self) bool {
         const target = self.resolveListener("on_data_available", DDS.DATA_AVAILABLE_STATUS) orelse return false;
         defer target.release();
         if (!self.claimDataAvailable()) return false;
@@ -3513,7 +3537,9 @@ pub const DataReaderImpl = struct {
     pub fn claimDataAvailable(self: *Self) bool {
         self.mu.lock();
         defer self.mu.unlock();
-        return self.claimStatusLocked(DDS.DATA_AVAILABLE_STATUS, true);
+        if (!self.claimStatusLocked(DDS.DATA_AVAILABLE_STATUS, true)) return false;
+        if (self.subscriberImpl()) |sub| sub.resetDataOnReaders();
+        return true;
     }
 
     // Neither navigational getter below is gated on enabled state -- see

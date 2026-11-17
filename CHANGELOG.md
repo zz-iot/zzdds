@@ -10,6 +10,24 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-16
 
+- A Subscriber's DATA_ON_READERS status works (DDS 1.4 §2.2.4.2.2, §2.2.4.4). Data arriving
+  at any of its readers sets it and wakes its StatusCondition; a read or take of any of its
+  readers, or a reader's `on_data_available`, resets it. When the Subscriber's listener, or
+  else its participant's, takes it, `on_data_on_readers` is called in place of the reader's
+  `on_data_available` and resets only DATA_ON_READERS, so `notify_datareaders` from it then
+  calls the readers' own. It used to be neither set nor called.
+- SPDP announces a participant's USER_DATA as `PID_USER_DATA` (0x002C), and a peer's shows up
+  in the DCPSParticipant built-in topic. A participant's `set_qos` that changes it announces
+  the participant again at once, and a peer reports the change as a new DCPSParticipant
+  sample. It used to be decoded and dropped, and never sent.
+- **Breaking** for discovery plugins written in Zig: `Discovery.Vtable` has an optional
+  `update_user_data`, which participants call with their new USER_DATA. A plugin that
+  leaves it null keeps announcing the USER_DATA it started with.
+- SEDP announces each endpoint's Topic TOPIC_DATA as `PID_TOPIC_DATA` (0x002E), and a peer's
+  shows up in the DCPSPublication and DCPSSubscription built-in topics. A reader on a
+  ContentFilteredTopic announces its related Topic's. A Topic's `set_qos` that changes it
+  announces the Topic's DataWriters and DataReaders again. It used to be neither sent nor
+  reported.
 - `WaitSet` and `GuardCondition` are created by generated constructors: C
   `DDS_WaitSet_create()`/`DDS_GuardCondition_create()` and their `_with_allocator` forms
   (NULL on failure), C++ `DDS::WaitSet::create()`/`DDS::GuardCondition::create()`, and Java

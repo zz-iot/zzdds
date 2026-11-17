@@ -481,6 +481,11 @@ test "intraprocess: same-participant writer and reader — no self-delivery" {
 /// The GROUP_DATA of the last DCPSPublication or DCPSSubscription sample
 /// `dr` holds (`T` its type), owned, after taking them all; null with none.
 fn lastBuiltinGroupData(comptime T: type, alloc: std.mem.Allocator, dr: *DataReaderImpl) !?[]u8 {
+    return lastBuiltinOctets(T, "group_data", alloc, dr);
+}
+
+/// `lastBuiltinGroupData`, for the policy `field` holding octets.
+fn lastBuiltinOctets(comptime T: type, comptime field: []const u8, alloc: std.mem.Allocator, dr: *DataReaderImpl) !?[]u8 {
     var last: ?[]u8 = null;
     errdefer if (last) |l| alloc.free(l);
     while (dr.takeRaw()) |sample| {
@@ -490,7 +495,7 @@ fn lastBuiltinGroupData(comptime T: type, alloc: std.mem.Allocator, dr: *DataRea
         var v: T = .{};
         try T.deserializeInto(&v, &cdr, alloc);
         defer v.deinit(alloc);
-        const g = v.group_data.value;
+        const g = @field(v, field).value;
         const bytes: []const u8 = if (g._buffer) |buf| buf[0..g._length] else &.{};
         if (last) |l| alloc.free(l);
         last = null;
@@ -500,6 +505,10 @@ fn lastBuiltinGroupData(comptime T: type, alloc: std.mem.Allocator, dr: *DataRea
 }
 
 fn octets(bytes: []const u8) @FieldType(DDS.GroupDataQosPolicy, "value") {
+    return .{ ._buffer = @constCast(bytes.ptr), ._length = @intCast(bytes.len), ._maximum = @intCast(bytes.len), ._release = false };
+}
+
+fn topicOctets(bytes: []const u8) @FieldType(DDS.TopicDataQosPolicy, "value") {
     return .{ ._buffer = @constCast(bytes.ptr), ._length = @intCast(bytes.len), ._maximum = @intCast(bytes.len), ._release = false };
 }
 
@@ -542,6 +551,122 @@ test "intraprocess: a remote participant's DCPSPublication and DCPSSubscription 
     try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.set_qos(pub_qos));
     fx.settle();
     try testing.expectEqual(@as(?[]u8, null), try lastBuiltinGroupData(DDS.PublicationBuiltinTopicData, alloc, pub_seen));
+}
+
+test "intraprocess: a remote participant's DCPSPublication and DCPSSubscription carry their Topic's TOPIC_DATA, and its change" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, "IPTopic", "IPType");
+    defer fx.deinit();
+    const ParticipantImpl = zzdds.dcps.DomainParticipantImpl;
+    const pub_seen = @as(*ParticipantImpl, @ptrCast(@alignCast(fx.dp_r.ptr))).builtin_sub.?.pub_dr;
+    const sub_seen = @as(*ParticipantImpl, @ptrCast(@alignCast(fx.dp_w.ptr))).builtin_sub.?.sub_dr;
+
+    // Set before its endpoints exist, and read back as set.
+    var w_qos = DDS.TopicQos{};
+    w_qos.topic_data.value = topicOctets("topic-1");
+    try testing.expectEqual(DDS.RETCODE_OK, fx.topic_w.set_qos(w_qos));
+    var got: DDS.TopicQos = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, fx.topic_w.get_qos(&got));
+    defer got.deinit(alloc);
+    try testing.expectEqualSlices(u8, "topic-1", got.topic_data.value._buffer.?[0..got.topic_data.value._length]);
+    _ = fx.makeWriterReader(.{}, .{});
+
+    const first_pub = (try lastBuiltinOctets(DDS.PublicationBuiltinTopicData, "topic_data", alloc, pub_seen)) orelse return error.NoSample;
+    defer alloc.free(first_pub);
+    try testing.expectEqualSlices(u8, "topic-1", first_pub);
+    const first_sub = (try lastBuiltinOctets(DDS.SubscriptionBuiltinTopicData, "topic_data", alloc, sub_seen)) orelse return error.NoSample;
+    defer alloc.free(first_sub);
+    try testing.expectEqual(@as(usize, 0), first_sub.len);
+
+    // A change once they are announced announces them again; one that
+    // changes nothing, or changes only another policy, does not.
+    w_qos.topic_data.value = topicOctets("topic-2");
+    try testing.expectEqual(DDS.RETCODE_OK, fx.topic_w.set_qos(w_qos));
+    var r_qos = DDS.TopicQos{};
+    r_qos.topic_data.value = topicOctets(&.{ 0, 0xee });
+    try testing.expectEqual(DDS.RETCODE_OK, fx.topic_r.set_qos(r_qos));
+    fx.settle();
+    const next_pub = (try lastBuiltinOctets(DDS.PublicationBuiltinTopicData, "topic_data", alloc, pub_seen)) orelse return error.NoSample;
+    defer alloc.free(next_pub);
+    try testing.expectEqualSlices(u8, "topic-2", next_pub);
+    const next_sub = (try lastBuiltinOctets(DDS.SubscriptionBuiltinTopicData, "topic_data", alloc, sub_seen)) orelse return error.NoSample;
+    defer alloc.free(next_sub);
+    try testing.expectEqualSlices(u8, &.{ 0, 0xee }, next_sub);
+
+    try testing.expectEqual(DDS.RETCODE_OK, fx.topic_w.set_qos(w_qos));
+    w_qos.transport_priority.value = 3;
+    try testing.expectEqual(DDS.RETCODE_OK, fx.topic_w.set_qos(w_qos));
+    fx.settle();
+    try testing.expectEqual(@as(?[]u8, null), try lastBuiltinOctets(DDS.PublicationBuiltinTopicData, "topic_data", alloc, pub_seen));
+
+    // A reader on a ContentFilteredTopic announces its related Topic's.
+    const cft = fx.dp_r.create_contentfilteredtopic("IPTopicCft", fx.topic_r, "", &DDS.StringSeq{});
+    defer _ = fx.dp_r.delete_contentfilteredtopic(cft);
+    const cft_impl: *zzdds.dcps.ContentFilteredTopicImpl = @ptrCast(@alignCast(cft.ptr));
+    const cft_reader = fx.sub_r.create_datareader(cft_impl.toTopicDescription(), .{}, null, 0);
+    try testing.expect(cft_reader.ptr != zzdds.dcps.nil_datareader.ptr);
+    defer _ = fx.sub_r.delete_datareader(cft_reader);
+    fx.settle();
+    const cft_sub = (try lastBuiltinOctets(DDS.SubscriptionBuiltinTopicData, "topic_data", alloc, sub_seen)) orelse return error.NoSample;
+    defer alloc.free(cft_sub);
+    try testing.expectEqualSlices(u8, &.{ 0, 0xee }, cft_sub);
+}
+
+/// The USER_DATA of the last DCPSParticipant sample `dr` holds, owned,
+/// after taking them all; null with none.
+fn lastParticipantUserData(alloc: std.mem.Allocator, dr: *DataReaderImpl) !?[]u8 {
+    var last: ?[]u8 = null;
+    errdefer if (last) |l| alloc.free(l);
+    while (dr.takeRaw()) |sample| {
+        defer alloc.free(sample.data);
+        if (!sample.info.valid_data) continue;
+        var cdr = try zzdds.zidl_cdr.CdrReader.init(sample.data);
+        var v: DDS.ParticipantBuiltinTopicData = .{};
+        try DDS.ParticipantBuiltinTopicData.deserializeInto(&v, &cdr, alloc);
+        defer v.deinit(alloc);
+        const u = v.user_data.value;
+        const bytes: []const u8 = if (u._buffer) |buf| buf[0..u._length] else &.{};
+        if (last) |l| alloc.free(l);
+        last = null;
+        last = try alloc.dupe(u8, bytes);
+    }
+    return last;
+}
+
+fn userOctets(bytes: []const u8) @FieldType(DDS.UserDataQosPolicy, "value") {
+    return .{ ._buffer = @constCast(bytes.ptr), ._length = @intCast(bytes.len), ._maximum = @intCast(bytes.len), ._release = false };
+}
+
+test "intraprocess: a remote participant's DCPSParticipant carries its USER_DATA, and its change" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, "IPTopic", "IPType");
+    defer fx.deinit();
+    const ParticipantImpl = zzdds.dcps.DomainParticipantImpl;
+    const seen = @as(*ParticipantImpl, @ptrCast(@alignCast(fx.dp_r.ptr))).builtin_sub.?.part_dr;
+    // The only other participant.
+    alloc.free((try lastParticipantUserData(alloc, seen)) orelse return error.NoSample);
+
+    var qos = DDS.DomainParticipantQos{};
+    qos.user_data.value = userOctets("user-1");
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp_w.set_qos(qos));
+    fx.settle();
+    const first = (try lastParticipantUserData(alloc, seen)) orelse return error.NoSample;
+    defer alloc.free(first);
+    try testing.expectEqualSlices(u8, "user-1", first);
+
+    // Unchanged, or another policy changed: not announced again.
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp_w.set_qos(qos));
+    qos.entity_factory.autoenable_created_entities = false;
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp_w.set_qos(qos));
+    fx.settle();
+    try testing.expectEqual(@as(?[]u8, null), try lastParticipantUserData(alloc, seen));
+
+    qos.user_data.value = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp_w.set_qos(qos));
+    fx.settle();
+    const cleared = (try lastParticipantUserData(alloc, seen)) orelse return error.NoSample;
+    defer alloc.free(cleared);
+    try testing.expectEqual(@as(usize, 0), cleared.len);
 }
 
 // Regression for a real gap found via zzdds-examples' `catchup` review

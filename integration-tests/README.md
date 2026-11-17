@@ -53,8 +53,7 @@ a deliberate ~8ms gap between the two writes so back-to-back UDP delivery
 can't accidentally make a broken reader-side gate look correct.
 
 The subscriber synchronizes via a `WaitSet` with a `ReadCondition` per
-reader (`on_data_on_readers` has zero firing sites in zzdds today -- see
-`docs/roadmap.md`) and asserts, after every `begin_access()`/`end_access()`
+reader and asserts, after every `begin_access()`/`end_access()`
 bracket, that the two readers' taken-`group_id` sequences stay exactly
 equal-length and pairwise equal -- a direct test of reader-side coherent-set
 gating, not a count-per-time-window guess (see

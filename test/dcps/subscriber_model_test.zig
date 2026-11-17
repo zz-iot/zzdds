@@ -146,6 +146,7 @@ const Harness = struct {
 
     fn createProtoReader(
         _: *anyopaque,
+        _: ?*zzdds.dcps.TopicImpl,
         _: []const u8,
         _: []const u8,
         _: DDS.DataReaderQos,
@@ -526,6 +527,7 @@ const match_on_register_vtable = proto.ProtocolReader.Vtable{
 
 fn createMatchOnRegisterReader(
     _: *anyopaque,
+    _: ?*zzdds.dcps.TopicImpl,
     _: []const u8,
     _: []const u8,
     _: DDS.DataReaderQos,

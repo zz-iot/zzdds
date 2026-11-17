@@ -132,6 +132,7 @@ pub const KnownParticipant = struct {
 
     pub fn deinit(self: *KnownParticipant) void {
         self.alloc.free(self.data.name);
+        self.alloc.free(self.data.user_data);
         self.alloc.free(self.data.metatraffic_unicast_locators);
         self.alloc.free(self.data.metatraffic_multicast_locators);
         self.alloc.free(self.data.default_unicast_locators);
@@ -601,6 +602,12 @@ pub const SpdpEndpoints = struct {
         log.spdp.info("spdp: announcing new locators: {d} metatraffic and {d} default unicast", .{ meta.len, def.len });
 
         self.writeAnnouncementLocked();
+        self.announceFastLocked();
+    }
+
+    /// Announces at the fast rate for two periods, from now. With
+    /// `announce_mu` held.
+    fn announceFastLocked(self: *Self) void {
         const until_ns = self.clock.nowNs() + 2 * @as(i64, self.announcement_period_ms) * std.time.ns_per_ms;
         self.fast_announce_until_ns.store(until_ns, .release);
         if (self.runtime) |rt| {
@@ -608,6 +615,29 @@ pub const SpdpEndpoints = struct {
             defer self.mu.unlock();
             if (!self.timers_stopping) _ = rt.armTimerNoLater(&self.announce_timer, self.nextAnnounceNs(self.last_announce_ns));
         }
+    }
+
+    /// Announces the local participant with `user_data` from now on, at
+    /// once, and at the fast announcement rate for a while, as
+    /// `updateLocators` does. Fails changing nothing; a no-op before `start`.
+    pub fn updateUserData(self: *Self, user_data: []const u8) !void {
+        self.announce_mu.lock();
+        defer self.announce_mu.unlock();
+        const old = self.local orelse return;
+        const owned = try self.alloc.dupe(u8, user_data);
+        errdefer self.alloc.free(owned);
+        var next = old;
+        next.user_data = owned;
+        const payload = try encodeSpdpParticipant(self.alloc, &next);
+
+        self.alloc.free(old.user_data);
+        if (self.local_payload) |p| self.alloc.free(p);
+        self.local = next;
+        self.local_payload = payload;
+        log.spdp.info("spdp: announcing new USER_DATA ({d} bytes)", .{owned.len});
+
+        self.writeAnnouncementLocked();
+        self.announceFastLocked();
     }
 
     pub fn stop(self: *Self) void {
@@ -753,6 +783,8 @@ pub const SpdpEndpoints = struct {
         // A known participant announcing different locators (its host
         // gained or lost an interface).
         var locators_changed = false;
+        // A known participant announcing different USER_DATA.
+        var user_data_changed = false;
         {
             self.lifecycle_mu.lock();
             defer self.lifecycle_mu.unlock();
@@ -815,6 +847,7 @@ pub const SpdpEndpoints = struct {
                 // Capture whether a probe was active before we overwrite the entry.
                 was_probing = gop.value_ptr.probe_active;
                 locators_changed = !same_sn and !participantLocatorsEql(&gop.value_ptr.data, &kp.data);
+                user_data_changed = !same_sn and !std.mem.eql(u8, gop.value_ptr.data.user_data, kp.data.user_data);
                 // Carry sedp_seen forward — a fresh decode always starts false.
                 kp.sedp_seen = gop.value_ptr.sedp_seen;
                 if (is_genuine_reannounce and !kp.sedp_seen) {
@@ -846,9 +879,17 @@ pub const SpdpEndpoints = struct {
                 }
             }
 
+            // DCPS learns the participant again: an update of its
+            // DCPSParticipant data.
+            if (user_data_changed) {
+                log.spdp.info("spdp: participant {x} announced new USER_DATA", .{guid_prefix.bytes});
+                if (self.callbacks) |cbs| cbs.on_participant_discovered(cbs.ctx, &kp.data);
+            }
+
             // Fire callbacks and unicast reply only for genuinely new participants.
             // Re-announcements from known participants refresh expires_ns silently;
-            // only new locators (above) reach SEDP, and nothing reaches DCPS.
+            // only new locators (above) reach SEDP, and only new USER_DATA
+            // (above) reaches DCPS.
             // Use &kp.data (stack-local) not &gop.value_ptr.data (heap) so the pointer
             // stays valid even if the hashmap rehashes inside a nested callback.
             if (is_new) {
@@ -1088,9 +1129,15 @@ pub const SpdpEndpoints = struct {
         // combined.zig's SpdpSedpDiscovery instead.
         .wlp_tick = noopWlpTick,
         .update_locators = vtUpdateLocators,
+        .update_user_data = vtUpdateUserData,
     };
 
     fn noopWlpTick(_: *anyopaque, _: i64, _: iface.WlpTickInfo) void {}
+
+    fn vtUpdateUserData(ctx: *anyopaque, user_data: []const u8) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.updateUserData(user_data);
+    }
 
     fn vtUpdateLocators(ctx: *anyopaque, metatraffic_unicast: []const Locator, default_unicast: []const Locator) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
@@ -1155,6 +1202,8 @@ fn locatorsEql(a: []const Locator, b: []const Locator) bool {
 fn dupeLocal(alloc: std.mem.Allocator, ann: *const ParticipantAnnouncement) !ParticipantAnnouncement {
     const name = try alloc.dupe(u8, ann.name);
     errdefer alloc.free(name);
+    const user_data = try alloc.dupe(u8, ann.user_data);
+    errdefer alloc.free(user_data);
     const meta_uc = try alloc.dupe(Locator, ann.metatraffic_unicast_locators);
     errdefer alloc.free(meta_uc);
     const meta_mc = try alloc.dupe(Locator, ann.metatraffic_multicast_locators);
@@ -1166,6 +1215,7 @@ fn dupeLocal(alloc: std.mem.Allocator, ann: *const ParticipantAnnouncement) !Par
         .guid = ann.guid,
         .domain_id = ann.domain_id,
         .name = name,
+        .user_data = user_data,
         .metatraffic_unicast_locators = meta_uc,
         .metatraffic_multicast_locators = meta_mc,
         .default_unicast_locators = def_uc,
@@ -1177,6 +1227,7 @@ fn dupeLocal(alloc: std.mem.Allocator, ann: *const ParticipantAnnouncement) !Par
 
 fn freeLocal(alloc: std.mem.Allocator, ann: *ParticipantAnnouncement) void {
     alloc.free(ann.name);
+    alloc.free(ann.user_data);
     alloc.free(ann.metatraffic_unicast_locators);
     alloc.free(ann.metatraffic_multicast_locators);
     alloc.free(ann.default_unicast_locators);
@@ -1201,6 +1252,12 @@ pub fn encodeSpdpParticipant(alloc: std.mem.Allocator, ann: *const ParticipantAn
         .leaseDuration = .{ .seconds = lease.seconds, .fraction = lease.fraction },
     };
     if (ann.name.len > 0) out.participantName = ann.name;
+    if (ann.user_data.len > 0) out.userData = .{
+        ._maximum = @intCast(ann.user_data.len),
+        ._length = @intCast(ann.user_data.len),
+        ._buffer = @constCast(ann.user_data.ptr),
+        ._release = false,
+    };
 
     const meta_uc = try wire_codec.ownedDiscLocatorSeq(alloc, ann.metatraffic_unicast_locators);
     defer alloc.free(meta_uc);
@@ -1278,6 +1335,8 @@ pub fn decodeSpdpParticipant(
 
     const name: []u8 = if (data.participantName) |n| try alloc.dupe(u8, n) else &.{};
     errdefer alloc.free(name);
+    const user_data: []u8 = try alloc.dupe(u8, iface.discUserData(&data));
+    errdefer alloc.free(user_data);
 
     const meta_uc = try wire_codec.wireLocatorsOwned(alloc, data.metatrafficUnicastLocatorList);
     errdefer alloc.free(meta_uc);
@@ -1306,6 +1365,7 @@ pub fn decodeSpdpParticipant(
             },
             .domain_id = data.domainId orelse domain_id,
             .name = name,
+            .user_data = user_data,
             .metatraffic_unicast_locators = meta_uc,
             .metatraffic_multicast_locators = meta_mc,
             .default_unicast_locators = data_uc,

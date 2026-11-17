@@ -46,9 +46,12 @@ pub const ParticipantCbs = struct {
     /// ContentFilteredTopic; null when it is not this participant's.
     retain_topic: *const fn (ctx: *anyopaque, topic: *anyopaque) ?topic_mod.TopicUse,
 
-    /// Allocate and start an RTPS ProtocolReader for a topic.
+    /// Allocate and start an RTPS ProtocolReader for a topic. `topic` is
+    /// the Topic whose TOPIC_DATA it announces, retained by the reader for
+    /// its life.
     create_proto_reader: *const fn (
         ctx: *anyopaque,
+        topic: ?*topic_mod.TopicImpl,
         topic_name: []const u8,
         type_name: []const u8,
         qos: DDS.DataReaderQos,
@@ -196,6 +199,13 @@ pub const SubscriberImpl = struct {
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
+    /// DATA_ON_READERS (DDS 1.4 §2.2.4.2.2): one of its readers' data
+    /// arrived since on_data_on_readers was last invoked, or one of them
+    /// was last read, taken or had on_data_available invoked. Not the OR
+    /// of the readers' DATA_AVAILABLE: invoking on_data_on_readers resets
+    /// only this. Each change is one store, so a later one always wins
+    /// (docs/design/concurrency/listeners.md#reader-and-subscriber-status-coordination).
+    data_on_readers: std.atomic.Value(bool) = .init(false),
     status_cond: ?*waitset.StatusConditionImpl,
 
     default_dr_qos: DDS.DataReaderQos,
@@ -399,10 +409,39 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtGetStatusChanges(ctx: *anyopaque) DDS.StatusMask {
-        const self = cast(ctx);
-        self.mu.lock();
-        defer self.mu.unlock();
-        return self.status_changes;
+        return getStatusFn(ctx);
+    }
+
+    /// One of this Subscriber's readers' data arrived: sets DATA_ON_READERS
+    /// and wakes its StatusCondition. Takes no lock, so a reader may call it
+    /// holding its own.
+    pub fn markDataOnReaders(self: *Self) void {
+        self.data_on_readers.store(true, .release);
+        if (self.status_cond) |sc| sc.notifyWakeup();
+    }
+
+    /// One of this Subscriber's readers was read or taken, or had
+    /// on_data_available invoked: resets DATA_ON_READERS.
+    pub fn resetDataOnReaders(self: *Self) void {
+        self.data_on_readers.store(false, .release);
+    }
+
+    /// For data that arrived at one of its readers: invokes this
+    /// Subscriber's on_data_on_readers, or its participant's, when one
+    /// takes DATA_ON_READERS, in place of the reader's on_data_available
+    /// (DDS 1.4 §2.2.4.4). Null when none does; otherwise whether it ran:
+    /// not when DATA_ON_READERS was reset since, nor when its listener runs
+    /// elsewhere (`listener_lane.admit`). Invoking it resets DATA_ON_READERS
+    /// first, and no reader's DATA_AVAILABLE. The caller holds the reader's
+    /// `quiesce`.
+    pub fn dispatchDataOnReaders(self: *Self) ?bool {
+        const Cb = listener_fallback.Callback(DDS.SubscriberListener, "on_data_on_readers");
+        const target = self.resolveReaderFallback(Cb, "on_data_on_readers", DDS.DATA_ON_READERS_STATUS) orelse return null;
+        defer target.release();
+        if (!listener_lane.admit(target)) return false;
+        if (!self.data_on_readers.swap(false, .acq_rel)) return false;
+        target.invoke(vtGetCAbiHandle(self), .{});
+        return true;
     }
 
     fn vtGetHandle(ctx: *anyopaque) DDS.InstanceHandle_t {
@@ -447,6 +486,7 @@ pub const SubscriberImpl = struct {
         var guid: proto.Guid = undefined;
         const pr = self.cbs.create_proto_reader(
             self.cbs.ctx,
+            topic_use.topicImpl(),
             topic_name,
             type_name,
             qos.*,
@@ -788,8 +828,10 @@ pub const SubscriberImpl = struct {
         for (pinned.items) |r| {
             // Tracked, so a deletion of `r` from outside a callback waits for it.
             var call: ListenerCall = .{};
-            if (r.listeners.enter(&call, DDS.DATA_AVAILABLE_STATUS)) {
-                _ = r.dispatchDataAvailable();
+            // Left to the reader's turn as its own kind, so DATA_ON_READERS
+            // cannot take it there.
+            if (r.listeners.enter(&call, listener_lane.NOTIFY_DATA_AVAILABLE)) {
+                _ = r.dispatchReaderDataAvailable();
                 r.listeners.leave(&call);
             }
             r.releaseQuiesce();
@@ -1375,7 +1417,7 @@ pub const SubscriberImpl = struct {
                 // Re-arm DATA_AVAILABLE_STATUS so StatusCondition users wake
                 // on the next wait rather than missing the deferred samples.
                 if (r.pending.items.len > 0) {
-                    r.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+                    r.markDataAvailableLocked();
                     if (r.status_cond) |sc| sc.notifyWakeup();
                 }
                 r.mu.unlock();
@@ -1442,9 +1484,10 @@ pub const SubscriberImpl = struct {
 
     fn getStatusFn(entity_ptr: *anyopaque) DDS.StatusMask {
         const self = cast(entity_ptr);
+        const data_on_readers: DDS.StatusMask = if (self.data_on_readers.load(.acquire)) DDS.DATA_ON_READERS_STATUS else 0;
         self.mu.lock();
         defer self.mu.unlock();
-        return self.status_changes;
+        return self.status_changes | data_on_readers;
     }
 
     fn cast(ctx: *anyopaque) *Self {

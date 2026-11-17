@@ -2522,6 +2522,49 @@ test "notify_datareaders from outside a callback leaves a listener running elsew
     m.runtime.deinit();
 }
 
+test "notify_datareaders left to the reader's turn runs the reader's listener, not on_data_on_readers" {
+    var m: Manual = undefined;
+    m.init();
+    var pair: Pair = undefined;
+    try pair.initWith(&m.runtime, PairOptions.bestEffort());
+    m.runtime.releaseOwner();
+    const dr = pair.dr.toDDSDataReader();
+    const sub = dr.get_subscriber();
+
+    // on_data_on_readers takes the sample's arrival, resetting DATA_ON_READERS
+    // and leaving the reader's DATA_AVAILABLE set.
+    var on_readers: Recorder = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, sub.set_listener(.{ .listener_data = &on_readers, .on_data_on_readers = Recorder.onData }, DDS.DATA_ON_READERS_STATUS));
+    try pair.write(0);
+    try settle(&m);
+    try testing.expectEqualSlices(Recorder.Call, &.{.data}, on_readers.slice());
+    try testing.expect(dr.get_status_changes() & DDS.DATA_AVAILABLE_STATUS != 0);
+
+    var rr: Recorder = .{ .lane = &pair.dr.listeners.ctx };
+    try testing.expectEqual(DDS.RETCODE_OK, dr.set_listener(.{ .listener_data = &rr, .on_data_available = Recorder.onData }, DDS.DATA_AVAILABLE_STATUS));
+    try settle(&m);
+    try testing.expectEqual(@as(usize, 0), rr.n);
+
+    // The reader's listener is running elsewhere, so the call is left to the
+    // reader's turn, which still calls the reader's own.
+    const identity = zzdds.util.listener_identity;
+    const id = try identity.global.retain(.{ .ptr = @intFromPtr(&rr), .kind = .context });
+    try testing.expect(id.tryTake());
+    try testing.expectEqual(DDS.RETCODE_OK, sub.notify_datareaders());
+    try testing.expectEqual(@as(usize, 0), rr.n);
+
+    id.releaseRight();
+    identity.global.release(id);
+    try settle(&m);
+    try testing.expectEqualSlices(Recorder.Call, &.{.data}, rr.slice());
+    try testing.expect(rr.all_in_lane);
+    try testing.expectEqualSlices(Recorder.Call, &.{.data}, on_readers.slice());
+
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
 /// Deletes the reader a traversal is about to reach.
 const DeleteBeforeEnter = struct {
     var dr: DDS.DataReader = undefined;

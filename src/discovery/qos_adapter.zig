@@ -15,6 +15,7 @@
 //!   * `groupGuid` (GROUP-scope publisher only)
 //!   * `partition` (from the Publisher/Subscriber PARTITION names)
 //!   * `groupData` (from the Publisher/Subscriber GROUP_DATA; see `setGroupData`)
+//!   * `topicData` (from the Topic's TOPIC_DATA; see `setTopicData`)
 //!   * `unknown_params` (PID_TYPE_INFORMATION blob, writer only)
 
 const std = @import("std");
@@ -223,4 +224,10 @@ pub fn readerDiscoveredData(
 pub fn setGroupData(out: anytype, bytes: []const u8) void {
     const FT = @FieldType(@TypeOf(out.*), "groupData");
     out.groupData = if (bytes.len > 0) octetSeq(FT, bytes) else null;
+}
+
+/// `setGroupData`, for the TOPIC_DATA of the endpoint's Topic.
+pub fn setTopicData(out: anytype, bytes: []const u8) void {
+    const FT = @FieldType(@TypeOf(out.*), "topicData");
+    out.topicData = if (bytes.len > 0) octetSeq(FT, bytes) else null;
 }

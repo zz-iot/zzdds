@@ -1277,3 +1277,71 @@ test "SPDP: new locators are announced at once, and a peer learns them" {
     try testing.expectEqualSlices(Locator, &.{new_data}, seen.default_unicast_locators);
     try testing.expectEqual(@as(u32, 1), sides[1].tr.discovered);
 }
+
+test "SPDP: a participant's USER_DATA is announced, a change at once, and a peer reports each change to DCPS" {
+    const alloc = testing.allocator;
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const group = [_]Locator{Locator.udp4(.{ 239, 255, 0, 1 }, 7400)};
+
+    const Side = struct {
+        mt: *MockTransport,
+        spdp: *SpdpEndpoints,
+        tr: Tracker = .{},
+        cbs: Callbacks = undefined,
+    };
+    var sides: [2]Side = undefined;
+    for (&sides, [_]u8{ 0xC1, 0xC2 }) |*s, p| {
+        s.* = .{
+            .mt = try MockTransport.init(alloc, net, &.{Locator.udp4(.{ 127, 0, 0, p }, 7410)}),
+            .spdp = try SpdpEndpoints.init(alloc, s.mt.transport(), 0, 3000),
+        };
+        s.cbs = s.tr.cbs();
+    }
+    defer for (&sides) |*s| {
+        s.spdp.stop();
+        s.spdp.deinit();
+        s.mt.deinit();
+    };
+    // B first, as in the locators test above.
+    const prefixes = [_]u8{ 0xC1, 0xC2 };
+    for ([_]usize{ 1, 0 }) |i| {
+        const s = &sides[i];
+        const p = prefixes[i];
+        const meta = [_]Locator{Locator.udp4(.{ 127, 0, 0, p }, 7410)};
+        try s.spdp.start(&.{
+            .guid = .{ .prefix = prefix(p), .entity_id = iface.EntityIds.participant },
+            .domain_id = 0,
+            .name = "",
+            .user_data = if (i == 0) "u-1" else "",
+            .metatraffic_unicast_locators = &meta,
+            .metatraffic_multicast_locators = &group,
+            .default_unicast_locators = &.{},
+            .default_multicast_locators = &.{},
+            .lease_duration_ms = 60_000,
+            .builtin_endpoint_set = 0,
+        }, &s.cbs);
+    }
+    net.deliverAll();
+    const b = sides[1].spdp;
+    try testing.expectEqualSlices(u8, "u-1", b.known.get(prefix(0xC1)).?.data.user_data);
+    try testing.expectEqual(@as(u32, 1), sides[1].tr.discovered);
+
+    // A change: one call announces it, and B reports the participant again.
+    try sides[0].spdp.updateUserData(&.{ 0, 0xfa, 'u' });
+    net.deliverAll();
+    try testing.expectEqualSlices(u8, &.{ 0, 0xfa, 'u' }, b.known.get(prefix(0xC1)).?.data.user_data);
+    try testing.expectEqual(@as(u32, 2), sides[1].tr.discovered);
+
+    // Announced again unchanged: nothing to report.
+    try sides[0].spdp.updateUserData(&.{ 0, 0xfa, 'u' });
+    net.deliverAll();
+    try testing.expectEqual(@as(u32, 2), sides[1].tr.discovered);
+
+    // Cleared: sent without the PID, and reported empty.
+    try sides[0].spdp.updateUserData(&.{});
+    net.deliverAll();
+    try testing.expectEqual(@as(usize, 0), b.known.get(prefix(0xC1)).?.data.user_data.len);
+    try testing.expectEqual(@as(u32, 3), sides[1].tr.discovered);
+    try testing.expectEqual(@as(u32, 0), sides[1].tr.lost);
+}

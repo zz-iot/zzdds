@@ -290,7 +290,19 @@ pub const SpdpSedpDiscovery = struct {
         .wlp_tick = vtWlpTick,
         .attach_runtime = vtAttachRuntime,
         .update_locators = vtUpdateLocators,
+        .update_user_data = vtUpdateUserData,
     };
+
+    /// SPDP's announcement carries it.
+    fn vtUpdateUserData(ctx: *anyopaque, user_data: []const u8) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (self.phase != .started) return;
+        }
+        return self.spdp.updateUserData(user_data);
+    }
 
     /// Only SPDP's announcement carries locators. This participant's own
     /// SEDP and WLP proxies keep the ones it started with: they include
@@ -385,6 +397,7 @@ pub const SpdpSedpDiscovery = struct {
             .guid = local.guid,
             .domain_id = local.domain_id,
             .name = local.name,
+            .user_data = local.user_data,
             .metatraffic_unicast_locators = local.metatraffic_unicast_locators,
             .metatraffic_multicast_locators = local.metatraffic_multicast_locators,
             .default_unicast_locators = local.default_unicast_locators,

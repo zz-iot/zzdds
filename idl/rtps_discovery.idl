@@ -90,7 +90,7 @@ struct SPDPdiscoveredParticipantData {
     @id(0x0031) @optional @pl_repeated sequence<Locator_t> defaultUnicastLocatorList; // PID_DEFAULT_UNICAST_LOCATOR
     @id(0x0048) @optional @pl_repeated sequence<Locator_t> defaultMulticastLocatorList;
     @id(0x0077) @optional unsigned long   builtinEndpointQos;  // decode only; never emitted
-    @id(0x002C) @optional sequence<octet> userData;     // decode only; never emitted
+    @id(0x002C) @optional sequence<octet> userData;     // PID_USER_DATA (the participant's); omitted when empty
     @id(0x0062) @optional string          participantName;     // PID_ENTITY_NAME
 };
 
@@ -136,6 +136,7 @@ struct DiscoveredWriterData {
     @id(0x0073)           sequence<short>   dataRepresentation; // always a 1-element seq ([0]=XCDR1, [2]=XCDR2)
     @id(0x0029) @optional sequence<string>  partition;          // PID_PARTITION; omitted when empty
     @id(0x002D) @optional sequence<octet>   groupData;          // PID_GROUP_DATA (Publisher/Subscriber); omitted when empty
+    @id(0x002E) @optional sequence<octet>   topicData;          // PID_TOPIC_DATA (the endpoint's Topic); omitted when empty
 };
 
 // ── DiscoveredReaderData (§8.5.4.3, §9.6.2.3) ───────────────────────────────
@@ -167,6 +168,7 @@ struct DiscoveredReaderData {
     @id(0x001B) @optional LivelinessWire    liveliness;         // omitted at AUTOMATIC + INFINITE
     @id(0x0029) @optional sequence<string>  partition;          // PID_PARTITION; omitted when empty
     @id(0x002D) @optional sequence<octet>   groupData;          // PID_GROUP_DATA (Publisher/Subscriber); omitted when empty
+    @id(0x002E) @optional sequence<octet>   topicData;          // PID_TOPIC_DATA (the endpoint's Topic); omitted when empty
 };
 
 // ── EndpointDisposal ───────────────────────────────────────────────────────

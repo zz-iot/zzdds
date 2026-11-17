@@ -700,6 +700,59 @@ test "SEDP: a writer's Publisher GROUP_DATA and a reader's Subscriber GROUP_DATA
     try testing.expectEqualSlices(u8, &sub_group, iface.discGroupData(&remote.rec.readers_found.items[0].qos));
 }
 
+test "SEDP: a writer's and a reader's TOPIC_DATA round-trip as binary octets, absent when empty" {
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+
+    var local = try Participant.init(net, 0x35);
+    var remote = try Participant.init(net, 0x36);
+    defer local.deinit();
+    defer remote.deinit();
+    local.discoverPeer(0x36);
+    remote.discoverPeer(0x35);
+
+    const topic_data = [_]u8{ 't', 0, 0xfd, 'd' };
+    try announceWriterNow(local.sedp, &.{
+        .guid = makeGuid(0x35, 0x10),
+        .participant_guid = makeGuid(0x35, 0x01),
+        .topic_name = "T",
+        .type_name = "TT",
+        .qos = .{},
+        .topic_data = &topic_data,
+        .type_object = &.{},
+        .type_info_cdr = &.{},
+    });
+    try announceReaderNow(local.sedp, &.{
+        .guid = makeGuid(0x35, 0x11),
+        .participant_guid = makeGuid(0x35, 0x01),
+        .topic_name = "T",
+        .type_name = "TT",
+        .qos = .{},
+        .topic_data = &topic_data,
+        .type_info_cdr = &.{},
+    });
+    try announceReaderNow(local.sedp, &.{
+        .guid = makeGuid(0x35, 0x12),
+        .participant_guid = makeGuid(0x35, 0x01),
+        .topic_name = "T",
+        .type_name = "TT",
+        .qos = .{},
+        .type_info_cdr = &.{},
+    });
+    net.deliverAll();
+
+    try testing.expectEqual(@as(usize, 1), remote.rec.writers_found.items.len);
+    try testing.expectEqualSlices(u8, &topic_data, iface.discTopicData(&remote.rec.writers_found.items[0].qos));
+    try testing.expectEqual(@as(usize, 2), remote.rec.readers_found.items.len);
+    for (remote.rec.readers_found.items) |*r| {
+        if (r.guid.eql(makeGuid(0x35, 0x11))) {
+            try testing.expectEqualSlices(u8, &topic_data, iface.discTopicData(&r.qos));
+        } else {
+            try testing.expect(r.qos.topicData == null);
+        }
+    }
+}
+
 test "SEDP: ReaderAnnouncement with non-default PRESENTATION round-trips correctly" {
     const net = try MockNetwork.init(testing.allocator);
     defer net.deinit();
