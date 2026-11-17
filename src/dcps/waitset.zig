@@ -636,9 +636,15 @@ pub const WaitSetImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         const cond = canonicalCondition(input);
         var removed: ?AttachedCondition = null;
+        // A condition whose entity was deleted counts as detached already, as
+        // attach, wait and get_conditions treat it. Its entry can outlive the
+        // deletion until the entity is freed, so drop it, but report it as
+        // not attached. Read under self.mu, while the entry keeps `cond` alive.
+        var retired = false;
         self.mu.lock();
         for (self.conditions.items, 0..) |entry, i| {
             if (entry.cond.ptr == cond.ptr) {
+                retired = conditionRetired(entry.cond);
                 removed = self.conditions.swapRemove(i);
                 // Stays inside the lock, same as before this function grew a
                 // release hook: unregisterFromCondition must run before
@@ -655,7 +661,7 @@ pub const WaitSetImpl = struct {
         // Fired only after releasing self.mu — see AttachedCondition.fireRelease's
         // own doc comment for why.
         entry.fireRelease();
-        return DDS.RETCODE_OK;
+        return if (retired) DDS.RETCODE_PRECONDITION_NOT_MET else DDS.RETCODE_OK;
     }
 
     fn vtGetConditions(ctx: *anyopaque, out: ?*DDS.ConditionSeq) DDS.ReturnCode_t {

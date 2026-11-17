@@ -8,6 +8,14 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-17
+
+- `WaitSet::detach_condition` returns `PRECONDITION_NOT_MET` for a condition whose entity was
+  deleted, as it already did once the entity was freed. Deleting an entity detaches its
+  StatusCondition and ReadConditions from every WaitSet at once, as `wait` and `get_conditions`
+  already showed. While a runtime thread still held the entity, `detach_condition` used to
+  return `OK`.
+
 ## 2026-11-16
 
 - A Subscriber's DATA_ON_READERS status works (DDS 1.4 §2.2.4.2.2, §2.2.4.4). Data arriving
