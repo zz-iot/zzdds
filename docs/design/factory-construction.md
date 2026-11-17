@@ -53,6 +53,10 @@ destroy participants, and it has no factory of its own.
   discretion of the implementation." It fails only with `RETCODE_ERROR`, for
   implementation-specific reasons, and has no precondition.
 
+DDS-XTypes 1.4 beta 1 (ptc/26-02-06) keeps all of this word for word. Its IDL still writes
+these, and `DynamicTypeSupport`'s `create_type_support`/`delete_type_support`, as ordinary
+operations commented `/*static*/`: there is still no IDL syntax for a static operation.
+
 So nothing specifies `delete_instance` for the participant factory. Borrowing XTypes' pair
 is a zzdds choice, as is whether it refuses or tears down.
 
