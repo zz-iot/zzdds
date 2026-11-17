@@ -87,31 +87,6 @@ bool zzdds_factory_is_nil(zzdds_DomainParticipantFactory factory);
 void zzdds_destroy_factory(zzdds_DomainParticipantFactory factory);
 
 /**
- * Deprecated, kept only for rmw_zzdds until it moves to the generated
- * functions; do not use in new code. dcps.h declares the generated
- * constructors and destructors of these standalone objects, which every
- * binding and example uses:
- *
- *     DDS_WaitSet DDS_WaitSet_create(void);
- *     DDS_WaitSet DDS_WaitSet_create_with_allocator(const ZidlAllocator *allocator);
- *     DDS_ReturnCode_t DDS_WaitSet_destroy(DDS_WaitSet self);
- *
- * and the same for DDS_GuardCondition. They return NULL on failure. The
- * functions below create the same objects, but return a nil sentinel on
- * failure, told apart with zzdds_waitset_is_nil/zzdds_guardcondition_is_nil.
- * A `ZidlAllocator` must outlive the object it allocates; NULL selects
- * libc malloc/free.
- */
-DDS_WaitSet zzdds_create_waitset(void);
-DDS_WaitSet zzdds_create_waitset_with_allocator(const ZidlAllocator *allocator);
-DDS_GuardCondition zzdds_create_guardcondition(void);
-DDS_GuardCondition zzdds_create_guardcondition_with_allocator(const ZidlAllocator *allocator);
-bool zzdds_waitset_is_nil(DDS_WaitSet waitset);
-bool zzdds_guardcondition_is_nil(DDS_GuardCondition guardcondition);
-void zzdds_destroy_waitset(DDS_WaitSet waitset);
-void zzdds_destroy_guardcondition(DDS_GuardCondition guardcondition);
-
-/**
  * Function pointer type for zzdds_waitset_attach_condition_with_release's
  * release_fn parameter — same shape as a listener struct's
  * release_listener_data field.

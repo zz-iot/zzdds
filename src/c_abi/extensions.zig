@@ -50,7 +50,6 @@ const history_mod = @import("../rtps/history.zig");
 const time_mod = @import("../util/time.zig");
 const nil = @import("../dcps/nil.zig");
 const listener_lane = @import("../dcps/listener_lane.zig");
-const standalone_create = @import("../util/standalone_create.zig");
 const proto = @import("../protocol/interface.zig");
 
 const FactoryOwner = struct {
@@ -754,84 +753,14 @@ fn exportConstructors() void {
     });
 }
 
-/// Deprecated forms of the generated DDS_WaitSet_create/DDS_GuardCondition_create
-/// and their destroy operations, kept only for rmw_zzdds (rmw_wait.cpp): remove
-/// them, with zzdds_waitset_is_nil/zzdds_guardcondition_is_nil and
-/// zzdds_destroy_waitset/zzdds_destroy_guardcondition, once it calls the
-/// generated functions. They return the nil sentinel on failure where the
-/// generated constructors return NULL.
-pub export fn zzdds_create_waitset() callconv(.c) *anyopaque {
-    return zzdds_create_waitset_with_allocator(null);
-}
-
 fn waitSetCtor(alloc: std.mem.Allocator) !DDS.WaitSet {
     const ws = try WaitSetImpl.init(alloc);
     return ws.toDDSWaitSet();
 }
 
-/// Same as zzdds_create_waitset, but every allocation the WaitSet itself
-/// makes (its `conditions` list) is routed through `allocator` instead of
-/// the default std.heap.c_allocator. Pass NULL for the default. `allocator`
-/// must outlive the WaitSet returned here — see ZidlAllocator's contract in
-/// zidl_allocator.h.
-pub export fn zzdds_create_waitset_with_allocator(allocator: ?*const zidl_bindings.ZidlAllocator) callconv(.c) *anyopaque {
-    return standalone_create.createWithAllocator(
-        DDS.WaitSet,
-        allocator,
-        "zzdds_create_waitset_with_allocator",
-        waitSetCtor,
-        nil.nil_waitset,
-    );
-}
-
-pub export fn zzdds_create_guardcondition() callconv(.c) *anyopaque {
-    return zzdds_create_guardcondition_with_allocator(null);
-}
-
 fn guardConditionCtor(alloc: std.mem.Allocator) !DDS.GuardCondition {
     const gc = try GuardConditionImpl.init(alloc);
     return gc.toDDSGuardCondition();
-}
-
-/// Same as zzdds_create_guardcondition, but the GuardCondition itself is
-/// allocated through `allocator` instead of the default std.heap.c_allocator.
-/// Pass NULL for the default. `allocator` must outlive the GuardCondition
-/// returned here — see ZidlAllocator's contract in zidl_allocator.h.
-pub export fn zzdds_create_guardcondition_with_allocator(allocator: ?*const zidl_bindings.ZidlAllocator) callconv(.c) *anyopaque {
-    return standalone_create.createWithAllocator(
-        DDS.GuardCondition,
-        allocator,
-        "zzdds_create_guardcondition_with_allocator",
-        guardConditionCtor,
-        nil.nil_guardcondition,
-    );
-}
-
-/// Deprecated, with zzdds_create_waitset: mirrors zzdds_factory_is_nil, telling
-/// a real WaitSet/GuardCondition apart from the boxed nil sentinel
-/// zzdds_create_waitset[_with_allocator] returns on allocation failure.
-pub export fn zzdds_waitset_is_nil(waitset: *anyopaque) callconv(.c) bool {
-    const w = zidl_bindings.unboxAs(DDS.WaitSet, waitset);
-    return w.ptr == nil.NIL_PTR;
-}
-
-pub export fn zzdds_guardcondition_is_nil(guardcondition: *anyopaque) callconv(.c) bool {
-    const g = zidl_bindings.unboxAsView(DDS.GuardCondition, guardcondition);
-    return g.ptr == nil.NIL_PTR;
-}
-
-/// Deprecated, with zzdds_create_waitset: use the generated
-/// DDS_WaitSet_destroy/DDS_GuardCondition_destroy. Mirrors zzdds_destroy_factory.
-pub export fn zzdds_destroy_waitset(waitset: *anyopaque) callconv(.c) void {
-    const w = zidl_bindings.unboxAs(DDS.WaitSet, waitset);
-    if (w.ptr == nil.NIL_PTR) return;
-    w.vtable.deinit(w.ptr);
-}
-
-pub export fn zzdds_destroy_guardcondition(guardcondition: *anyopaque) callconv(.c) void {
-    const g = zidl_bindings.unboxAsView(DDS.GuardCondition, guardcondition);
-    if (g.ptr == nil.NIL_PTR) return;
-    g.vtable.deinit(g.ptr);
 }
 
 /// Same as the generated `attach_condition`, except `release_fn` (if

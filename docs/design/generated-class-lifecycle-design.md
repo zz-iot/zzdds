@@ -165,8 +165,9 @@ generated: `DDS_WaitSet_create[_with_allocator]` in C, `DDS::WaitSet::create()` 
 `DDS.WaitSet.create()` in Java. The boundary above still holds: the generated
 `exportCAbiConstructors` takes zzdds's constructors at comptime, from `extensions.zig`, so
 no generated code names a concrete impl type. Every in-tree caller and binding uses the
-generated functions. The hand-written `zzdds_create_*` / `zzdds_destroy_*` C functions
-remain, deprecated, only for rmw_zzdds, and go once it moves to the generated ones.
+generated functions. The hand-written `zzdds_create_*` / `zzdds_destroy_*` C functions,
+kept deprecated for rmw_zzdds until it moved over, were removed on 2026-11-17 along with
+`standalone_create.zig`.
 
 ## `DomainParticipantFactory` and the other no-parent-op types
 
