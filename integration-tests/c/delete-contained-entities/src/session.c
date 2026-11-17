@@ -237,8 +237,8 @@ int main(int argc, char **argv) {
     }
     printf("Create reader for topic: SessionIn_cft\n");
 
-    DDS_WaitSet ws = zzdds_create_waitset();
-    if (zzdds_waitset_is_nil(ws)) {
+    DDS_WaitSet ws = DDS_WaitSet_create();
+    if (!ws) {
         fprintf(stderr, "FAIL: create_waitset() failed\n");
         return 1;
     }
@@ -349,7 +349,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    zzdds_destroy_waitset(ws);
+    DDS_WaitSet_destroy(ws);
     printf("Session: torn down via delete_contained_entities.\n");
 
     zzdds_destroy_factory(factory);

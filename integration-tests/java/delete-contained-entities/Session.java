@@ -187,9 +187,9 @@ public class Session {
         }
         System.out.println("Create reader for topic: SessionIn_cft");
 
-        Dcps.DDS.WaitSet ws = (Dcps.DDS.WaitSet) io.zzdds.runtime.ZzddsRuntime.createWaitSet();
+        Dcps.DDS.WaitSet ws = Dcps.DDS.WaitSet.create();
         if (ws == null) {
-            System.err.println("FAIL: createWaitSet() failed");
+            System.err.println("FAIL: WaitSet.create() failed");
             System.exit(1);
         }
         Dcps.DDS.ReadCondition inRc = inDr.create_readcondition(
@@ -291,6 +291,7 @@ public class Session {
             System.exit(1);
         }
 
+        ws.close();
         System.out.println("Session: torn down via delete_contained_entities.");
     }
 }

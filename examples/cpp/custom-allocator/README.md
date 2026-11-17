@@ -32,7 +32,7 @@ Two sample types show two different allocation shapes:
   scratch-buffer growth). Both programs write/read both types in one run.
 
 The subscriber also creates a `WaitSet`+`GuardCondition` under the same
-allocator (`zzdds::create_waitset`/`create_guardcondition`) and exercises a
+allocator (`DDS::WaitSet::create`/`DDS::GuardCondition::create`) and exercises a
 real attach/trigger/`wait()` cycle — showing standalone entities (no factory
 operation creates these two types) are covered too, not just value/struct
 types like `SensorSample`/`SensorLog` above. One honest caveat, not papered

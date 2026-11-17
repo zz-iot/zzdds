@@ -1111,7 +1111,13 @@ fn nilQueryconditionGetCAbiHandle(ctx: *anyopaque) *anyopaque {
     return nil_querycondition_c_abi.get(nil_alloc, ctx, &nil_querycondition_views);
 }
 
+/// Destroying the nil WaitSet or GuardCondition destroys nothing.
+fn nilDestroy(_: *anyopaque) DDS.ReturnCode_t {
+    return DDS.RETCODE_BAD_PARAMETER;
+}
+
 var nil_guardcondition_vtable = DDS.GuardCondition.Vtable{
+    .destroy = nilDestroy,
     .get_trigger_value = struct {
         fn f(_: *anyopaque) bool {
             return false;
@@ -1138,6 +1144,7 @@ fn nilGuardconditionGetCAbiHandle(ctx: *anyopaque) *anyopaque {
 }
 
 var nil_waitset_vtable = DDS.WaitSet.Vtable{
+    .destroy = nilDestroy,
     .wait = struct {
         fn f(_: *anyopaque, _: ?*DDS.ConditionSeq, _: *const DDS.Duration_t) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;

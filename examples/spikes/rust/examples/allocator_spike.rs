@@ -41,12 +41,12 @@ fn main() {
         // this session via the C/C++ custom-allocator examples' own
         // `noalloc_guard`), not a new claim about Rust's own allocator
         // story specifically.
-        let waitset = ffi::zzdds_create_waitset_with_allocator(allocator);
-        assert!(!ffi::zzdds_waitset_is_nil(waitset), "zzdds_create_waitset_with_allocator returned nil");
-        let guard = ffi::zzdds_create_guardcondition_with_allocator(allocator);
+        let waitset = ffi::DDS_WaitSet_create_with_allocator(allocator);
+        assert!(!waitset.is_null(), "DDS_WaitSet_create_with_allocator returned NULL");
+        let guard = ffi::DDS_GuardCondition_create_with_allocator(allocator);
         assert!(
-            !ffi::zzdds_guardcondition_is_nil(guard),
-            "zzdds_create_guardcondition_with_allocator returned nil"
+            !guard.is_null(),
+            "DDS_GuardCondition_create_with_allocator returned NULL"
         );
         println!("[allocator_spike] WaitSet + GuardCondition created under the same allocator");
 
@@ -68,8 +68,8 @@ fn main() {
         println!("[allocator_spike] wait() reported the triggered GuardCondition — OK");
 
         ffi::DDS_WaitSet_detach_condition(waitset, guard_cond);
-        ffi::zzdds_destroy_guardcondition(guard);
-        ffi::zzdds_destroy_waitset(waitset);
+        ffi::DDS_GuardCondition_destroy(guard);
+        ffi::DDS_WaitSet_destroy(waitset);
         ffi::zzdds_destroy_factory(factory);
 
         println!("PASS");

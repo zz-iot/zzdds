@@ -835,48 +835,28 @@ inline std::shared_ptr<DomainParticipantFactory> create_factory(const ZidlAlloca
 
 namespace detail {
 
-// WaitSet and GuardCondition are the only two condition-family types with no
-// factory operation in dcps.idl (per OMG spec, both are app-instantiated
-// directly), so — like DomainParticipantFactorySupport above — they need a
-// thin subclass over the generated ::DDS::WaitSetImpl/::DDS::GuardConditionImpl
-// (whose own destructor is `= default` and does not call zzdds_destroy_*)
-// adding the C-ABI teardown call. Unlike DomainParticipantFactorySupport,
-// neither interface is vendor-extended by zzdds.idl, so these subclass the
-// plain ::DDS:: generated impl classes directly — no --cpp-impl-override
-// wiring needed, and no *Support class for zzdds::create_waitset() to
-// register anywhere.
-//
-// WaitSet has no family to register into (not `@shared_c_abi_box`, no
-// concrete sibling implementors — every WaitSet view really is a WaitSet).
-// GuardCondition is different: it's a real member of Condition's shared
-// C-ABI box family (see dcps.idl's `@shared_c_abi_box` annotations and
-// zidl/docs/design/binding-c-abi-identity.md), and
-// `WaitSet::wait()`/`get_conditions()` construct a generic `::DDS::Condition`
-// for every handle they return via `::DDS::ConditionImpl::_getOrCreate` — the
-// same shared per-family cache `StatusConditionImpl`/`ReadConditionImpl`/
-// `QueryConditionImpl` all consult in dcps_impl.cpp. Because GuardCondition
-// is never wrapped via any generated `_getOrCreate` (nothing in dcps.idl
-// returns/holds a generic `Condition` value that's ever *constructed* from
-// this path — only `wait()`'s return path does that, from the OTHER side),
-// `wrapGuardConditionHandle` below has to register the object it constructs
-// into that same shared cache itself, or a later `wait()` call would
-// construct an unrelated second `ConditionImpl` for the identical handle —
-// exactly the identity-fragmentation bug the shared cache exists to prevent.
-
+// The generated DDS::WaitSet::create() boxes its new WaitSet through this
+// class (--cpp-impl-override in build.zig), so every application WaitSet
+// keeps an attached condition alive while it stays attached. Creation,
+// ownership and destruction are the generated ones (see dcps.idl's
+// @constructor/@destructor); GuardCondition needs nothing beyond them.
 class WaitSetSupport final : public ::DDS::WaitSetImpl {
 public:
     explicit WaitSetSupport(DDS_WaitSet handle) noexcept
         : ::DDS::WaitSetImpl(handle), handle_(handle)
     {}
 
-    ~WaitSetSupport() override
+    // Nothing but the generated constructor boxes a WaitSet handle, so this
+    // is always the first wrapper for `h`. It joins WaitSetImpl's cache, so
+    // the retire hook still reaches it.
+    static std::shared_ptr<WaitSetSupport> _getOrCreate(DDS_WaitSet h)
     {
-        // Every still-attached condition's release_fn (see attach_condition
-        // below) fires synchronously as part of this call, before it
-        // returns -- each one destroys its own ReleaseCtx (and the
-        // shared_ptr keepalive it owns directly) via release_trampoline, so
-        // there's nothing left to clean up here.
-        zzdds_destroy_waitset(handle_);
+        if (!h) return nullptr;
+        auto sp = std::allocate_shared<WaitSetSupport>(
+            std::pmr::polymorphic_allocator<WaitSetSupport>(std::pmr::get_default_resource()), h);
+        std::lock_guard<std::mutex> lock(::DDS::WaitSetImpl::_soloMutex());
+        ::DDS::WaitSetImpl::_soloCache()[h] = sp;
+        return sp;
     }
 
     // Keeps a shared_ptr keep-alive for every attached condition, released
@@ -912,6 +892,7 @@ public:
     // real registration and trust that answer, rather than guessing first.
     ::DDS::ReturnCode_t attach_condition(std::shared_ptr<::DDS::Condition> cond) override
     {
+        if (_zidl_is_retired()) return ::DDS::RETCODE_ALREADY_DELETED;
         if (!cond) return ::DDS::WaitSetImpl::attach_condition(cond);
         // A condition this binding did not create has no C handle.
         DDS_Condition h = cond->_zidl_handle_DDS_Condition();
@@ -1005,100 +986,7 @@ private:
     DDS_WaitSet handle_;
 };
 
-class GuardConditionSupport final : public ::DDS::GuardConditionImpl {
-public:
-    explicit GuardConditionSupport(DDS_GuardCondition handle) noexcept
-        : ::DDS::GuardConditionImpl(handle), handle_(handle)
-    {}
-
-    ~GuardConditionSupport() override
-    {
-        zzdds_destroy_guardcondition(handle_);
-    }
-
-private:
-    DDS_GuardCondition handle_;
-};
-
-// Same allocate_shared-against-the-process-wide-pmr-resource shape as
-// wrapFactoryHandle above; see its comment for why this is a separate knob
-// from `handle`'s own allocator.
-inline std::shared_ptr<::DDS::WaitSet> wrapWaitSetHandle(DDS_WaitSet handle)
-{
-    if (zzdds_waitset_is_nil(handle)) return {};
-
-    ScopeGuard guard([handle] { zzdds_destroy_waitset(handle); });
-    auto sp = std::allocate_shared<WaitSetSupport>(
-        std::pmr::polymorphic_allocator<WaitSetSupport>(
-            std::pmr::get_default_resource()),
-        handle
-    );
-    guard.dismiss();
-    return sp;
-}
-
-inline std::shared_ptr<::DDS::GuardCondition> wrapGuardConditionHandle(DDS_GuardCondition handle)
-{
-    if (zzdds_guardcondition_is_nil(handle)) return {};
-
-    ScopeGuard guard([handle] { zzdds_destroy_guardcondition(handle); });
-    auto sp = std::allocate_shared<GuardConditionSupport>(
-        std::pmr::polymorphic_allocator<GuardConditionSupport>(
-            std::pmr::get_default_resource()),
-        handle
-    );
-    // From here on sp's destructor owns the handle.
-    guard.dismiss();
-    // Register into Condition's shared family cache (see the comment
-    // above this function) so a later WaitSet::wait()/get_conditions()
-    // resolving the same handle via ::DDS::ConditionImpl::_getOrCreate
-    // finds THIS object instead of constructing an unrelated one.
-    // create_guardcondition() always mints a fresh handle, so this is
-    // always a first registration, never a "someone else already cached
-    // it" race to reconcile against.
-    {
-        std::lock_guard<std::mutex> _lock(::DDS::ConditionImpl::_familyMutex());
-        ::DDS::ConditionImpl::_familyInsert(
-            DDS_GuardCondition_as_DDS_Condition(handle),
-            {sp, ::DDS::GuardConditionImpl::_familyTag(), static_cast<::DDS::GuardConditionImpl*>(sp.get()), &::DDS::GuardConditionImpl::_zidlRetire});
-    }
-    return sp;
-}
-
 } // namespace detail
-
-inline std::shared_ptr<::DDS::WaitSet> create_waitset()
-{
-    return detail::wrapWaitSetHandle(zzdds_create_waitset());
-}
-
-/**
- * Same as create_waitset(), but every allocation the WaitSet itself makes is
- * routed through `allocator` instead of the default libc malloc/free (see
- * zzdds_create_waitset_with_allocator's contract in zzdds_c.h). `allocator`
- * must outlive the returned WaitSet. Pass nullptr for the default
- * (equivalent to create_waitset()).
- */
-inline std::shared_ptr<::DDS::WaitSet> create_waitset(const ZidlAllocator* allocator)
-{
-    return detail::wrapWaitSetHandle(zzdds_create_waitset_with_allocator(allocator));
-}
-
-inline std::shared_ptr<::DDS::GuardCondition> create_guardcondition()
-{
-    return detail::wrapGuardConditionHandle(zzdds_create_guardcondition());
-}
-
-/**
- * Same as create_guardcondition(), but the GuardCondition itself is
- * allocated through `allocator` instead of the default libc malloc/free.
- * `allocator` must outlive the returned GuardCondition. Pass nullptr for
- * the default (equivalent to create_guardcondition()).
- */
-inline std::shared_ptr<::DDS::GuardCondition> create_guardcondition(const ZidlAllocator* allocator)
-{
-    return detail::wrapGuardConditionHandle(zzdds_create_guardcondition_with_allocator(allocator));
-}
 
 /**
  * Resolve `path` as a zzdds TOML config file and install the result as the

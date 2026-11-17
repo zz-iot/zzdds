@@ -78,7 +78,7 @@ int main(void) {
 
     zzdds_DomainParticipantFactory factory = zzdds_create_factory_with_allocator(&static_pool_allocator);
     if (zzdds_factory_is_nil(factory)) {
-        fprintf(stderr, "FAIL: zzdds_create_factory_with_allocator returned nil\n");
+        fprintf(stderr, "FAIL: zzdds_create_factory_with_allocator returned NULL\n");
         return 1;
     }
     DDS_DomainParticipantFactory dds_factory = zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory);
@@ -152,7 +152,7 @@ int main(void) {
     }
 
     /* WaitSet and GuardCondition are the two condition-family types with no
-     * factory operation (see zzdds_c.h's comment on zzdds_create_waitset) --
+     * factory operation (see dcps.h's DDS_WaitSet_create) --
      * the app constructs them directly. Creating them under the same
      * static-pool allocator, and exercising wait()'s ConditionSeq output,
      * shows the custom-allocator story covers standalone entities too, not
@@ -160,14 +160,14 @@ int main(void) {
      * doubles as a real regression guard: the noalloc guard already armed
      * above aborts this process outright if any of this ever falls back to
      * libc malloc/free under the hood. */
-    DDS_WaitSet ws = zzdds_create_waitset_with_allocator(&static_pool_allocator);
-    if (zzdds_waitset_is_nil(ws)) {
-        fprintf(stderr, "FAIL: create_waitset_with_allocator returned nil\n");
+    DDS_WaitSet ws = DDS_WaitSet_create_with_allocator(&static_pool_allocator);
+    if (!ws) {
+        fprintf(stderr, "FAIL: create_waitset_with_allocator returned NULL\n");
         return 1;
     }
-    DDS_GuardCondition gc = zzdds_create_guardcondition_with_allocator(&static_pool_allocator);
-    if (zzdds_guardcondition_is_nil(gc)) {
-        fprintf(stderr, "FAIL: create_guardcondition_with_allocator returned nil\n");
+    DDS_GuardCondition gc = DDS_GuardCondition_create_with_allocator(&static_pool_allocator);
+    if (!gc) {
+        fprintf(stderr, "FAIL: create_guardcondition_with_allocator returned NULL\n");
         return 1;
     }
     if (DDS_WaitSet_attach_condition(ws, DDS_GuardCondition_as_DDS_Condition(gc)) != DDS_RETCODE_OK) {
@@ -192,8 +192,8 @@ int main(void) {
     printf("subscriber: WaitSet+GuardCondition under custom allocator: OK\n");
 
     DDS_WaitSet_detach_condition(ws, DDS_GuardCondition_as_DDS_Condition(gc));
-    zzdds_destroy_guardcondition(gc);
-    zzdds_destroy_waitset(ws);
+    DDS_GuardCondition_destroy(gc);
+    DDS_WaitSet_destroy(ws);
 
     printf("subscriber: waiting for up to %d samples on domain %d (timeout %ds)...\n",
            EXPECTED_SAMPLES, DOMAIN_ID, MAX_WAIT_SECONDS);

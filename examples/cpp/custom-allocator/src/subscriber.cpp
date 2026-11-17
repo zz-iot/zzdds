@@ -150,7 +150,7 @@ int main() {
     // under the same static-pool allocator shows the custom-allocator story
     // covers standalone entities too, not just value/struct types like
     // SensorSample/SensorLog above -- and, armed below, is a real regression
-    // guard for it: zzdds::create_waitset/create_guardcondition,
+    // guard for it: WaitSet::create/GuardCondition::create,
     // WaitSet::attach_condition, and GuardCondition::set_trigger_value all
     // abort the process outright (via the noalloc guard) if any of their
     // internal C++ wrapper bookkeeping ever falls back to global
@@ -158,14 +158,14 @@ int main() {
     // installed above.
     if (matched) noalloc_guard_try_arm();
 
-    auto ws = zzdds::create_waitset(&static_pool_allocator);
+    auto ws = ::DDS::WaitSet::create(&static_pool_allocator);
     if (!ws) {
-        std::fprintf(stderr, "FAIL: create_waitset_with_allocator returned null\n");
+        std::fprintf(stderr, "FAIL: WaitSet::create(allocator) returned null\n");
         return 1;
     }
-    auto gc = zzdds::create_guardcondition(&static_pool_allocator);
+    auto gc = ::DDS::GuardCondition::create(&static_pool_allocator);
     if (!gc) {
-        std::fprintf(stderr, "FAIL: create_guardcondition_with_allocator returned null\n");
+        std::fprintf(stderr, "FAIL: GuardCondition::create(allocator) returned null\n");
         return 1;
     }
     if (ws->attach_condition(gc) != ::DDS::RETCODE_OK) {
@@ -204,10 +204,9 @@ int main() {
     std::printf("subscriber: WaitSet+GuardCondition under custom allocator: OK\n");
 
     ws->detach_condition(gc);
-    // No manual destroy needed -- ws/gc are shared_ptrs; WaitSetSupport's/
-    // GuardConditionSupport's destructors call zzdds_destroy_waitset/
-    // zzdds_destroy_guardcondition once the last reference (right here,
-    // both go out of scope at end of main) is dropped.
+    // No manual destroy needed -- ws/gc are the shared_ptrs their create()
+    // returned, which destroy the objects once the last reference (right
+    // here, both go out of scope at end of main) is dropped.
 
     std::printf("subscriber: waiting for up to %d samples on domain %d (timeout %ds)...\n",
                 EXPECTED_SAMPLES, DOMAIN_ID, MAX_WAIT_SECONDS);

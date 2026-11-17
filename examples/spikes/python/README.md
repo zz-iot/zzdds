@@ -233,7 +233,7 @@ directly rather than left as a hypothesis.** `probe5 --waitset`: a
 background thread enters `DDS_WaitSet_wait()` with a real 10s timeout and
 no conditions attached; ~0.5s in, the main thread drops the only Python
 reference to a GC-triggered-destroy wrapper around that same `WaitSet` and
-forces `gc.collect()`, synchronously running `zzdds_destroy_waitset()`
+forces `gc.collect()`, synchronously running `DDS_WaitSet_destroy()` (`zzdds_destroy_waitset()` when this ran)
 *while the background thread is still inside the blocking call*. Result:
 no crash, no hang forever — the background thread's call simply rides out
 its own 10-second timeout and returns `DDS_RETCODE_TIMEOUT` (10) cleanly,

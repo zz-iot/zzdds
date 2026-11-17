@@ -127,9 +127,9 @@ public class Subscriber {
 
         // ── WaitSet setup: all four condition types on one WaitSet ──
 
-        Dcps.DDS.WaitSet ws = (Dcps.DDS.WaitSet) io.zzdds.runtime.ZzddsRuntime.createWaitSet();
+        Dcps.DDS.WaitSet ws = Dcps.DDS.WaitSet.create();
         if (ws == null) {
-            System.err.println("FAIL: createWaitSet() failed");
+            System.err.println("FAIL: WaitSet.create() failed");
             System.exit(1);
         }
 
@@ -154,9 +154,9 @@ public class Subscriber {
             System.exit(1);
         }
 
-        Dcps.DDS.GuardCondition gc = (Dcps.DDS.GuardCondition) io.zzdds.runtime.ZzddsRuntime.createGuardCondition();
+        Dcps.DDS.GuardCondition gc = Dcps.DDS.GuardCondition.create();
         if (gc == null) {
-            System.err.println("FAIL: createGuardCondition() failed");
+            System.err.println("FAIL: GuardCondition.create() failed");
             System.exit(1);
         }
 
@@ -279,8 +279,8 @@ public class Subscriber {
         dr.delete_readcondition(qcCond);
         sub.delete_datareader(dr);
 
-        io.zzdds.runtime.ZzddsRuntime.destroyGuardCondition(gc);
-        io.zzdds.runtime.ZzddsRuntime.destroyWaitSet(ws);
+        gc.close();
+        ws.close();
 
         System.out.println("Subscriber: done.");
     }

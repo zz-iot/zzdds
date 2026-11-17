@@ -25,7 +25,7 @@
  * to be impossible: WaitSet::wait()'s generated C++ binding always re-wrapped
  * a returned Condition as the base ::DDS::ConditionImpl, constructed via its
  * own independent identity cache -- never the same C++ object as the
- * GuardConditionSupport/StatusConditionImpl this program already holds, even
+ * GuardConditionImpl/StatusConditionImpl this program already holds, even
  * though both refer to the same underlying condition (see zidl's
  * `zidl/docs/design/binding-c-abi-identity.md` for the raw-C-ABI-handle
  * fix, and its "shared-family _getOrCreate cache" follow-up for the
@@ -33,10 +33,8 @@
  * handle alone wasn't enough, since every condition subtype kept its own
  * separate C++ object cache). Fixed by collapsing every sibling's cache into
  * one shared per-family cache (zidl, `dcps_impl.cpp`'s `_familyMutex()`/
- * `_familyCache()`) that GuardCondition also registers into on construction
- * (zzdds's `zzdds_cpp.hpp`, since GuardCondition has no generated
- * `_getOrCreate` of its own) -- confirmed by testing directly against the
- * fixed zzdds, not just reasoned about.
+ * `_familyCache()`), which GuardCondition::create() boxes its new object
+ * through like every other family member.
  *
  * After the run completes, delete_datawriter() is called WITHOUT first
  * detaching the writer's StatusCondition from the WaitSet -- deliberately,
@@ -172,9 +170,9 @@ int main(int argc, char **argv) {
 
     // ── WaitSet setup: StatusCondition + GuardCondition together ────────────
 
-    auto ws = zzdds::create_waitset();
+    auto ws = ::DDS::WaitSet::create();
     if (!ws) {
-        std::fprintf(stderr, "FAIL: create_waitset() failed\n");
+        std::fprintf(stderr, "FAIL: WaitSet::create() failed\n");
         return 1;
     }
 
@@ -188,9 +186,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    auto gc = zzdds::create_guardcondition();
+    auto gc = ::DDS::GuardCondition::create();
     if (!gc) {
-        std::fprintf(stderr, "FAIL: create_guardcondition() failed\n");
+        std::fprintf(stderr, "FAIL: GuardCondition::create() failed\n");
         return 1;
     }
     if (ws->attach_condition(gc) != ::DDS::RETCODE_OK) {

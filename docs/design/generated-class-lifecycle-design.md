@@ -158,6 +158,16 @@ compiler-checked, never in generated code or an annotation string. The plain
 `zzdds_create_waitset()`/`zzdds_create_guardcondition()` forms are unchanged, already-minimal
 one-liners delegating to the `_with_allocator` form with a null allocator.
 
+**Update (2026-11-15): generated now.** zidl's `@constructor`/`@destructor` annotations
+(zidl `docs/design/standalone-construction.md`) declare `WaitSet`'s and
+`GuardCondition`'s construction in `dcps.idl`, so every binding's constructor is
+generated: `DDS_WaitSet_create[_with_allocator]` in C, `DDS::WaitSet::create()` in C++,
+`DDS.WaitSet.create()` in Java. The boundary above still holds: the generated
+`exportCAbiConstructors` takes zzdds's constructors at comptime, from `extensions.zig`, so
+no generated code names a concrete impl type. Every in-tree caller and binding uses the
+generated functions. The hand-written `zzdds_create_*` / `zzdds_destroy_*` C functions
+remain, deprecated, only for rmw_zzdds, and go once it moves to the generated ones.
+
 ## `DomainParticipantFactory` and the other no-parent-op types
 
 The factory is the root, and stays a deliberate exception, not a generalization target.
@@ -376,8 +386,8 @@ Hand-curated, with narrative detail the automated sweep below doesn't capture:
 
 | Type | How created | How freed today | Crosses app/mw boundary | Needs entity context to free? | Category |
 |---|---|---|---|---|---|
-| `GuardCondition` | `zzdds_create_guardcondition[_with_allocator]` (hand-written, no IDL op) | `zzdds_destroy_guardcondition` | Y | N — self-contained pair already threads its own allocator | 2 (hand-written, `@standalone`-marked) |
-| `WaitSet` | `zzdds_create_waitset[_with_allocator]` (hand-written, no IDL op) | `zzdds_destroy_waitset` | Y | N — same pattern | 2 (hand-written, `@standalone`-marked) |
+| `GuardCondition` | `DDS_GuardCondition_create[_with_allocator]` (generated from its `@constructor`) | `DDS_GuardCondition_destroy` | Y | N — self-contained pair already threads its own allocator | 2 (`@standalone`) |
+| `WaitSet` | `DDS_WaitSet_create[_with_allocator]` (generated from its `@constructor`) | `DDS_WaitSet_destroy` | Y | N — same pattern | 2 (`@standalone`) |
 | `ConditionSeq` (`WaitSet::wait()`/`get_conditions()` output) | Boxed via `emitTypedef`'s `is_entity_seq` branch | Generic `_free()`, routes through the process-wide allocator (app-owned half) / entity's own `get_allocator()` (native-temporary half) | Y (buffer of boxed handles) | Split — see [Allocator resolution](#allocator-resolution); the sweep below independently flags `wait`/`get_conditions` as a structurally-ambiguous pair, consistent with this | 2 |
 | `key_hashes`/`cdr_payloads`/`sample_infos` (`take_raw`/`read_raw`) | Produced by `DataReader::take_raw`/`read_raw` | `return_loan_raw(reader, ...)` | Y | N | 1 — reference example, cleanly confirmed by the sweep below (no review flag) |
 | Struct-with-owned-fields (e.g. `SensorLog`) | Decoded via generated `_deserialize` | Generic `{Type}_free()`, routes through the process-wide allocator | Y | N — already allocator-aware | 2 |

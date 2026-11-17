@@ -31,13 +31,11 @@ is the only flag either class takes.
 
 ## Notes
 
-- `ZzddsRuntime.createWaitSet()`/`createGuardCondition()` (and their
-  `destroy*` counterparts) are hand-written native bootstrap methods, added
-  alongside `createFactory()` — neither `WaitSet` nor `GuardCondition` has a
-  factory operation in `dcps.idl` (per OMG spec, both are app-instantiated
-  directly), and neither has a factory delete operation either, so
-  `destroyWaitSet()`/`destroyGuardCondition()` are the only way to release
-  one.
+- `WaitSet` and `GuardCondition` have no factory operation in `dcps.idl`
+  (per OMG spec, both are app-instantiated directly). Their generated static
+  `Dcps.DDS.WaitSet.create()`/`Dcps.DDS.GuardCondition.create()` return an
+  `AutoCloseable` object its creator owns: `close()` releases it, and
+  `destroy()` is the strict DCPS-style delete.
 - Java's condition interfaces (`GuardCondition`, `StatusCondition`,
   `ReadCondition`, `QueryCondition`) all `extends Condition` directly in the
   generated interface hierarchy, same as C++ — `ws.attach_condition(sc)`
@@ -52,10 +50,8 @@ is the only flag either class takes.
   `src/backend/java.zig`), with no identity cache at all — worse than C++'s
   per-concrete-type cache, not the same shape. Fixed by giving
   `zidl_java_box_<c_name>` a shared native (JNI weak-global-ref) cache per
-  `@shared_c_abi_box` family, plus a registration hook for `GuardCondition`
-  (`ZzddsRuntime.createGuardCondition()`'s native implementation calls it
-  directly, since — like C++'s `GuardConditionSupport` — it constructs its
-  Java object by hand rather than through any generated box helper). See
+  `@shared_c_abi_box` family, which `GuardCondition.create()` boxes its new
+  object through like every other family member. See
   zidl's `zidl/docs/design/binding-c-abi-identity.md` and its "Java
   backend: native weak-global-ref box cache" follow-up for the fuller
   writeup. Verified directly against the fixed zzdds (rebuilt, both classes

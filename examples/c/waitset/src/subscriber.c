@@ -185,8 +185,8 @@ int main(int argc, char **argv) {
 
     /* ── WaitSet setup: all four condition types on one WaitSet ── */
 
-    DDS_WaitSet ws = zzdds_create_waitset();
-    if (zzdds_waitset_is_nil(ws)) {
+    DDS_WaitSet ws = DDS_WaitSet_create();
+    if (!ws) {
         fprintf(stderr, "FAIL: create_waitset() failed\n");
         return 1;
     }
@@ -218,8 +218,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    DDS_GuardCondition gc = zzdds_create_guardcondition();
-    if (zzdds_guardcondition_is_nil(gc)) {
+    DDS_GuardCondition gc = DDS_GuardCondition_create();
+    if (!gc) {
         fprintf(stderr, "FAIL: create_guardcondition() failed\n");
         return 1;
     }
@@ -374,8 +374,8 @@ int main(int argc, char **argv) {
     DDS_DataReader_delete_readcondition(dr, DDS_QueryCondition_as_DDS_ReadCondition(qc_cond));
     DDS_Subscriber_delete_datareader(sub, dr);
 
-    zzdds_destroy_guardcondition(gc);
-    zzdds_destroy_waitset(ws);
+    DDS_GuardCondition_destroy(gc);
+    DDS_WaitSet_destroy(ws);
 
     printf("Subscriber: done.\n");
     zzdds_destroy_factory(factory);

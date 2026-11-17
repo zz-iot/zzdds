@@ -575,6 +575,83 @@ test "standalone_create: construct failure falls back to the nil sentinel instea
     try testing.expect(extensions.zzdds_guardcondition_is_nil(gc_boxed));
 }
 
+// ── Generated constructors (dcps.idl @constructor/@destructor) ───────────────
+
+/// The generated C constructors, which only a build generating the C ABI
+/// (-Dc-binding) exports; resolved only when a test runs.
+const GeneratedCtors = struct {
+    const H = ?*anyopaque;
+    const A = ?*const zidl_bindings.ZidlAllocator;
+    const available = @hasDecl(DDS.WaitSet, "exportCAbiConstructors");
+    fn get(comptime T: type, comptime name: []const u8) T {
+        return @extern(T, .{ .name = name });
+    }
+    const ws_create = get(*const fn () callconv(.c) H, "DDS_WaitSet_create");
+    const ws_create_with = get(*const fn (A) callconv(.c) H, "DDS_WaitSet_create_with_allocator");
+    const ws_destroy = get(*const fn (*anyopaque) callconv(.c) DDS.ReturnCode_t, "DDS_WaitSet_destroy");
+    const ws_attach = get(*const fn (*anyopaque, H) callconv(.c) DDS.ReturnCode_t, "DDS_WaitSet_attach_condition");
+    const gc_create = get(*const fn () callconv(.c) H, "DDS_GuardCondition_create");
+    const gc_create_with = get(*const fn (A) callconv(.c) H, "DDS_GuardCondition_create_with_allocator");
+    const gc_destroy = get(*const fn (*anyopaque) callconv(.c) DDS.ReturnCode_t, "DDS_GuardCondition_destroy");
+    const gc_as_condition = get(*const fn (*anyopaque) callconv(.c) H, "DDS_GuardCondition_as_DDS_Condition");
+};
+
+fn createAndDestroyThroughCAbi() !void {
+    const C = GeneratedCtors;
+    const ws = C.ws_create().?;
+    const gc = C.gc_create().?;
+    try testing.expectEqual(DDS.RETCODE_OK, C.ws_attach(ws, C.gc_as_condition(gc)));
+    // Destroying an attached condition detaches it from the WaitSet first.
+    try testing.expectEqual(DDS.RETCODE_OK, C.gc_destroy(gc));
+    try testing.expectEqual(DDS.RETCODE_OK, C.ws_destroy(ws));
+}
+
+test "generated constructors: WaitSet and GuardCondition are created and destroyed through the C ABI" {
+    if (comptime GeneratedCtors.available) try createAndDestroyThroughCAbi() else return error.SkipZigTest;
+}
+
+fn allocatorFormsThroughCAbi() !void {
+    const C = GeneratedCtors;
+    var track = TrackingCtx{ .child = testing.allocator };
+    const c_alloc = zidl_bindings.ZidlAllocator{
+        .ctx = &track,
+        .alloc = trackAlloc,
+        .resize = trackResize,
+        .free = trackFree,
+    };
+    const expected = zidl_bindings.toAllocator(&c_alloc);
+
+    const ws_boxed = C.ws_create_with(&c_alloc).?;
+    const ws = zidl_bindings.unboxAs(DDS.WaitSet, ws_boxed);
+    try testing.expectEqual(expected, ws.vtable.get_allocator(ws.ptr));
+    const gc_boxed = C.gc_create_with(&c_alloc).?;
+    const gc = zidl_bindings.unboxAsView(DDS.GuardCondition, gc_boxed);
+    try testing.expectEqual(expected, gc.vtable.get_allocator(gc.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, C.gc_destroy(gc_boxed));
+    try testing.expectEqual(DDS.RETCODE_OK, C.ws_destroy(ws_boxed));
+    try testing.expect(track.alloc_calls.load(.monotonic) > 0);
+    try testing.expectEqual(track.alloc_calls.load(.monotonic), track.free_calls.load(.monotonic));
+
+    const failing_alloc = zidl_bindings.ZidlAllocator{
+        .ctx = undefined,
+        .alloc = alwaysFailAlloc,
+        .resize = alwaysFailResize,
+        .free = alwaysFailFree,
+    };
+    try testing.expect(C.ws_create_with(&failing_alloc) == null);
+    try testing.expect(C.gc_create_with(&failing_alloc) == null);
+}
+
+test "generated constructors: the allocator forms allocate through it, and a failed one returns NULL" {
+    if (comptime GeneratedCtors.available) try allocatorFormsThroughCAbi() else return error.SkipZigTest;
+}
+
+test "generated constructors: the nil sentinel refuses destroy" {
+    const nd = zzdds.dcps;
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, nd.nil_waitset.vtable.destroy(nd.nil_waitset.ptr));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, nd.nil_guardcondition.vtable.destroy(nd.nil_guardcondition.ptr));
+}
+
 fn DDS_DomainParticipantFactory_create_participant_for_test(
     factory: DDS.DomainParticipantFactory,
     domain_id: DDS.DomainId_t,
@@ -1460,16 +1537,40 @@ test "extensions: DDS_TopicDescription_as_DDS_* checked downcasts recover the re
     try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_TopicDescription_as_DDS_MultiTopic(cft_td_boxed));
 }
 
-// ── zzdds_create_waitset / zzdds_create_guardcondition ──────────────────────────
+// ── WaitSet / GuardCondition through the C ABI ─────────────────────────────────
 //
 // WaitSet and GuardCondition have no factory operation in dcps.idl (per OMG
-// spec, both are app-instantiated directly), so — like
-// zzdds_create_factory — they need a hand-written C-ABI bootstrap rather than
-// generated construction. These tests exercise that bootstrap through the
-// real C-ABI entry points (not WaitSetImpl.init directly, as the boxing test
-// above does), matching zzdds_create_factory_with_allocator's own coverage
-// shape: a plain construct/use/destroy round trip, then an allocator-tracking
-// test proving the injected allocator is actually used, not just accepted.
+// spec, both are app-instantiated directly). dcps.idl declares their
+// constructors, which zidl generates as DDS_WaitSet_create and the like (see
+// "generated constructors" above), but only in a language-binding build.
+// The zzdds_create_waitset family is the older hand-written form, kept for
+// rmw_zzdds until it moves to the generated functions: the tests naming it
+// cover it. The rest only need handles, and make them as the generated
+// export does (newWaitSetHandle below), so they run in every build.
+
+/// A new WaitSet's C-ABI handle, boxed as DDS_WaitSet_create boxes it.
+fn newWaitSetHandle() !*anyopaque {
+    const ws = try zzdds.createWaitSet(std.heap.c_allocator);
+    return ws.vtable.get_c_abi_handle(ws.ptr);
+}
+
+/// A new GuardCondition's C-ABI handle, boxed as DDS_GuardCondition_create boxes it.
+fn newGuardConditionHandle() !*anyopaque {
+    const gc = try zzdds.createGuardCondition(std.heap.c_allocator);
+    return gc.vtable.get_c_abi_handle(gc.ptr);
+}
+
+/// DDS_WaitSet_destroy's body.
+fn destroyWaitSetHandle(h: *anyopaque) void {
+    const ws = zidl_bindings.unboxAs(DDS.WaitSet, h);
+    std.debug.assert(ws.vtable.destroy(ws.ptr) == DDS.RETCODE_OK);
+}
+
+/// DDS_GuardCondition_destroy's body.
+fn destroyGuardConditionHandle(h: *anyopaque) void {
+    const gc = zidl_bindings.unboxAsView(DDS.GuardCondition, h);
+    std.debug.assert(gc.vtable.destroy(gc.ptr) == DDS.RETCODE_OK);
+}
 
 test "waitset: zzdds_waitset_is_nil/zzdds_guardcondition_is_nil" {
     const ws_boxed = extensions.zzdds_create_waitset();
@@ -1535,10 +1636,10 @@ test "waitset: WaitSet.wait() returns the SAME boxed C-ABI handle the app derive
     // as plain native vtable dispatch (never boxed, never broken -- see the
     // design doc) so this test's own plumbing doesn't accidentally
     // depend on the very fix it's meant to verify.
-    const ws_boxed = extensions.zzdds_create_waitset();
-    defer extensions.zzdds_destroy_waitset(ws_boxed);
-    const gc_boxed = extensions.zzdds_create_guardcondition();
-    defer extensions.zzdds_destroy_guardcondition(gc_boxed);
+    const ws_boxed = try newWaitSetHandle();
+    defer destroyWaitSetHandle(ws_boxed);
+    const gc_boxed = try newGuardConditionHandle();
+    defer destroyGuardConditionHandle(gc_boxed);
 
     // The app derives its own Condition-view handle once -- exactly what a C
     // caller must do, since DDS_WaitSet_attach_condition's C signature takes
@@ -1574,7 +1675,7 @@ test "waitset: WaitSet.wait() returns the SAME boxed C-ABI handle the app derive
     // Stronger version of the same property, one step earlier: GuardCondition's
     // OWN creation box and its OWN Condition-view upcast box are the very same
     // address too, not just "wait() agrees with whatever the app derived" --
-    // both `zzdds_create_guardcondition()` and the Condition-view boxing above
+    // both the GuardCondition's own handle and the Condition-view boxing above
     // dispatch through the same shared `GuardConditionImpl.c_abi` cache.
     try testing.expectEqual(gc_boxed, c_boxed);
 }
@@ -1601,10 +1702,10 @@ fn trackRelease(ctx: ?*anyopaque) callconv(.c) void {
 }
 
 test "waitset: attach_condition_with_release fires on explicit detach_condition, exactly once" {
-    const ws_boxed = extensions.zzdds_create_waitset();
-    defer extensions.zzdds_destroy_waitset(ws_boxed);
-    const gc_boxed = extensions.zzdds_create_guardcondition();
-    defer extensions.zzdds_destroy_guardcondition(gc_boxed);
+    const ws_boxed = try newWaitSetHandle();
+    defer destroyWaitSetHandle(ws_boxed);
+    const gc_boxed = try newGuardConditionHandle();
+    defer destroyGuardConditionHandle(gc_boxed);
 
     var tracker = ReleaseTracker{};
     // Manual native-level equivalent of the generated
@@ -1636,9 +1737,9 @@ test "waitset: attach_condition_with_release fires on explicit detach_condition,
 }
 
 test "waitset: attach_condition_with_release fires when the WaitSet is destroyed while still attached" {
-    const ws_boxed = extensions.zzdds_create_waitset();
-    const gc_boxed = extensions.zzdds_create_guardcondition();
-    defer extensions.zzdds_destroy_guardcondition(gc_boxed);
+    const ws_boxed = try newWaitSetHandle();
+    const gc_boxed = try newGuardConditionHandle();
+    defer destroyGuardConditionHandle(gc_boxed);
 
     var tracker = ReleaseTracker{};
     // Manual native-level equivalent of the generated
@@ -1657,7 +1758,7 @@ test "waitset: attach_condition_with_release fires when the WaitSet is destroyed
     // No explicit detach_condition() first -- exactly the case this hook
     // exists for (WaitSet attachment is not ownership; nothing else would
     // ever tell a binding this attachment just ended).
-    extensions.zzdds_destroy_waitset(ws_boxed);
+    destroyWaitSetHandle(ws_boxed);
 
     try testing.expectEqual(@as(u32, 1), tracker.fired_count);
 }
@@ -1665,8 +1766,8 @@ test "waitset: attach_condition_with_release fires when the WaitSet is destroyed
 test "waitset: attach_condition_with_release fires when the condition is destroyed while still attached, and does not double-fire when the WaitSet is destroyed afterward" {
     // No defer for ws_boxed's own destruction -- the test explicitly
     // destroys it itself below, as part of what it's proving.
-    const ws_boxed = extensions.zzdds_create_waitset();
-    const gc_boxed = extensions.zzdds_create_guardcondition();
+    const ws_boxed = try newWaitSetHandle();
+    const gc_boxed = try newGuardConditionHandle();
 
     var tracker = ReleaseTracker{};
     // Manual native-level equivalent of the generated
@@ -1685,21 +1786,21 @@ test "waitset: attach_condition_with_release fires when the condition is destroy
     // No explicit detach_condition() first -- the condition's own teardown
     // (WakeupList.invalidateAll -> WaitSetImpl.vtInvalidateHandle) is what
     // must fire this.
-    extensions.zzdds_destroy_guardcondition(gc_boxed);
+    destroyGuardConditionHandle(gc_boxed);
     try testing.expectEqual(@as(u32, 1), tracker.fired_count);
 
     // The condition already removed itself from ws.conditions above -- the
     // WaitSet's own teardown (reallyDeinit) below must find nothing left to
     // fire a second time for.
-    extensions.zzdds_destroy_waitset(ws_boxed);
+    destroyWaitSetHandle(ws_boxed);
     try testing.expectEqual(@as(u32, 1), tracker.fired_count);
 }
 
 test "waitset: attach_condition_with_release on an already-attached condition does not replace the original registration" {
-    const ws_boxed = extensions.zzdds_create_waitset();
-    defer extensions.zzdds_destroy_waitset(ws_boxed);
-    const gc_boxed = extensions.zzdds_create_guardcondition();
-    defer extensions.zzdds_destroy_guardcondition(gc_boxed);
+    const ws_boxed = try newWaitSetHandle();
+    defer destroyWaitSetHandle(ws_boxed);
+    const gc_boxed = try newGuardConditionHandle();
+    defer destroyGuardConditionHandle(gc_boxed);
 
     var first = ReleaseTracker{};
     var second = ReleaseTracker{};

@@ -18,8 +18,8 @@ Two sample types show two different allocation shapes:
   is also registered. Both programs write/read both types in one run.
 
 The subscriber also creates a `WaitSet`+`GuardCondition` under the same
-static-pool allocator (`zzdds_create_waitset_with_allocator`/
-`zzdds_create_guardcondition_with_allocator`) and exercises a real
+static-pool allocator (`DDS_WaitSet_create_with_allocator`/
+`DDS_GuardCondition_create_with_allocator`) and exercises a real
 attach/trigger/`wait()` cycle — showing the custom-allocator story covers
 standalone entities (no factory operation creates these two types), not just
 value/struct types like `SensorSample`/`SensorLog` above.
