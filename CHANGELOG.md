@@ -10,6 +10,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-17
 
+- Removed the deprecated C functions `zzdds_create_waitset`/`zzdds_create_guardcondition` (and
+  `_with_allocator`), `zzdds_waitset_is_nil`/`zzdds_guardcondition_is_nil` and
+  `zzdds_destroy_waitset`/`zzdds_destroy_guardcondition`. Use the generated
+  `DDS_WaitSet_create`/`DDS_GuardCondition_create` (and `_with_allocator`), which return NULL
+  on failure, and `DDS_WaitSet_destroy`/`DDS_GuardCondition_destroy`. rmw_zzdds, their last
+  user, has moved to the generated functions.
 - A `create_*` that fails releases the listener it was given (`release_listener_data`),
   once, wherever it fails: inconsistent QoS, another participant's Topic, out of memory, or
   a nil parent. It used to free the registration without releasing it. The C++ and Java
