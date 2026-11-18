@@ -73,7 +73,6 @@ int main(void) {
     assert(DDS_Entity_get_instance_handle(NULL) == DDS_HANDLE_NIL);
     assert(DDS_DomainParticipant_delete_topic(dp, NULL) != DDS_RETCODE_OK);
     assert(DDS_DataWriter_as_zzdds_DataWriter(NULL) == NULL);
-    assert(zzdds_factory_is_nil(NULL));
     zzdds_destroy_factory(NULL);
 
     DDS_ReturnCode_t rc = DDS_DomainParticipantFactory_delete_participant(dds_factory, dp);

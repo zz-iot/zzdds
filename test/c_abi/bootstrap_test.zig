@@ -1226,17 +1226,8 @@ test "extensions: factory DDS-view get_c_abi_handle boxes nil handle correctly" 
     try testing.expectEqual(zzdds.dcps.NIL_PTR, unboxed.ptr);
 }
 
-test "extensions: zzdds_factory_is_nil distinguishes nil and real handles" {
-    const alloc = testing.allocator;
-    const nil_boxed = try zidl_bindings.boxEntity(alloc, zzdds.dcps.NIL_PTR, &extensions.factory_views);
-    defer zidl_bindings.freeEntityBox(alloc, nil_boxed);
-    try testing.expect(extensions.zzdds_factory_is_nil(nil_boxed));
-    try testing.expect(extensions.zzdds_factory_is_nil(null));
+test "extensions: zzdds_destroy_factory of NULL does nothing" {
     extensions.zzdds_destroy_factory(null);
-
-    const real_boxed = extensions.zzdds_create_factory().?;
-    defer extensions.zzdds_destroy_factory(real_boxed);
-    try testing.expect(!extensions.zzdds_factory_is_nil(real_boxed));
 }
 
 // ── C-ABI handle coverage: real WaitSet / conditions ───────────────────────────

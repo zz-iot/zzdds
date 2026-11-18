@@ -721,12 +721,6 @@ pub export fn zzdds_create_factory_with_allocator(allocator: ?*const zidl_bindin
     return r.vtable.get_c_abi_handle(r.ptr);
 }
 
-/// Deprecated: a failed zzdds_create_factory returns NULL. True for NULL.
-pub export fn zzdds_factory_is_nil(factory: ?*anyopaque) callconv(.c) bool {
-    const f = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, factory orelse return true);
-    return f.ptr == nil.NIL_PTR;
-}
-
 pub export fn zzdds_destroy_factory(factory: ?*anyopaque) callconv(.c) void {
     const f = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, factory orelse return);
     if (f.ptr == nil.NIL_PTR) return;

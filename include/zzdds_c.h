@@ -86,8 +86,6 @@ zzdds_DomainParticipantFactory zzdds_create_factory(void);
  */
 zzdds_DomainParticipantFactory zzdds_create_factory_with_allocator(const ZidlAllocator *allocator);
 
-/* Deprecated: a failed zzdds_create_factory returns NULL. True for NULL. */
-bool zzdds_factory_is_nil(zzdds_DomainParticipantFactory factory);
 /* Does nothing for NULL. */
 void zzdds_destroy_factory(zzdds_DomainParticipantFactory factory);
 

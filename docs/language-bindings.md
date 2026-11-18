@@ -164,17 +164,17 @@ at most once per entity.
 `bool` is a 1-byte C ABI type (matching C's own `_Bool`/`<stdbool.h> bool`),
 but many FFI layers default a bound function's boolean-looking return to a
 4-byte `int`-width type unless told otherwise — a real, reproducible bug, not
-a hypothetical one: Haskell's `zzdds_factory_is_nil` binding declared the
-return as `CInt` where zzdds's actual C signature returns `bool`/`_Bool`,
-reading 3 bytes of adjacent stack/register garbage along with the real byte
-and getting a wrong answer intermittently rather than a clean crash — exactly
-the kind of bug that's hard to pin down after the fact. This is not specific
-to Haskell or to `zzdds_factory_is_nil`: it's a general risk for *any*
+a hypothetical one: Haskell's binding of `zzdds_factory_is_nil` (since removed)
+declared the return as `CInt` where zzdds's actual C signature returned
+`bool`/`_Bool`, reading 3 bytes of adjacent stack/register garbage along with
+the real byte and getting a wrong answer intermittently rather than a clean
+crash — exactly the kind of bug that's hard to pin down after the fact. This
+is not specific to Haskell or to that function: it's a general risk for *any*
 hand-written, header-independent FFI binding (i.e. one that redeclares
 zzdds's C signatures itself — via Haskell's FFI import, Python's `ctypes`,
 Go's `cgo` with a hand-copied signature, etc. — rather than generating or
 parsing them mechanically from `zzdds_c.h`). Every zzdds C function that
-returns `bool` (the `*_is_nil` family, `*_get_trigger_value`, and others)
+returns `bool` (`*_get_trigger_value`, `*_contains_entity`, and others)
 is exposed to this risk. When binding by hand, double-check the declared
 width matches the real C type exactly rather than assuming a "boolean-ish"
 default; when generating a binding, prefer deriving signatures directly from
