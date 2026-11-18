@@ -3245,6 +3245,8 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtDeleteReadCondition(_: *anyopaque, a_condition: DDS.ReadCondition) DDS.ReturnCode_t {
+        // A NULL condition from C arrives as the nil.
+        if (nil.isNil(a_condition)) return DDS.RETCODE_BAD_PARAMETER;
         // Destroy the condition via its vtable — ReadConditionImpl.deinit()/
         // QueryConditionImpl.deinit() hold the owning reader's quiesce
         // reference themselves now (see waitset.zig), so this call can't

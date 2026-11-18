@@ -38,9 +38,8 @@ pub const DomainParticipantFactory = struct {
 };
 
 pub fn createFactory() CreateFactoryError!DomainParticipantFactory {
-    const boxed = extensions.zzdds_create_factory();
+    const boxed = extensions.zzdds_create_factory() orelse return error.FactoryCreateFailed;
     const handle = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, boxed);
-    if (nil.isNil(handle)) return error.FactoryCreateFailed;
     return .{ .handle = handle };
 }
 
@@ -62,9 +61,8 @@ pub fn createFactory() CreateFactoryError!DomainParticipantFactory {
 /// `c_alloc` as its own local and got exactly that crash on first
 /// `deinit()`).
 pub fn createFactoryWithAllocator(c_alloc: *const zidl_bindings.ZidlAllocator) CreateFactoryError!DomainParticipantFactory {
-    const boxed = extensions.zzdds_create_factory_with_allocator(c_alloc);
+    const boxed = extensions.zzdds_create_factory_with_allocator(c_alloc) orelse return error.FactoryCreateFailed;
     const handle = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, boxed);
-    if (nil.isNil(handle)) return error.FactoryCreateFailed;
     return .{ .handle = handle };
 }
 

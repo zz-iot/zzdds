@@ -286,6 +286,16 @@ test "DataReader: create_readcondition and delete_readcondition" {
     try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.delete_readcondition(dr.ptr, rc));
 }
 
+test "DataReader: delete_readcondition of a nil is BAD_PARAMETER" {
+    // A NULL condition from C arrives as the nil.
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr);
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, dr.vtable.delete_readcondition(dr.ptr, nil.nil_readcondition));
+}
+
 test "DataReader: create_querycondition with no TypeSupport and non-empty expression returns nil" {
     // Without a registered TypeSupport, field access is unavailable and a
     // non-empty SQL expression cannot be evaluated.  create_querycondition must

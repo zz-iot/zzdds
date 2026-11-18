@@ -68,6 +68,9 @@ typedef bool (*zzdds_get_field_from_cdr_ctx_fn)(
     uint8_t *scratch, size_t scratch_len
 );
 
+/* NULL on failure. At the C ABI, NULL is every interface's nil: a function
+ * given NULL for an object or argument treats it as nil, and a function with
+ * no object to return returns NULL. */
 zzdds_DomainParticipantFactory zzdds_create_factory(void);
 
 /**
@@ -79,11 +82,13 @@ zzdds_DomainParticipantFactory zzdds_create_factory(void);
  *
  * `allocator` must outlive the returned factory and everything created
  * through it — zzdds never copies it. See ZidlAllocator's contract in
- * zidl_allocator.h.
+ * zidl_allocator.h. NULL on failure.
  */
 zzdds_DomainParticipantFactory zzdds_create_factory_with_allocator(const ZidlAllocator *allocator);
 
+/* Deprecated: a failed zzdds_create_factory returns NULL. True for NULL. */
 bool zzdds_factory_is_nil(zzdds_DomainParticipantFactory factory);
+/* Does nothing for NULL. */
 void zzdds_destroy_factory(zzdds_DomainParticipantFactory factory);
 
 /**
@@ -158,6 +163,9 @@ DDS_ReturnCode_t zzdds_process_configure_from_file(
     const char *path,
     const ZidlAllocator *allocator
 );
+/* The DDS_X_as_zzdds_X conversions return NULL for NULL, or for a handle
+ * zzdds did not issue; zzdds_X_as_DDS_X and zzdds_topic_as_description
+ * return NULL for NULL. */
 DDS_DomainParticipantFactory zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(zzdds_DomainParticipantFactory factory);
 zzdds_DomainParticipantFactory DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(DDS_DomainParticipantFactory factory);
 DDS_DomainParticipant zzdds_DomainParticipant_as_DDS_DomainParticipant(zzdds_DomainParticipant participant);

@@ -50,7 +50,7 @@ int main(void) {
     ZidlAllocator tracking = {NULL, track_alloc, track_resize, track_free};
 
     zzdds_DomainParticipantFactory factory = zzdds_create_factory_with_allocator(&tracking);
-    assert(!zzdds_factory_is_nil(factory));
+    assert(factory != NULL);
     /* Bootstrapping the factory itself (FactoryOwner) already allocates. */
     assert(g_alloc_calls > 0);
     size_t calls_after_bootstrap = g_alloc_calls;
@@ -64,6 +64,17 @@ int main(void) {
     DDS_DomainParticipant dp = DDS_DomainParticipantFactory_create_participant(dds_factory, 0, NULL, NULL, 0);
     assert(dp != NULL);
     assert(g_alloc_calls > calls_after_bootstrap);
+
+    /* NULL is every interface's nil: nothing found, or nothing made, is NULL;
+     * NULL given as an object or argument is the nil, which refuses. */
+    assert(DDS_DomainParticipant_lookup_topicdescription(dp, "NoSuchTopic") == NULL);
+    assert(DDS_Topic_as_DDS_TopicDescription(NULL) == NULL);
+    assert(DDS_Entity_enable(NULL) == DDS_RETCODE_ERROR);
+    assert(DDS_Entity_get_instance_handle(NULL) == DDS_HANDLE_NIL);
+    assert(DDS_DomainParticipant_delete_topic(dp, NULL) != DDS_RETCODE_OK);
+    assert(DDS_DataWriter_as_zzdds_DataWriter(NULL) == NULL);
+    assert(zzdds_factory_is_nil(NULL));
+    zzdds_destroy_factory(NULL);
 
     DDS_ReturnCode_t rc = DDS_DomainParticipantFactory_delete_participant(dds_factory, dp);
     assert(rc == DDS_RETCODE_OK);
