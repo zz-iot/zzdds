@@ -76,6 +76,49 @@ const FactoryOwner = struct {
     fac_c_abi: c_abi_handle.CachedCAbiHandle = .{},
     /// Allocates from `debug_gpa`: see `FactoryLeakCheck`.
     on_debug_gpa: bool = false,
+    /// The process-wide factory (`get_instance`). Only `delete_instance`
+    /// deletes it: `destroy` refuses, and `release` and `deinit` do nothing.
+    is_instance: bool = false,
+
+    /// Closes the factory to new participants if it has none. The check and
+    /// the close are one step under `mu`, so a `create_participant` on
+    /// another thread either appended its participant first (and this
+    /// refuses) or sees the factory closed and fails.
+    fn closeIfEmpty(self: *@This()) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.stacks.items.len != 0) return false;
+        self.lifetime.close();
+        return true;
+    }
+
+    /// The factory's `delete_contained_entities`: every participant and
+    /// everything in it, or nothing while any of them has an outstanding
+    /// loan. The participants are taken out while they are checked, so a
+    /// concurrent `delete_participant` cannot free one mid-check, and put
+    /// back if any refuses.
+    fn deleteContainedEntities(self: *@This()) DDS.ReturnCode_t {
+        if (!self.lifetime.acquire()) return DDS.RETCODE_ALREADY_DELETED;
+        defer self.lifetime.release(self, destroy);
+        self.mu.lock();
+        var taken = self.stacks;
+        self.stacks = .empty;
+        self.mu.unlock();
+        for (taken.items) |stack| {
+            const p: *DomainParticipantImpl = @ptrCast(@alignCast(stack.participant.ptr));
+            const rc = p.checkDeleteContainedPrecondition();
+            if (rc == DDS.RETCODE_OK) continue;
+            self.mu.lock();
+            defer self.mu.unlock();
+            taken.appendSlice(self.alloc, self.stacks.items) catch @panic("zzdds: out of memory restoring the factory's participants");
+            self.stacks.deinit(self.alloc);
+            self.stacks = taken;
+            return rc;
+        }
+        for (taken.items) |stack| stack.deinit();
+        taken.deinit(self.alloc);
+        return DDS.RETCODE_OK;
+    }
 
     fn deinit(self: *@This()) void {
         self.lifetime.close();
@@ -278,6 +321,8 @@ const ParticipantStack = struct {
 };
 
 pub const factory_vtable = ZZDDS.DomainParticipantFactory.Vtable{
+    .destroy = factoryDestroy,
+    .release = factoryRelease,
     .create_participant_ex = factoryCreateParticipantEx,
     .set_default_participant_config = factorySetDefaultParticipantConfig,
     .get_default_participant_config = factoryGetDefaultParticipantConfig,
@@ -326,6 +371,7 @@ const dds_factory_vtable = DDS.DomainParticipantFactory.Vtable{
     .get_default_participant_qos = factoryGetDefaultParticipantQos,
     .set_qos = factorySetQos,
     .get_qos = factoryGetQos,
+    .delete_contained_entities = factoryDeleteContained,
     .deinit = factoryDeinit,
     .get_c_abi_handle = factoryGetCAbiHandleDds,
     .get_allocator = factoryGetAllocator,
@@ -740,7 +786,7 @@ comptime {
 /// The nil module, as `nil` is the provider's function in CAbiProvider.
 const nils = nil;
 
-const CAbiProvider = struct {
+pub const CAbiProvider = struct {
     /// What a NULL handle stands for at the C ABI, and what goes out as
     /// NULL: each interface's nil, whose `.ptr` is `NIL_PTR`. The zzdds
     /// extension interfaces' own vtables answer for `NIL_PTR` themselves.
@@ -790,10 +836,75 @@ const CAbiProvider = struct {
                     return guardConditionCtor(alloc);
                 }
             },
+            ZZDDS.DomainParticipantFactory => struct {
+                /// The generated function passes libc's allocator when the
+                /// caller gave none; that is zzdds's default, so the factory
+                /// gets zzdds's own (see `createFactoryWith`).
+                pub fn create(alloc: std.mem.Allocator) !ZZDDS.DomainParticipantFactory {
+                    const default = alloc.vtable == std.heap.c_allocator.vtable;
+                    return createFactoryWith(if (default) null else alloc);
+                }
+            },
             else => @compileError("zzdds has no constructors for " ++ @typeName(I)),
         };
     }
+
+    /// dcps.idl's @static operations.
+    pub fn statics(comptime I: type) type {
+        return switch (I) {
+            DDS.DomainParticipantFactory => struct {
+                pub fn get_instance() DDS.DomainParticipantFactory {
+                    return getInstance();
+                }
+                pub fn delete_instance() DDS.ReturnCode_t {
+                    return deleteInstance();
+                }
+            },
+            else => @compileError("zzdds has no statics for " ++ @typeName(I)),
+        };
+    }
 };
+
+// ── The process-wide factory ─────────────────────────────────────────────────
+
+var instance: ?*FactoryOwner = null;
+var instance_mu: Mutex = .{};
+
+/// `DomainParticipantFactory::get_instance()`: the process-wide factory,
+/// created on first use with zzdds's default allocator and the process
+/// configuration (so `zzdds_process_configure` must come first), and the
+/// same one for every caller until `delete_instance()`. Its DDS view; nil
+/// when it cannot be created.
+fn getInstance() DDS.DomainParticipantFactory {
+    instance_mu.lock();
+    defer instance_mu.unlock();
+    const owner = instance orelse blk: {
+        const f = createFactoryWith(null) catch |err| {
+            std.log.err("DDS_DomainParticipantFactory_get_instance: {}", .{err});
+            return nil.nil_factory;
+        };
+        const owner: *FactoryOwner = @ptrCast(@alignCast(f.ptr));
+        owner.is_instance = true;
+        instance = owner;
+        break :blk owner;
+    };
+    return .{ .ptr = owner, .vtable = &dds_factory_vtable };
+}
+
+/// `DomainParticipantFactory::delete_instance()`: deletes the process-wide
+/// factory, or returns PRECONDITION_NOT_MET while it has participants; OK
+/// when there is none. Deleting it retires its handle, so the bindings'
+/// references to it return ALREADY_DELETED, and the next `get_instance()`
+/// creates a new one.
+fn deleteInstance() DDS.ReturnCode_t {
+    instance_mu.lock();
+    defer instance_mu.unlock();
+    const owner = instance orelse return DDS.RETCODE_OK;
+    if (!owner.closeIfEmpty()) return DDS.RETCODE_PRECONDITION_NOT_MET;
+    instance = null;
+    owner.deinit();
+    return DDS.RETCODE_OK;
+}
 
 fn waitSetCtor(alloc: std.mem.Allocator) !DDS.WaitSet {
     const ws = try WaitSetImpl.init(alloc);
@@ -1283,9 +1394,16 @@ fn debugGpaRelease() void {
 }
 
 fn createFactory(allocator: ?*const zidl_bindings.ZidlAllocator) !ZZDDS.DomainParticipantFactory {
+    return createFactoryWith(if (allocator) |a| zidl_bindings.toAllocator(a) else null);
+}
+
+/// `null` is zzdds's default allocator: the DebugAllocator under
+/// `-Ddebug-allocator`, which checks for leaks when the last factory on it
+/// goes (see `FactoryLeakCheck`), else libc's.
+fn createFactoryWith(allocator: ?std.mem.Allocator) !ZZDDS.DomainParticipantFactory {
     const on_debug_gpa = build_options.debug_allocator and allocator == null;
     const alloc = if (allocator) |a|
-        zidl_bindings.toAllocator(a)
+        a
     else if (on_debug_gpa)
         debug_gpa.allocator()
     else
@@ -1485,7 +1603,32 @@ fn factoryGetQos(ctx: *anyopaque, qos: *DDS.DomainParticipantFactoryQos) DDS.Ret
 fn factoryDeinit(ctx: *anyopaque) void {
     if (ctx == nil.NIL_PTR) return;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
+    if (owner.is_instance) return; // only delete_instance deletes it
     owner.deinit();
+}
+
+/// The `@destructor`: deletes the factory, or returns PRECONDITION_NOT_MET
+/// while it has participants, as every DDS `delete_*` refuses while
+/// something is contained.
+fn factoryDestroy(ctx: *anyopaque) DDS.ReturnCode_t {
+    if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
+    const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
+    if (owner.is_instance) return DDS.RETCODE_PRECONDITION_NOT_MET;
+    if (!owner.closeIfEmpty()) return DDS.RETCODE_PRECONDITION_NOT_MET;
+    owner.deinit();
+    return DDS.RETCODE_OK;
+}
+
+/// The `@finalizer`: deletes every participant and everything in it, then
+/// the factory, as `zzdds_destroy_factory` always has.
+fn factoryRelease(ctx: *anyopaque) void {
+    factoryDeinit(ctx);
+}
+
+fn factoryDeleteContained(ctx: *anyopaque) DDS.ReturnCode_t {
+    if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
+    const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
+    return owner.deleteContainedEntities();
 }
 
 fn participantRegisterTypeSupport(ctx: *anyopaque, type_name: [*:0]const u8) DDS.ReturnCode_t {

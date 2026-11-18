@@ -10,6 +10,27 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-18
 
+- The DomainParticipantFactory moves onto zidl's generated construction
+  (`docs/design/factory-construction.md`). A factory of one's own is
+  `zzdds_DomainParticipantFactory_create[_with_allocator]` in C,
+  `zzdds::DomainParticipantFactory::create([allocator])` in C++ and
+  `Zzdds.zzdds.DomainParticipantFactory.create()` in Java (`AutoCloseable`). Its strict
+  `destroy()` returns PRECONDITION_NOT_MET while participants remain; `release()`, which
+  C++ and Java run when the owner is dropped or closed, deletes them first, as
+  `zzdds_destroy_factory` always did. Java factories are now deleted on `close()`.
+- The spec's process-wide factory: `DDS::DomainParticipantFactory::get_instance()`
+  creates it on first use and returns it, borrowed, to every caller, and
+  `delete_instance()` deletes it, or returns PRECONDITION_NOT_MET while it has
+  participants (zidl's `@static`). The next `get_instance()` creates a new one.
+- `DomainParticipantFactory::delete_contained_entities()` deletes every participant and
+  everything in it, or returns PRECONDITION_NOT_MET and deletes nothing while any of them
+  has an outstanding loan.
+- Deprecated: `zzdds_create_factory[_with_allocator]`, `zzdds_destroy_factory`, C++'s
+  `zzdds::create_factory` and Java's `ZzddsRuntime.createFactory`. They stay until
+  rmw_zzdds moves over. The hand-written C++ `DomainParticipantFactorySupport` is gone:
+  zidl's generated class is concrete. `ZzddsRuntime.asZzddsFactory` returns a factory
+  that is already the zzdds view as is.
+- Every example and test creates its factory through the generated functions.
 - `zzdds_factory_is_nil` is removed: a failed `zzdds_create_factory` is NULL, so check for
   that. The examples, integration tests, spikes and the C++ and Java runtimes now do.
   **Breaking** for C callers of `zzdds_factory_is_nil`.

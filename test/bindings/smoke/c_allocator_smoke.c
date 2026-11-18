@@ -1,5 +1,5 @@
 /* Binding smoke test for zzdds_c.h's plain C-ABI allocator-injection
- * surface: zzdds_create_factory_with_allocator(const ZidlAllocator*).
+ * surface: zzdds_DomainParticipantFactory_create_with_allocator(const ZidlAllocator*).
  * Compiled and run by `zig build test-bindings -Dc-binding=true`.
  *
  * Proves the C-ABI allocator injection actually reaches every downstream
@@ -49,7 +49,7 @@ static void track_free(void *ctx, void *ptr, size_t len, size_t alignment) {
 int main(void) {
     ZidlAllocator tracking = {NULL, track_alloc, track_resize, track_free};
 
-    zzdds_DomainParticipantFactory factory = zzdds_create_factory_with_allocator(&tracking);
+    zzdds_DomainParticipantFactory factory = zzdds_DomainParticipantFactory_create_with_allocator(&tracking);
     assert(factory != NULL);
     /* Bootstrapping the factory itself (FactoryOwner) already allocates. */
     assert(g_alloc_calls > 0);
@@ -73,15 +73,41 @@ int main(void) {
     assert(DDS_Entity_get_instance_handle(NULL) == DDS_HANDLE_NIL);
     assert(DDS_DomainParticipant_delete_topic(dp, NULL) != DDS_RETCODE_OK);
     assert(DDS_DataWriter_as_zzdds_DataWriter(NULL) == NULL);
-    zzdds_destroy_factory(NULL);
+    zzdds_DomainParticipantFactory_release(NULL);
 
     DDS_ReturnCode_t rc = DDS_DomainParticipantFactory_delete_participant(dds_factory, dp);
     assert(rc == DDS_RETCODE_OK);
 
-    zzdds_destroy_factory(factory);
+    zzdds_DomainParticipantFactory_release(factory);
 
     /* Everything torn down, nothing leaked. */
     assert(g_alloc_calls == g_free_calls);
+
+    /* The generated strict destroy refuses while a participant remains. */
+    zzdds_DomainParticipantFactory own = zzdds_DomainParticipantFactory_create();
+    assert(own != NULL);
+    DDS_DomainParticipantFactory own_dds = zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(own);
+    DDS_DomainParticipant own_dp = DDS_DomainParticipantFactory_create_participant(own_dds, 0, NULL, NULL, 0);
+    assert(own_dp != NULL);
+    assert(zzdds_DomainParticipantFactory_destroy(own) == DDS_RETCODE_PRECONDITION_NOT_MET);
+    /* delete_contained_entities empties it, so destroy then succeeds. */
+    assert(DDS_DomainParticipantFactory_delete_contained_entities(own_dds) == DDS_RETCODE_OK);
+    assert(zzdds_DomainParticipantFactory_destroy(own) == DDS_RETCODE_OK);
+
+    /* The process-wide factory: the same one until delete_instance, which
+     * refuses while it has participants. */
+    assert(DDS_DomainParticipantFactory_delete_instance() == DDS_RETCODE_OK);
+    DDS_DomainParticipantFactory inst = DDS_DomainParticipantFactory_get_instance();
+    assert(inst != NULL);
+    assert(DDS_DomainParticipantFactory_get_instance() == inst);
+    DDS_DomainParticipant inst_dp = DDS_DomainParticipantFactory_create_participant(inst, 0, NULL, NULL, 0);
+    assert(inst_dp != NULL);
+    assert(DDS_DomainParticipantFactory_delete_instance() == DDS_RETCODE_PRECONDITION_NOT_MET);
+    /* Nobody owns it: its zzdds view's destroy refuses. */
+    assert(zzdds_DomainParticipantFactory_destroy(DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(inst)) == DDS_RETCODE_PRECONDITION_NOT_MET);
+    assert(DDS_DomainParticipantFactory_delete_participant(inst, inst_dp) == DDS_RETCODE_OK);
+    assert(DDS_DomainParticipantFactory_delete_instance() == DDS_RETCODE_OK);
+    assert(DDS_DomainParticipantFactory_delete_instance() == DDS_RETCODE_OK);
 
     printf("c_allocator_smoke: OK\n");
     return 0;

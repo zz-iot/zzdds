@@ -6000,6 +6000,39 @@ pub const DomainParticipantImpl = struct {
         return DDS.RETCODE_UNSUPPORTED;
     }
 
+    /// What `delete_contained_entities` would refuse with, without deleting
+    /// anything: PRECONDITION_NOT_MET while a reader or writer has an
+    /// outstanding loan. The lists are taken while they are checked, as in
+    /// `vtDeleteContained`, so no concurrent delete frees one mid-check, and
+    /// always put back. The factory's own `delete_contained_entities` checks
+    /// every participant with this before deleting any.
+    pub fn checkDeleteContainedPrecondition(self: *Self) DDS.ReturnCode_t {
+        var pubs: std.ArrayListUnmanaged(*publisher_mod.PublisherImpl) = undefined;
+        var subs: std.ArrayListUnmanaged(*subscriber_mod.SubscriberImpl) = undefined;
+        self.mu.lock();
+        pubs = self.publishers;
+        self.publishers = .empty;
+        subs = self.subscribers;
+        self.subscribers = .empty;
+        self.mu.unlock();
+        const rc = check: {
+            for (subs.items) |sub| {
+                const rc = sub.checkDeleteContainedPrecondition();
+                if (rc != DDS.RETCODE_OK) break :check rc;
+            }
+            for (pubs.items) |pb| {
+                const rc = pb.checkDeleteContainedPrecondition();
+                if (rc != DDS.RETCODE_OK) break :check rc;
+            }
+            break :check DDS.RETCODE_OK;
+        };
+        self.mu.lock();
+        defer self.mu.unlock();
+        restoreTaken(*publisher_mod.PublisherImpl, self.alloc, &self.publishers, &pubs);
+        restoreTaken(*subscriber_mod.SubscriberImpl, self.alloc, &self.subscribers, &subs);
+        return rc;
+    }
+
     fn vtDeleteContained(ctx: *anyopaque) DDS.ReturnCode_t {
         {
             const rc = cast(ctx).checkEnabledPrecondition();

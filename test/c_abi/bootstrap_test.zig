@@ -1869,3 +1869,108 @@ test "support factory: the last factory can be destroyed from a listener that de
     try ctx.done.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
     try testing.expectEqual(DDS.RETCODE_OK, ctx.rc);
 }
+
+// ── Generated factory construction, get_instance and delete_instance ─────────
+//
+// Through the provider functions zidl's generated C functions call
+// (extensions.CAbiProvider): this test build generates no C API. The C
+// functions themselves are exercised by test/bindings/smoke.
+
+const Ctors = extensions.CAbiProvider.constructors(ZZDDS.DomainParticipantFactory);
+const Statics = extensions.CAbiProvider.statics(DDS.DomainParticipantFactory);
+
+fn createOwn() !ZZDDS.DomainParticipantFactory {
+    // libc's allocator is what the generated function passes for "none".
+    return Ctors.create(std.heap.c_allocator);
+}
+
+test "factory: get_instance returns one process-wide factory until delete_instance" {
+    try testing.expectEqual(DDS.RETCODE_OK, Statics.delete_instance());
+    const factory = Statics.get_instance();
+    try testing.expect(factory.ptr != zzdds.dcps.NIL_PTR);
+    try testing.expectEqual(factory.ptr, Statics.get_instance().ptr);
+
+    // Nobody owns it: its zzdds view's destroy refuses, and release and the
+    // deprecated zzdds_destroy_factory leave it alone.
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, extensions.factory_vtable.destroy(factory.ptr));
+    extensions.factory_vtable.release(factory.ptr);
+    extensions.zzdds_destroy_factory(factory.vtable.get_c_abi_handle(factory.ptr));
+
+    const dp = DDS_DomainParticipantFactory_create_participant_for_test(factory, test_domain.get(), null);
+    try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, Statics.delete_instance());
+    try testing.expectEqual(DDS.RETCODE_OK, factory.delete_participant(dp));
+    try testing.expectEqual(DDS.RETCODE_OK, Statics.delete_instance());
+    try testing.expectEqual(DDS.RETCODE_OK, Statics.delete_instance());
+
+    // The next get_instance creates a new one, which works.
+    const next = Statics.get_instance();
+    const dp2 = DDS_DomainParticipantFactory_create_participant_for_test(next, test_domain.get(), null);
+    try testing.expect(dp2.ptr != zzdds.dcps.NIL_PTR);
+    try testing.expectEqual(DDS.RETCODE_OK, next.delete_participant(dp2));
+    try testing.expectEqual(DDS.RETCODE_OK, Statics.delete_instance());
+}
+
+test "factory: the constructor's destroy refuses while participants remain, and release deletes them" {
+    const own = try createOwn();
+    const factory = own.vtable.as_DomainParticipantFactory(own.ptr);
+    const dp = DDS_DomainParticipantFactory_create_participant_for_test(factory, test_domain.get(), null);
+    try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, own.vtable.destroy(own.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, factory.delete_participant(dp));
+    try testing.expectEqual(DDS.RETCODE_OK, own.vtable.destroy(own.ptr));
+
+    const own2 = try createOwn();
+    const factory2 = own2.vtable.as_DomainParticipantFactory(own2.ptr);
+    try testing.expect(DDS_DomainParticipantFactory_create_participant_for_test(factory2, test_domain.get(), null).ptr != zzdds.dcps.NIL_PTR);
+    own2.vtable.release(own2.ptr); // deletes the participant too
+}
+
+test "factory: the constructor allocates through a caller's allocator" {
+    var track = TrackingCtx{ .child = testing.allocator };
+    const c_alloc = zidl_bindings.ZidlAllocator{
+        .ctx = &track,
+        .alloc = trackAlloc,
+        .resize = trackResize,
+        .free = trackFree,
+    };
+    const own = try Ctors.create(zidl_bindings.toAllocator(&c_alloc));
+    try testing.expect(track.alloc_calls.load(.monotonic) > 0);
+    try testing.expectEqual(DDS.RETCODE_OK, own.vtable.destroy(own.ptr));
+}
+
+test "factory: delete_contained_entities deletes every participant, or none while a loan is out" {
+    const own = try createOwn();
+    defer own.vtable.release(own.ptr);
+    const factory = own.vtable.as_DomainParticipantFactory(own.ptr);
+
+    const quiet = DDS_DomainParticipantFactory_create_participant_for_test(factory, test_domain.get(), null);
+    const dp = DDS_DomainParticipantFactory_create_participant_for_test(factory, test_domain.get(), null);
+    try testing.expect(quiet.ptr != zzdds.dcps.NIL_PTR and dp.ptr != zzdds.dcps.NIL_PTR);
+    const ext_dp = zidl_bindings.unboxAsView(ZZDDS.DomainParticipant, extensions.DDS_DomainParticipant_as_zzdds_DomainParticipant(dp.vtable.get_c_abi_handle(dp.ptr)).?);
+    try testing.expectEqual(DDS.RETCODE_OK, ext_dp.register_type_support("KeylessSmoke"));
+    const topic = dp.create_topic("FactoryDceLoan", "KeylessSmoke", .{}, null, 0);
+    const publisher = dp.create_publisher(.{}, null, 0);
+    const dw = publisher.create_datawriter(topic, .{}, null, 0);
+    try testing.expect(dw.ptr != zzdds.dcps.NIL_PTR);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+    const buf = try dw_impl.loanForWrite(1);
+
+    // One participant has a loan out: nothing is deleted, either one.
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, factory.vtable.delete_contained_entities(factory.ptr));
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, own.vtable.destroy(own.ptr));
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, dw_impl.checkDeletePrecondition());
+
+    dw_impl.cancelLoan(buf);
+    try testing.expectEqual(DDS.RETCODE_OK, factory.vtable.delete_contained_entities(factory.ptr));
+    // Both participants are gone: the factory no longer knows either.
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, factory.delete_participant(quiet));
+    try testing.expect(factory.lookup_participant(test_domain.get()).ptr == zzdds.dcps.NIL_PTR);
+}
+
+test "factory: the nil factory's delete_contained_entities fails" {
+    const n = extensions.CAbiProvider.nil(DDS.DomainParticipantFactory);
+    try testing.expect(n.vtable.delete_contained_entities(n.ptr) != DDS.RETCODE_OK);
+    const zn = extensions.CAbiProvider.nil(ZZDDS.DomainParticipantFactory);
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, zn.vtable.destroy(zn.ptr));
+}

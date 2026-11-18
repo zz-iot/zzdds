@@ -171,18 +171,24 @@ kept deprecated for rmw_zzdds until it moved over, were removed on 2026-11-17 al
 
 ## `DomainParticipantFactory` and the other no-parent-op types
 
-The factory is the root, and stays a deliberate exception, not a generalization target.
-Every `@standalone` type exists independent of any particular allocator instance — several
-`GuardCondition`s could be constructed under several different allocators in the same
-process, no problem. The factory is different: it's the one object that *establishes* which
-allocator everything downstream inherits. Folding
-`zzdds_create_factory_with_allocator`/`zzdds_destroy_factory` into the same
-annotation-driven pattern as leaf value types would force an artificial uniformity onto
-something structurally singular — an allocator's origin point, not just another allocator
-consumer — for no real benefit. Its hand-written `extensions.zig` implementation stays as
-architecturally is: already correct, already the reference the rest of
-`allocator-strategy.md`'s phases build on. Explicit allocator injection at construction is
-the shared idea with the rest of this design; the mechanics legitimately differ for a root.
+The factory was long kept a deliberate exception, on the reasoning that it is where the
+allocator everything downstream inherits comes from. That was written before
+`@standalone`: a generated `create_with_allocator` serves an allocator's origin as well as
+a hand-written one, so the reason no longer holds (decided in
+[`factory-construction.md`](factory-construction.md)).
+
+`zzdds::DomainParticipantFactory` is now `@standalone`:
+`zzdds_DomainParticipantFactory_create[_with_allocator]`, a strict `_destroy`
+(PRECONDITION_NOT_MET while participants remain) and a `_release` that deletes them, as
+`zzdds_destroy_factory` always did. C++ and Java run `release` when the owner is dropped or
+closed. `DDS::DomainParticipantFactory` also has the spec's process-wide factory, through
+zidl's `@static`: `get_instance()` creates it on first use and `delete_instance()` deletes it
+(strict). Neither owns anything, so dropping a reference to it releases nothing. The
+hand-written `zzdds_create_factory[_with_allocator]` and `zzdds_destroy_factory` (and C++'s `zzdds::create_factory`, Java's
+`ZzddsRuntime.createFactory`) are deprecated, and go once rmw_zzdds moves over.
+
+The other types with no parent operation are the ones above (`WaitSet`,
+`GuardCondition`).
 
 ## Future bindings
 
@@ -392,7 +398,7 @@ Hand-curated, with narrative detail the automated sweep below doesn't capture:
 | `ConditionSeq` (`WaitSet::wait()`/`get_conditions()` output) | Boxed via `emitTypedef`'s `is_entity_seq` branch | Generic `_free()`, routes through the process-wide allocator (app-owned half) / entity's own `get_allocator()` (native-temporary half) | Y (buffer of boxed handles) | Split — see [Allocator resolution](#allocator-resolution); the sweep below independently flags `wait`/`get_conditions` as a structurally-ambiguous pair, consistent with this | 2 |
 | `key_hashes`/`cdr_payloads`/`sample_infos` (`take_raw`/`read_raw`) | Produced by `DataReader::take_raw`/`read_raw` | `return_loan_raw(reader, ...)` | Y | N | 1 — reference example, cleanly confirmed by the sweep below (no review flag) |
 | Struct-with-owned-fields (e.g. `SensorLog`) | Decoded via generated `_deserialize` | Generic `{Type}_free()`, routes through the process-wide allocator | Y | N — already allocator-aware | 2 |
-| `DomainParticipantFactory` | `zzdds_create_factory[_with_allocator]` | `zzdds_destroy_factory` | Y (root) | N — root/bootstrap case, binds the allocator everything else inherits | Root exception |
+| `DomainParticipantFactory` | `zzdds_DomainParticipantFactory_create[_with_allocator]` (generated from its `@constructor`), or the process-wide `DDS_DomainParticipantFactory_get_instance` (`@static`) | `zzdds_DomainParticipantFactory_destroy`/`_release`; `DDS_DomainParticipantFactory_delete_instance` | Y (root) | N — binds the allocator everything else inherits | 2 (`@standalone`) |
 | Every other entity (`DomainParticipant`, `Publisher`, `Subscriber`, `Topic`, `DataWriter`, `DataReader`, `StatusCondition`, `ReadCondition`, `QueryCondition`) | Parent factory op | Matching `delete_*` on parent | Y (handle, not buffer) | N — parent entity already has `self.alloc` in scope | 1 |
 
 ### Full sweep

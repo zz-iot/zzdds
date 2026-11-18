@@ -1,12 +1,12 @@
 // Binding smoke test for zzdds_cpp.hpp's allocator-injection surfaces:
-// zzdds::create_factory(const ZidlAllocator*) (C-ABI-level factory/entity
+// zzdds::DomainParticipantFactory::create(const ZidlAllocator*) (C-ABI-level factory/entity
 // allocation) and zidl::setCppAllocator (C++ wrapper-object allocation via
 // std::pmr). Compiled and run by `zig build test-bindings -Dcpp-binding=true`.
 //
 // Covers the Greptile-flagged PR #50 P1 finding: if the PMR allocator is
 // exhausted, std::allocate_shared throws *before*
 // DomainParticipantFactorySupport is constructed, so its destructor (which
-// owns the only zzdds_destroy_factory(handle) call) never runs -- without
+// owns the only zzdds_DomainParticipantFactory_release(handle) call) never runs -- without
 // the cleanup in wrapFactoryHandle, this leaks the already-created
 // C-ABI factory and everything its own allocator allocated during bootstrap.
 #include "zzdds_cpp.hpp"
@@ -17,8 +17,8 @@
 #include <cstdlib>
 
 // C-level allocator for the factory itself
-// (zzdds_create_factory_with_allocator) -- tracks alloc/free counts to prove
-// whether zzdds_destroy_factory actually ran. Atomic: on the shared runtime
+// (zzdds_DomainParticipantFactory_create_with_allocator) -- tracks alloc/free counts to prove
+// whether zzdds_DomainParticipantFactory_release actually ran. Atomic: on the shared runtime
 // the factory's worker threads allocate and free through it too.
 static std::atomic<size_t> c_alloc_calls{0}, c_free_calls{0};
 static void* c_alloc(void*, size_t len, size_t) { c_alloc_calls++; return std::malloc(len); }
@@ -30,7 +30,7 @@ static void test_happy_path() {
     c_alloc_calls = 0;
     c_free_calls = 0;
     {
-        auto factory = zzdds::create_factory(&c_tracking);
+        auto factory = zzdds::DomainParticipantFactory::create(&c_tracking);
         assert(factory);
         auto dp = factory->create_participant(
             0, ::DDS::DomainParticipantQos::default_value(), nullptr, 0);
@@ -58,7 +58,7 @@ static void test_pmr_exhaustion_does_not_leak_factory() {
     zidl::setCppAllocator(&failing);
     bool threw = false;
     try {
-        auto factory = zzdds::create_factory(&c_tracking);
+        auto factory = zzdds::DomainParticipantFactory::create(&c_tracking);
         (void)factory;
     } catch (const std::bad_alloc&) {
         threw = true;

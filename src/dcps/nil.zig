@@ -1222,6 +1222,11 @@ var nil_factory_vtable = DDS.DomainParticipantFactory.Vtable{
             return DDS.RETCODE_ERROR;
         }
     }.f,
+    .delete_contained_entities = struct {
+        fn f(_: *anyopaque) DDS.ReturnCode_t {
+            return DDS.RETCODE_ERROR;
+        }
+    }.f,
     .deinit = nilDeinit,
     .get_c_abi_handle = nilFactoryGetCAbiHandle,
     .get_allocator = nilGetAllocator,

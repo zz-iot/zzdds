@@ -203,13 +203,36 @@ public class JavaSmoke {
         ws.close();
     }
 
+    // A factory of one's own is AutoCloseable and owned: its strict destroy()
+    // refuses while a participant remains, and close() deletes it. The
+    // process-wide factory is borrowed: one wrapper until delete_instance(),
+    // which refuses while it has participants.
+    static void checkFactoryConstruction(int domain) {
+        int ok = Dcps.DDS.RETCODE_OK.value;
+        int refused = Dcps.DDS.RETCODE_PRECONDITION_NOT_MET.value;
+        try (Zzdds.zzdds.DomainParticipantFactory own = Zzdds.zzdds.DomainParticipantFactory.create()) {
+            check(own != null, "zzdds DomainParticipantFactory.create() returned non-null");
+            check(own.create_participant(domain, null, null, 0) != null, "create_participant on an own factory");
+            check(own.destroy() == refused, "destroy() refuses a factory with a participant");
+        }
+        check(Dcps.DDS.DomainParticipantFactory.delete_instance() == ok, "delete_instance() with no instance");
+        Dcps.DDS.DomainParticipantFactory inst = Dcps.DDS.DomainParticipantFactory.get_instance();
+        check(inst != null, "get_instance() returned non-null");
+        check(Dcps.DDS.DomainParticipantFactory.get_instance() == inst, "get_instance() returns the same wrapper");
+        check(inst.create_participant(domain, null, null, 0) != null, "create_participant on the process-wide factory");
+        check(Dcps.DDS.DomainParticipantFactory.delete_instance() == refused, "delete_instance() refuses while a participant remains");
+        check(inst.delete_contained_entities() == ok, "delete_contained_entities() on the process-wide factory");
+        check(Dcps.DDS.DomainParticipantFactory.delete_instance() == ok, "delete_instance()");
+    }
+
     public static void main(String[] args) throws Exception {
         System.out.println("Java binding smoke test:");
         checkGeneratedConstruction();
+        checkFactoryConstruction(0);
 
         Dcps.DDS.DomainParticipantFactory factory =
-            (Dcps.DDS.DomainParticipantFactory) io.zzdds.runtime.ZzddsRuntime.createFactory();
-        check(factory != null, "createFactory() returned non-null");
+            io.zzdds.ext.Zzdds.zzdds.DomainParticipantFactory.create();
+        check(factory != null, "DomainParticipantFactory.create() returned non-null");
 
         Dcps.DDS.DomainParticipant dpWriter = factory.create_participant(0, null, null, 0);
         Dcps.DDS.DomainParticipant dpReader = factory.create_participant(0, null, null, 0);
