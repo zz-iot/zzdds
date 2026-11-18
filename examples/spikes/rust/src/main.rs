@@ -17,7 +17,7 @@ const MAGIC: u64 = 0xFEEDFACECAFEBEEF;
 fn main() {
     unsafe {
         let factory = ffi::zzdds_create_factory();
-        assert!(!ffi::zzdds_factory_is_nil(factory), "zzdds_create_factory() returned nil");
+        assert!(!factory.is_null(), "zzdds_create_factory() returned NULL");
         let dds_factory = ffi::zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory);
 
         let dp = ffi::DDS_DomainParticipantFactory_create_participant(

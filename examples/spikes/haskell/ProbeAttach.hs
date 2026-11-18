@@ -38,16 +38,6 @@ import System.IO (hFlush, stdout)
 
 foreign import ccall "zzdds_create_factory"
   c_zzdds_create_factory :: IO (Ptr ())
--- NOTE: this returns C `bool` (1 byte, per the SysV ABI), NOT `int` (4
--- bytes). Declaring it as CInt here (an earlier version of this file did)
--- compiles fine and silently captures whatever garbage happens to be in
--- the upper 3 bytes of the return register along with the real 1-byte
--- result -- confirmed live: it read back as 871572480 for what was
--- actually a valid, non-nil factory pointer. CBool is the correct mapping.
--- See ../README.md's Findings for why this is worth flagging for the
--- review, not just fixing quietly.
-foreign import ccall "zzdds_factory_is_nil"
-  c_zzdds_factory_is_nil :: Ptr () -> IO CBool
 foreign import ccall "zzdds_destroy_factory"
   c_zzdds_destroy_factory :: Ptr () -> IO ()
 foreign import ccall "zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory"
@@ -121,9 +111,8 @@ main = do
     hFlush stdout
 
   factory <- c_zzdds_create_factory
-  isNil <- c_zzdds_factory_is_nil factory
-  when (isNil /= 0) $ do
-    putStrLn "FAIL: zzdds_create_factory() returned nil"
+  when (factory == nullPtr) $ do
+    putStrLn "FAIL: zzdds_create_factory() returned NULL"
     exitFailure
 
   ddsFactory <- c_factory_as_dds factory

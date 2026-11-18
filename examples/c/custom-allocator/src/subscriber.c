@@ -77,7 +77,7 @@ int main(void) {
     }
 
     zzdds_DomainParticipantFactory factory = zzdds_create_factory_with_allocator(&static_pool_allocator);
-    if (zzdds_factory_is_nil(factory)) {
+    if (factory == NULL) {
         fprintf(stderr, "FAIL: zzdds_create_factory_with_allocator returned NULL\n");
         return 1;
     }

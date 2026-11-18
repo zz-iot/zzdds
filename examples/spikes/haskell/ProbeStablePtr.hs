@@ -34,7 +34,6 @@ import System.IO (hFlush, stdout)
 import System.Mem (performGC)
 
 foreign import ccall "zzdds_create_factory" c_zzdds_create_factory :: IO (Ptr ())
-foreign import ccall "zzdds_factory_is_nil" c_zzdds_factory_is_nil :: Ptr () -> IO CBool
 foreign import ccall "zzdds_destroy_factory" c_zzdds_destroy_factory :: Ptr () -> IO ()
 foreign import ccall "zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory"
   c_factory_as_dds :: Ptr () -> IO (Ptr ())
@@ -106,8 +105,7 @@ main = do
   releaseCbPtr <- mkReleaseCb $ \_ -> putStrLn "[callback] release_listener_data fired"
 
   factory <- c_zzdds_create_factory
-  isNil <- c_zzdds_factory_is_nil factory
-  when (isNil /= 0) $ putStrLn "FAIL: zzdds_create_factory nil" >> exitFailure
+  when (factory == nullPtr) $ putStrLn "FAIL: zzdds_create_factory nil" >> exitFailure
   ddsFactory <- c_factory_as_dds factory
   dp <- c_create_participant ddsFactory domainId nullPtr nullPtr 0
   when (dp == nullPtr) $ putStrLn "FAIL: create_participant" >> exitFailure

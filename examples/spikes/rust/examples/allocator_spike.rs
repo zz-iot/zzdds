@@ -29,7 +29,7 @@ fn main() {
         // from Rust across the same C ABI, no bindgen, no unstable
         // features.
         let factory = ffi::zzdds_create_factory_with_allocator(allocator);
-        assert!(!ffi::zzdds_factory_is_nil(factory), "zzdds_create_factory_with_allocator returned nil");
+        assert!(!factory.is_null(), "zzdds_create_factory_with_allocator returned NULL");
         println!("[allocator_spike] factory created under static-pool allocator");
 
         // WaitSet/GuardCondition: the two condition-family types with no

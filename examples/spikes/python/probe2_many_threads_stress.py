@@ -73,8 +73,8 @@ def run_one_iteration(zzdds, shim, domain_id, state):
     listener.release_listener_data = p.RELEASE_LISTENER_DATA_CB(0)
 
     factory = zzdds.zzdds_create_factory()
-    if zzdds.zzdds_factory_is_nil(factory):
-        sys.exit("FAIL: zzdds_create_factory() returned nil")
+    if not factory:
+        sys.exit("FAIL: zzdds_create_factory() returned NULL")
     dds_factory = zzdds.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory)
     dp = zzdds.DDS_DomainParticipantFactory_create_participant(dds_factory, domain_id, None, None, 0)
     if not dp:
