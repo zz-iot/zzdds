@@ -15,6 +15,7 @@ const qos_change = @import("qos_change.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const listener_box_mod = @import("../util/listener_box.zig");
 const listener_lane = @import("listener_lane.zig");
+const listener_fallback = @import("../util/listener_fallback.zig");
 const ListenerBox = listener_box_mod.ListenerBox;
 const Mutex = @import("../util/mutex.zig").Mutex;
 const extensions_mod = @import("../c_abi/extensions.zig");
@@ -40,6 +41,13 @@ pub const Endpoints = struct {
     /// Announces again those announced already.
     announce: *const fn (participant: *anyopaque, topic: *TopicImpl) void,
 };
+
+/// The callback type of `on_inconsistent_topic`.
+pub const InconsistentTopicCb = listener_fallback.Callback(DDS.TopicListener, "on_inconsistent_topic");
+
+/// A participant's listener for a status its Topic's own listener does not
+/// take (DDS 1.4 §2.2.4.1.5), resolved but not invoked.
+pub const ParticipantFallback = *const fn (participant: *anyopaque, bit: DDS.StatusMask) ?listener_fallback.Resolved(InconsistentTopicCb);
 
 pub const TopicImpl = struct {
     alloc: std.mem.Allocator,
@@ -93,13 +101,24 @@ pub const TopicImpl = struct {
     /// locked mutator, confirmed via TSan there; TopicImpl had no
     /// general-purpose mutex at all before this).
     mu: Mutex = .{},
-    /// No topic-listener dispatch path reads this today, but it is the same
-    /// concept as the writer/reader/publisher/subscriber/participant
-    /// `listener_mask` (all made `@atomicStore`/`@atomicLoad` `.monotonic`
-    /// after a stress-test TSan finding) -- kept atomic here too so a
-    /// future `on_inconsistent_topic` fallback path can't reintroduce the
-    /// race. Initialisers stay plain.
+    /// Read by the INCONSISTENT_TOPIC dispatch with `@atomicLoad`
+    /// `.monotonic`, as every entity's `listener_mask` is since a
+    /// stress-test TSan finding. Initialisers stay plain.
     listener_mask: DDS.StatusMask,
+    /// Runs this Topic's listener turns (listener_lane.zig). Each poster
+    /// holds a reference, so the lane's owner reference is just another.
+    listeners: listener_lane.PendingListeners = .{},
+    /// Set by the participant: its listener, when this Topic's own does not
+    /// take a status.
+    participant_fallback: ?ParticipantFallback = null,
+    /// Guarded by the participant's `mu`: one for `create_topic` and one for
+    /// each `find_topic` since. `delete_topic` deletes the Topic with the
+    /// last (DDS 1.4 §2.2.2.2.1.11).
+    handles: u32 = 1,
+    /// Guarded by the participant's `mu`: INCONSISTENT_TOPIC changed and is
+    /// raised once that is released (participant.zig's
+    /// `raiseInconsistentTopics`).
+    raise_pending: bool = false,
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
     status_cond: ?*waitset.StatusConditionImpl,
@@ -154,7 +173,15 @@ pub const TopicImpl = struct {
             .status_changes = 0,
             .status_cond = null,
             .inconsistent = .{},
+            .listeners = .init(alloc, .{
+                .ctx = undefined,
+                .acquire = laneAcquire,
+                .release = laneRelease,
+                .status = dispatchStatusFn,
+                .ready = dispatchReadyFn,
+            }),
         };
+        self.listeners.owner.ctx = self;
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
         self.status_cond = sc;
         return self;
@@ -173,6 +200,12 @@ pub const TopicImpl = struct {
         return self.users.load(.acquire) != 0;
     }
 
+    /// Takes a reference with the owning participant's `mu` held, for a
+    /// Topic found in its list.
+    pub fn pin(self: *Self) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
     /// A user was deleted. Its reference stays until `release`.
     pub fn endUse(self: *Self) void {
         _ = self.users.fetchSub(1, .acq_rel);
@@ -182,6 +215,9 @@ pub const TopicImpl = struct {
     /// wrappers retire now, even if a deleted user still finishing keeps it
     /// alive a while longer.
     pub fn deleted(self: *Self) void {
+        self.listeners.close();
+        // Hold no lock here: the listener may call back into it.
+        self.listeners.awaitIdle();
         self.c_abi.retire();
         self.td_c_abi.retire();
         if (self.status_cond) |sc| sc.c_abi.retire();
@@ -194,6 +230,7 @@ pub const TopicImpl = struct {
     }
 
     fn destroy(self: *Self) void {
+        self.listeners.deinit();
         self.retired_listeners.deinit(self.alloc);
         self.listener_box.releaseHold(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
@@ -266,6 +303,12 @@ pub const TopicImpl = struct {
         if (self.enabled.load(.acquire)) return DDS.RETCODE_OK;
         if (!self.is_participant_enabled_fn(self.participant_ptr)) return DDS.RETCODE_PRECONDITION_NOT_MET;
         self.enabled.store(true, .release);
+        // A disabled Topic's listener is not called: an inconsistency
+        // counted meanwhile reaches it now.
+        self.mu.lock();
+        const pending = self.status_changes & DDS.INCONSISTENT_TOPIC_STATUS != 0;
+        self.mu.unlock();
+        if (pending) self.raiseInconsistent();
         return DDS.RETCODE_OK;
     }
 
@@ -412,6 +455,89 @@ pub const TopicImpl = struct {
         self.inconsistent.total_count_change = 0;
         self.status_changes &= ~DDS.INCONSISTENT_TOPIC_STATUS;
         return DDS.RETCODE_OK;
+    }
+
+    /// Counts `n` discovered DataWriters or DataReaders on this Topic's name
+    /// with another type (DDS 1.4 §2.2.4.1, INCONSISTENT_TOPIC). The caller
+    /// raises it afterwards with no participant lock held.
+    pub fn recordInconsistent(self: *Self, n: i32) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.inconsistent.total_count += n;
+        self.inconsistent.total_count_change += n;
+        self.status_changes |= DDS.INCONSISTENT_TOPIC_STATUS;
+    }
+
+    /// Wakes the StatusCondition for INCONSISTENT_TOPIC, which changed, then
+    /// raises its listener -- see `reader.zig`'s `raise`. The caller holds a
+    /// reference.
+    pub fn raiseInconsistent(self: *Self) void {
+        if (self.status_cond) |sc| sc.notifyWakeup();
+        if (!self.listeners.post(DDS.INCONSISTENT_TOPIC_STATUS)) dispatchStatusFn(self, DDS.INCONSISTENT_TOPIC_STATUS);
+    }
+
+    fn dispatchStatusFn(ctx: *anyopaque, kind: DDS.StatusMask) void {
+        const self = cast(ctx);
+        switch (kind) {
+            DDS.INCONSISTENT_TOPIC_STATUS => self.dispatchInconsistent(),
+            else => unreachable,
+        }
+    }
+
+    /// A Topic has no reliable-ready events.
+    fn dispatchReadyFn(_: *anyopaque, _: listener_lane.ReadyEvent) void {
+        unreachable;
+    }
+
+    fn laneAcquire(ctx: *anyopaque) bool {
+        cast(ctx).pin();
+        return true;
+    }
+
+    fn laneRelease(ctx: *anyopaque) void {
+        cast(ctx).release();
+    }
+
+    /// Resolves, then claims under `mu` and invokes after unlocking -- see
+    /// `reader.zig`'s `resolveListener`. Not while disabled: `vtEnable`
+    /// raises it again.
+    fn dispatchInconsistent(self: *Self) void {
+        const bit = DDS.INCONSISTENT_TOPIC_STATUS;
+        if (!self.enabled.load(.acquire)) return;
+        const target = self.resolveListener(bit);
+        defer if (target) |t| t.release();
+        self.mu.lock();
+        const status = self.inconsistent;
+        const claimed = target != null and self.status_changes & bit != 0;
+        if (claimed) {
+            self.status_changes &= ~bit;
+            self.inconsistent.total_count_change = 0;
+        }
+        self.mu.unlock();
+        if (claimed) target.?.invoke(vtGetCAbiHandle(self), .{&status});
+    }
+
+    /// This Topic's `on_inconsistent_topic`, if its listener has one and
+    /// `listener_mask` includes `bit`, otherwise the participant's (DDS 1.4
+    /// §2.2.4.1.5), or null. Release the result with no lock held.
+    fn resolveListener(self: *Self, bit: DDS.StatusMask) ?listener_fallback.Resolved(InconsistentTopicCb) {
+        const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
+        const r = listener_fallback.resolveBox(InconsistentTopicCb, "on_inconsistent_topic", mask, bit, self.acquireListener(), self.alloc) orelse blk: {
+            const fallback = self.participant_fallback orelse return null;
+            break :blk fallback(self.participant_ptr, bit) orelse return null;
+        };
+        // Its identity running elsewhere parks this turn: nothing to invoke.
+        if (!listener_lane.admit(r)) {
+            r.release();
+            return null;
+        }
+        return r;
+    }
+
+    fn acquireListener(self: *Self) *ListenerBox(DDS.TopicListener) {
+        self.listener_mu.lock();
+        defer self.listener_mu.unlock();
+        return self.listener_box.acquireLocked();
     }
 
     fn vtDeinit(ctx: *anyopaque) void {

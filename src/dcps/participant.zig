@@ -2522,6 +2522,55 @@ pub const DomainParticipantImpl = struct {
     /// is pinned under self.mu by its matched_notify (registered alongside
     /// incompat_qos) so a concurrent delete cannot free it meanwhile. Batches
     /// are fixed-size, so raising them needs no memory either.
+    /// With `mu` held: counts a newly discovered DataWriter or DataReader
+    /// against each of this participant's Topics with its name and another
+    /// type (DDS 1.4 §2.2.4.1, INCONSISTENT_TOPIC). Returns whether any
+    /// counted it: `raiseInconsistentTopics` raises them once `mu` is
+    /// released. Type names decide, as they do matching.
+    fn recordInconsistentLocked(self: *Self, topic_name: []const u8, type_name: []const u8) bool {
+        var any = false;
+        for (self.topics.items) |t| {
+            if (!std.mem.eql(u8, t.topic_name, topic_name) or std.mem.eql(u8, t.type_name, type_name)) continue;
+            t.recordInconsistent(1);
+            t.raise_pending = true;
+            any = true;
+        }
+        return any;
+    }
+
+    /// Raises INCONSISTENT_TOPIC on each Topic `recordInconsistentLocked`
+    /// counted, with `mu` released. Call with no lock held.
+    fn raiseInconsistentTopics(self: *Self) void {
+        while (true) {
+            var pinned: [16]*topic_mod.TopicImpl = undefined;
+            var n: usize = 0;
+            var more = false;
+            self.mu.lock();
+            for (self.topics.items) |t| {
+                if (!t.raise_pending) continue;
+                if (n == pinned.len) {
+                    more = true;
+                    break;
+                }
+                t.raise_pending = false;
+                t.pin();
+                pinned[n] = t;
+                n += 1;
+            }
+            self.mu.unlock();
+            for (pinned[0..n]) |t| {
+                t.raiseInconsistent();
+                t.release();
+            }
+            if (!more) return;
+        }
+    }
+
+    /// A Topic's fallback for `on_inconsistent_topic` (DDS 1.4 §2.2.4.1.5).
+    fn topicListenerFallback(ctx: *anyopaque, bit: DDS.StatusMask) ?listener_fallback.Resolved(topic_mod.InconsistentTopicCb) {
+        return cast(ctx).resolveFallback(topic_mod.InconsistentTopicCb, "on_inconsistent_topic", bit);
+    }
+
     fn raiseIncompatQos(self: *Self, comptime which: enum { readers, writers }) void {
         const Job = struct { notify: IncompatQosNotify, pin: MatchedNotify, pending: IncompatQosPending };
         while (true) {
@@ -3454,6 +3503,7 @@ pub const DomainParticipantImpl = struct {
         // A writer already discovered was checked against every announced
         // reader then, at its announcement or at the reader's own.
         const prev_qos = self.discoveredWriterQosLocked(data.guid);
+        const inconsistent = prev_qos == null and self.recordInconsistentLocked(data.topic_name, data.type_name);
         // A refresh a matched reader no longer matches unmatches it, as a
         // loss does for that reader. Room is made first, as in onWriterLost;
         // without it, no match is removed.
@@ -3574,6 +3624,7 @@ pub const DomainParticipantImpl = struct {
         // its place, until it expires or the writer is announced again.
         if (!self.localChangedSinceLocked(jobs.items)) self.settleWriterLocked(data.guid, gen);
         self.mu.unlock();
+        if (inconsistent) self.raiseInconsistentTopics();
         if (push_dr) |dr| pushBuiltinPublicationCdr(self.alloc, dr, data);
         if (push_topic_dr) |dr| if (new_topic) |dt| pushBuiltinTopicCdr(self.alloc, dr, .{
             .key = topicNameToKey(dt.topic_name),
@@ -3770,6 +3821,7 @@ pub const DomainParticipantImpl = struct {
         // As in onWriterDiscovered.
         const gen = self.newDiscoveryGenLocked(data.guid);
         const prev_qos = self.discoveredReaderQosLocked(data.guid);
+        const inconsistent = prev_qos == null and self.recordInconsistentLocked(data.topic_name, data.type_name);
         var removed: std.ArrayListUnmanaged(RemovedReaderJob) = .empty;
         defer removed.deinit(self.alloc);
         const can_unmatch = if (removed.ensureTotalCapacityPrecise(self.alloc, self.active_writers.count())) |_| true else |_| false;
@@ -3873,6 +3925,7 @@ pub const DomainParticipantImpl = struct {
             };
             job.proto.quiesceRelease();
         }
+        if (inconsistent) self.raiseInconsistentTopics();
         if (push_dr) |dr| pushBuiltinSubscriptionCdr(self.alloc, dr, data);
         if (push_topic_dr) |dr| if (new_topic) |dt| pushBuiltinTopicCdr(self.alloc, dr, .{
             .key = topicNameToKey(dt.topic_name),
@@ -5666,15 +5719,38 @@ pub const DomainParticipantImpl = struct {
             handle,
         ) catch return nil.nil_topic;
         t.endpoints = .{ .prepare = prepareTopicEndpoints, .announce = announceTopicEndpoints };
+        t.participant_fallback = topicListenerFallback;
+        if (self.listenerGroup()) |g| t.listeners.attach(g);
         // Gated on the participant's own enabled state too -- see
         // vtCreatePublisher's identical comment (PR #91 Greptile finding).
         t.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
         self.mu.lock();
+        // A local TopicDescription is identified by its name (DDS 1.4
+        // §2.2.2.2.1.12; DDS-XTypes 1.3 §7.6.4.1 states the restriction it
+        // lifts): another reference to a Topic comes from find_topic.
+        if (self.hasDescriptionNamedLocked(tn_s)) {
+            self.mu.unlock();
+            t.deleted();
+            return nil.nil_topic;
+        }
         self.topics.append(self.alloc, t) catch {
             self.mu.unlock();
-            t.release();
+            t.deleted();
             return nil.nil_topic;
         };
+        // DataWriters and DataReaders discovered already with this name and
+        // another type are inconsistent with it too.
+        var inconsistent: i32 = 0;
+        for (self.discovered_writers.items) |dw| {
+            if (std.mem.eql(u8, dw.topic_name, tn_s) and !std.mem.eql(u8, dw.type_name, tt_s)) inconsistent += 1;
+        }
+        for (self.discovered_readers.items) |dr| {
+            if (std.mem.eql(u8, dr.topic_name, tn_s) and !std.mem.eql(u8, dr.type_name, tt_s)) inconsistent += 1;
+        }
+        if (inconsistent > 0) {
+            t.recordInconsistent(inconsistent);
+            t.pin();
+        }
         // Register in discovered_topics so get_discovered_topics / get_discovered_topic_data
         // work for locally-created topics.  The same (topic_name, type_name) dedup key used
         // by the SEDP callbacks prevents a duplicate entry when the topic later appears on wire.
@@ -5707,6 +5783,10 @@ pub const DomainParticipantImpl = struct {
         const maybe_topic_dr: ?*reader_mod.DataReaderImpl =
             if (self.builtin_sub) |bs| bs.topic_dr else null;
         self.mu.unlock();
+        if (inconsistent > 0) {
+            t.raiseInconsistent();
+            t.release();
+        }
         if (maybe_topic_dr) |dr| pushBuiltinTopicCdr(self.alloc, dr, .{
             .key = topicNameToKey(tn_s),
             .name = tn_s,
@@ -5737,6 +5817,13 @@ pub const DomainParticipantImpl = struct {
         self.mu.lock();
         for (self.topics.items, 0..) |t, i| {
             if (t.toDDSTopic().ptr == a_topic.ptr) {
+                // Spec §2.2.2.2.1.11: a Topic found again is deleted as many
+                // times as it was created or found; only the last deletes it.
+                if (t.handles > 1) {
+                    t.handles -= 1;
+                    self.mu.unlock();
+                    return DDS.RETCODE_OK;
+                }
                 // Spec §2.2.2.2.1.6: not while a DataWriter, DataReader or
                 // ContentFilteredTopic uses it.
                 if (t.inUse()) {
@@ -5792,9 +5879,21 @@ pub const DomainParticipantImpl = struct {
         self.mu.lock();
         defer self.mu.unlock();
         for (self.topics.items) |t| {
-            if (std.mem.eql(u8, t.topic_name, tn_s)) return t.toDDSTopic();
+            if (std.mem.eql(u8, t.topic_name, tn_s)) {
+                // Deleted as many times as found (§2.2.2.2.1.11).
+                t.handles += 1;
+                return t.toDDSTopic();
+            }
         }
         return nil.nil_topic;
+    }
+
+    /// With `mu` held: whether a Topic or ContentFilteredTopic of this
+    /// participant is named `name`.
+    fn hasDescriptionNamedLocked(self: *Self, name: []const u8) bool {
+        for (self.topics.items) |t| if (std.mem.eql(u8, t.topic_name, name)) return true;
+        for (self.cft_topics.items) |c| if (std.mem.eql(u8, c.name, name)) return true;
+        return false;
     }
 
     fn vtLookupTopicDesc(ctx: *anyopaque, name: [*:0]const u8) DDS.TopicDescription {
@@ -5850,6 +5949,12 @@ pub const DomainParticipantImpl = struct {
             return nil.nil_cft;
         };
         self.mu.lock();
+        // Its name is taken: see vtCreateTopic.
+        if (self.hasDescriptionNamedLocked(name_s)) {
+            self.mu.unlock();
+            cft.deleted();
+            return nil.nil_cft;
+        }
         self.cft_topics.append(self.alloc, cft) catch {
             self.mu.unlock();
             cft.deleted();

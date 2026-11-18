@@ -827,3 +827,93 @@ test "CFT: set_expression_parameters replaces pre-existing params" {
     try testing.expectEqual(@as(u32, 1), out._length);
     try testing.expectEqualStrings("new", std.mem.span(out._buffer.?[0]));
 }
+
+// ── Names ─────────────────────────────────────────────────────────────────────
+//
+// A participant's TopicDescriptions are identified by their names (DDS 1.4
+// §2.2.2.2.1.12; DDS-XTypes 1.3 §7.6.4.1): find_topic gives another
+// reference to a Topic, deleted like the one create_topic gave.
+
+fn countRelease(ld: ?*anyopaque) callconv(.c) void {
+    @as(*u32, @ptrCast(@alignCast(ld.?))).* += 1;
+}
+
+test "create_topic: a name the participant has already is refused, whatever the type, and releases its listener" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("Taken", "T", .{}, null, 0);
+    try testing.expect(topic.ptr != nil.NIL_PTR);
+    var released: u32 = 0;
+    const l = DDS.TopicListener{ .listener_data = &released, .release_listener_data = countRelease };
+    try testing.expect(fx.dp.create_topic("Taken", "T", .{}, l, 0).ptr == nil.NIL_PTR);
+    try testing.expect(fx.dp.create_topic("Taken", "Other", .{}, l, 0).ptr == nil.NIL_PTR);
+    try testing.expectEqual(@as(u32, 2), released);
+
+    // Deleted, its name is free again.
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.vtable.delete_topic(fx.dp.ptr, topic));
+    const again = fx.dp.create_topic("Taken", "Other", .{}, null, 0);
+    try testing.expect(again.ptr != nil.NIL_PTR);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.vtable.delete_topic(fx.dp.ptr, again));
+}
+
+test "create_topic: another participant's Topic of the same name does not take it" {
+    var a = try Fixture.init(testing.allocator);
+    defer a.deinit();
+    var b = try Fixture.init(testing.allocator);
+    defer b.deinit();
+    const ta = a.dp.create_topic("Shared", "T", .{}, null, 0);
+    defer _ = a.dp.vtable.delete_topic(a.dp.ptr, ta);
+    const tb = b.dp.create_topic("Shared", "T", .{}, null, 0);
+    try testing.expect(tb.ptr != nil.NIL_PTR);
+    defer _ = b.dp.vtable.delete_topic(b.dp.ptr, tb);
+}
+
+test "a Topic and a ContentFilteredTopic of one participant never share a name" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("Base", "T", .{}, null, 0);
+    try testing.expect(fx.dp.create_contentfilteredtopic("Base", topic, "x = 1", &DDS.StringSeq{}).ptr == nil.NIL_PTR);
+    const cft = fx.dp.create_contentfilteredtopic("Filtered", topic, "x = 1", &DDS.StringSeq{});
+    try testing.expect(cft.ptr != nil.NIL_PTR);
+    try testing.expect(fx.dp.create_contentfilteredtopic("Filtered", topic, "x = 2", &DDS.StringSeq{}).ptr == nil.NIL_PTR);
+    try testing.expect(fx.dp.create_topic("Filtered", "T", .{}, null, 0).ptr == nil.NIL_PTR);
+
+    // The refused ones left the Topic used only by the one made.
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, fx.dp.vtable.delete_topic(fx.dp.ptr, topic));
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.vtable.delete_contentfilteredtopic(fx.dp.ptr, cft));
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.vtable.delete_topic(fx.dp.ptr, topic));
+}
+
+test "find_topic: a Topic is deleted as many times as it was created or found" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("Found", "T", .{}, null, 0);
+    const timeout = DDS.Duration_t{ .sec = 0, .nanosec = 0 };
+    const found = fx.dp.vtable.find_topic(fx.dp.ptr, "Found", &timeout);
+    try testing.expectEqual(topic.ptr, found.ptr);
+    const found_again = fx.dp.vtable.find_topic(fx.dp.ptr, "Found", &timeout);
+    try testing.expectEqual(topic.ptr, found_again.ptr);
+
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.vtable.delete_topic(fx.dp.ptr, found));
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.vtable.delete_topic(fx.dp.ptr, topic));
+    try testing.expect(fx.dp.vtable.lookup_topicdescription(fx.dp.ptr, "Found").ptr != nil.NIL_PTR);
+    // Its name stays taken until the last.
+    try testing.expect(fx.dp.create_topic("Found", "T", .{}, null, 0).ptr == nil.NIL_PTR);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.vtable.delete_topic(fx.dp.ptr, found_again));
+    try testing.expect(fx.dp.vtable.lookup_topicdescription(fx.dp.ptr, "Found").ptr == nil.NIL_PTR);
+}
+
+test "find_topic: a deletion that is not the last succeeds while the Topic is in use" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("FoundUsed", "T", .{}, null, 0);
+    const timeout = DDS.Duration_t{ .sec = 0, .nanosec = 0 };
+    const found = fx.dp.vtable.find_topic(fx.dp.ptr, "FoundUsed", &timeout);
+    const pub_ = fx.dp.create_publisher(.{}, null, 0);
+    const dw = pub_.create_datawriter(topic, .{}, null, 0);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.vtable.delete_topic(fx.dp.ptr, found));
+    // The last deletion still waits for its users.
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, fx.dp.vtable.delete_topic(fx.dp.ptr, topic));
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.delete_datawriter(dw));
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.vtable.delete_topic(fx.dp.ptr, topic));
+}

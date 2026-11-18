@@ -331,8 +331,6 @@ or an optimisation on an already-improved path):
   accept this later without rework). ~1 day with full-decode of wanted nested structs,
   ~2 days fully selective. Impact of deferring: a nested field reference silently never
   matches (unknown field → `eval` passes the sample) — a pre-existing gap.
-- **`on_inconsistent_topic` has zero firing sites** — the underlying status detection is
-  not wired up.
 - **`SampleInfo` `sample_rank` / `generation_rank` / `absolute_generation_rank`** stay at
   their defaults.
 - **`wait_for_historical_data` on a BEST_EFFORT reader** has no guaranteed history wait.
@@ -427,9 +425,6 @@ or an optimisation on an already-improved path):
   zzdds C function returning `bool` (`*_is_nil`, `*_get_trigger_value`, …).
 - **Example: `--publisher-matches` / `--subscriber-matches`** are parsed then silently
   ignored in all four `shape` ports (no reference implementation defines their semantics).
-- **Example: Java listener replacement leaks the old JNI global reference** — a second
-  `set_listener`-style call on an entity doesn't release the previous one
-  (`examples/java/listener-pubsub`).
 - **Examples: review how each binding uses the generated typed API; zidl's output may need
   fixes too.** The examples are meant to show the same calls on the generated
   `{T}DataReader`/`{T}DataWriter` in every binding, but the generated read/take operations
@@ -637,6 +632,15 @@ announcements (advertising it without a working TypeLookup stalls OpenDDS) and o
 reader announcements (the GET_TYPES round-trip isn't implemented). This is also the clean
 long-term fix for the keyed-instance-NIL gap above. Remaining TypeSupport work: the C-ABI /
 non-Zig binding bridge, then TypeLookup integration. `design/thread-model.md`.
+
+Its Topic rules replace two of DDS 1.4's, which zzdds follows until then:
+
+- **INCONSISTENT_TOPIC** is counted per DataWriter and DataReader pair that fails type
+  consistency enforcement (§7.6.3.4.2), on both their Topics. zzdds counts each discovered
+  endpoint with a local Topic's name and another type name, in `recordInconsistentLocked`.
+- **Topics of one name**: a participant may have several, provided their types are subsets
+  of one network topic and their QoS consistent (§7.6.4.1), and `lookup_topicdescription`
+  takes an index (§7.6.4.2). zzdds refuses a name already taken.
 
 ### Configurable allocation for embedded/real-time targets
 

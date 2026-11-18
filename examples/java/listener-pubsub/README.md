@@ -64,10 +64,3 @@ Both `Publisher`/`Subscriber` use nothing but the generated Java API —
 "use default" throughout), and a registered `DataReaderListener` — plus the
 typed `SensorSampleTypeSupport`/`DataWriter`/`DataReader` wrappers generated
 from `idl/sensor.idl` by `zidl -b java --generate-zzdds-wrappers`.
-
-## Known limitations
-
-- Replacing a listener already registered on the same entity (a second
-  `set_listener`-style call) leaks the old global reference — not an issue
-  for this example (each entity's listener is set once). See zzdds's
-  `docs/language-bindings.md` for the full list of Java-binding notes.
