@@ -2,8 +2,9 @@
 
 ## Status
 
-Proposal, with five decisions (below), two of them still open: whether `get_instance` comes
-in a second phase (3), and the loan behaviour of `release` (5). Follows WaitSet and GuardCondition onto zidl's
+Proposal, with five decisions (below), all made: `get_instance` comes with the rest, in
+one zidl release (3), and `release` retires a reader's or writer's handle on its last
+loan's return (5). Follows WaitSet and GuardCondition onto zidl's
 `@standalone` construction ([#167](https://github.com/zz-iot/zzdds/pull/167), zidl
 `docs/design/standalone-construction.md`). A throwaway prototype of the constructor half is
 on the local branch `proto-factory-standalone` (557bb74); its findings are recorded here.
@@ -110,8 +111,8 @@ them, as the WaitSet functions were (#172).
    `delete_*` does, and the finalizer keeps today's cascade. Code that drops or closes its
    factory behaves as today. *Recommendation: as proposed.* The prototype checks both
    through the generated C functions.
-3. **`get_instance` beside factories of one's own.** *Recommendation: have both, as
-   proposed, with `delete_instance` strict.* Two choices within it:
+3. **`get_instance` beside factories of one's own.** *Decided: both, as proposed, with
+   `delete_instance` strict, in one effort, so zidl changes once.* Two choices within it:
    - *Where `get_instance` lives.* On `DDS::DomainParticipantFactory`, where the spec puts
      it, it returns the DDS view. Code that calls zzdds's own operations
      (`create_participant_ex`, the participant config) then narrows: in C with the existing
@@ -128,7 +129,8 @@ them, as the WaitSet functions were (#172).
      code in the process created. *Recommendation: strict, as DDS deletes are.*
 4. **zidl work first.** Detailed below: making zzdds's generated C++ classes concrete
    ([zidl#83](https://github.com/zz-iot/zidl/pull/83)), and `@static`. Each released before
-   the zzdds work that needs it. *Recommendation: zidl#83 now; `@static` with `get_instance`.*
+   the zzdds work that needs it. *Decided: both now* (`@static` is
+   [zidl#84](https://github.com/zz-iot/zidl/pull/84)), *in one zidl release.*
 5. **A factory `delete_contained_entities`, and loans in the cascade.** A zzdds operation
    with the participant's semantics: delete every participant and its contents, or return
    `PRECONDITION_NOT_MET` and delete nothing while any loan is outstanding. A
@@ -148,8 +150,10 @@ them, as the WaitSet functions were (#172).
      is deleted, so C++ and Java can return the loan. Every other operation on it returns
      `ALREADY_DELETED`. Nothing keeps running; only memory stays until the loan comes back.
 
-   *Recommendation: add the operation, and retire on the last loan* (see "Loans in the
-   cascade" below). It needs no zidl change.
+   *Decided: add the operation, and retire on the last loan* (see "Loans in the cascade"
+   below). It needs no zidl change. Only the reader or writer, its protocol endpoint,
+   its parent subscriber or publisher and its topic stay allocated until the loan comes
+   back, as memory; the participant is torn down at once.
 
 ## Loans in the cascade
 
@@ -549,14 +553,18 @@ migration like rmw_zzdds#16.
 ## Plan
 
 1. **zidl:** C++ implements operations inherited across IDL files
-   ([zidl#83](https://github.com/zz-iot/zidl/pull/83)). Then a release. `@static`, in a
-   later zidl release, before `get_instance`.
-2. **zzdds:** the IDL above; `destroy`, `release`, the constructor, `get_instance` and
-   `delete_instance` in `extensions.zig`; `DomainParticipantFactorySupport` as the C++
-   override; the old functions deprecated; every in-tree caller renamed; this document's
-   decisions recorded in `generated-class-lifecycle-design.md`. Then a release.
-3. **rmw_zzdds:** move to the generated functions.
-4. **zzdds:** remove the deprecated functions and bump the rmw_zzdds pin.
-5. **zzdds, optional:** move the examples to `get_instance`.
+   ([zidl#83](https://github.com/zz-iot/zidl/pull/83)), and `@static` operations
+   ([zidl#84](https://github.com/zz-iot/zidl/pull/84)). Then one release.
+2. **zzdds:** the IDL above, with the factory's `delete_contained_entities`; `destroy`,
+   `release`, the constructor and the statics in `extensions.zig`;
+   `DomainParticipantFactorySupport` removed, since the generated class is concrete; the
+   old functions deprecated; every in-tree caller renamed; this document's decisions
+   recorded in `generated-class-lifecycle-design.md`. Then a release.
+3. **zzdds:** retire on the last loan (decision 5), with its deleted-entity checks and
+   the leak check's change. It needs nothing from zidl, so it can come before or after
+   the factory work.
+4. **rmw_zzdds:** move to the generated functions.
+5. **zzdds:** remove the deprecated functions and bump the rmw_zzdds pin.
+6. **zzdds, optional:** move the examples to `get_instance`.
 
 ExecutionRuntime's construction and the factory's `set_default_runtime` build on the result.
