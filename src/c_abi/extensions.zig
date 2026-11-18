@@ -79,6 +79,10 @@ const FactoryOwner = struct {
     /// The process-wide factory (`get_instance`). Only `delete_instance`
     /// deletes it: `destroy` refuses, and `release` and `deinit` do nothing.
     is_instance: bool = false,
+    /// Participants `deleteContainedEntities` has taken out of `stacks` to
+    /// check or delete them. Under `mu`. They still exist, so the strict
+    /// `closeIfEmpty` counts them.
+    stacks_taken: usize = 0,
 
     /// Closes the factory to new participants if it has none. The check and
     /// the close are one step under `mu`, so a `create_participant` on
@@ -87,7 +91,7 @@ const FactoryOwner = struct {
     fn closeIfEmpty(self: *@This()) bool {
         self.mu.lock();
         defer self.mu.unlock();
-        if (self.stacks.items.len != 0) return false;
+        if (self.stacks.items.len != 0 or self.stacks_taken != 0) return false;
         self.lifetime.close();
         return true;
     }
@@ -96,28 +100,42 @@ const FactoryOwner = struct {
     /// everything in it, or nothing while any of them has an outstanding
     /// loan. The participants are taken out while they are checked, so a
     /// concurrent `delete_participant` cannot free one mid-check, and put
-    /// back if any refuses.
+    /// back if any refuses. `stacks_taken` keeps them counted for a
+    /// concurrent strict `destroy`/`delete_instance` meanwhile.
     fn deleteContainedEntities(self: *@This()) DDS.ReturnCode_t {
         if (!self.lifetime.acquire()) return DDS.RETCODE_ALREADY_DELETED;
         defer self.lifetime.release(self, destroy);
         self.mu.lock();
         var taken = self.stacks;
         self.stacks = .empty;
+        self.stacks_taken += taken.items.len;
         self.mu.unlock();
-        for (taken.items) |stack| {
-            const p: *DomainParticipantImpl = @ptrCast(@alignCast(stack.participant.ptr));
-            const rc = p.checkDeleteContainedPrecondition();
-            if (rc == DDS.RETCODE_OK) continue;
+        const rc = check: {
+            for (taken.items) |stack| {
+                const p: *DomainParticipantImpl = @ptrCast(@alignCast(stack.participant.ptr));
+                const rc = p.checkDeleteContainedPrecondition();
+                if (rc != DDS.RETCODE_OK) break :check rc;
+            }
+            break :check DDS.RETCODE_OK;
+        };
+        if (rc != DDS.RETCODE_OK) restore: {
             self.mu.lock();
             defer self.mu.unlock();
+            // A `release` that began meanwhile deleted every participant it
+            // found; these are deleted below, as it would have.
+            if (self.lifetime.tearingDown()) break :restore;
+            self.stacks_taken -= taken.items.len;
             taken.appendSlice(self.alloc, self.stacks.items) catch @panic("zzdds: out of memory restoring the factory's participants");
             self.stacks.deinit(self.alloc);
             self.stacks = taken;
             return rc;
         }
         for (taken.items) |stack| stack.deinit();
+        self.mu.lock();
+        self.stacks_taken -= taken.items.len;
+        self.mu.unlock();
         taken.deinit(self.alloc);
-        return DDS.RETCODE_OK;
+        return rc;
     }
 
     fn deinit(self: *@This()) void {

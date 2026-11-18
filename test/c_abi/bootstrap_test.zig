@@ -1968,6 +1968,69 @@ test "factory: delete_contained_entities deletes every participant, or none whil
     try testing.expect(factory.lookup_participant(test_domain.get()).ptr == zzdds.dcps.NIL_PTR);
 }
 
+const FactoryDceThread = struct {
+    factory: DDS.DomainParticipantFactory,
+    rc: std.atomic.Value(DDS.ReturnCode_t) = .init(-1),
+
+    fn run(self: *FactoryDceThread) void {
+        self.rc.store(self.factory.vtable.delete_contained_entities(self.factory.ptr), .release);
+    }
+};
+
+test "factory: strict destroy refuses while delete_contained_entities is checking participants" {
+    const own = try createOwn();
+    var destroyed = false;
+    defer if (!destroyed) own.vtable.release(own.ptr);
+    const factory = own.vtable.as_DomainParticipantFactory(own.ptr);
+    const domain = test_domain.get();
+
+    const dp = DDS_DomainParticipantFactory_create_participant_for_test(factory, domain, null);
+    try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);
+    const ext_dp = zidl_bindings.unboxAsView(ZZDDS.DomainParticipant, extensions.DDS_DomainParticipant_as_zzdds_DomainParticipant(dp.vtable.get_c_abi_handle(dp.ptr)).?);
+    try testing.expectEqual(DDS.RETCODE_OK, ext_dp.register_type_support("KeylessSmoke"));
+    const topic = dp.create_topic("FactoryDceRace", "KeylessSmoke", .{}, null, 0);
+    const dw = dp.create_publisher(.{}, null, 0).create_datawriter(topic, .{}, null, 0);
+    try testing.expect(dw.ptr != zzdds.dcps.NIL_PTR);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+    const buf = try dw_impl.loanForWrite(1);
+    defer dw_impl.cancelLoan(buf);
+
+    // Holding the participant's lock stops delete_contained_entities in its
+    // loan check, after it has taken the participant out of the factory's
+    // list (lookup_participant no longer finds it).
+    const dp_impl: *zzdds.dcps.DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+    dp_impl.mu.lock();
+    var locked = true;
+    errdefer if (locked) dp_impl.mu.unlock();
+    var dce: FactoryDceThread = .{ .factory = factory };
+    const t = try std.Thread.spawn(.{}, FactoryDceThread.run, .{&dce});
+    defer t.join();
+    // Unlocks before the join on a failure.
+    errdefer if (locked) {
+        locked = false;
+        dp_impl.mu.unlock();
+    };
+    var spins: usize = 0;
+    while (factory.lookup_participant(domain).ptr != zzdds.dcps.NIL_PTR) : (spins += 1) {
+        try testing.expect(spins < 1_000_000);
+        std.Thread.yield() catch {};
+    }
+
+    // The participant still exists, so the strict destroy refuses.
+    const destroy_rc = own.vtable.destroy(own.ptr);
+    destroyed = destroy_rc == DDS.RETCODE_OK;
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, destroy_rc);
+
+    locked = false;
+    dp_impl.mu.unlock();
+    while (dce.rc.load(.acquire) == -1) std.Thread.yield() catch {};
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, dce.rc.load(.acquire));
+    // Put back, in a factory that is still open.
+    try testing.expectEqual(dp.ptr, factory.lookup_participant(domain).ptr);
+    const dp2 = DDS_DomainParticipantFactory_create_participant_for_test(factory, domain, null);
+    try testing.expect(dp2.ptr != zzdds.dcps.NIL_PTR);
+}
+
 test "factory: the nil factory's delete_contained_entities fails" {
     const n = extensions.CAbiProvider.nil(DDS.DomainParticipantFactory);
     try testing.expect(n.vtable.delete_contained_entities(n.ptr) != DDS.RETCODE_OK);
