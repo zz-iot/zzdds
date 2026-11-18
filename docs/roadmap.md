@@ -422,7 +422,7 @@ or an optimisation on an already-improved path):
   slice-friendly QoS builders) is not built; Zig callers use the native fat-pointer vtable
   directly. `language-bindings.md`.
 - **FFI bool-width mismatch risk** for hand-written, header-independent bindings of every
-  zzdds C function returning `bool` (`*_is_nil`, `*_get_trigger_value`, …).
+  zzdds C function returning `bool` (`*_get_trigger_value`, …).
 - **Example: `--publisher-matches` / `--subscriber-matches`** are parsed then silently
   ignored in all four `shape` ports (no reference implementation defines their semantics).
 - **Examples: review how each binding uses the generated typed API; zidl's output may need

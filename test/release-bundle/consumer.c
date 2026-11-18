@@ -16,7 +16,7 @@
 
 int main(void) {
     zzdds_DomainParticipantFactory factory = zzdds_create_factory();
-    if (zzdds_factory_is_nil(factory)) {
+    if (factory == NULL) {
         fprintf(stderr, "FAIL: zzdds_create_factory() returned the nil sentinel\n");
         return 1;
     }

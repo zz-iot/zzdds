@@ -801,7 +801,7 @@ namespace detail {
 // that gap, not the constructor's own noexcept-ness.
 inline std::shared_ptr<DomainParticipantFactory> wrapFactoryHandle(zzdds_DomainParticipantFactory handle)
 {
-    if (zzdds_factory_is_nil(handle)) return {};
+    if (handle == nullptr) return {};
 
     ScopeGuard guard([handle] { zzdds_destroy_factory(handle); });
     auto sp = std::allocate_shared<detail::DomainParticipantFactorySupport>(

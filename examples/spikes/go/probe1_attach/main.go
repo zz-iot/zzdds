@@ -101,7 +101,7 @@ func main() {
 	fmt.Printf("[main] pid=%d main_goroutine_id=%d GOMAXPROCS=%d\n", os.Getpid(), mainGoID, runtime.GOMAXPROCS(0))
 
 	factory := C.zzdds_create_factory()
-	if bool(C.zzdds_factory_is_nil(factory)) {
+	if factory == nil {
 		fmt.Println("FAIL: zzdds_create_factory() returned nil")
 		os.Exit(1)
 	}

@@ -123,7 +123,7 @@ int main(int argc, char **argv) {
     Options opts = parse_args(argc, argv);
 
     zzdds_DomainParticipantFactory factory = zzdds_create_factory();
-    if (zzdds_factory_is_nil(factory)) {
+    if (factory == NULL) {
         fprintf(stderr, "FAIL: createFactory() failed\n");
         return 1;
     }

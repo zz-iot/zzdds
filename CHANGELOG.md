@@ -10,6 +10,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-18
 
+- `zzdds_factory_is_nil` is removed: a failed `zzdds_create_factory` is NULL, so check for
+  that. The examples, integration tests, spikes and the C++ and Java runtimes now do.
+  **Breaking** for C callers of `zzdds_factory_is_nil`.
 - At the C ABI, NULL is every interface's nil (zidl v0.3.34's provider contract,
   `docs/design/c-abi-provider.md` there). A function that finds or makes nothing returns
   NULL: a failed `create_*`, `lookup_*` or `find_topic`, a failed `zzdds_create_factory`,

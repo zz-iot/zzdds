@@ -187,7 +187,6 @@ impl DDS_SampleInfoSeq {
 
 unsafe extern "C" {
     pub fn zzdds_create_factory() -> ZzddsDomainParticipantFactory;
-    pub fn zzdds_factory_is_nil(factory: ZzddsDomainParticipantFactory) -> bool;
     pub fn zzdds_destroy_factory(factory: ZzddsDomainParticipantFactory);
     pub fn zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(
         factory: ZzddsDomainParticipantFactory,

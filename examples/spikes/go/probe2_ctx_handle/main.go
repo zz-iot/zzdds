@@ -134,7 +134,7 @@ func main() {
 	fmt.Printf("[main] mode=%s\n", mode)
 
 	factory := C.zzdds_create_factory()
-	if bool(C.zzdds_factory_is_nil(factory)) {
+	if factory == nil {
 		fmt.Println("FAIL: zzdds_create_factory() returned nil")
 		os.Exit(1)
 	}

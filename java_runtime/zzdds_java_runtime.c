@@ -235,7 +235,7 @@ static bool zzdds_java_require_instance_of_any(JNIEnv *env, jobject obj, zzdds_j
 JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createFactory(JNIEnv *env, jclass self_cls) {
     (void)self_cls;
     zzdds_DomainParticipantFactory zf = zzdds_create_factory();
-    if (zzdds_factory_is_nil(zf)) return NULL;
+    if (zf == NULL) return NULL;
     DDS_DomainParticipantFactory df = zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(zf);
 
     static zzdds_java_class_cache cache = {0};

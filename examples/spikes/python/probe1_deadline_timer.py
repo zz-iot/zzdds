@@ -68,8 +68,6 @@ def declare_signatures(zzdds, shim):
     zzdds.zzdds_create_factory.restype = c_void_p
     zzdds.zzdds_create_factory.argtypes = []
 
-    zzdds.zzdds_factory_is_nil.restype = ctypes.c_bool
-    zzdds.zzdds_factory_is_nil.argtypes = [c_void_p]
 
     zzdds.zzdds_destroy_factory.restype = None
     zzdds.zzdds_destroy_factory.argtypes = [c_void_p]
@@ -179,8 +177,8 @@ def main():
     listener.release_listener_data = release_listener_data
 
     factory = zzdds.zzdds_create_factory()
-    if zzdds.zzdds_factory_is_nil(factory):
-        sys.exit("FAIL: zzdds_create_factory() returned nil")
+    if not factory:
+        sys.exit("FAIL: zzdds_create_factory() returned NULL")
 
     dds_factory = zzdds.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory)
     dp = zzdds.DDS_DomainParticipantFactory_create_participant(dds_factory, DOMAIN_ID, None, None, 0)

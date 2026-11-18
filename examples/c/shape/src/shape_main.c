@@ -1074,8 +1074,8 @@ int main(int argc, char **argv) {
     }
 
     zzdds_DomainParticipantFactory factory = zzdds_create_factory();
-    if (zzdds_factory_is_nil(factory)) {
-        fprintf(stderr, "FAIL: zzdds_create_factory returned nil\n");
+    if (factory == NULL) {
+        fprintf(stderr, "FAIL: zzdds_create_factory returned NULL\n");
         return 1;
     }
 
