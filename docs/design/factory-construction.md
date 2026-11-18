@@ -2,7 +2,8 @@
 
 ## Status
 
-Proposal, with four open decisions (below). Follows WaitSet and GuardCondition onto zidl's
+Proposal, with five decisions (below), two of them still open: whether `get_instance` comes
+in a second phase (3), and the loan behaviour of `release` (5). Follows WaitSet and GuardCondition onto zidl's
 `@standalone` construction ([#167](https://github.com/zz-iot/zzdds/pull/167), zidl
 `docs/design/standalone-construction.md`). A throwaway prototype of the constructor half is
 on the local branch `proto-factory-standalone` (557bb74); its findings are recorded here.
@@ -125,8 +126,9 @@ them, as the WaitSet functions were (#172).
      deletes its participants first, which decision 5 shortens to one call. Cascading is
      shorter, but deleting the process-wide factory then silently deletes participants other
      code in the process created. *Recommendation: strict, as DDS deletes are.*
-4. **zidl work first.** Detailed below: one fix and one new feature, released before zzdds
-   can move. *Recommendation: both, in one zidl PR.*
+4. **zidl work first.** Detailed below: making zzdds's generated C++ classes concrete
+   ([zidl#83](https://github.com/zz-iot/zidl/pull/83)), and `@static`. Each released before
+   the zzdds work that needs it. *Recommendation: zidl#83 now; `@static` with `get_instance`.*
 5. **A factory `delete_contained_entities`, and loans in the cascade.** A zzdds operation
    with the participant's semantics: delete every participant and its contents, or return
    `PRECONDITION_NOT_MET` and delete nothing while any loan is outstanding. A
@@ -139,10 +141,15 @@ them, as the WaitSet functions were (#172).
      the loan, so it leaks until the process exits.
    - *Finish later.* `release` deletes everything without a loan at once. An entity with
      an outstanding loan keeps its handle usable until the last loan is returned, and is then
-     deleted along with whatever contains it.
+     deleted along with whatever contains it. Its participant's threads and sockets keep
+     running until then.
+   - *Retire on the last loan.* `release` deletes everything at once, as today, but a
+     reader's or writer's handle is retired when its last loan is returned instead of when it
+     is deleted, so C++ and Java can return the loan. Every other operation on it returns
+     `ALREADY_DELETED`. Nothing keeps running; only memory stays until the loan comes back.
 
-   *Recommendation: add the operation, and finish later.* A loan being returned is the only
-   event that can complete it, so finishing later loses nothing.
+   *Recommendation: add the operation, and retire on the last loan* (see "Loans in the
+   cascade" below). It needs no zidl change.
 
 ## Loans in the cascade
 
@@ -166,11 +173,40 @@ through each participant.
   would try to send through a participant whose transport is being torn down. The probes
   only cancelled it.
 
+### Retiring on the last loan
+
+Checked by reading the code; not yet implemented.
+
+- **Identity stays safe.** zzdds retires a handle again when the entity is finally freed
+  (`CachedCAbiHandle.free`), before the handle's box is freed, so the C++ and Java identity
+  caches drop it before its address can be reused (the #124 hazard).
+- **The call that frees it is safe.** The generated C function copies the handle's pointer
+  and vtable before calling, so `return_loan_raw` freeing the reader during the call touches
+  nothing freed afterwards.
+- **zzdds must refuse everything else.** Many reader and writer operations check neither
+  deletion nor the quiesce guard: `enable`, `get_topicdescription`, `get_subscriber`,
+  `get_qos`, the status getters, and `get_matched_*`, which reaches the protocol endpoint. A
+  deleted reader or writer returns `ALREADY_DELETED` (NULL for an entity) from each, except
+  `return_loan_raw`. `publish_loan_raw` already consumes the loan on every path; on a deleted
+  writer it discards it and returns `ALREADY_DELETED`. This also defines C's behaviour in the
+  same case.
+- **Only when a loan is out.** `retireHandles` skips the entity's own handle only while it has
+  outstanding loans; its conditions are retired at deletion as now. An ordinary
+  `delete_datareader` or `delete_datawriter` refuses while a loan is out, so only a cascade
+  reaches this.
+- **`-Ddebug-allocator`.** `FactoryLeakCheck` checks when the last factory goes, and would
+  report a loan-pinned entity. It checks when the last such entity is freed instead.
+- **Allocator lifetime.** A factory's custom allocator must outlive its outstanding loans,
+  not just the factory.
+- **Still to verify:** the teardown that runs when a loan comes back after its participant
+  is gone (the protocol endpoint's own teardown included), under the DebugAllocator or
+  Valgrind. The probes used Zig's testing allocator, which does not detect use after free.
+
 ## What zidl needs
 
 The prototype marked `zzdds::DomainParticipantFactory` `@standalone`, implemented its
-`destroy` and `release` slots, exported its constructor with `exportCAbiConstructors`, and
-built every binding.
+`destroy` and `release` slots, exported its constructor with `exportCAbiConstructors` (since
+zidl#82, `exportCAbi`), and built every binding.
 
 **Supported as is: the constructor, destructor and finalizer.** zidl accepted the IDL without
 change. zidl's documented limit is constructors on a shared-box family *root*.
@@ -182,7 +218,8 @@ zzdds view, so Java no longer needs `asZzddsFactory` for a factory it creates. A
 against the prototype confirmed that `destroy` refuses while a participant remains and
 succeeds after it is deleted, and that `release` deletes a remaining participant.
 
-**Needs a fix: C++.** The C++ binding does not compile. `zzdds::DomainParticipantFactoryImpl`
+**Needs a fix: C++** (done in [zidl#83](https://github.com/zz-iot/zidl/pull/83)). The C++
+binding does not compile. `zzdds::DomainParticipantFactoryImpl`
 is abstract: the generated class implements zzdds's operations but not the ones it inherits
 from `DDS::DomainParticipantFactory`, which is declared in another IDL file. That is why
 `include/zzdds_cpp.hpp` has the hand-written `DomainParticipantFactorySupport`, which
@@ -199,8 +236,15 @@ compile even with `--cpp-impl-override` pointing `create()` at
 - *Larger:* generate forwarding for operations inherited from an interface in another IDL
   file, so the zzdds class is concrete and `DomainParticipantFactorySupport` goes away.
 
-*Recommendation: the smaller fix now.* The larger one also removes hand-written forwarding
-elsewhere, and can come later.
+The larger fix turned out small: the C++ backend already forwarded inherited operations
+through the generated upcasts within one IDL file, and only lacked an imported base's
+operations, which zidl gave the Java backend alone. zidl#83 gives them to C++ too and
+converts the handle in the inherited raw-loan operations. Built against it, all eight
+generated `zzdds::*Impl` classes are concrete and zzdds's C++ binding smoke tests pass.
+`DomainParticipantFactorySupport` then goes away with the factory's `@standalone`
+construction. The other `*Support` classes need one more zidl change: their `DDS::*`
+overrides build a zzdds object from a `DDS_*` handle, so the generated class needs a
+`_getOrCreate` from its base's handle. That can come later.
 
 **New: static operations.** `get_instance` and `delete_instance` have no receiver and confer
 no ownership, which no zidl annotation expresses. A `@constructor` won't do: its result is
@@ -254,19 +298,27 @@ DDS_DomainParticipantFactory DDS_DomainParticipantFactory_get_instance(void);
 DDS_ReturnCode_t             DDS_DomainParticipantFactory_delete_instance(void);
 ```
 
-**Zig provider.** The interface struct gains `exportCAbiStatics`, which the provider calls from
-a `comptime` block with a type declaring each static. It is separate from
-`exportCAbiConstructors`, because a `@static` can be on an interface that is not
-`@standalone`:
+**Zig provider.** Since [zidl#82](https://github.com/zz-iot/zidl/pull/82), a module's C
+functions are exported by one `exportCAbi(comptime Provider: type)` call, and the provider
+type gives each interface's constructors (`constructors(comptime I: type) type`) and nil
+(`nil(comptime I: type) I`). Statics follow the same pattern, as a separate declaration
+because a `@static` can be on an interface that is not `@standalone`:
 
 ```zig
-comptime {
-    DDS.DomainParticipantFactory.exportCAbiStatics(struct {
-        pub fn get_instance() DDS.DomainParticipantFactory { ... }
-        pub fn delete_instance() DDS.ReturnCode_t { ... }
-    });
-}
+const Provider = struct {
+    pub fn statics(comptime I: type) type {
+        if (I == DDS.DomainParticipantFactory) return struct {
+            pub fn get_instance() DDS.DomainParticipantFactory { ... }
+            pub fn delete_instance() DDS.ReturnCode_t { ... }
+        };
+        // ...
+    }
+    // constructors, nil
+};
 ```
+
+A nil `get_instance` result crosses the C ABI as NULL, as every interface result does since
+zidl#82.
 
 The generated exports convert parameters and box a returned interface as instance operations
 do. A static takes no allocator: whatever it creates is the provider's business.
@@ -496,8 +548,9 @@ migration like rmw_zzdds#16.
 
 ## Plan
 
-1. **zidl:** C++ constructs only the override class of an overridden `@standalone`
-   interface; `@static` operations. Then a release.
+1. **zidl:** C++ implements operations inherited across IDL files
+   ([zidl#83](https://github.com/zz-iot/zidl/pull/83)). Then a release. `@static`, in a
+   later zidl release, before `get_instance`.
 2. **zzdds:** the IDL above; `destroy`, `release`, the constructor, `get_instance` and
    `delete_instance` in `extensions.zig`; `DomainParticipantFactorySupport` as the C++
    override; the old functions deprecated; every in-tree caller renamed; this document's
