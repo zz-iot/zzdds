@@ -1054,3 +1054,16 @@ test "QueryConditionImpl: set_query_parameters OOM mid-loop preserves old params
     try testing.expectEqual(@as(usize, 1), qc.query_parameters.items.len);
     try testing.expectEqualStrings("5", qc.query_parameters.items[0]);
 }
+
+test "WaitSet: a nil condition is neither attached nor detached" {
+    // A NULL condition from C arrives as the nil.
+    const ws = try WaitSetImpl.init(testing.allocator);
+    defer ws.deinit();
+    const dws = ws.toDDSWaitSet();
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, dws.attach_condition(dcps.nil_condition));
+    var accepted = true;
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, ws.attachConditionWithRelease(dcps.nil_condition, null, null, &accepted));
+    try testing.expect(!accepted);
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, dws.detach_condition(dcps.nil_condition));
+    try testing.expectEqual(@as(usize, 0), ws.conditions.items.len);
+}

@@ -535,6 +535,11 @@ pub const WaitSetImpl = struct {
         release_fn: ?*const fn (?*anyopaque) callconv(.c) void,
         out_accepted: ?*bool,
     ) DDS.ReturnCode_t {
+        // A NULL condition from C arrives as the nil.
+        if (nil.isNil(input)) {
+            if (out_accepted) |accepted| accepted.* = false;
+            return DDS.RETCODE_BAD_PARAMETER;
+        }
         const cond = canonicalCondition(input);
         if (conditionRetired(cond)) {
             if (out_accepted) |accepted| accepted.* = false;
@@ -634,6 +639,7 @@ pub const WaitSetImpl = struct {
 
     fn vtDetach(ctx: *anyopaque, input: DDS.Condition) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (nil.isNil(input)) return DDS.RETCODE_BAD_PARAMETER;
         const cond = canonicalCondition(input);
         var removed: ?AttachedCondition = null;
         // A condition whose entity was deleted counts as detached already, as

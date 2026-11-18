@@ -61,10 +61,11 @@ fn isNullHandle(handle: *anyopaque) bool {
 /// generated exports only exist when C bindings are actually requested
 /// (need_c_abi) — depending on one from the other would make this function
 /// uncompilable in a Zig-only build.
-pub export fn zzdds_topic_as_description(topic: *anyopaque) callconv(.c) *anyopaque {
-    if (isNullHandle(topic)) return nil.nil_topic_description.vtable.get_c_abi_handle(nil.nil_topic_description.ptr);
-    const t = zidl_bindings.unboxAsView(DDS.Topic, topic);
+pub export fn zzdds_topic_as_description(topic: ?*anyopaque) callconv(.c) ?*anyopaque {
+    // NULL, or a nil, is NULL, as for the generated upcast.
+    const t = zidl_bindings.unboxAsView(DDS.Topic, topic orelse return null);
     const r = t.vtable.as_TopicDescription(t.ptr);
+    if (r.ptr == nil.NIL_PTR) return null;
     return r.vtable.get_c_abi_handle(r.ptr);
 }
 

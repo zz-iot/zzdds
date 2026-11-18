@@ -186,7 +186,7 @@ test "support factory: destroy_factory is safe on nil handle" {
 }
 
 test "support factory: generated create_participant and delete_participant" {
-    const ext_factory_boxed = extensions.zzdds_create_factory();
+    const ext_factory_boxed = extensions.zzdds_create_factory().?;
     defer extensions.zzdds_destroy_factory(ext_factory_boxed);
     const ext_factory = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
 
@@ -197,7 +197,7 @@ test "support factory: generated create_participant and delete_participant" {
 }
 
 test "support factory: generated create_participant_ex uses config defaults" {
-    const ext_factory_boxed = extensions.zzdds_create_factory();
+    const ext_factory_boxed = extensions.zzdds_create_factory().?;
     defer extensions.zzdds_destroy_factory(ext_factory_boxed);
     const ext_factory = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
 
@@ -256,7 +256,7 @@ fn trackFree(ctx: ?*anyopaque, ptr: ?[*]u8, len: usize, alignment: usize) callco
 }
 
 test "support factory: zzdds_create_factory_with_allocator(NULL) matches zzdds_create_factory" {
-    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(null);
+    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(null).?;
     defer extensions.zzdds_destroy_factory(ext_factory_boxed);
     const ext_factory = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
     try testing.expect(ext_factory.ptr != zzdds.dcps.NIL_PTR);
@@ -271,7 +271,7 @@ test "support factory: zzdds_create_factory_with_allocator routes every allocati
         .free = trackFree,
     };
 
-    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(&c_alloc);
+    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(&c_alloc).?;
     defer extensions.zzdds_destroy_factory(ext_factory_boxed);
     const ext_factory = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
 
@@ -302,7 +302,7 @@ test "support factory: get_default_participant_config on a custom-allocator fact
         .resize = trackResize,
         .free = trackFree,
     };
-    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(&c_alloc);
+    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(&c_alloc).?;
     defer extensions.zzdds_destroy_factory(ext_factory_boxed);
     const ext_factory = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
 
@@ -336,7 +336,7 @@ test "support factory: get_default_participant_qos on a custom-allocator factory
         .resize = trackResize,
         .free = trackFree,
     };
-    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(&c_alloc);
+    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(&c_alloc).?;
     defer extensions.zzdds_destroy_factory(ext_factory_boxed);
     const ext_factory = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
     const factory = ext_factory.vtable.as_DomainParticipantFactory(ext_factory.ptr);
@@ -395,7 +395,7 @@ test "get_allocator: extensions-layer C-ABI vtables return the injected custom a
     // not an approximation.
     const expected = zidl_bindings.toAllocator(&c_alloc);
 
-    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(&c_alloc);
+    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(&c_alloc).?;
     defer extensions.zzdds_destroy_factory(ext_factory_boxed);
     const ext_factory = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
     try testing.expectEqual(expected, ext_factory.vtable.get_allocator(ext_factory.ptr));
@@ -432,32 +432,32 @@ test "get_allocator: extensions-layer C-ABI vtables return the injected custom a
     // C caller would use to reach the ZZDDS namespace -- otherwise a typo'd
     // get_allocator in any of those four vtable literals would compile fine
     // and go completely unexercised by this suite.
-    const zdp_boxed = extensions.DDS_DomainParticipant_as_zzdds_DomainParticipant(dp.vtable.get_c_abi_handle(dp.ptr));
+    const zdp_boxed = extensions.DDS_DomainParticipant_as_zzdds_DomainParticipant(dp.vtable.get_c_abi_handle(dp.ptr)).?;
     const zdp = zidl_bindings.unboxAsView(ZZDDS.DomainParticipant, zdp_boxed);
     try testing.expectEqual(expected, zdp.vtable.get_allocator(zdp.ptr));
 
-    const ztopic_boxed = extensions.DDS_Topic_as_zzdds_Topic(topic.vtable.get_c_abi_handle(topic.ptr));
+    const ztopic_boxed = extensions.DDS_Topic_as_zzdds_Topic(topic.vtable.get_c_abi_handle(topic.ptr)).?;
     const ztopic = zidl_bindings.unboxAsView(ZZDDS.Topic, ztopic_boxed);
     try testing.expectEqual(expected, ztopic.vtable.get_allocator(ztopic.ptr));
 
-    const zdw_boxed = extensions.DDS_DataWriter_as_zzdds_DataWriter(dw.vtable.get_c_abi_handle(dw.ptr));
+    const zdw_boxed = extensions.DDS_DataWriter_as_zzdds_DataWriter(dw.vtable.get_c_abi_handle(dw.ptr)).?;
     const zdw = zidl_bindings.unboxAsView(ZZDDS.DataWriter, zdw_boxed);
     try testing.expectEqual(expected, zdw.vtable.get_allocator(zdw.ptr));
 
-    const zdr_boxed = extensions.DDS_DataReader_as_zzdds_DataReader(dr.vtable.get_c_abi_handle(dr.ptr));
+    const zdr_boxed = extensions.DDS_DataReader_as_zzdds_DataReader(dr.vtable.get_c_abi_handle(dr.ptr)).?;
     const zdr = zidl_bindings.unboxAsView(ZZDDS.DataReader, zdr_boxed);
     try testing.expectEqual(expected, zdr.vtable.get_allocator(zdr.ptr));
 
-    const zpub_boxed = extensions.DDS_Publisher_as_zzdds_Publisher(pub_ent.vtable.get_c_abi_handle(pub_ent.ptr));
+    const zpub_boxed = extensions.DDS_Publisher_as_zzdds_Publisher(pub_ent.vtable.get_c_abi_handle(pub_ent.ptr)).?;
     const zpub = zidl_bindings.unboxAsView(ZZDDS.Publisher, zpub_boxed);
     try testing.expectEqual(expected, zpub.vtable.get_allocator(zpub.ptr));
 
-    const zsub_boxed = extensions.DDS_Subscriber_as_zzdds_Subscriber(sub_ent.vtable.get_c_abi_handle(sub_ent.ptr));
+    const zsub_boxed = extensions.DDS_Subscriber_as_zzdds_Subscriber(sub_ent.vtable.get_c_abi_handle(sub_ent.ptr)).?;
     const zsub = zidl_bindings.unboxAsView(ZZDDS.Subscriber, zsub_boxed);
     try testing.expectEqual(expected, zsub.vtable.get_allocator(zsub.ptr));
 
     const cft = dp.create_contentfilteredtopic("GAllocCft", topic, "", &DDS.StringSeq{});
-    const zcft_boxed = extensions.DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic(cft.vtable.get_c_abi_handle(cft.ptr));
+    const zcft_boxed = extensions.DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic(cft.vtable.get_c_abi_handle(cft.ptr)).?;
     const zcft = zidl_bindings.unboxAsView(ZZDDS.ContentFilteredTopic, zcft_boxed);
     try testing.expectEqual(expected, zcft.vtable.get_allocator(zcft.ptr));
 }
@@ -617,22 +617,14 @@ test "bootstrap: topic_as_description returns TopicDescription with correct name
     const topic_w_boxed = try zidl_bindings.boxEntity(alloc, fx.topic_w.ptr, &TopicImpl.views);
     defer zidl_bindings.freeEntityBox(alloc, topic_w_boxed);
 
-    const td_boxed = bootstrap.zzdds_topic_as_description(topic_w_boxed);
+    const td_boxed = bootstrap.zzdds_topic_as_description(topic_w_boxed).?;
     const td = zidl_bindings.unboxAsView(DDS.TopicDescription, td_boxed);
     try testing.expectEqualStrings("BootTopic", std.mem.span(td.vtable.get_name(td.ptr)));
 }
 
-test "bootstrap: topic_as_description returns nil TopicDescription for a NULL topic handle" {
-    // Regression test: zidl_bindings.unboxAs dereferences its argument
-    // unconditionally, so a literal NULL passed by a C caller (a normal,
-    // expected "no object" value in C, not UB) must be caught before
-    // unboxing, not after -- @ptrFromInt(0) constructs the same bit pattern
-    // a real C caller's NULL would produce at the ABI boundary. The old
-    // (pre-boxing-fix) implementation explicitly returned a nil
-    // TopicDescription for this input; this must still hold.
-    const td_boxed = bootstrap.zzdds_topic_as_description(makeNullHandle());
-    const td = zidl_bindings.unboxAsView(DDS.TopicDescription, td_boxed);
-    try testing.expectEqual(nil.NIL_PTR, td.ptr);
+test "bootstrap: topic_as_description of NULL is NULL" {
+    // At the C ABI, NULL is every interface's nil, both ways.
+    try testing.expect(bootstrap.zzdds_topic_as_description(null) == null);
 }
 
 // ── register_instance_raw ─────────────────────────────────────────────────────
@@ -809,7 +801,7 @@ test "extensions: DDS_DataReader_as_zzdds and back round-trip" {
 
     // DDS → ZZDDS: still hand-written (genuine downcast, no IDL relationship
     // zidl could derive it from).
-    const zdr_boxed = extensions.DDS_DataReader_as_zzdds_DataReader(pair.dr.vtable.get_c_abi_handle(pair.dr.ptr));
+    const zdr_boxed = extensions.DDS_DataReader_as_zzdds_DataReader(pair.dr.vtable.get_c_abi_handle(pair.dr.ptr)).?;
     const zdr = zidl_bindings.unboxAsView(ZZDDS.DataReader, zdr_boxed);
     try testing.expect(zdr.ptr != np);
 
@@ -819,7 +811,7 @@ test "extensions: DDS_DataReader_as_zzdds and back round-trip" {
     try testing.expectEqual(pair.dr.ptr, ddr.ptr);
 
     // Same for DataWriter
-    const zdw_boxed = extensions.DDS_DataWriter_as_zzdds_DataWriter(pair.dw.vtable.get_c_abi_handle(pair.dw.ptr));
+    const zdw_boxed = extensions.DDS_DataWriter_as_zzdds_DataWriter(pair.dw.vtable.get_c_abi_handle(pair.dw.ptr)).?;
     const zdw = zidl_bindings.unboxAsView(ZZDDS.DataWriter, zdw_boxed);
     try testing.expect(zdw.ptr != np);
     const ddw = zdw.vtable.as_DataWriter(zdw.ptr);
@@ -850,7 +842,7 @@ test "extensions: DataReader's Entity, DataReader, and ZZDDS.DataReader views al
     // (extensions.zig -- the one hand-written call site zidl's codegen sweep
     // can't reach, per this test file's own "DDS → ZZDDS: still hand-written"
     // comment above).
-    const zdr_boxed = extensions.DDS_DataReader_as_zzdds_DataReader(dr_boxed);
+    const zdr_boxed = extensions.DDS_DataReader_as_zzdds_DataReader(dr_boxed).?;
     try testing.expectEqual(dr_boxed, zdr_boxed);
 }
 
@@ -862,7 +854,7 @@ test "extensions: DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic shares 
     const cft = fx.dp_r.create_contentfilteredtopic("BootCft", fx.topic_r, "x > 1", &DDS.StringSeq{});
     defer _ = fx.dp_r.vtable.delete_contentfilteredtopic(fx.dp_r.ptr, cft);
     const cft_boxed = cft.vtable.get_c_abi_handle(cft.ptr);
-    const zcft_boxed = extensions.DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic(cft_boxed);
+    const zcft_boxed = extensions.DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic(cft_boxed).?;
     try testing.expectEqual(cft_boxed, zcft_boxed);
     const zcft = zidl_bindings.unboxAsView(ZZDDS.ContentFilteredTopic, zcft_boxed);
     try testing.expectEqual(cft.ptr, zcft.ptr);
@@ -900,14 +892,14 @@ test "extensions: DDS_Publisher/Subscriber_as_zzdds_* share the boxed handle and
     const np = zzdds.dcps.NIL_PTR;
 
     const pub_boxed = fx.pub_w.vtable.get_c_abi_handle(fx.pub_w.ptr);
-    const zpub_boxed = extensions.DDS_Publisher_as_zzdds_Publisher(pub_boxed);
+    const zpub_boxed = extensions.DDS_Publisher_as_zzdds_Publisher(pub_boxed).?;
     try testing.expectEqual(pub_boxed, zpub_boxed);
     const zpub = zidl_bindings.unboxAsView(ZZDDS.Publisher, zpub_boxed);
     try testing.expectEqual(fx.pub_w.ptr, zpub.ptr);
     try testing.expectEqual(fx.pub_w.ptr, zpub.vtable.as_Publisher(zpub.ptr).ptr);
 
     const sub_boxed = fx.sub_r.vtable.get_c_abi_handle(fx.sub_r.ptr);
-    const zsub_boxed = extensions.DDS_Subscriber_as_zzdds_Subscriber(sub_boxed);
+    const zsub_boxed = extensions.DDS_Subscriber_as_zzdds_Subscriber(sub_boxed).?;
     try testing.expectEqual(sub_boxed, zsub_boxed);
     const zsub = zidl_bindings.unboxAsView(ZZDDS.Subscriber, zsub_boxed);
     try testing.expectEqual(fx.sub_r.ptr, zsub.ptr);
@@ -994,19 +986,19 @@ test "extensions: RTPS GUIDs identify participants and endpoints" {
 
     const zdp = zidl_bindings.unboxAsView(
         ZZDDS.DomainParticipant,
-        extensions.DDS_DomainParticipant_as_zzdds_DomainParticipant(fx.dp_w.vtable.get_c_abi_handle(fx.dp_w.ptr)),
+        extensions.DDS_DomainParticipant_as_zzdds_DomainParticipant(fx.dp_w.vtable.get_c_abi_handle(fx.dp_w.ptr)).?,
     );
     const zdp_reader = zidl_bindings.unboxAsView(
         ZZDDS.DomainParticipant,
-        extensions.DDS_DomainParticipant_as_zzdds_DomainParticipant(fx.dp_r.vtable.get_c_abi_handle(fx.dp_r.ptr)),
+        extensions.DDS_DomainParticipant_as_zzdds_DomainParticipant(fx.dp_r.vtable.get_c_abi_handle(fx.dp_r.ptr)).?,
     );
     const zdw = zidl_bindings.unboxAsView(
         ZZDDS.DataWriter,
-        extensions.DDS_DataWriter_as_zzdds_DataWriter(pair.dw.vtable.get_c_abi_handle(pair.dw.ptr)),
+        extensions.DDS_DataWriter_as_zzdds_DataWriter(pair.dw.vtable.get_c_abi_handle(pair.dw.ptr)).?,
     );
     const zdr = zidl_bindings.unboxAsView(
         ZZDDS.DataReader,
-        extensions.DDS_DataReader_as_zzdds_DataReader(pair.dr.vtable.get_c_abi_handle(pair.dr.ptr)),
+        extensions.DDS_DataReader_as_zzdds_DataReader(pair.dr.vtable.get_c_abi_handle(pair.dr.ptr)).?,
     );
 
     var participant_guid: ZZDDS.RtpsGuid = undefined;
@@ -1082,7 +1074,7 @@ test "extensions: take_serialized via ZZDDS DataReader vtable" {
     writeRawViaOp(pair.dw, KEY_HASH, &PAYLOAD);
     fx.settle();
 
-    const zdr = zidl_bindings.unboxAsView(ZZDDS.DataReader, extensions.DDS_DataReader_as_zzdds_DataReader(pair.dr.vtable.get_c_abi_handle(pair.dr.ptr)));
+    const zdr = zidl_bindings.unboxAsView(ZZDDS.DataReader, extensions.DDS_DataReader_as_zzdds_DataReader(pair.dr.vtable.get_c_abi_handle(pair.dr.ptr)).?);
     var sample: ZZDDS.SerializedSample = std.mem.zeroes(ZZDDS.SerializedSample);
     const rc = zdr.vtable.take_serialized(zdr.ptr, &sample);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
@@ -1163,76 +1155,63 @@ test "nil singletons: as_Base upcast slots return the correct nil singleton" {
 
 // ── C-ABI handle coverage: extensions.zig nil-guard regression ────────────────
 
-test "extensions: as_Base borrowed-view upcasts are safe on nil ZZDDS handles" {
-    // Regression test for the nil-guard fix in participantAsDds / topicAsDds /
-    // writerAsDds / readerAsDds: each used to @ptrCast(@alignCast(ctx)) without
-    // checking ctx == NIL_PTR, which panics (safe builds) or is UB (ReleaseFast)
-    // when a C caller downcasts a non-FactoryOwner handle (getting a nil ZZDDS
-    // view back) and then upcasts it again via the generated as_Base export.
+test "extensions: DDS_X_as_zzdds_X is NULL for NULL and for a handle zzdds did not issue" {
+    const nd = zzdds.dcps;
+    try testing.expect(extensions.DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(null) == null);
+    try testing.expect(extensions.DDS_DomainParticipant_as_zzdds_DomainParticipant(null) == null);
+    try testing.expect(extensions.DDS_Topic_as_zzdds_Topic(null) == null);
+    try testing.expect(extensions.DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic(null) == null);
+    try testing.expect(extensions.DDS_DataWriter_as_zzdds_DataWriter(null) == null);
+    try testing.expect(extensions.DDS_DataReader_as_zzdds_DataReader(null) == null);
+    try testing.expect(extensions.DDS_Publisher_as_zzdds_Publisher(null) == null);
+    try testing.expect(extensions.DDS_Subscriber_as_zzdds_Subscriber(null) == null);
+
+    // A nil's handle is not one of zzdds's entities.
+    try testing.expect(extensions.DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(nd.nil_factory.vtable.get_c_abi_handle(nd.nil_factory.ptr)) == null);
+    try testing.expect(extensions.DDS_DomainParticipant_as_zzdds_DomainParticipant(nd.nil_participant.vtable.get_c_abi_handle(nd.nil_participant.ptr)) == null);
+    try testing.expect(extensions.DDS_Topic_as_zzdds_Topic(nd.nil_topic.vtable.get_c_abi_handle(nd.nil_topic.ptr)) == null);
+    try testing.expect(extensions.DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic(nd.nil_cft.vtable.get_c_abi_handle(nd.nil_cft.ptr)) == null);
+    try testing.expect(extensions.DDS_DataWriter_as_zzdds_DataWriter(nd.nil_datawriter.vtable.get_c_abi_handle(nd.nil_datawriter.ptr)) == null);
+    try testing.expect(extensions.DDS_DataReader_as_zzdds_DataReader(nd.nil_datareader.vtable.get_c_abi_handle(nd.nil_datareader.ptr)) == null);
+    try testing.expect(extensions.DDS_Publisher_as_zzdds_Publisher(nd.nil_publisher.vtable.get_c_abi_handle(nd.nil_publisher.ptr)) == null);
+    try testing.expect(extensions.DDS_Subscriber_as_zzdds_Subscriber(nd.nil_subscriber.vtable.get_c_abi_handle(nd.nil_subscriber.ptr)) == null);
+}
+
+test "extensions: the zzdds extension nils are safe to call through" {
+    // What a NULL zzdds_* handle stands for at the C ABI: NIL_PTR with the
+    // extension's own vtable, whose functions answer for NIL_PTR.
     const nd = zzdds.dcps;
 
-    const nil_dp_boxed = nd.nil_participant.vtable.get_c_abi_handle(nd.nil_participant.ptr);
-    const zdp_boxed = extensions.DDS_DomainParticipant_as_zzdds_DomainParticipant(nil_dp_boxed);
-    const zdp = zidl_bindings.unboxAsView(ZZDDS.DomainParticipant, zdp_boxed);
-    try testing.expectEqual(nd.NIL_PTR, zdp.ptr);
+    const zdp: ZZDDS.DomainParticipant = .{ .ptr = nd.NIL_PTR, .vtable = &extensions.participant_vtable };
     const back_dp = zdp.vtable.as_DomainParticipant(zdp.ptr);
     try testing.expectEqual(nd.nil_participant.ptr, back_dp.ptr);
     try testing.expectEqual(nd.nil_participant.vtable, back_dp.vtable);
 
-    const nil_topic_boxed = nd.nil_topic.vtable.get_c_abi_handle(nd.nil_topic.ptr);
-    const ztopic_boxed = extensions.DDS_Topic_as_zzdds_Topic(nil_topic_boxed);
-    const ztopic = zidl_bindings.unboxAsView(ZZDDS.Topic, ztopic_boxed);
-    const back_topic = ztopic.vtable.as_Topic(ztopic.ptr);
-    try testing.expectEqual(nd.nil_topic.ptr, back_topic.ptr);
+    const ztopic: ZZDDS.Topic = .{ .ptr = nd.NIL_PTR, .vtable = &extensions.topic_vtable };
+    try testing.expectEqual(nd.nil_topic.ptr, ztopic.vtable.as_Topic(ztopic.ptr).ptr);
 
-    const nil_dw_boxed = nd.nil_datawriter.vtable.get_c_abi_handle(nd.nil_datawriter.ptr);
-    const zdw_boxed = extensions.DDS_DataWriter_as_zzdds_DataWriter(nil_dw_boxed);
-    const zdw = zidl_bindings.unboxAsView(ZZDDS.DataWriter, zdw_boxed);
-    const back_dw = zdw.vtable.as_DataWriter(zdw.ptr);
-    try testing.expectEqual(nd.nil_datawriter.ptr, back_dw.ptr);
+    const zdw: ZZDDS.DataWriter = .{ .ptr = nd.NIL_PTR, .vtable = &extensions.writer_vtable };
+    try testing.expectEqual(nd.nil_datawriter.ptr, zdw.vtable.as_DataWriter(zdw.ptr).ptr);
 
-    const nil_dr_boxed = nd.nil_datareader.vtable.get_c_abi_handle(nd.nil_datareader.ptr);
-    const zdr_boxed = extensions.DDS_DataReader_as_zzdds_DataReader(nil_dr_boxed);
-    const zdr = zidl_bindings.unboxAsView(ZZDDS.DataReader, zdr_boxed);
-    const back_dr = zdr.vtable.as_DataReader(zdr.ptr);
-    try testing.expectEqual(nd.nil_datareader.ptr, back_dr.ptr);
+    const zdr: ZZDDS.DataReader = .{ .ptr = nd.NIL_PTR, .vtable = &extensions.reader_vtable };
+    try testing.expectEqual(nd.nil_datareader.ptr, zdr.vtable.as_DataReader(zdr.ptr).ptr);
 
-    // Publisher/Subscriber: a foreign (here nil) handle upcasts to the nil
-    // extension view, whose operations return nil entities rather than
-    // dereferencing the nil context.
-    const nil_pub_boxed = nd.nil_publisher.vtable.get_c_abi_handle(nd.nil_publisher.ptr);
-    const zpub_boxed = extensions.DDS_Publisher_as_zzdds_Publisher(nil_pub_boxed);
-    const zpub = zidl_bindings.unboxAsView(ZZDDS.Publisher, zpub_boxed);
-    try testing.expectEqual(nd.NIL_PTR, zpub.ptr);
+    const zpub: ZZDDS.Publisher = .{ .ptr = nd.NIL_PTR, .vtable = &extensions.publisher_vtable };
     try testing.expectEqual(nd.nil_publisher.ptr, zpub.vtable.as_Publisher(zpub.ptr).ptr);
     try testing.expectEqual(std.heap.c_allocator, zpub.vtable.get_allocator(zpub.ptr));
     const dw_qos = DDS.DataWriterQos{};
     try testing.expectEqual(nd.NIL_PTR, zpub.vtable.create_datawriter_ex(zpub.ptr, nd.nil_topic, &dw_qos, null, 0).ptr);
 
-    const nil_sub_boxed = nd.nil_subscriber.vtable.get_c_abi_handle(nd.nil_subscriber.ptr);
-    const zsub_boxed = extensions.DDS_Subscriber_as_zzdds_Subscriber(nil_sub_boxed);
-    const zsub = zidl_bindings.unboxAsView(ZZDDS.Subscriber, zsub_boxed);
-    try testing.expectEqual(nd.NIL_PTR, zsub.ptr);
+    const zsub: ZZDDS.Subscriber = .{ .ptr = nd.NIL_PTR, .vtable = &extensions.subscriber_vtable };
     try testing.expectEqual(nd.nil_subscriber.ptr, zsub.vtable.as_Subscriber(zsub.ptr).ptr);
     try testing.expectEqual(std.heap.c_allocator, zsub.vtable.get_allocator(zsub.ptr));
     const dr_qos = DDS.DataReaderQos{};
     try testing.expectEqual(nd.NIL_PTR, zsub.vtable.create_datareader_ex(zsub.ptr, nd.nil_topic_description, &dr_qos, null, 0).ptr);
 
-    const nil_cft_boxed = nd.nil_cft.vtable.get_c_abi_handle(nd.nil_cft.ptr);
-    const zcft_boxed = extensions.DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic(nil_cft_boxed);
-    const zcft = zidl_bindings.unboxAsView(ZZDDS.ContentFilteredTopic, zcft_boxed);
-    try testing.expectEqual(nd.NIL_PTR, zcft.ptr);
+    const zcft: ZZDDS.ContentFilteredTopic = .{ .ptr = nd.NIL_PTR, .vtable = &extensions.cft_vtable };
     try testing.expectEqual(nd.nil_cft.ptr, zcft.vtable.as_ContentFilteredTopic(zcft.ptr).ptr);
     try testing.expectEqual(std.heap.c_allocator, zcft.vtable.get_allocator(zcft.ptr));
     try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, zcft.vtable.set_filter_expression(zcft.ptr, "x = 1", null));
-}
-
-test "extensions: DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory rejects foreign handles" {
-    const nd = zzdds.dcps;
-    const nil_fac_boxed = nd.nil_factory.vtable.get_c_abi_handle(nd.nil_factory.ptr);
-    const zf_boxed = extensions.DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(nil_fac_boxed);
-    const zf = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, zf_boxed);
-    try testing.expectEqual(nd.NIL_PTR, zf.ptr);
 }
 
 test "extensions: factory DDS-view get_c_abi_handle boxes nil handle correctly" {
@@ -1252,8 +1231,10 @@ test "extensions: zzdds_factory_is_nil distinguishes nil and real handles" {
     const nil_boxed = try zidl_bindings.boxEntity(alloc, zzdds.dcps.NIL_PTR, &extensions.factory_views);
     defer zidl_bindings.freeEntityBox(alloc, nil_boxed);
     try testing.expect(extensions.zzdds_factory_is_nil(nil_boxed));
+    try testing.expect(extensions.zzdds_factory_is_nil(null));
+    extensions.zzdds_destroy_factory(null);
 
-    const real_boxed = extensions.zzdds_create_factory();
+    const real_boxed = extensions.zzdds_create_factory().?;
     defer extensions.zzdds_destroy_factory(real_boxed);
     try testing.expect(!extensions.zzdds_factory_is_nil(real_boxed));
 }
@@ -1836,7 +1817,7 @@ test "readerSetListenerEx: real C-ABI set_listener_ex delegates to DataReaderImp
     const td = @as(*TopicImpl, @ptrCast(@alignCast(fx.topic_r.ptr))).toTopicDescription();
     const dr = fx.sub_r.create_datareader(td, .{}, null, 0);
 
-    const zdr_boxed = extensions.DDS_DataReader_as_zzdds_DataReader(dr.vtable.get_c_abi_handle(dr.ptr));
+    const zdr_boxed = extensions.DDS_DataReader_as_zzdds_DataReader(dr.vtable.get_c_abi_handle(dr.ptr)).?;
     const zdr = zidl_bindings.unboxAsView(ZZDDS.DataReader, zdr_boxed);
 
     var state = ReadyState{};
@@ -1878,7 +1859,7 @@ const DestroyFromListener = struct {
 };
 
 test "support factory: the last factory can be destroyed from a listener that deleted its participant" {
-    const boxed = extensions.zzdds_create_factory();
+    const boxed = extensions.zzdds_create_factory().?;
     const ext = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, boxed);
     const dp = ext.create_participant_ex(test_domain.get(), .{}, null, 0, ZZDDS.DomainParticipantConfig.default());
     try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);

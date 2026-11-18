@@ -8,6 +8,22 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-18
+
+- At the C ABI, NULL is every interface's nil (zidl v0.3.34's provider contract,
+  `docs/design/c-abi-provider.md` there). A function that finds or makes nothing returns
+  NULL: a failed `create_*`, `lookup_*` or `find_topic`, a failed `zzdds_create_factory`,
+  and a `DDS_X_as_zzdds_X` conversion of a handle zzdds did not issue. They used to
+  return a nil handle, which is not NULL, so C callers' NULL checks never fired. NULL
+  given as a function's object or argument is the nil, which refuses the call, where a
+  NULL object used to crash; downcasts and conversions of NULL are NULL.
+  `zzdds_factory_is_nil` is deprecated and true for NULL. C++ and Java `create_*`
+  failures are now `nullptr` and `null`. **Breaking** for C callers that called through
+  a failed `create_*`'s result unchecked: it is NULL now, which still refuses the call.
+- `attach_condition` and `detach_condition` of a nil condition, and `delete_readcondition`
+  of a nil, return `BAD_PARAMETER`. A NULL condition from C used to reach them with an
+  undefined vtable.
+
 ## 2026-11-17
 
 - Removed the deprecated C functions `zzdds_create_waitset`/`zzdds_create_guardcondition` (and
