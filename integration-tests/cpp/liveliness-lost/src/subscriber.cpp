@@ -118,7 +118,7 @@ std::shared_ptr<::DDS::DataReader> create_reader(std::shared_ptr<::DDS::DomainPa
 int main(int argc, char **argv) {
     uint32_t domain_id = parse_domain(argc, argv);
 
-    auto factory = zzdds::create_factory();
+    auto factory = zzdds::DomainParticipantFactory::create();
     if (!factory) {
         std::fprintf(stderr, "FAIL: createFactory() failed\n");
         return 1;

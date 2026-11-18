@@ -2,7 +2,7 @@
  * Narrow, targeted regression check: arms the guard BEFORE doing anything at
  * all, then does exactly the bootstrap sequence a caller who wants zero libc
  * malloc from process start would use --
- * zzdds_process_configure_from_file() + zzdds_create_factory_with_allocator()
+ * zzdds_process_configure_from_file() + zzdds_DomainParticipantFactory_create_with_allocator()
  * -- and nothing else. publisher.c/subscriber.c's own guard only arms after
  * a lot of additional setup (participant/topic/writer/reader creation,
  * discovery settling), so passing there doesn't specifically prove THIS
@@ -25,14 +25,14 @@ int main(void) {
         return 1;
     }
 
-    zzdds_DomainParticipantFactory factory = zzdds_create_factory_with_allocator(&static_pool_allocator);
+    zzdds_DomainParticipantFactory factory = zzdds_DomainParticipantFactory_create_with_allocator(&static_pool_allocator);
     if (factory == NULL) {
-        fprintf(stderr, "FAIL: zzdds_create_factory_with_allocator returned NULL\n");
+        fprintf(stderr, "FAIL: zzdds_DomainParticipantFactory_create_with_allocator returned NULL\n");
         return 1;
     }
 
     noalloc_guard_try_disarm();
-    zzdds_destroy_factory(factory);
+    zzdds_DomainParticipantFactory_release(factory);
     printf("bootstrap_noalloc_check: OK -- config resolve + factory bootstrap made zero libc malloc calls\n");
     return 0;
 }

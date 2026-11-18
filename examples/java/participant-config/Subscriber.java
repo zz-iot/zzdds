@@ -52,9 +52,9 @@ public class Subscriber {
             }
         }
 
-        Object baseFactory = io.zzdds.runtime.ZzddsRuntime.createFactory();
+        Object baseFactory = io.zzdds.ext.Zzdds.zzdds.DomainParticipantFactory.create();
         if (baseFactory == null) {
-            System.err.println("FAIL: createFactory() failed");
+            System.err.println("FAIL: DomainParticipantFactory.create() failed");
             System.exit(1);
         }
 

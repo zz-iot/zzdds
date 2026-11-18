@@ -68,7 +68,7 @@ int main() {
         return 1;
     }
 
-    auto factory = zzdds::create_factory(&static_pool_allocator);
+    auto factory = zzdds::DomainParticipantFactory::create(&static_pool_allocator);
     if (!factory) {
         std::fprintf(stderr, "FAIL: create_factory returned null\n");
         return 1;

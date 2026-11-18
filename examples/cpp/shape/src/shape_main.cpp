@@ -930,7 +930,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    auto factory = zzdds::create_factory();
+    auto factory = zzdds::DomainParticipantFactory::create();
     if (!factory) {
         std::fprintf(stderr, "FAIL: create_factory returned null\n");
         return 1;

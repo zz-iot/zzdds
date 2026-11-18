@@ -850,7 +850,7 @@ public class ShapeMain {
             }
         }
 
-        Object baseFactory = io.zzdds.runtime.ZzddsRuntime.createFactory();
+        Object baseFactory = io.zzdds.ext.Zzdds.zzdds.DomainParticipantFactory.create();
         if (baseFactory == null) {
             System.err.println("FAIL: createFactory() returned null");
             System.exit(1);

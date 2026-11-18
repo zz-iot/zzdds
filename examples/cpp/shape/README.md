@@ -39,7 +39,7 @@ LD_LIBRARY_PATH=/path/to/zzdds/zig-out/lib ./shape_main -P --write-period 200 -w
 ## Config-file support (`--config <path>`)
 
 `zzdds::process_configure_from_file(path, nullptr)`, called before
-`zzdds::create_factory()` — see the design doc and `zzdds-examples/config/`
+`zzdds::DomainParticipantFactory::create()` — see the design doc and `zzdds-examples/config/`
 for the example scenario files.
 
 ## Notes

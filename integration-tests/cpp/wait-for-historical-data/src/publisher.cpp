@@ -83,7 +83,7 @@ static int writer_matched(const Writer &dw) {
 int main(int argc, char **argv) {
     uint32_t domain_id = parse_domain(argc, argv);
 
-    auto factory = zzdds::create_factory();
+    auto factory = zzdds::DomainParticipantFactory::create();
     if (!factory) {
         std::fprintf(stderr, "FAIL: createFactory() failed\n");
         return 1;

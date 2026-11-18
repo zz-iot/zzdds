@@ -47,13 +47,11 @@ either class takes.
 
 ## Notes
 
-- `ZzddsRuntime.createFactory()` always boxes into the base
-  `io.zzdds.dcps.DomainParticipantFactoryImpl` view — programmatic mode
-  narrows it to `io.zzdds.ext.Zzdds.zzdds.DomainParticipantFactory` via the
-  new `ZzddsRuntime.asZzddsFactory()` helper (added for this example;
-  mirrors the existing `asZzddsDataWriter()` narrowing `on_reliable_reader_
-  ready` already needed) to reach `create_participant_ex`/
+- `Zzdds.zzdds.DomainParticipantFactory.create()` already returns zzdds's
+  extension view, which has `create_participant_ex`/
   `set_default_participant_config`/`get_default_participant_config`.
+  `ZzddsRuntime.asZzddsFactory()` returns it as is; it narrows the DDS view
+  of a factory from `Dcps.DDS.DomainParticipantFactory.get_instance()`.
 - zidl's Java backend names the generated file's outer wrapper class from
   the IDL file's stem (`config_ping` → `Config_ping`), separately from the
   struct's own name (`ConfigPing`) — a sample is constructed as

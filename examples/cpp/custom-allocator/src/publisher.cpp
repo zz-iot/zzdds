@@ -3,7 +3,7 @@
  * UDP DDS discovery, using a fixed-size static-pool allocator for every
  * allocation the factory and everything it creates makes (participant,
  * topic, publisher, writer, history cache -- via
- * zzdds_create_factory_with_allocator) AND every C++ wrapper object
+ * zzdds_DomainParticipantFactory_create_with_allocator) AND every C++ wrapper object
  * (DomainParticipant/Topic/DataWriter impl objects, via
  * zidl::setCppAllocator's std::pmr routing) -- no libc malloc/free/operator
  * new anywhere in this process's steady-state publishing loop.
@@ -80,7 +80,7 @@ int main() {
         return 1;
     }
 
-    auto factory = zzdds::create_factory(&static_pool_allocator);
+    auto factory = zzdds::DomainParticipantFactory::create(&static_pool_allocator);
     if (!factory) {
         std::fprintf(stderr, "FAIL: create_factory returned null\n");
         return 1;
