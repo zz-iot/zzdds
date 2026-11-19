@@ -95,7 +95,6 @@ test "discovery_race: write after both sides confirm match is always delivered (
     _ = try writer.dw_impl.writeRaw(
         .alive,
         RtpsTimestamp.now(),
-        history_mod.INSTANCE_HANDLE_NIL,
         std.mem.zeroes([16]u8),
         payload,
     );
@@ -138,7 +137,6 @@ test "discovery_race: a genuinely late VOLATILE joiner does not receive earlier 
     _ = try writer.dw_impl.writeRaw(
         .alive,
         RtpsTimestamp.now(),
-        history_mod.INSTANCE_HANDLE_NIL,
         std.mem.zeroes([16]u8),
         early_payload,
     );
@@ -176,7 +174,6 @@ test "discovery_race: a genuinely late VOLATILE joiner does not receive earlier 
     _ = try writer.dw_impl.writeRaw(
         .alive,
         RtpsTimestamp.now(),
-        history_mod.INSTANCE_HANDLE_NIL,
         std.mem.zeroes([16]u8),
         later_payload,
     );

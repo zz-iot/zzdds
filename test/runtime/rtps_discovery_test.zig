@@ -98,7 +98,7 @@ const Endpoints = struct {
 
     fn write(self: *Endpoints, i: usize) !void {
         const payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, @truncate(i) };
-        _ = try self.dw.writeRaw(.alive, RtpsTimestamp.now(), history.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &payload);
+        _ = try self.dw.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &payload);
     }
 
     fn takeInto(self: *Endpoints, got: *std.ArrayListUnmanaged(u8)) !void {

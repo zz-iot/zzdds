@@ -733,7 +733,7 @@ const Pair = struct {
 
     fn write(self: *Pair, i: usize) !void {
         const payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, @truncate(i) };
-        _ = try self.dw.writeRaw(.alive, RtpsTimestamp.now(), history.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &payload);
+        _ = try self.dw.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &payload);
     }
 
     /// Deletes both participants: the runtime's last owners.
@@ -882,7 +882,7 @@ test "datagrams past the ingress bound are dropped, as a full receive buffer dro
     defer got.deinit(alloc);
     for (0..written) |i| {
         const payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, @truncate(i) };
-        _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), history.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &payload);
+        _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &payload);
     }
     var drives: usize = 0;
     while (drives < 20) : (drives += 1) {
@@ -1068,7 +1068,7 @@ test "a participant deleted from its own listener is freed after that turn" {
     // Two samples: the second is queued behind the turn that deletes.
     for (0..2) |i| {
         const payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, @intCast(i) };
-        _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), history.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &payload);
+        _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &payload);
     }
     var drives: usize = 0;
     while (!sd.deleted and drives < 100) : (drives += 1) _ = try m.runtime.drive(64, 0);
@@ -1124,7 +1124,7 @@ test "a participant deleted from its own listener retires its wrappers before th
     const dw: *DataWriterImpl = @ptrCast(@alignCast(publisher.create_datawriter(topic_w, .{}, null, 0).ptr));
 
     const payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0x00 };
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), history.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &payload);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &payload);
     var drives: usize = 0;
     while (!sd.deleted and drives < 100) : (drives += 1) _ = try m.runtime.drive(64, 0);
     try testing.expect(sd.deleted);

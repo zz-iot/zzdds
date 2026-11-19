@@ -183,7 +183,7 @@ pub fn writeRaw(
     if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
     defer impl.releaseQuiesce();
     const ck = toChangeKind(kind, impl);
-    _ = try impl.writeRaw(ck, time_mod.RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, key_hash, data);
+    _ = try impl.writeRaw(ck, time_mod.RtpsTimestamp.now(), key_hash, data);
 }
 
 /// Write a pre-serialized CDR payload with an explicit source timestamp.
@@ -200,7 +200,7 @@ pub fn writeRawWithTimestamp(
     const ck = toChangeKind(kind, impl);
     const t = time_mod.Time{ .sec = ts.sec, .nanosec = ts.nanosec };
     const rtps_ts = time_mod.RtpsTimestamp.fromTime(t);
-    _ = try impl.writeRaw(ck, rtps_ts, history_mod.INSTANCE_HANDLE_NIL, key_hash, data);
+    _ = try impl.writeRaw(ck, rtps_ts, key_hash, data);
 }
 
 /// Compute a stable instance handle for a given key hash without writing.

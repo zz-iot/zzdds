@@ -8,6 +8,15 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-19
+
+- A Zig application's keyed KEEP_LAST DataWriter keeps `depth` samples per instance, as
+  a C or C++ one does. The generated Zig code's write path gave the writer's history no
+  instance, so it kept `depth` samples across all instances, and a late-joining
+  TRANSIENT_LOCAL reader or a reliable reader repairing a loss missed the rest.
+  `DataWriterImpl.writeRaw`, `publishLoan`, `disposeRaw` and `unregisterRaw` lose their
+  `instance_handle` argument: the instance is the key hash.
+
 ## 2026-11-18
 
 - The DomainParticipantFactory moves onto zidl's generated construction

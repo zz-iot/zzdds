@@ -149,7 +149,7 @@ const Fixture = struct {
 };
 
 fn writeAlive(dw: *DataWriterImpl) !void {
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &PAYLOAD);
 }
 
 fn freeOut(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(TakenSample)) void {
@@ -303,7 +303,7 @@ test "takeFiltered: instance_state mask selects ALIVE only" {
 
     // Write alive, dispose — queue has alive + disposed.
     try writeAlive(pair.dw);
-    try pair.dw.disposeRaw(RtpsTimestamp.now(), NIL_IH, NIL_KEY);
+    try pair.dw.disposeRaw(RtpsTimestamp.now(), NIL_KEY);
     fx.settle();
 
     // takeFiltered with ALIVE only.
@@ -363,7 +363,7 @@ test "readNextInstanceRaw: returns one sample from the first instance" {
     defer fx.deinit();
     const pair = fx.makeWriterReader(.{}, .{});
 
-    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), KEY_A, &PAYLOAD);
     fx.settle();
 
     const s = pair.dr.readNextInstanceRaw(0);
@@ -387,8 +387,8 @@ test "readNextInstanceRaw: iterates instances in handle order" {
     defer fx.deinit();
     const pair = fx.makeWriterReader(.{}, .{});
 
-    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
-    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_B, &PAYLOAD);
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), KEY_A, &PAYLOAD);
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), KEY_B, &PAYLOAD);
     fx.settle();
 
     const ih_a = DataWriterImpl.registerInstanceRaw(KEY_A);
@@ -417,7 +417,7 @@ test "getKeyValueRaw (reader): returns CDR payload for known alive instance" {
     defer fx.deinit();
     const pair = fx.makeWriterReader(.{}, .{});
 
-    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), KEY_A, &PAYLOAD);
     fx.settle();
 
     const ih = DataWriterImpl.registerInstanceRaw(KEY_A);
@@ -444,7 +444,7 @@ test "lookupInstance: true for alive instance, false for unknown" {
     defer fx.deinit();
     const pair = fx.makeWriterReader(.{}, .{});
 
-    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), KEY_A, &PAYLOAD);
     fx.settle();
 
     const ih_a = DataWriterImpl.registerInstanceRaw(KEY_A);
@@ -460,7 +460,7 @@ test "getKeyValueRaw (writer): returns CDR payload after alive write" {
     defer fx.deinit();
     const pair = fx.makeWriterReader(.{}, .{});
 
-    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), KEY_A, &PAYLOAD);
     fx.settle();
 
     const ih = DataWriterImpl.registerInstanceRaw(KEY_A);
@@ -497,7 +497,7 @@ test "getKeyValueRaw (writer): returns null for handle with no prior write" {
 fn writeTagged(dw: *DataWriterImpl, key: [16]u8, tag: u8) !void {
     var payload = PAYLOAD;
     payload[4] = tag;
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, key, &payload);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), key, &payload);
 }
 
 const TagField = struct {
@@ -625,8 +625,8 @@ test "takeNextInstanceWithReadConditionRaw: instance selection skips a non-match
     // still select whichever instance has the smaller handle, regardless of
     // sample_state -- takeNextInstanceWithReadConditionRaw must skip an
     // instance whose only sample doesn't match the condition's own mask.
-    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
-    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_B, &PAYLOAD);
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), KEY_A, &PAYLOAD);
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), KEY_B, &PAYLOAD);
     fx.settle();
     const ih_a = DataWriterImpl.registerInstanceRaw(KEY_A);
     const ih_b = DataWriterImpl.registerInstanceRaw(KEY_B);
@@ -658,7 +658,7 @@ test "readNextInstanceWithReadConditionRaw: non-destructive, sample remains for 
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
     const pair = fx.makeWriterReader(.{}, .{});
-    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), KEY_A, &PAYLOAD);
     fx.settle();
 
     const dr = pair.dr.toDDSDataReader();

@@ -161,7 +161,7 @@ test "listener fallback: reader with no listener falls back to Subscriber's on_d
 
     const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
     const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &PAYLOAD);
     fx.settle();
 
     try testing.expectEqual(FiredOn.subscriber, state.fired_on);
@@ -190,7 +190,7 @@ test "listener fallback: reader and Subscriber both silent falls back to DomainP
 
     const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
     const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &PAYLOAD);
     fx.settle();
 
     try testing.expectEqual(FiredOn.participant, state.fired_on);
@@ -220,7 +220,7 @@ test "listener fallback: reader's own listener wins over Subscriber's (no fallba
 
     const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
     const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &PAYLOAD);
     fx.settle();
 
     try testing.expectEqual(FiredOn.reader, state.fired_on);

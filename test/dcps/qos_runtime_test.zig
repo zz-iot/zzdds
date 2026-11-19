@@ -38,7 +38,6 @@ fn writeRaw(dw: *DataWriterImpl, payload: []const u8) !void {
     _ = try dw.writeRaw(
         .alive,
         RtpsTimestamp.now(),
-        history_mod.INSTANCE_HANDLE_NIL,
         std.mem.zeroes([16]u8),
         payload,
     );
@@ -207,7 +206,6 @@ test "resource_limits: writer BEST_EFFORT — returns OutOfResources when cache 
     const err = pair.dw.writeRaw(
         .alive,
         RtpsTimestamp.now(),
-        history_mod.INSTANCE_HANDLE_NIL,
         std.mem.zeroes([16]u8),
         &PAYLOAD_C,
     );
@@ -268,12 +266,37 @@ test "resource_limits: writer RELIABLE TRANSIENT_LOCAL — acknowledged samples 
     try testing.expectError(error.Timeout, pair.dw.writeRaw(
         .alive,
         RtpsTimestamp.now(),
-        history_mod.INSTANCE_HANDLE_NIL,
         std.mem.zeroes([16]u8),
         &PAYLOAD_C,
     ));
     fx.settle();
     try testing.expectEqual(@as(usize, 2), pair.dw.proto_writer.cacheLen());
+}
+
+test "history: a keyed KEEP_LAST writer written through raw_ops keeps depth samples per instance" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var dw_qos = DDS.DataWriterQos{};
+    var dr_qos = DDS.DataReaderQos{};
+    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dw_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+    dw_qos.history = .{ .kind = .KEEP_LAST_HISTORY_QOS, .depth = 1 };
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+
+    const pair = fx.makeWriterReader(dw_qos, dr_qos);
+    const dw = pair.dw.toDDSDataWriter();
+    // The generated Zig code's path (typesupport.zig), not the C ABI's.
+    for ([_]u8{ 1, 2, 3, 1 }) |k| {
+        var key = std.mem.zeroes([16]u8);
+        key[3] = k;
+        try zzdds.writeRaw(dw, .alive, key, &PAYLOAD_A);
+        fx.settle();
+    }
+    // One sample per instance kept for late joiners; the second write of
+    // instance 1 replaced its first.
+    try testing.expectEqual(@as(usize, 3), pair.dw.proto_writer.cacheLen());
 }
 
 test "a publisher's default writer QoS blocks a full RELIABLE write for 100 ms" {
@@ -753,7 +776,7 @@ test "ownership: EXCLUSIVE — owner transfer when current owner is removed" {
 fn writeRawKeyed(dw: *DataWriterImpl, payload: []const u8, key: u8) !void {
     var kh = std.mem.zeroes([16]u8);
     kh[0] = key;
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), kh, kh, payload);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), kh, payload);
 }
 
 test "keep_last: reader depth=1 silently replaces oldest for same instance (no rejection)" {
@@ -829,7 +852,6 @@ fn writeRawAt(dw: *DataWriterImpl, payload: []const u8, secs: u32) !void {
     _ = try dw.writeRaw(
         .alive,
         .{ .seconds = secs, .fraction = 0 },
-        history_mod.INSTANCE_HANDLE_NIL,
         std.mem.zeroes([16]u8),
         payload,
     );
@@ -838,7 +860,7 @@ fn writeRawAt(dw: *DataWriterImpl, payload: []const u8, secs: u32) !void {
 fn writeRawAtKeyed(dw: *DataWriterImpl, payload: []const u8, secs: u32, key: u8) !void {
     var kh = std.mem.zeroes([16]u8);
     kh[0] = key;
-    _ = try dw.writeRaw(.alive, .{ .seconds = secs, .fraction = 0 }, kh, kh, payload);
+    _ = try dw.writeRaw(.alive, .{ .seconds = secs, .fraction = 0 }, kh, payload);
 }
 
 test "time_based_filter: zero separation (default) — all samples pass" {

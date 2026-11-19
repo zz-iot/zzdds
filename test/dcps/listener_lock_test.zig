@@ -169,7 +169,7 @@ test "on_data_available may call into its participant, subscriber and reader" {
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_raw);
     const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));
 
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &PAYLOAD);
     fx.settle();
     try testing.expect(probe.calls >= 1);
     try testing.expect(probe.participant_ok);
@@ -288,7 +288,7 @@ test "listeners raised by notify_datareaders may call into their subscriber" {
 
     // Data arrives while the listener is masked out, leaving a change for
     // notify_datareaders to claim.
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &PAYLOAD);
     fx.settle();
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
     @atomicStore(DDS.StatusMask, &dr_impl.listener_mask, DDS.DATA_AVAILABLE_STATUS, .monotonic);

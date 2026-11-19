@@ -386,7 +386,6 @@ pub const DataWriterImpl = struct {
         self: *Self,
         kind: history_mod.ChangeKind,
         source_timestamp: history_mod.RtpsTimestamp,
-        instance_handle: history_mod.InstanceHandle,
         key_hash: [16]u8,
         data: []const u8,
     ) !history_mod.SequenceNumber {
@@ -411,7 +410,7 @@ pub const DataWriterImpl = struct {
             }
         }
 
-        const sn = try self.proto_writer.write(kind, source_timestamp, instance_handle, key_hash, data);
+        const sn = try self.proto_writer.write(kind, source_timestamp, key_hash, key_hash, data);
         self.last_sn.store(sn, .monotonic);
         if (kind == .alive) {
             const ih = keyHashToHandle(key_hash);
@@ -472,7 +471,6 @@ pub const DataWriterImpl = struct {
         self: *Self,
         kind: history_mod.ChangeKind,
         source_timestamp: history_mod.RtpsTimestamp,
-        instance_handle: history_mod.InstanceHandle,
         key_hash: [16]u8,
         buf: []u8,
         used_len: usize,
@@ -481,7 +479,7 @@ pub const DataWriterImpl = struct {
             self.alloc.free(buf);
             _ = self.outstanding_loans.fetchSub(1, .monotonic);
         }
-        return self.writeRaw(kind, source_timestamp, instance_handle, key_hash, buf[0..used_len]);
+        return self.writeRaw(kind, source_timestamp, key_hash, buf[0..used_len]);
     }
 
     /// Cancel a previously-loaned buffer (from `loanForWrite`) without
@@ -540,13 +538,12 @@ pub const DataWriterImpl = struct {
     pub fn disposeRaw(
         self: *Self,
         source_timestamp: history_mod.RtpsTimestamp,
-        instance_handle: history_mod.InstanceHandle,
         key_hash: [16]u8,
     ) !void {
         _ = try self.proto_writer.write(
             .not_alive_disposed,
             source_timestamp,
-            instance_handle,
+            key_hash,
             key_hash,
             &.{},
         );
@@ -557,14 +554,13 @@ pub const DataWriterImpl = struct {
     pub fn unregisterRaw(
         self: *Self,
         source_timestamp: history_mod.RtpsTimestamp,
-        instance_handle: history_mod.InstanceHandle,
         key_hash: [16]u8,
     ) !void {
         const kind: history_mod.ChangeKind = if (self.qos.writer_data_lifecycle.autodispose_unregistered_instances)
             .not_alive_disposed
         else
             .not_alive_unregistered;
-        _ = try self.proto_writer.write(kind, source_timestamp, instance_handle, key_hash, &.{});
+        _ = try self.proto_writer.write(kind, source_timestamp, key_hash, key_hash, &.{});
     }
 
     pub fn toDDSDataWriter(self: *Self) DDS.DataWriter {
@@ -1405,7 +1401,7 @@ pub const DataWriterImpl = struct {
         if (!self.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
         defer self.releaseQuiesce();
         const data = if (payload._buffer) |b| b[0..payload._length] else &[_]u8{};
-        _ = self.writeRaw(change_kind, rtpsTimestampFromRaw(source_timestamp), kh, kh, data) catch |err| return switch (err) {
+        _ = self.writeRaw(change_kind, rtpsTimestampFromRaw(source_timestamp), kh, data) catch |err| return switch (err) {
             error.OutOfResources => DDS.RETCODE_OUT_OF_RESOURCES,
             error.Timeout => DDS.RETCODE_TIMEOUT,
             else => DDS.RETCODE_ERROR,
@@ -1498,7 +1494,7 @@ pub const DataWriterImpl = struct {
         // every path.
         defer self.releaseQuiesce();
         defer self.proto_writer.quiesceRelease();
-        _ = self.publishLoan(change_kind, time_mod.RtpsTimestamp.now(), kh, kh, full_buf, used_len) catch |err| return switch (err) {
+        _ = self.publishLoan(change_kind, time_mod.RtpsTimestamp.now(), kh, full_buf, used_len) catch |err| return switch (err) {
             error.OutOfResources => DDS.RETCODE_OUT_OF_RESOURCES,
             error.Timeout => DDS.RETCODE_TIMEOUT,
             else => DDS.RETCODE_ERROR,

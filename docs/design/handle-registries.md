@@ -27,14 +27,11 @@ although its doc comment says it does, and two writers hand out the same handle 
 key.
 
 The RTPS history cache (`src/rtps/history.zig`) does not use these handles. Its
-`InstanceHandle` is 16 bytes, so its KEEP_LAST trimming cannot collide. The DCPS writer
-passes it the key hash from the C ABI (`write_raw`, `publish_loan_raw`), but
-`raw_ops.writeRaw` and `writeRawWithTimestamp`, which the generated Zig code calls (via
-`typesupport.zig`), pass `INSTANCE_HANDLE_NIL`. A Zig application's keyed KEEP_LAST writer
-therefore keeps `depth` samples in all, not per instance: three instances written at depth
-1 leave one sample in the history (checked 2026-11-18 with a probe test). A late-joining
-TRANSIENT_LOCAL reader, or a reliable reader repairing a loss, gets the other instances'
-latest samples from no one.
+`InstanceHandle` is 16 bytes, so its KEEP_LAST trimming cannot collide. The study found
+that the generated Zig code's write path (`raw_ops.writeRaw`, `writeRawWithTimestamp`)
+gave it `INSTANCE_HANDLE_NIL` rather than the key hash, so a Zig application's keyed
+KEEP_LAST writer kept `depth` samples in all, not per instance. Fixed 2026-11-19: the
+DCPS writer's write functions no longer take an instance, and use the key hash.
 
 ### Entity handles
 
@@ -165,10 +162,7 @@ entries. The factory's and participant's counters go.
 
 1. **This study.**
 2. **Instance registries** for DataReader and DataWriter, with `lookup_instance`
-   returning `HANDLE_NIL` for unknown keys. Separately, and first, since it does not need a
-   registry: `raw_ops.writeRaw` and `writeRawWithTimestamp` pass the key hash to the RTPS
-   history, as the C ABI does, with a test that a keyed KEEP_LAST writer keeps `depth`
-   samples per instance.
+   returning `HANDLE_NIL` for unknown keys.
 3. **The participant's entity registry**, then removing `guidToHandle`, `topicToHandle`,
    `keyHashToHandle` and their re-export from `dcps/root.zig`.
 4. **Follow-ons**, each its own roadmap item: instance reclamation bounded by

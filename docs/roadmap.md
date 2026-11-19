@@ -300,13 +300,6 @@ Forward-looking only: known gaps, planned features, and open design questions.
      RESOURCE_LIMITS `max_instances` (no reader or writer forgets an instance today); the
      participant's `discovered_*` lists, searched linearly by GUID or name.
 
-- **A native Zig writer's KEEP_LAST history is per topic, not per instance.**
-  `raw_ops.writeRaw` and `writeRawWithTimestamp`, which generated Zig code calls, give the
-  RTPS history `INSTANCE_HANDLE_NIL` rather than the key hash, so a keyed KEEP_LAST writer
-  keeps `depth` samples across all its instances: three instances written at depth 1 leave
-  one. Late-joining TRANSIENT_LOCAL readers and reliable repair lose the others. The C ABI
-  passes the key hash. Found in the handle registry study; independent of it.
-
 ### Selective CDR parse (`deserialize_selected`) — deferred follow-ups
 
 zidl v0.3.12 adds a mask-driven selective parser (`deserialize_selected(want)` /

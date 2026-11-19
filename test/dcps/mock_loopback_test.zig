@@ -140,7 +140,6 @@ fn runMockLoopback(
         _ = try dw_impl.writeRaw(
             .alive,
             RtpsTimestamp.now(),
-            history_mod.INSTANCE_HANDLE_NIL,
             std.mem.zeroes([16]u8),
             p,
         );
@@ -299,7 +298,6 @@ test "mock_loopback: incompatible QoS — best_effort writer vs reliable reader"
     _ = try dw_impl.writeRaw(
         .alive,
         RtpsTimestamp.now(),
-        history_mod.INSTANCE_HANDLE_NIL,
         std.mem.zeroes([16]u8),
         &PAYLOAD_A,
     );
@@ -494,9 +492,9 @@ test "mock_loopback: suspend_publications holds writes across end_coherent_chang
     // B must stay in the writer's pending buffer until resume_publications.
     _ = pub_w.vtable.suspend_publications(pub_w.ptr);
     _ = pub_w.vtable.begin_coherent_changes(pub_w.ptr);
-    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &PAYLOAD_A);
+    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &PAYLOAD_A);
     _ = pub_w.vtable.end_coherent_changes(pub_w.ptr); // flushes A, re-engages suspension
-    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &PAYLOAD_B);
+    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &PAYLOAD_B);
 
     // Deliver A to the reader.  B is still deferred in the writer's coherent buffer.
     net.deliverAll();
@@ -614,13 +612,13 @@ test "mock_loopback: coherent sets from two writers are buffered independently" 
 
     // Publisher A: coherent set with 2 samples (A1=PAYLOAD_A, A2=PAYLOAD_C).
     _ = pub_a.vtable.begin_coherent_changes(pub_a.ptr);
-    _ = try dw_a_impl.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &PAYLOAD_A);
-    _ = try dw_a_impl.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &PAYLOAD_C);
+    _ = try dw_a_impl.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &PAYLOAD_A);
+    _ = try dw_a_impl.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &PAYLOAD_C);
     _ = pub_a.vtable.end_coherent_changes(pub_a.ptr);
 
     // Publisher B: coherent set with 1 sample (B1=PAYLOAD_B).
     _ = pub_b.vtable.begin_coherent_changes(pub_b.ptr);
-    _ = try dw_b_impl.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &PAYLOAD_B);
+    _ = try dw_b_impl.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &PAYLOAD_B);
     _ = pub_b.vtable.end_coherent_changes(pub_b.ptr);
 
     // Deliver until the reader has two complete independent sets.
@@ -758,8 +756,8 @@ test "mock_loopback: coherent set delivered atomically via begin_access" {
 
     // ── Write coherent set ────────────────────────────────────────────────────
     _ = pub_w.vtable.begin_coherent_changes(pub_w.ptr);
-    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &PAYLOAD_A);
-    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &PAYLOAD_B);
+    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &PAYLOAD_A);
+    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &PAYLOAD_B);
     _ = pub_w.vtable.end_coherent_changes(pub_w.ptr);
 
     // Deliver the coherent DATA packets.
@@ -891,11 +889,11 @@ test "mock_loopback: ordered access sorts pending queue via begin_access" {
     // (ordered_access=true, coherent_access=false), assigning distinct group_seq_nums.
     // Samples arrive at the reader as plain pending changes, not coherent-buffered.
     _ = pub_w.vtable.begin_coherent_changes(pub_w.ptr);
-    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &PAYLOAD_A);
+    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &PAYLOAD_A);
     _ = pub_w.vtable.end_coherent_changes(pub_w.ptr); // GSN=1 for PAYLOAD_A
 
     _ = pub_w.vtable.begin_coherent_changes(pub_w.ptr);
-    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &PAYLOAD_B);
+    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &PAYLOAD_B);
     _ = pub_w.vtable.end_coherent_changes(pub_w.ptr); // GSN=2 for PAYLOAD_B
 
     // Wait until both samples land in the reader's pending queue.
@@ -1009,9 +1007,9 @@ test "mock_loopback: pre-coherent-window writes not tagged as part of coherent s
 
     // suspend → write A (pre-window) → begin_coherent → write B (in window) → end_coherent
     _ = pub_w.vtable.suspend_publications(pub_w.ptr);
-    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &PAYLOAD_A);
+    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &PAYLOAD_A);
     _ = pub_w.vtable.begin_coherent_changes(pub_w.ptr);
-    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &PAYLOAD_B);
+    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &PAYLOAD_B);
     _ = pub_w.vtable.end_coherent_changes(pub_w.ptr);
     _ = pub_w.vtable.resume_publications(pub_w.ptr);
 
@@ -1723,7 +1721,7 @@ const Pubsub = struct {
     /// Writes `payload` and delivers until the reader takes it.
     fn exchange(self: *Pubsub, net: *MockNetwork, payload: []const u8) !void {
         const dw: *DataWriterImpl = @ptrCast(@alignCast(self.dw.ptr));
-        _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), payload);
+        _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), payload);
         try std.testing.expect(pumpUntil(net, self, struct {
             fn f(s: *Pubsub) bool {
                 const dr: *DataReaderImpl = @ptrCast(@alignCast(s.dr.ptr));

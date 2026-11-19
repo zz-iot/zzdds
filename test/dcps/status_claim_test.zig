@@ -32,7 +32,7 @@ const NIL_KEY = std.mem.zeroes([16]u8);
 const PAYLOAD = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0x42 };
 
 fn write(dw: *DataWriterImpl) !void {
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &PAYLOAD);
 }
 
 // ── Injecting listener ────────────────────────────────────────────────────────

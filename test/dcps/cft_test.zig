@@ -529,12 +529,12 @@ test "cft: end-to-end sample delivery with post-take filtering" {
 
     // Write payload with value = 0x42 = 66 (should NOT pass "value > 70").
     const low_payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0x42 }; // 66
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &low_payload);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &low_payload);
     fx.settle();
 
     // Write payload with value = 0x80 = 128 (should pass "value > 70").
     const high_payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0x80 }; // 128
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &high_payload);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &high_payload);
     fx.settle();
 
     // Drain all samples, apply the CFT filter manually (typed-wrapper style).
@@ -702,8 +702,8 @@ test "cft: set_filter_expression switches a live reader's filter and keeps its m
 
     const low = [_]u8{ 0x00, 0x01, 0x00, 0x00, 66 };
     const high = [_]u8{ 0x00, 0x01, 0x00, 0x00, 128 };
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &low);
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &high);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &low);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &high);
     fx.settle();
     var before = try takeValues(alloc, dr);
     defer before.deinit(alloc);
@@ -723,8 +723,8 @@ test "cft: set_filter_expression switches a live reader's filter and keeps its m
     try testing.expectEqual(@as(i32, 1), status.current_count);
     try testing.expectEqual(@as(i32, 1), status.total_count);
 
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &low);
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &high);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &low);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &high);
     fx.settle();
     var after = try takeValues(alloc, dr);
     defer after.deinit(alloc);
@@ -732,8 +732,8 @@ test "cft: set_filter_expression switches a live reader's filter and keeps its m
 
     // An empty expression passes everything.
     try testing.expectEqual(DDS.RETCODE_OK, zcft.vtable.set_filter_expression(zcft.ptr, "", null));
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &low);
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &high);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &low);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &high);
     fx.settle();
     var all = try takeValues(alloc, dr);
     defer all.deinit(alloc);

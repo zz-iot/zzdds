@@ -150,7 +150,7 @@ const Fixture = struct {
 };
 
 fn writeAlive(dw: *DataWriterImpl) !void {
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &PAYLOAD);
 }
 
 fn takeOne(dr: *DataReaderImpl) !zzdds.dcps.TakenSample {
@@ -219,7 +219,7 @@ test "sample_info: dispose delivers NOT_ALIVE_DISPOSED, valid_data=false" {
     defer alloc.free(alive.data);
 
     // Dispose the instance.
-    try pair.dw.disposeRaw(RtpsTimestamp.now(), NIL_IH, NIL_KEY);
+    try pair.dw.disposeRaw(RtpsTimestamp.now(), NIL_KEY);
     fx.settle();
 
     const disposed = try takeOne(pair.dr);
@@ -242,7 +242,7 @@ test "sample_info: alive after dispose gets NEW_VIEW (resurrection)" {
     fx.settle();
     const s1 = try takeOne(pair.dr);
     defer alloc.free(s1.data);
-    try pair.dw.disposeRaw(RtpsTimestamp.now(), NIL_IH, NIL_KEY);
+    try pair.dw.disposeRaw(RtpsTimestamp.now(), NIL_KEY);
     fx.settle();
     const disposed = try takeOne(pair.dr);
     defer alloc.free(disposed.data);
@@ -273,7 +273,7 @@ test "sample_info: unregister (autodispose=false) delivers NOT_ALIVE_NO_WRITERS"
     const alive = try takeOne(pair.dr);
     defer alloc.free(alive.data);
 
-    try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_IH, NIL_KEY);
+    try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_KEY);
     fx.settle();
 
     const unreg = try takeOne(pair.dr);
@@ -298,7 +298,7 @@ test "sample_info: unregister (autodispose=true) delivers NOT_ALIVE_DISPOSED" {
     const alive = try takeOne(pair.dr);
     defer alloc.free(alive.data);
 
-    try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_IH, NIL_KEY);
+    try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_KEY);
     fx.settle();
 
     const unreg = try takeOne(pair.dr);
@@ -315,7 +315,7 @@ test "sample_info: source_timestamp is propagated from writer" {
 
     const pair = fx.makeWriterReader(.{}, .{});
     const ts = RtpsTimestamp{ .seconds = 1_700_000_000, .fraction = 0 };
-    _ = try pair.dw.writeRaw(.alive, ts, NIL_IH, NIL_KEY, &PAYLOAD);
+    _ = try pair.dw.writeRaw(.alive, ts, NIL_KEY, &PAYLOAD);
     fx.settle();
 
     const s = try takeOne(pair.dr);
@@ -400,9 +400,9 @@ test "keyless topic: varying-content alive samples are one instance, delivered i
     payload2[4] = 0x20;
     var payload3 = PAYLOAD;
     payload3[4] = 0x30;
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &payload1);
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &payload2);
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &payload3);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &payload1);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &payload2);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &payload3);
     fx.settle();
 
     // Delivered in write order, via the listener, not by polling.
