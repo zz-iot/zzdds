@@ -152,7 +152,7 @@ private:
 
 int main(int /*argc*/, char** /*argv*/)
 {
-    auto factory = zzdds::create_factory();
+    auto factory = zzdds::DomainParticipantFactory::create();
     if (!factory) {
         std::cerr << "Failed to create factory." << std::endl;
         return 1;

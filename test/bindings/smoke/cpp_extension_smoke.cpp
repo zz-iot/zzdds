@@ -92,7 +92,7 @@ int main() {
     const char *base = std::getenv("ZZDDS_TEST_DOMAIN_BASE");
     const ::DDS::DomainId_t domain = base ? std::atoi(base) : 100;
 
-    auto factory = zzdds::create_factory();
+    auto factory = zzdds::DomainParticipantFactory::create();
     CHECK(factory);
     auto dp_w = factory->create_participant(domain, ::DDS::DomainParticipantQos::default_value(), nullptr, 0);
     auto dp_r = factory->create_participant(domain, ::DDS::DomainParticipantQos::default_value(), nullptr, 0);
@@ -197,6 +197,31 @@ int main() {
     CHECK(dp_r->delete_contained_entities() == ::DDS::RETCODE_OK);
     CHECK(factory->delete_participant(dp_w) == ::DDS::RETCODE_OK);
     CHECK(factory->delete_participant(dp_r) == ::DDS::RETCODE_OK);
+    CHECK(factory->destroy() == ::DDS::RETCODE_OK);
+
+    // A factory of one's own: the strict destroy refuses while a participant
+    // remains; dropping the owner deletes it (the finalizer).
+    {
+        auto own = zzdds::DomainParticipantFactory::create();
+        CHECK(own);
+        auto dp = own->create_participant(domain, ::DDS::DomainParticipantQos::default_value(), nullptr, 0);
+        CHECK(dp);
+        CHECK(own->destroy() == ::DDS::RETCODE_PRECONDITION_NOT_MET);
+    }
+
+    // The process-wide factory: one borrowed wrapper until delete_instance,
+    // which refuses while it has participants; dropping it releases nothing.
+    CHECK(::DDS::DomainParticipantFactory::delete_instance() == ::DDS::RETCODE_OK);
+    {
+        auto inst = ::DDS::DomainParticipantFactory::get_instance();
+        CHECK(inst);
+        CHECK(::DDS::DomainParticipantFactory::get_instance() == inst);
+        auto dp = inst->create_participant(domain, ::DDS::DomainParticipantQos::default_value(), nullptr, 0);
+        CHECK(dp);
+        CHECK(::DDS::DomainParticipantFactory::delete_instance() == ::DDS::RETCODE_PRECONDITION_NOT_MET);
+        CHECK(inst->delete_contained_entities() == ::DDS::RETCODE_OK);
+    }
+    CHECK(::DDS::DomainParticipantFactory::delete_instance() == ::DDS::RETCODE_OK);
     std::printf("cpp_extension_smoke: OK\n");
     return 0;
 }

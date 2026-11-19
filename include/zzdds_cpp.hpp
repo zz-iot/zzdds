@@ -13,103 +13,8 @@ namespace zzdds {
 
 namespace detail {
 
-// Runs `f` on scope exit unless dismissed. The wrap*Handle functions below
-// use it to destroy a C handle when constructing its wrapper fails: with
-// exceptions, std::allocate_shared throws std::bad_alloc and unwinding runs
-// the guard; without them, allocation failure aborts.
-template <typename F>
-class ScopeGuard {
-public:
-    explicit ScopeGuard(F f) : f_(std::move(f)) {}
-    ScopeGuard(const ScopeGuard&) = delete;
-    ScopeGuard& operator=(const ScopeGuard&) = delete;
-    ~ScopeGuard() { if (active_) f_(); }
-    void dismiss() noexcept { active_ = false; }
-
-private:
-    F f_;
-    bool active_ = true;
-};
-
-class DomainParticipantFactorySupport final : public DomainParticipantFactoryImpl {
-public:
-    explicit DomainParticipantFactorySupport(zzdds_DomainParticipantFactory handle)
-        : DomainParticipantFactoryImpl(handle),
-          dds_(zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(handle)),
-          handle_(handle)
-    {}
-
-    // Sole teardown path for the underlying FactoryOwner (see wrapFactoryHandle's
-    // former comment on this, now folded in here): ~DomainParticipantFactoryImpl()
-    // is `= default` and does NOT call vtable->deinit, so destroying this object
-    // alone would not tear down the C-ABI factory without this. Living in the
-    // destructor (rather than a separate custom deleter, as before) is what makes
-    // this class constructible via std::allocate_shared, which does not support a
-    // deleter distinct from the allocator-driven one.
-    ~DomainParticipantFactorySupport() override
-    {
-        zzdds_destroy_factory(handle_);
-    }
-
-    std::shared_ptr<::DDS::DomainParticipant> create_participant(
-        ::DDS::DomainId_t domain_id,
-        ::DDS::DomainParticipantQos qos,
-        std::shared_ptr<::DDS::DomainParticipantListener> a_listener,
-        ::DDS::StatusMask mask
-    ) override
-    {
-        return dds_.create_participant(domain_id, qos, std::move(a_listener), mask);
-    }
-
-    ::DDS::ReturnCode_t delete_participant(
-        std::shared_ptr<::DDS::DomainParticipant> a_participant
-    ) override
-    {
-        return dds_.delete_participant(std::move(a_participant));
-    }
-
-    std::shared_ptr<::DDS::DomainParticipant> lookup_participant(
-        ::DDS::DomainId_t domain_id
-    ) override
-    {
-        return dds_.lookup_participant(domain_id);
-    }
-
-    ::DDS::ReturnCode_t set_default_participant_qos(
-        ::DDS::DomainParticipantQos qos
-    ) override
-    {
-        return dds_.set_default_participant_qos(qos);
-    }
-
-    ::DDS::ReturnCode_t get_default_participant_qos(
-        ::DDS::DomainParticipantQos& qos
-    ) override
-    {
-        return dds_.get_default_participant_qos(qos);
-    }
-
-    ::DDS::ReturnCode_t set_qos(::DDS::DomainParticipantFactoryQos qos) override
-    {
-        return dds_.set_qos(qos);
-    }
-
-    ::DDS::ReturnCode_t get_qos(::DDS::DomainParticipantFactoryQos& qos) override
-    {
-        return dds_.get_qos(qos);
-    }
-
-private:
-    ::DDS::DomainParticipantFactoryImpl dds_;
-    zzdds_DomainParticipantFactory handle_;
-};
-
-} // namespace detail
-
-namespace detail {
-
 // TopicSupport/DataWriterSupport/DataReaderSupport/PublisherSupport/
-// SubscriberSupport/DomainParticipantSupport exist for the same reason DomainParticipantFactorySupport above does: the
+// SubscriberSupport/DomainParticipantSupport exist because the
 // zidl-generated zzdds::TopicImpl/DataWriterImpl/DataReaderImpl/
 // DomainParticipantImpl (from zzdds_impl.hpp, generated from zzdds.idl
 // alone) only implement the *new* zzdds-specific methods
@@ -119,8 +24,9 @@ namespace detail {
 // inherited DDS::Topic/DataWriter/DataReader/DomainParticipant base methods
 // are left unimplemented (abstract) on those classes. Composing a
 // fully-implemented DDS::*Impl member and delegating every base method to
-// it, same shape as DomainParticipantFactorySupport, makes each one
-// concrete.
+// it makes each one concrete. (zidl now implements inherited cross-file
+// operations itself, so the generated classes are concrete too; these stay
+// until zidl can construct them from a DDS_* handle.)
 //
 // Unlike the factory (a bootstrap singleton constructed directly from
 // zzdds_create_factory(), never via another entity's factory method), these
@@ -768,69 +674,27 @@ private:
 
 } // namespace detail
 
-namespace detail {
-
-// Shared by both create_factory() overloads below.
-//
-// Allocates DomainParticipantFactorySupport via std::allocate_shared against
-// the process-wide std::pmr default resource — see zidl::setCppAllocator
-// (zidl_allocator_pmr.hpp) to register a ZidlAllocator-backed one. This is a
-// SEPARATE, independent knob from `handle`'s own allocator
-// (zzdds_create_factory_with_allocator): that one controls the zzdds/Zig-side
-// factory and everything IT creates (participants, topics, writers, readers,
-// history cache); this one controls the C++ wrapper OBJECTS
-// (DomainParticipantFactorySupport here, and every generated `_getOrCreate`)
-// sitting on top of the C-ABI. They can't be unified into one call even in
-// principle: `handle`'s allocator is scoped per-factory, while
-// std::pmr::set_default_resource is process-wide — silently having one call
-// imply the other would misrepresent which scope each actually has.
-//
-// allocate_shared requires the teardown call (zzdds_destroy_factory) to live
-// in DomainParticipantFactorySupport's own destructor rather than a separate
-// custom deleter — allocate_shared has no hook for a deleter distinct from
-// the allocator-driven one, unlike the raw new + shared_ptr(ptr, deleter)
-// construction this replaced. DomainParticipantFactorySupport's own
-// constructor can't throw partway through and leave `handle` stored nowhere
-// (every initializer is a trivial, noexcept, handle-storing constructor) --
-// but that's not the only way to fail here: std::allocate_shared's PMR
-// allocation itself (the control-block + object storage) can throw
-// std::bad_alloc *before* the constructor ever runs, e.g. under a bounded
-// pool allocator registered via zidl::setCppAllocator that's exhausted. In
-// that case DomainParticipantFactorySupport never exists, so its destructor
-// never runs, so nothing frees `handle` -- the guard below is what closes
-// that gap, not the constructor's own noexcept-ness.
-inline std::shared_ptr<DomainParticipantFactory> wrapFactoryHandle(zzdds_DomainParticipantFactory handle)
-{
-    if (handle == nullptr) return {};
-
-    ScopeGuard guard([handle] { zzdds_destroy_factory(handle); });
-    auto sp = std::allocate_shared<detail::DomainParticipantFactorySupport>(
-        std::pmr::polymorphic_allocator<detail::DomainParticipantFactorySupport>(
-            std::pmr::get_default_resource()),
-        handle
-    );
-    guard.dismiss();
-    return sp;
-}
-
-} // namespace detail
-
+/**
+ * Deprecated: use zzdds::DomainParticipantFactory::create(), which this
+ * calls, or ::DDS::DomainParticipantFactory::get_instance() for the
+ * process-wide factory. Dropping the last reference to the factory deletes
+ * every participant it still has, and everything in them.
+ */
+[[deprecated("use zzdds::DomainParticipantFactory::create()")]]
 inline std::shared_ptr<DomainParticipantFactory> create_factory()
 {
-    return detail::wrapFactoryHandle(zzdds_create_factory());
+    return DomainParticipantFactory::create();
 }
 
 /**
- * Same as create_factory(), but every allocation the factory and everything it
- * ever creates makes is routed through `allocator` instead of the default
- * libc malloc/free (see zzdds_create_factory_with_allocator's contract in
- * zzdds_c.h). `allocator` must outlive the returned factory and everything
- * created through it. Pass nullptr for the default (equivalent to
- * create_factory()).
+ * Deprecated: use zzdds::DomainParticipantFactory::create(allocator). Every
+ * allocation the factory and everything it creates makes goes through
+ * `allocator`, which must outlive them. nullptr is the default allocator.
  */
+[[deprecated("use zzdds::DomainParticipantFactory::create(allocator)")]]
 inline std::shared_ptr<DomainParticipantFactory> create_factory(const ZidlAllocator* allocator)
 {
-    return detail::wrapFactoryHandle(zzdds_create_factory_with_allocator(allocator));
+    return DomainParticipantFactory::create(allocator);
 }
 
 namespace detail {

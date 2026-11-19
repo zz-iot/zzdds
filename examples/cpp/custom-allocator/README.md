@@ -7,7 +7,7 @@ each other over real UDP DDS discovery and exchange samples, with every
 allocation routed through a caller-supplied fixed-size static-pool allocator
 (`src/static_pool_allocator.c`) instead of libc `malloc`/`free`/`operator
 new` — both at the C-ABI level (factory/entity bootstrap, via
-`zzdds_create_factory_with_allocator`) and at the C++ level (wrapper objects
+`zzdds_DomainParticipantFactory_create_with_allocator`) and at the C++ level (wrapper objects
 via `zidl::setCppAllocator`'s `std::pmr` routing, and `string`/`sequence`
 fields via `--cpp-pmr-containers`).
 

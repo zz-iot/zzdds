@@ -14,7 +14,7 @@ public class Publisher {
 
     public static void main(String[] args) throws Exception {
         Dcps.DDS.DomainParticipantFactory factory =
-            (Dcps.DDS.DomainParticipantFactory) io.zzdds.runtime.ZzddsRuntime.createFactory();
+            io.zzdds.ext.Zzdds.zzdds.DomainParticipantFactory.create();
         if (factory == null) {
             System.err.println("FAIL: createFactory() returned null");
             System.exit(1);

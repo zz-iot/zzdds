@@ -66,7 +66,7 @@ int main(void) {
 
     /* Resolve+install zzdds.toml as the process-wide config BEFORE creating
      * any factory, through the same static-pool allocator everything else in
-     * this process uses. Without this, zzdds_create_factory_with_allocator's
+     * this process uses. Without this, zzdds_DomainParticipantFactory_create_with_allocator's
      * own ambient lazy-default resolution (config/process.zig's
      * getForNewFactory) would still route this one-time bootstrap step
      * through libc malloc regardless of the allocator passed to it -- see
@@ -77,9 +77,9 @@ int main(void) {
         return 1;
     }
 
-    zzdds_DomainParticipantFactory factory = zzdds_create_factory_with_allocator(&static_pool_allocator);
+    zzdds_DomainParticipantFactory factory = zzdds_DomainParticipantFactory_create_with_allocator(&static_pool_allocator);
     if (factory == NULL) {
-        fprintf(stderr, "FAIL: zzdds_create_factory_with_allocator returned NULL\n");
+        fprintf(stderr, "FAIL: zzdds_DomainParticipantFactory_create_with_allocator returned NULL\n");
         return 1;
     }
     DDS_DomainParticipantFactory dds_factory = zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory);
@@ -200,7 +200,7 @@ int main(void) {
      * (notably on Windows CI) retains the last completed application phase. */
     printf("publisher: destroying factory...\n");
     fflush(stdout);
-    zzdds_destroy_factory(factory);
+    zzdds_DomainParticipantFactory_release(factory);
     printf("publisher: done\n");
     return 0;
 }

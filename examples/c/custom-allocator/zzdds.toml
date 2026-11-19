@@ -1,6 +1,6 @@
 # Process-wide zzdds configuration. Picked up automatically the first time
-# any factory is created in this process (zzdds_create_factory()/
-# zzdds_create_factory_with_allocator()), as long as the app never calls
+# any factory is created in this process (zzdds_DomainParticipantFactory_create()/
+# zzdds_DomainParticipantFactory_create_with_allocator()), as long as the app never calls
 # zzdds_process_configure() itself first -- see zzdds's
 # src/config/resolve.zig/process.zig. No code change needed in publisher.c/
 # subscriber.c to pick this up: CMake copies this file next to the built

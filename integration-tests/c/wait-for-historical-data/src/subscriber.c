@@ -154,7 +154,7 @@ static int reader_matched(DDS_DataReader dr) {
 int main(int argc, char **argv) {
     uint32_t domain_id = parse_domain(argc, argv);
 
-    zzdds_DomainParticipantFactory factory = zzdds_create_factory();
+    zzdds_DomainParticipantFactory factory = zzdds_DomainParticipantFactory_create();
     if (factory == NULL) {
         fprintf(stderr, "FAIL: createFactory() failed\n");
         return 1;
@@ -289,6 +289,6 @@ int main(int argc, char **argv) {
     DDS_Subscriber_delete_datareader(sub, dr);
 
     printf("Subscriber: observed historical batch then live batch correctly.\n");
-    zzdds_destroy_factory(factory);
+    zzdds_DomainParticipantFactory_release(factory);
     return 0;
 }

@@ -928,13 +928,15 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_asZzddsFactory(
 {
     (void)self_cls;
     static zzdds_java_class_cache type_check_cache = {0};
+    static zzdds_java_class_cache cache = {0};
     if (!zzdds_java_require_non_null(env, factory, "factory")) return NULL;
+    if (!zzdds_java_get_or_cache_class(env, &cache, "io/zzdds/ext/DomainParticipantFactoryImpl")) return NULL;
+    /* A factory from the generated Zzdds.zzdds.DomainParticipantFactory.create()
+     * is already the zzdds view. */
+    if ((*env)->IsInstanceOf(env, factory, cache.cls)) return factory;
     if (!zzdds_java_require_instance_of(env, factory, &type_check_cache, "io/zzdds/dcps/DomainParticipantFactoryImpl", "factory")) return NULL;
     DDS_DomainParticipantFactory f = (DDS_DomainParticipantFactory)zzdds_java_require_unboxed(env, factory, "factory");
     if (f == NULL) return NULL;
     zzdds_DomainParticipantFactory zf = DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(f);
-
-    static zzdds_java_class_cache cache = {0};
-    if (!zzdds_java_get_or_cache_class(env, &cache, "io/zzdds/ext/DomainParticipantFactoryImpl")) return NULL;
     return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)zf);
 }

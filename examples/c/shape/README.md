@@ -48,5 +48,5 @@ then one line per received sample.
 ## Config-file support (`--config <path>`)
 
 Same mechanism as `c/custom-allocator`: `zzdds_process_configure_from_file(path, NULL)`,
-called before `zzdds_create_factory()`. See the design doc above and
+called before `zzdds_DomainParticipantFactory_create()`. See the design doc above and
 `zzdds-examples/config/` for the example scenario files.

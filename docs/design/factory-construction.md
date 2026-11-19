@@ -1,0 +1,570 @@
+# DomainParticipantFactory construction
+
+## Status
+
+Proposal, with five decisions (below), all made: `get_instance` comes with the rest, in
+one zidl release (3), and `release` retires a reader's or writer's handle on its last
+loan's return (5). Follows WaitSet and GuardCondition onto zidl's
+`@standalone` construction ([#167](https://github.com/zz-iot/zzdds/pull/167), zidl
+`docs/design/standalone-construction.md`). A throwaway prototype of the constructor half is
+on the local branch `proto-factory-standalone` (557bb74); its findings are recorded here.
+
+## Today
+
+Every binding creates a factory with a hand-written function and destroys it with another.
+
+| Binding | Create | Destroy |
+| --- | --- | --- |
+| C | `zzdds_create_factory[_with_allocator]()`, checked with `zzdds_factory_is_nil` | `zzdds_destroy_factory` |
+| C++ | `zzdds::create_factory([allocator])`, a hand-written `DomainParticipantFactorySupport` | dropping the last `shared_ptr` |
+| Java | `ZzddsRuntime.createFactory()` (JNI), returning the DDS view; `ZzddsRuntime.asZzddsFactory` reaches zzdds's operations | never |
+| Zig | `zzdds.createFactory[WithAllocator]()` | `factory.deinit()` |
+
+Destroying a factory cannot fail: it deletes every participant it still has, and everything
+those contain. The examples rely on that: no C or Java example deletes its participants, and
+2 of 22 C++ examples do. Java never destroys a factory, so each Java process leaves its
+factory to process exit.
+
+There is no `get_instance()`. DDS defines `DomainParticipantFactory::get_instance()` as a
+static operation, which IDL cannot declare, so `dcps.idl` leaves it out.
+
+## What the specs say
+
+DDS 1.4 §2.2.2.2.2 describes the factory as "a pre-existing singleton object that can be
+accessed by means of the get_instance class operation". Its sole purpose is to create and
+destroy participants, and it has no factory of its own.
+
+- **`get_instance`** (§2.2.2.2.2.3) returns that singleton. It is idempotent: every call
+  returns the same instance, without side effects. It is a static operation "implemented
+  using the syntax of the native language", since IDL cannot express one, and §2.3 says each
+  language mapping should provide it. `TheParticipantFactory` is an alias for it.
+- **No `delete_instance`.** DDS 1.4 has no way to destroy, recreate or create a factory. A
+  process has exactly one, for its whole life. Factories of one's own, and deleting one, are
+  zzdds extensions.
+- **The factory has no `delete_contained_entities`.** Tearing down means deleting each
+  participant, which refuses with `PRECONDITION_NOT_MET` while it still contains entities.
+
+`delete_instance` comes from DDS-XTypes 1.3, which gives `DynamicTypeBuilderFactory`
+(§7.5.2.2.9, §7.5.2.2.11) and `DynamicDataFactory` (§7.5.2.10.3, §7.5.2.10.4) a static pair:
+
+- **`get_instance`** returns an object that "behaves like a singleton, although the caller
+  cannot assume pointer equality". Calling it after `delete_instance` is legal, and the
+  implementation recreates the singleton.
+- **`delete_instance`** reclaims everything previously returned from `get_instance`. "Any
+  references to these objects held by previous callers ... may become invalid at the
+  discretion of the implementation." It fails only with `RETCODE_ERROR`, for
+  implementation-specific reasons, and has no precondition.
+
+DDS-XTypes 1.4 beta 1 (ptc/26-02-06) keeps all of this word for word. Its IDL still writes
+these, and `DynamicTypeSupport`'s `create_type_support`/`delete_type_support`, as ordinary
+operations commented `/*static*/`: there is still no IDL syntax for a static operation.
+
+So nothing specifies `delete_instance` for the participant factory. Borrowing XTypes' pair
+is a zzdds choice, as is whether it refuses or tears down.
+
+## Proposal
+
+```idl
+// dcps.idl
+@shared_c_abi_box interface DomainParticipantFactory {
+    @static DomainParticipantFactory get_instance();   // needs zidl: see decision 4
+    @static ReturnCode_t delete_instance();
+    // ... create_participant and the rest, unchanged
+};
+
+// zzdds.idl
+@shared_c_abi_box @standalone interface DomainParticipantFactory : DDS::DomainParticipantFactory {
+    @constructor DomainParticipantFactory create();
+    @destructor  DDS::ReturnCode_t destroy();   // refuses while participants remain
+    @finalizer   void release();                // deletes them, as zzdds_destroy_factory does
+    // ... create_participant_ex and the config operations, unchanged
+};
+```
+
+Two ways to get a factory:
+
+- **The process-wide instance.** `get_instance()` creates it on first use, with the default
+  allocator and the process configuration, and returns it to every later caller. It is
+  borrowed: dropping a C++ or Java reference to it releases nothing. `delete_instance()`
+  deletes it, and refuses while it has participants. A later `get_instance()` creates a new
+  one. This is the spec's shape, and what portable DDS code expects.
+- **A factory of one's own.** `zzdds::DomainParticipantFactory::create([allocator])` makes a
+  new, independent factory, as `zzdds_create_factory` does today. The creator owns it. Its
+  strict `destroy()` refuses while participants remain. Its `release()`, which C++ and Java
+  run when the owner is dropped or closed, deletes them, as `zzdds_destroy_factory` does
+  today. Needed for a custom allocator, or for more than one factory in a process.
+
+The hand-written C functions, `zzdds::create_factory`, `ZzddsRuntime.createFactory` and
+`ZzddsRuntime.asZzddsFactory` become deprecated, and are removed once rmw_zzdds stops calling
+them, as the WaitSet functions were (#172).
+
+## Decisions
+
+1. **Drop the factory's exemption from generated construction.**
+   `generated-class-lifecycle-design.md` says the factory "stays a deliberate exception"
+   because it is where the allocator everything inherits comes from. That was written before
+   `@standalone` existed. A generated `create_with_allocator` serves an allocator's origin as
+   well as any hand-written one, so the reason no longer holds. *Recommendation: drop it, and
+   update that document.*
+2. **Strict `destroy`, cascading `release`.** zidl's model fits the factory well: the strict
+   destructor refuses with `PRECONDITION_NOT_MET` while participants remain, as every DDS
+   `delete_*` does, and the finalizer keeps today's cascade. Code that drops or closes its
+   factory behaves as today. *Recommendation: as proposed.* The prototype checks both
+   through the generated C functions.
+3. **`get_instance` beside factories of one's own.** *Decided: both, as proposed, with
+   `delete_instance` strict, in one effort, so zidl changes once.* Two choices within it:
+   - *Where `get_instance` lives.* On `DDS::DomainParticipantFactory`, where the spec puts
+     it, it returns the DDS view. Code that calls zzdds's own operations
+     (`create_participant_ex`, the participant config) then narrows: in C with the existing
+     generated `DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory`, in Java with
+     `ZzddsRuntime.asZzddsFactory`, which would then stay. On
+     `zzdds::DomainParticipantFactory` it would return the zzdds view, which C++ and Java can
+     use as either, but the spec's `DDS::DomainParticipantFactory::get_instance()` would not
+     exist. *Recommendation: the DDS interface.* Only four programs use zzdds's factory
+     operations, and those could create their own factory instead.
+   - *Whether `delete_instance` cascades.* XTypes' `delete_instance` tears down, invalidating
+     references, but DDS deletes refuse while anything is contained. Strict means a program
+     deletes its participants first, which decision 5 shortens to one call. Cascading is
+     shorter, but deleting the process-wide factory then silently deletes participants other
+     code in the process created. *Recommendation: strict, as DDS deletes are.*
+4. **zidl work first.** Detailed below: making zzdds's generated C++ classes concrete
+   ([zidl#83](https://github.com/zz-iot/zidl/pull/83)), and `@static`. Each released before
+   the zzdds work that needs it. *Decided: both now* (`@static` is
+   [zidl#84](https://github.com/zz-iot/zidl/pull/84)), *in one zidl release.*
+5. **A factory `delete_contained_entities`, and loans in the cascade.** A zzdds operation
+   with the participant's semantics: delete every participant and its contents, or return
+   `PRECONDITION_NOT_MET` and delete nothing while any loan is outstanding. A
+   `get_instance` program then tears down with
+   `factory->delete_contained_entities(); DomainParticipantFactory::delete_instance();`. It
+   also defines `release`: `delete_contained_entities`, then `destroy`. A finalizer cannot
+   fail, though, so `release` still needs an answer for outstanding loans, which today's
+   cascade handles badly in C++ and Java (see "Loans in the cascade" below). Either:
+   - *Force*, as today. The loan's entity stays allocated, but C++ and Java can never return
+     the loan, so it leaks until the process exits.
+   - *Finish later.* `release` deletes everything without a loan at once. An entity with
+     an outstanding loan keeps its handle usable until the last loan is returned, and is then
+     deleted along with whatever contains it. Its participant's threads and sockets keep
+     running until then.
+   - *Retire on the last loan.* `release` deletes everything at once, as today, but a
+     reader's or writer's handle is retired when its last loan is returned instead of when it
+     is deleted, so C++ and Java can return the loan. Every other operation on it returns
+     `ALREADY_DELETED`. Nothing keeps running; only memory stays until the loan comes back.
+
+   *Decided: add the operation, and retire on the last loan* (see "Loans in the cascade"
+   below). It needs no zidl change. Only the reader or writer, its protocol endpoint,
+   its parent subscriber or publisher and its topic stay allocated until the loan comes
+   back, as memory; the participant is torn down at once.
+
+## Loans in the cascade
+
+Checked with throwaway tests on the local branch `probe-cascade-loans` (0e51f46). They tear
+down the factory while a reader holds a read loan or a writer holds a write loan, using the
+in-process fixture and the inner factory's teardown, which `zzdds_destroy_factory` reaches
+through each participant.
+
+- **The cascade itself is safe.** Each loan holds a reference on its reader or writer and on
+  that endpoint's protocol reader or writer, so neither is freed while the loan is
+  outstanding. The loaned bytes stay valid.
+- **Returning the loan afterwards frees everything,** with no leak, in Zig and C: the C
+  export still reaches zzdds, because the handle's storage lives as long as the entity.
+- **C++ and Java cannot return it.** Deletion retires the entity's handle, which retires
+  every wrapper of it. A retired wrapper's `return_loan_raw` returns `ALREADY_DELETED`
+  without calling zzdds (generated C++: `if (_zidl_is_retired()) return 9;`; Java clears its
+  pointer). Read from the generated code; the probes ran in Zig only.
+- **A loan never returned leaks** its reader or writer, protocol endpoint and samples: 23
+  allocations for a read loan and 15 for a write loan in the probes.
+- **Not checked:** publishing a write loan (`publish_loan_raw`) after the cascade, which
+  would try to send through a participant whose transport is being torn down. The probes
+  only cancelled it.
+
+### Retiring on the last loan
+
+Checked by reading the code; not yet implemented.
+
+- **Identity stays safe.** zzdds retires a handle again when the entity is finally freed
+  (`CachedCAbiHandle.free`), before the handle's box is freed, so the C++ and Java identity
+  caches drop it before its address can be reused (the #124 hazard).
+- **The call that frees it is safe.** The generated C function copies the handle's pointer
+  and vtable before calling, so `return_loan_raw` freeing the reader during the call touches
+  nothing freed afterwards.
+- **zzdds must refuse everything else.** Many reader and writer operations check neither
+  deletion nor the quiesce guard: `enable`, `get_topicdescription`, `get_subscriber`,
+  `get_qos`, the status getters, and `get_matched_*`, which reaches the protocol endpoint. A
+  deleted reader or writer returns `ALREADY_DELETED` (NULL for an entity) from each, except
+  `return_loan_raw`. `publish_loan_raw` already consumes the loan on every path; on a deleted
+  writer it discards it and returns `ALREADY_DELETED`. This also defines C's behaviour in the
+  same case.
+- **Only when a loan is out.** `retireHandles` skips the entity's own handle only while it has
+  outstanding loans; its conditions are retired at deletion as now. An ordinary
+  `delete_datareader` or `delete_datawriter` refuses while a loan is out, so only a cascade
+  reaches this.
+- **`-Ddebug-allocator`.** `FactoryLeakCheck` checks when the last factory goes, and would
+  report a loan-pinned entity. It checks when the last such entity is freed instead.
+- **Allocator lifetime.** A factory's custom allocator must outlive its outstanding loans,
+  not just the factory.
+- **Still to verify:** the teardown that runs when a loan comes back after its participant
+  is gone (the protocol endpoint's own teardown included), under the DebugAllocator or
+  Valgrind. The probes used Zig's testing allocator, which does not detect use after free.
+
+## What zidl needs
+
+The prototype marked `zzdds::DomainParticipantFactory` `@standalone`, implemented its
+`destroy` and `release` slots, exported its constructor with `exportCAbiConstructors` (since
+zidl#82, `exportCAbi`), and built every binding.
+
+**Supported as is: the constructor, destructor and finalizer.** zidl accepted the IDL without
+change. zidl's documented limit is constructors on a shared-box family *root*.
+`zzdds::DomainParticipantFactory` is a *member* of `DDS::DomainParticipantFactory`'s
+family, the shape GuardCondition already has. The generated C functions are
+`zzdds_DomainParticipantFactory_create[_with_allocator]`, `_destroy` and `_release`. Java
+generates `Zzdds.zzdds.DomainParticipantFactory.create()` returning an `AutoCloseable`
+zzdds view, so Java no longer needs `asZzddsFactory` for a factory it creates. A C program
+against the prototype confirmed that `destroy` refuses while a participant remains and
+succeeds after it is deleted, and that `release` deletes a remaining participant.
+
+**Needs a fix: C++** (done in [zidl#83](https://github.com/zz-iot/zidl/pull/83)). The C++
+binding does not compile. `zzdds::DomainParticipantFactoryImpl`
+is abstract: the generated class implements zzdds's operations but not the ones it inherits
+from `DDS::DomainParticipantFactory`, which is declared in another IDL file. That is why
+`include/zzdds_cpp.hpp` has the hand-written `DomainParticipantFactorySupport`, which
+forwards them. Until now nothing generated ever constructed the class. `@standalone` makes
+zidl emit an identity cache and a `_getOrCreate` that constructs it, and that fails to
+compile even with `--cpp-impl-override` pointing `create()` at
+`DomainParticipantFactorySupport`. Two fixes:
+
+- *Smaller:* when an interface has `--cpp-impl-override`, construct only the override class.
+  WaitSet already works this way, but `WaitSetImpl` is concrete, so the problem never
+  showed. `DomainParticipantFactorySupport` then supplies `_getOrCreate`, as `WaitSetSupport`
+  does, and its destructor stops calling `zzdds_destroy_factory`, since the generated owner
+  releases the factory.
+- *Larger:* generate forwarding for operations inherited from an interface in another IDL
+  file, so the zzdds class is concrete and `DomainParticipantFactorySupport` goes away.
+
+The larger fix turned out small: the C++ backend already forwarded inherited operations
+through the generated upcasts within one IDL file, and only lacked an imported base's
+operations, which zidl gave the Java backend alone. zidl#83 gives them to C++ too and
+converts the handle in the inherited raw-loan operations. Built against it, all eight
+generated `zzdds::*Impl` classes are concrete and zzdds's C++ binding smoke tests pass.
+`DomainParticipantFactorySupport` then goes away with the factory's `@standalone`
+construction. The other `*Support` classes need one more zidl change: their `DDS::*`
+overrides build a zzdds object from a `DDS_*` handle, so the generated class needs a
+`_getOrCreate` from its base's handle. That can come later.
+
+**New: static operations.** `get_instance` and `delete_instance` have no receiver and confer
+no ownership, which no zidl annotation expresses. A `@constructor` won't do: its result is
+owned, so dropping the last C++ reference to the process-wide factory would delete it.
+Proposed: `@static`, sketched in the next section. zidl#80, which added `@standalone`, was
+about 2,300 lines including tests. `@static` reuses most of its C, Zig and JNI plumbing
+without the ownership parts.
+
+**Minor: the default allocator.** The generated `create_with_allocator(NULL)` resolves NULL to
+zidl's default allocator before calling zzdds. zzdds's `-Ddebug-allocator` currently routes
+factories created with NULL through its DebugAllocator and checks them for leaks
+(`FactoryLeakCheck`), and the generated path hides that NULL. `get_instance` is zzdds's own
+code and is unaffected. Either zzdds recognizes zidl's default allocator, or zidl passes the
+raw `ZidlAllocator` pointer to constructors that ask for it. *Recommendation: decide during
+implementation.*
+
+## Sketch: `@static`
+
+### IDL and rules
+
+```idl
+// dcps.idl
+@shared_c_abi_box interface DomainParticipantFactory {
+    @static DomainParticipantFactory get_instance();
+    @static ReturnCode_t delete_instance();
+    DomainParticipant create_participant(/* ... */);
+    // ...
+};
+```
+
+Another IDL compiler sees two ordinary operations, as the specs' own `/*static*/` comments
+do. The builder checks:
+
+| Rule | Why |
+| --- | --- |
+| No receiver, no vtable slot, not inherited | A static belongs to the interface, as a constructor does |
+| Parameters are `in`; not `oneway` | As for constructors |
+| Allowed on any interface, including a shared-box family root | Nothing is owned, so the root's limit for constructors does not apply |
+| Not also `@constructor`, `@destructor` or `@finalizer` | One role per operation |
+| No instance operation of the same name in the family | The C function names, and Java's static and instance methods, would collide |
+
+An interface a static returns is **borrowed**: boxed through the identity cache like any
+operation's result, never adopted as owned. Dropping or closing it releases nothing.
+
+### Per language
+
+**C.** Free functions, using the same convention as instance operations for a nil result:
+
+```c
+DDS_DomainParticipantFactory DDS_DomainParticipantFactory_get_instance(void);
+DDS_ReturnCode_t             DDS_DomainParticipantFactory_delete_instance(void);
+```
+
+**Zig provider.** Since [zidl#82](https://github.com/zz-iot/zidl/pull/82), a module's C
+functions are exported by one `exportCAbi(comptime Provider: type)` call, and the provider
+type gives each interface's constructors (`constructors(comptime I: type) type`) and nil
+(`nil(comptime I: type) I`). Statics follow the same pattern, as a separate declaration
+because a `@static` can be on an interface that is not `@standalone`:
+
+```zig
+const Provider = struct {
+    pub fn statics(comptime I: type) type {
+        if (I == DDS.DomainParticipantFactory) return struct {
+            pub fn get_instance() DDS.DomainParticipantFactory { ... }
+            pub fn delete_instance() DDS.ReturnCode_t { ... }
+        };
+        // ...
+    }
+    // constructors, nil
+};
+```
+
+A nil `get_instance` result crosses the C ABI as NULL, as every interface result does since
+zidl#82.
+
+The generated exports convert parameters and box a returned interface as instance operations
+do. A static takes no allocator: whatever it creates is the provider's business.
+
+**C++.** Static members on the abstract class, defined in the impl file beside the
+constructors. `get_instance` boxes through the family root's `_getOrCreate` and does not call
+`_zidlAdopt`:
+
+```cpp
+class DomainParticipantFactory {
+public:
+    static std::shared_ptr<DomainParticipantFactory> get_instance();
+    static ReturnCode_t delete_instance();
+    // ...
+};
+
+std::shared_ptr<DomainParticipantFactory> DomainParticipantFactory::get_instance() {
+    DDS_DomainParticipantFactory h = DDS_DomainParticipantFactory_get_instance();
+    if (!h) return nullptr;
+    return ::DDS::DomainParticipantFactoryImpl::_getOrCreate(h);   // borrowed
+}
+```
+
+`zzdds::DomainParticipantFactory::get_instance()` would also compile, since C++ looks static
+members up through base classes, and returns the DDS view.
+
+**Java.** Static interface methods, so `Zzdds.zzdds.DomainParticipantFactory.get_instance()`
+does not exist (Java does not inherit them), and a static JNI native on the impl class. The
+bridge boxes the handle and, unlike a constructor's, releases nothing if boxing fails:
+
+```java
+public interface DomainParticipantFactory {
+    static DomainParticipantFactory get_instance() { return DomainParticipantFactoryImpl.get_instance(); }
+    static int delete_instance() { return DomainParticipantFactoryImpl.delete_instance(); }
+    // ...
+}
+```
+
+```c
+JNIEXPORT jobject JNICALL Java_io_zzdds_dcps_DomainParticipantFactoryImpl_n_1get_1instance(JNIEnv *env, jclass cls) {
+    (void)cls;
+    void *h = (void *)DDS_DomainParticipantFactory_get_instance();
+    return h == NULL ? NULL : zidl_java_box_DDS_DomainParticipantFactory(env, h);
+}
+```
+
+### zzdds's implementation
+
+In `extensions.zig`, beside the constructors:
+
+- **The instance.** A module-level `?*FactoryOwner` guarded by a mutex. `get_instance` creates
+  it on first use with zzdds's default allocator. Like `zzdds_create_factory`, it resolves the
+  process configuration if nothing has yet, so `zzdds_process_configure` must come first.
+  Every call until `delete_instance` returns its DDS view. A concurrent first call creates
+  exactly one.
+- **`delete_instance`.** Under the mutex, it closes the instance only if it has no
+  participants, or returns `PRECONDITION_NOT_MET`, or `OK` when there is no instance. The
+  check and the close must be one step under the `FactoryOwner`'s own lock, so a
+  `create_participant` on another thread cannot slip in between them and be deleted. (The
+  prototype's strict `destroy` has this race, and the real one needs the same fix.)
+  Deleting retires the handle, so C++ and Java wrappers of the old instance return
+  `ALREADY_DELETED`, as XTypes allows ("references ... may become invalid"). The next
+  `get_instance` creates a new instance, with a new wrapper.
+- **Not anyone's to destroy.** The instance's `FactoryOwner` is marked. `destroy` on it,
+  reached through `DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory`, returns
+  `PRECONDITION_NOT_MET`, and `release` does nothing. A narrowed C++ or Java wrapper was
+  never adopted, so dropping or closing it calls neither.
+- **Independent of `create`.** Factories of one's own are separate `FactoryOwner`s. They
+  neither see nor affect the instance.
+- **`-Ddebug-allocator`.** `get_instance` is zzdds's code, so its instance goes through the
+  DebugAllocator and `FactoryLeakCheck` as `zzdds_create_factory()` does today. A program
+  checked for leaks must call `delete_instance`.
+
+### zidl tests
+
+Extend `test/integration/standalone/` with a static pair on a family root, driven from Zig, C++
+and Java:
+
+- Two `get_instance` calls return the same wrapper.
+- Dropping or closing it leaves the instance alive.
+- `delete_instance` refuses while the instance is in use, then retires every wrapper.
+- `get_instance` after that returns a new instance at a possibly reused address.
+- A static on an interface with an instance operation of the same name is rejected.
+
+Other hand-written statics, `ZzddsRuntime.configureFromFile` and `zzdds_process_configure`
+among them, could move to `@static` later.
+
+## Application code, before and after
+
+### C
+
+Before:
+
+```c
+zzdds_DomainParticipantFactory factory = zzdds_create_factory();
+if (zzdds_factory_is_nil(factory)) return 1;
+DDS_DomainParticipantFactory dds_factory =
+    zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory);
+DDS_DomainParticipant dp = DDS_DomainParticipantFactory_create_participant(dds_factory, domain, NULL, NULL, 0);
+/* ... */
+zzdds_destroy_factory(factory);   /* also deletes dp and everything in it */
+```
+
+After, with the process-wide instance:
+
+```c
+DDS_DomainParticipantFactory factory = DDS_DomainParticipantFactory_get_instance();
+if (factory == NULL) return 1;
+DDS_DomainParticipant dp = DDS_DomainParticipantFactory_create_participant(factory, domain, NULL, NULL, 0);
+/* ... */
+DDS_DomainParticipant_delete_contained_entities(dp);
+DDS_DomainParticipantFactory_delete_participant(factory, dp);
+DDS_DomainParticipantFactory_delete_instance();
+```
+
+After, with a factory of one's own:
+
+```c
+zzdds_DomainParticipantFactory factory = zzdds_DomainParticipantFactory_create_with_allocator(&pool);
+if (factory == NULL) return 1;
+/* ... as before, through zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory ... */
+zzdds_DomainParticipantFactory_release(factory);   /* deletes what remains, as before */
+```
+
+### C++
+
+Before:
+
+```cpp
+auto factory = zzdds::create_factory();
+if (!factory) return 1;
+auto dp = factory->create_participant(domain, ::DDS::DomainParticipantQos::default_value(), nullptr, 0);
+// ...
+// dropping the last reference to `factory` deletes dp and everything in it
+```
+
+After, with the process-wide instance:
+
+```cpp
+auto factory = ::DDS::DomainParticipantFactory::get_instance();
+if (!factory) return 1;
+auto dp = factory->create_participant(domain, ::DDS::DomainParticipantQos::default_value(), nullptr, 0);
+// ...
+dp->delete_contained_entities();
+factory->delete_participant(dp);
+::DDS::DomainParticipantFactory::delete_instance();
+```
+
+After, with a factory of one's own, the change is the name. Dropping it behaves as before,
+and `create_participant_ex` and the config operations are on it directly, as today:
+
+```cpp
+auto factory = zzdds::DomainParticipantFactory::create(&static_pool_allocator);
+```
+
+### Java
+
+Before:
+
+```java
+Dcps.DDS.DomainParticipantFactory factory =
+    (Dcps.DDS.DomainParticipantFactory) io.zzdds.runtime.ZzddsRuntime.createFactory();
+if (factory == null) System.exit(1);
+Dcps.DDS.DomainParticipant participant = factory.create_participant(DOMAIN_ID, null, null, 0);
+// ... the factory is never destroyed.
+// zzdds's own operations need a second view of the same factory:
+Zzdds.zzdds.DomainParticipantFactory zf =
+    (Zzdds.zzdds.DomainParticipantFactory) io.zzdds.runtime.ZzddsRuntime.asZzddsFactory(factory);
+```
+
+After, with the process-wide instance:
+
+```java
+Dcps.DDS.DomainParticipantFactory factory = Dcps.DDS.DomainParticipantFactory.get_instance();
+if (factory == null) System.exit(1);
+Dcps.DDS.DomainParticipant participant = factory.create_participant(DOMAIN_ID, null, null, 0);
+// ...
+participant.delete_contained_entities();
+factory.delete_participant(participant);
+Dcps.DDS.DomainParticipantFactory.delete_instance();
+```
+
+After, with a factory of one's own. It is both views at once, and closing it deletes what
+remains, which today never happens in Java:
+
+```java
+try (Zzdds.zzdds.DomainParticipantFactory factory = Zzdds.zzdds.DomainParticipantFactory.create()) {
+    factory.set_default_participant_config(cfg);
+    Dcps.DDS.DomainParticipant participant = factory.create_participant(DOMAIN_ID, null, null, 0);
+    // ...
+}
+```
+
+### Zig
+
+Zig programs use zzdds's own `zzdds.createFactory()` wrapper, not generated code, and are
+unaffected. A `zzdds.getInstance()` can follow if wanted.
+
+## Impact on examples and tests
+
+| | Examples creating a factory | Of those, deleting their participants | Tests and integration tests | Need their own factory |
+| --- | --- | --- | --- | --- |
+| C | 20 | 0 | 22 | 3 (custom-allocator) |
+| C++ | 22 | 2 | 22 | 2 (custom-allocator) |
+| Java | 19 | 0 | 20 | none |
+| Zig | | | | unaffected |
+
+Two ways to migrate them:
+
+- *Rename only:* every program creates its own factory with the generated functions and keeps
+  relying on the cascade. Mechanical, a line or two per file. Java gains `try`-with-resources
+  and stops leaking its factory.
+- *Move the examples to `get_instance`* and leave the tests on factories of their own. Each
+  example that relied on the cascade gains two or three lines of explicit teardown: about 20
+  C, 20 C++ and 19 Java examples. The examples then read like portable DDS code, which is what
+  people copy. The examples' DebugAllocator lane needs `delete_instance` to succeed, so their
+  teardown must be complete.
+
+*Recommendation: the second, in its own PR after the API lands.* The rename is the first
+PR's in-tree migration, as #167 did for WaitSet.
+
+The language spikes (Python, Rust, Go, Haskell) call `zzdds_create_factory` over FFI and
+need the rename. rmw_zzdds creates one factory per ROS context and destroys it at shutdown
+(`rmw_init.cpp`, and its C binding test). A factory of its own,
+`zzdds_DomainParticipantFactory_create` and `_release`, keeps that lifetime: another
+migration like rmw_zzdds#16.
+
+## Plan
+
+1. **zidl:** C++ implements operations inherited across IDL files
+   ([zidl#83](https://github.com/zz-iot/zidl/pull/83)), and `@static` operations
+   ([zidl#84](https://github.com/zz-iot/zidl/pull/84)). Then one release.
+2. **zzdds:** the IDL above, with the factory's `delete_contained_entities`; `destroy`,
+   `release`, the constructor and the statics in `extensions.zig`;
+   `DomainParticipantFactorySupport` removed, since the generated class is concrete; the
+   old functions deprecated; every in-tree caller renamed; this document's decisions
+   recorded in `generated-class-lifecycle-design.md`. Then a release.
+3. **zzdds:** retire on the last loan (decision 5), with its deleted-entity checks and
+   the leak check's change. It needs nothing from zidl, so it can come before or after
+   the factory work.
+4. **rmw_zzdds:** move to the generated functions.
+5. **zzdds:** remove the deprecated functions and bump the rmw_zzdds pin.
+6. **zzdds, optional:** move the examples to `get_instance`.
+
+ExecutionRuntime's construction and the factory's `set_default_runtime` build on the result.

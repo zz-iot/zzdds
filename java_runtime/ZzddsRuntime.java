@@ -21,8 +21,12 @@ public final class ZzddsRuntime {
 
     static { System.loadLibrary("zzdds_jni"); }
 
-    /** Bootstraps the process-wide DomainParticipantFactory (a DDS_DomainParticipantFactory,
-     * boxed the same way every other entity handle is). Returns null on failure. */
+    /** Deprecated: creates a new DomainParticipantFactory (a DDS_DomainParticipantFactory,
+     * boxed the same way every other entity handle is), which nothing ever deletes.
+     * Returns null on failure. Use {@code Zzdds.zzdds.DomainParticipantFactory.create()},
+     * which {@code close()} deletes, or the process-wide
+     * {@code Dcps.DDS.DomainParticipantFactory.get_instance()}. */
+    @Deprecated
     public static native Object createFactory();
 
     /**
@@ -184,7 +188,9 @@ public final class ZzddsRuntime {
      * {@code io.zzdds.dcps.DomainParticipantFactoryImpl} view (see its own doc
      * comment in {@code zzdds_java_runtime.c}) since nothing needed the
      * extension view at bootstrap time before this; call this narrowing
-     * function to get it. Returns an {@code io.zzdds.ext.DomainParticipantFactoryImpl}.
+     * function to get it. Returns an {@code io.zzdds.ext.DomainParticipantFactoryImpl};
+     * a factory that already is one (from
+     * {@code Zzdds.zzdds.DomainParticipantFactory.create()}) is returned as is.
      */
     public static native Object asZzddsFactory(Object factory);
 }

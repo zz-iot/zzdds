@@ -22,7 +22,7 @@ extern "C" {
  */
 
 /* Reset the pool to fully free. Call once, before any zzdds/zidl allocation
- * happens (i.e. before zzdds_create_factory_with_allocator). Not
+ * happens (i.e. before zzdds_DomainParticipantFactory_create_with_allocator). Not
  * thread-safe -- matches ZidlAllocator's own "configure once at startup"
  * contract used throughout zzdds/zidl. */
 void static_pool_allocator_reset(void);

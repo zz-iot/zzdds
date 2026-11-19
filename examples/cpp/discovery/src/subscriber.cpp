@@ -104,7 +104,7 @@ Options parse_args(int argc, char **argv) {
 int main(int argc, char **argv) {
     Options opts = parse_args(argc, argv);
 
-    auto factory = zzdds::create_factory();
+    auto factory = zzdds::DomainParticipantFactory::create();
     if (!factory) {
         std::fprintf(stderr, "FAIL: createFactory() failed\n");
         return 1;

@@ -189,14 +189,14 @@ always-been-stable Rust, ABI-identical to the C struct in `zidl_allocator.h`.
 `examples/allocator_spike.rs` reuses the existing `static_pool_allocator.c`
 (copied into this directory, not reimplemented in Rust — the question here
 is whether Rust can consume a `ZidlAllocator`, not whether it can author
-one), passes `&static_pool_allocator` to `zzdds_create_factory_with_allocator`
+one), passes `&static_pool_allocator` to `zzdds_DomainParticipantFactory_create_with_allocator`
 /`DDS_WaitSet_create_with_allocator`/`DDS_GuardCondition_create_with_allocator`,
 attaches the `GuardCondition` to the `WaitSet`, triggers it, and confirms a
 real `DDS_WaitSet_wait()` reports it fired — `cargo run --example
 allocator_spike` passes cleanly (`PASS`). **Proven, not just "ran without
 crashing"**: deliberately skipping `static_pool_allocator_reset()` (leaving
 the pool's free list genuinely empty) makes the very same run fail for real
-— `zzdds_create_factory_with_allocator: error.OutOfMemory`, factory returns
+— `zzdds_DomainParticipantFactory_create_with_allocator: error.OutOfMemory`, factory returns
 nil — confirming the allocator is actually being consulted by zzdds's core,
 not silently bypassed to a process default. Reverting the skip restores the
 clean pass. Since `WaitSet`/`GuardCondition` specifically exercise this

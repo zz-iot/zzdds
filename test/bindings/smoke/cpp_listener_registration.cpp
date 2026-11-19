@@ -329,7 +329,7 @@ int main() {
     const char *base = std::getenv("ZZDDS_TEST_DOMAIN_BASE");
     const ::DDS::DomainId_t domain = base ? std::atoi(base) : 101;
 
-    auto factory = zzdds::create_factory();
+    auto factory = zzdds::DomainParticipantFactory::create();
     CHECK(factory);
     auto dp_w = factory->create_participant(domain, ::DDS::DomainParticipantQos::default_value(), nullptr, 0);
     auto dp_r = factory->create_participant(domain, ::DDS::DomainParticipantQos::default_value(), nullptr, 0);

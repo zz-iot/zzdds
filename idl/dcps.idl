@@ -849,6 +849,18 @@ module DDS {
     // -----------------------------------------------------------------------
 
     @shared_c_abi_box interface DomainParticipantFactory {
+        // The process-wide factory (DDS 1.4 §2.2.2.2.2.3), created on first
+        // use and borrowed by every caller: dropping or closing it releases
+        // nothing. A static operation, which IDL cannot declare (zidl's
+        // @static; the specs write /*static*/).
+        @static DomainParticipantFactory get_instance();
+        // A zzdds extension, after DDS-XTypes' delete_instance: deletes the
+        // process-wide factory, or returns PRECONDITION_NOT_MET while it has
+        // participants. OK when there is none. The next get_instance()
+        // creates a new one; references to the old one return
+        // ALREADY_DELETED.
+        @static ReturnCode_t delete_instance();
+
         DomainParticipant create_participant(
             in DomainId_t                   domain_id,
             in DomainParticipantQos         qos,
@@ -869,6 +881,12 @@ module DDS {
             in DomainParticipantFactoryQos qos);
         ReturnCode_t get_qos(
             inout DomainParticipantFactoryQos qos);
+
+        // A zzdds extension, with DomainParticipant::delete_contained_entities'
+        // semantics: deletes every participant and everything in it, or
+        // returns PRECONDITION_NOT_MET and deletes nothing while any of them
+        // has an outstanding loan.
+        ReturnCode_t delete_contained_entities();
     };
 
     interface TypeSupport {

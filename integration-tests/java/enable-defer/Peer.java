@@ -30,9 +30,9 @@ public class Peer {
         int domainId = parseDomain(args);
 
         Dcps.DDS.DomainParticipantFactory factory =
-            (Dcps.DDS.DomainParticipantFactory) io.zzdds.runtime.ZzddsRuntime.createFactory();
+            io.zzdds.ext.Zzdds.zzdds.DomainParticipantFactory.create();
         if (factory == null) {
-            System.err.println("FAIL: createFactory() failed");
+            System.err.println("FAIL: DomainParticipantFactory.create() failed");
             System.exit(1);
         }
 

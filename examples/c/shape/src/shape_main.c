@@ -1073,9 +1073,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    zzdds_DomainParticipantFactory factory = zzdds_create_factory();
+    zzdds_DomainParticipantFactory factory = zzdds_DomainParticipantFactory_create();
     if (factory == NULL) {
-        fprintf(stderr, "FAIL: zzdds_create_factory returned NULL\n");
+        fprintf(stderr, "FAIL: zzdds_DomainParticipantFactory_create returned NULL\n");
         return 1;
     }
 
@@ -1089,7 +1089,7 @@ int main(int argc, char **argv) {
         zzdds_DomainParticipantConfig_default(&cfg);
         if (zzdds_DomainParticipantFactory_get_default_participant_config(factory, &cfg) != DDS_RETCODE_OK) {
             fprintf(stderr, "FAIL: get_default_participant_config() failed\n");
-            zzdds_destroy_factory(factory);
+            zzdds_DomainParticipantFactory_release(factory);
             return 1;
         }
         if (opts.datafrag_size > 0) cfg.rtps.fragment_size = opts.datafrag_size;
@@ -1102,26 +1102,26 @@ int main(int argc, char **argv) {
     }
     if (!dp) {
         fprintf(stderr, "failed to create participant on domain %u\n", opts.domain_id);
-        zzdds_destroy_factory(factory);
+        zzdds_DomainParticipantFactory_release(factory);
         return 1;
     }
 
     if (ShapeTypeTypeSupport_register(dp, "ShapeType") != DDS_RETCODE_OK) {
         fprintf(stderr, "registerTypeSupport() failed\n");
-        zzdds_destroy_factory(factory);
+        zzdds_DomainParticipantFactory_release(factory);
         return 1;
     }
 
     DDS_Topic topic = DDS_DomainParticipant_create_topic(dp, opts.topic_name, "ShapeType", NULL, NULL, 0);
     if (!topic) {
         fprintf(stderr, "failed to create topic '%s'\n", opts.topic_name);
-        zzdds_destroy_factory(factory);
+        zzdds_DomainParticipantFactory_release(factory);
         return 1;
     }
     printf("Create topic: %s\n", opts.topic_name);
 
     int rc = opts.publish ? run_publisher(dp, topic, &opts) : run_subscriber(dp, topic, &opts);
 
-    zzdds_destroy_factory(factory);
+    zzdds_DomainParticipantFactory_release(factory);
     return rc;
 }

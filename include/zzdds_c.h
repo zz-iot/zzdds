@@ -68,12 +68,20 @@ typedef bool (*zzdds_get_field_from_cdr_ctx_fn)(
     uint8_t *scratch, size_t scratch_len
 );
 
-/* NULL on failure. At the C ABI, NULL is every interface's nil: a function
+/* Deprecated factory functions: use the generated
+ * zzdds_DomainParticipantFactory_create, _create_with_allocator, _destroy
+ * (strict: PRECONDITION_NOT_MET while participants remain) and _release
+ * (deletes them too), or DDS_DomainParticipantFactory_get_instance for the
+ * process-wide factory. These stay until rmw_zzdds stops calling them.
+ *
+ * NULL on failure. At the C ABI, NULL is every interface's nil: a function
  * given NULL for an object or argument treats it as nil, and a function with
  * no object to return returns NULL. */
 zzdds_DomainParticipantFactory zzdds_create_factory(void);
 
 /**
+ * Deprecated: zzdds_DomainParticipantFactory_create_with_allocator.
+ *
  * Same as zzdds_create_factory, but every allocation the factory and
  * everything it ever creates makes (participants, topics, writers, readers,
  * history cache entries, ...) is routed through `allocator` instead of the
@@ -86,7 +94,10 @@ zzdds_DomainParticipantFactory zzdds_create_factory(void);
  */
 zzdds_DomainParticipantFactory zzdds_create_factory_with_allocator(const ZidlAllocator *allocator);
 
-/* Does nothing for NULL. */
+/* Deprecated: zzdds_DomainParticipantFactory_release. Deletes the factory and
+ * every participant it still has. Does nothing for NULL, or for the
+ * process-wide factory (only DDS_DomainParticipantFactory_delete_instance
+ * deletes that). */
 void zzdds_destroy_factory(zzdds_DomainParticipantFactory factory);
 
 /**

@@ -53,7 +53,7 @@ ghc -threaded -O0 -o ProbeStablePtr ProbeStablePtr.hs \
 **1. A real, live FFI ABI bug found by actually running this, not by
 reading the header — `bool`-returning C functions must be declared
 `CBool`, not `CInt`.** The very first run failed at the earliest possible
-point: `zzdds_create_factory()` returned a legitimate, non-null pointer
+point: `zzdds_DomainParticipantFactory_create()` returned a legitimate, non-null pointer
 (confirmed by printing it), but `zzdds_factory_is_nil()` — declared
 `Ptr () -> IO CInt` — read back `871572480` for what was actually a valid,
 non-nil handle. Root cause: the C function's real return type is `bool` (1

@@ -108,7 +108,7 @@ static Options parse_args(int argc, char **argv) {
 int main(int argc, char **argv) {
     Options opts = parse_args(argc, argv);
 
-    zzdds_DomainParticipantFactory factory = zzdds_create_factory();
+    zzdds_DomainParticipantFactory factory = zzdds_DomainParticipantFactory_create();
     if (factory == NULL) {
         fprintf(stderr, "FAIL: createFactory() failed\n");
         return 1;
@@ -269,6 +269,6 @@ int main(int argc, char **argv) {
     }
 
     printf("Publisher: done.\n");
-    zzdds_destroy_factory(factory);
+    zzdds_DomainParticipantFactory_release(factory);
     return 0;
 }

@@ -223,10 +223,17 @@ pub const DomainParticipantFactoryImpl = struct {
         .get_default_participant_qos = vtGetDefaultDpQos,
         .set_qos = vtSetQos,
         .get_qos = vtGetQos,
+        .delete_contained_entities = vtDeleteContained,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandleFactory,
         .get_allocator = vtGetAllocatorFactory,
     };
+
+    /// The application's factory (extensions.zig's `FactoryOwner`) holds one
+    /// of these per participant and implements the operation itself.
+    fn vtDeleteContained(_: *anyopaque) DDS.ReturnCode_t {
+        return DDS.RETCODE_UNSUPPORTED;
+    }
 
     fn vtGetCAbiHandleFactory(ctx: *anyopaque) *anyopaque {
         const self: *Self = @ptrCast(@alignCast(ctx));

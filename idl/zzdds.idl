@@ -182,7 +182,17 @@ module zzdds {
         unsigned long        instance_state;
     };
 
-    @shared_c_abi_box interface DomainParticipantFactory : DDS::DomainParticipantFactory {
+    // A factory of one's own, independent of the process-wide one
+    // (DDS::DomainParticipantFactory::get_instance): needed for a custom
+    // allocator or more than one factory in a process. Its creator owns it.
+    @shared_c_abi_box @standalone interface DomainParticipantFactory : DDS::DomainParticipantFactory {
+        @constructor DomainParticipantFactory create();
+        // Strict: PRECONDITION_NOT_MET while the factory has participants.
+        @destructor DDS::ReturnCode_t destroy();
+        // Deletes every participant and everything in it, then the factory.
+        // What dropping (C++) or closing (Java) the owner runs.
+        @finalizer void release();
+
         DDS::DomainParticipant create_participant_ex(
             in DDS::DomainId_t                   domain_id,
             in DDS::DomainParticipantQos         qos,

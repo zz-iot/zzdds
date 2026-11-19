@@ -11,7 +11,7 @@ Two sample types show two different allocation shapes:
 
 - **`SensorSample`** (`idl/sensor.idl`) is fully bounded (no unbounded
   `string`/`sequence` field) — it only needs the factory/entity-bootstrap
-  allocator (`zzdds_create_factory_with_allocator`).
+  allocator (`zzdds_DomainParticipantFactory_create_with_allocator`).
 - **`SensorLog`** (same IDL file) has an unbounded `string log_message` and
   `sequence<double> readings` — decoding those fields needs a real,
   size-at-decode-time heap allocation, which is why `zidl_cdr_set_allocator`

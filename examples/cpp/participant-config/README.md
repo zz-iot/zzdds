@@ -49,7 +49,7 @@ either binary takes.
 ## Notes
 
 - `factory->set_default_participant_config`/`get_default_participant_config`/
-  `create_participant_ex` are called directly on `zzdds::create_factory()`'s
+  `create_participant_ex` are called directly on `zzdds::DomainParticipantFactory::create()`'s
   return value — unlike `zzdds::DataWriter`/`Topic`, the factory interface
   already exposes zzdds's extension operations without any upcast, since
   `create_factory()` returns the extension view from the start.

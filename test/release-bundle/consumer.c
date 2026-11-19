@@ -15,12 +15,12 @@
 #include <stdio.h>
 
 int main(void) {
-    zzdds_DomainParticipantFactory factory = zzdds_create_factory();
+    zzdds_DomainParticipantFactory factory = zzdds_DomainParticipantFactory_create();
     if (factory == NULL) {
-        fprintf(stderr, "FAIL: zzdds_create_factory() returned the nil sentinel\n");
+        fprintf(stderr, "FAIL: zzdds_DomainParticipantFactory_create() returned the nil sentinel\n");
         return 1;
     }
-    zzdds_destroy_factory(factory);
+    zzdds_DomainParticipantFactory_release(factory);
     printf("ok: zzdds bundle consumer linked against libzzdds and ran\n");
     return 0;
 }
