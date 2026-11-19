@@ -898,6 +898,8 @@ pub fn build(b: *std.Build) void {
         c_alloc_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
         c_alloc_smoke_mod.addIncludePath(b.path("include"));
         c_alloc_smoke_mod.linkLibrary(zzdds_lib);
+        // zzdds.dll does not export zidl-cdr's C API (see the JNI glue below).
+        if (target.result.os.tag == .windows) linkCdr(c_alloc_smoke_mod, cdr_lib.?);
         const c_alloc_smoke = b.addExecutable(.{ .name = "zzdds_c_allocator_smoke", .root_module = c_alloc_smoke_mod });
         binding_smoke_step.dependOn(&b.addRunArtifact(c_alloc_smoke).step);
 
@@ -1452,6 +1454,12 @@ pub fn build(b: *std.Build) void {
             zzdds_jni_mod.addIncludePath(.{ .cwd_relative = jni_inc.base });
             zzdds_jni_mod.addIncludePath(.{ .cwd_relative = jni_inc.platform });
             zzdds_jni_mod.linkLibrary(zzdds_lib_for_reuse.?);
+            // The JNI glue allocates through zidl_cdr_alloc
+            // (--java-jni-cdr-allocator). libzzdds.so exports it, so the glue
+            // shares the library's process-wide allocator; zzdds.dll does not
+            // (C consumers link zidl_cdr.lib themselves), so on Windows the
+            // glue has its own copy, which allocates with malloc as before.
+            if (target.result.os.tag == .windows) linkCdr(zzdds_jni_mod, cdr_lib.?);
             const zzdds_jni_lib = b.addLibrary(.{
                 .name = "zzdds_jni",
                 .linkage = .dynamic,
