@@ -506,6 +506,7 @@ fn writerGetAllocator(ctx: *anyopaque) std.mem.Allocator {
 fn writerGetRtpsGuid(ctx: *anyopaque, out: *ZZDDS.RtpsGuid) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const writer: *DataWriterImpl = @ptrCast(@alignCast(ctx));
+    if (writer.deleted()) return DDS.RETCODE_ALREADY_DELETED;
     writeGuid(out, writer.guid);
     return DDS.RETCODE_OK;
 }
@@ -518,6 +519,7 @@ fn writerGetMatchedSubscriptionRtpsGuid(
     if (ctx == nil.NIL_PTR or subscription_handle == DDS.HANDLE_NIL)
         return DDS.RETCODE_BAD_PARAMETER;
     const writer: *DataWriterImpl = @ptrCast(@alignCast(ctx));
+    if (writer.deleted()) return DDS.RETCODE_ALREADY_DELETED;
     var guids: std.ArrayListUnmanaged(proto.Guid) = .empty;
     defer guids.deinit(writer.alloc);
     writer.proto_writer.listMatchedReaders(writer.alloc, &guids) catch
@@ -724,6 +726,7 @@ fn readerGetAllocator(ctx: *anyopaque) std.mem.Allocator {
 fn readerGetRtpsGuid(ctx: *anyopaque, out: *ZZDDS.RtpsGuid) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const reader: *DataReaderImpl = @ptrCast(@alignCast(ctx));
+    if (reader.deleted()) return DDS.RETCODE_ALREADY_DELETED;
     writeGuid(out, reader.guid);
     return DDS.RETCODE_OK;
 }
@@ -736,6 +739,7 @@ fn readerGetMatchedPublicationRtpsGuid(
     if (ctx == nil.NIL_PTR or publication_handle == DDS.HANDLE_NIL)
         return DDS.RETCODE_BAD_PARAMETER;
     const reader: *DataReaderImpl = @ptrCast(@alignCast(ctx));
+    if (reader.deleted()) return DDS.RETCODE_ALREADY_DELETED;
     const guid = reader.resolvePublicationGuid(publication_handle) catch |err| return switch (err) {
         error.HandleCollision => DDS.RETCODE_PRECONDITION_NOT_MET,
         error.NoData => DDS.RETCODE_NO_DATA,
@@ -1657,6 +1661,7 @@ fn readerSetListenerEx(
 fn readerTakeSerialized(ctx: *anyopaque, sample: *ZZDDS.SerializedSample) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));
+    if (impl.deleted()) return DDS.RETCODE_ALREADY_DELETED;
     // Peek the first sample non-destructively to pre-allocate the c_allocator
     // buffer before taking.  Without this, an OOM after takeRaw would permanently
     // discard the sample with no recovery path.
@@ -1715,6 +1720,7 @@ fn readerTakeNextInstanceSerialized(
 ) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));
+    if (impl.deleted()) return DDS.RETCODE_ALREADY_DELETED;
     // Peek (non-destructive) to pre-allocate the copy buffer before removing
     // the sample — same guarantee as readerTakeSerialized.
     const peeked = impl.readNextInstanceRaw(previous_instance) orelse return DDS.RETCODE_NO_DATA;

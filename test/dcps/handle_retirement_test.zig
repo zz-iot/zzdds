@@ -1,6 +1,8 @@
 const std = @import("std");
 const dds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
+const ZZDDS = dds.ZZDDS;
+const extensions = dds.c_abi.extensions;
 const rt = @import("zidl_bindings");
 const testing = std.testing;
 const alloc = testing.allocator;
@@ -262,6 +264,13 @@ test "a writer deleted with loans out keeps its handle until the last loan comes
     var another = DDS.OctetSeq{};
     try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, writer.vtable.loan_raw(writer.ptr, 4, &another));
 
+    // So is every operation of its zzdds view.
+    const zwriter: ZZDDS.DataWriter = .{ .ptr = writer.ptr, .vtable = &extensions.writer_vtable };
+    var guid: ZZDDS.RtpsGuid = undefined;
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, zwriter.vtable.get_rtps_guid(zwriter.ptr, &guid));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, zwriter.vtable.get_matched_subscription_rtps_guid(zwriter.ptr, 1, &guid));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, zwriter.vtable.set_listener_ex(zwriter.ptr, null, 0));
+
     // Publishing a loan on a deleted writer consumes it and sends nothing.
     var key_hash_bytes = @as([16]u8, @splat(0));
     const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
@@ -308,6 +317,16 @@ test "a reader deleted with a loan out keeps its handle until the loan comes bac
     var more_hashes = DDS.OctetSeq{};
     var more_infos = DDS.SampleInfoSeq{};
     try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, reader.vtable.take_raw(reader.ptr, &more, &more_hashes, &more_infos, DDS.HANDLE_NIL, dds.dcps.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+
+    // So is every operation of its zzdds view.
+    const zreader: ZZDDS.DataReader = .{ .ptr = reader.ptr, .vtable = &extensions.reader_vtable };
+    var guid: ZZDDS.RtpsGuid = undefined;
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, zreader.vtable.get_rtps_guid(zreader.ptr, &guid));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, zreader.vtable.get_matched_publication_rtps_guid(zreader.ptr, 1, &guid));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, zreader.vtable.set_listener_ex(zreader.ptr, null, 0));
+    var serialized: ZZDDS.SerializedSample = undefined;
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, zreader.vtable.take_serialized(zreader.ptr, &serialized));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, zreader.vtable.take_next_instance_serialized(zreader.ptr, DDS.HANDLE_NIL, &serialized));
 
     try testing.expectEqual(DDS.RETCODE_OK, reader.vtable.return_loan_raw(reader.ptr, &payloads, &hashes, &infos));
     try observed.expect_once();

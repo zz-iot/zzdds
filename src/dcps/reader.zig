@@ -3130,7 +3130,8 @@ pub const DataReaderImpl = struct {
     /// NOT_ENABLED precondition, mirroring participant.zig's identical helper.
     /// Deleted: only an outstanding loan keeps a deleted reader's handle
     /// usable (see `retireHandles`), and only so the loan can come back.
-    fn deleted(self: *Self) bool {
+    /// The zzdds extension view (src/c_abi/extensions.zig) checks it too.
+    pub fn deleted(self: *Self) bool {
         return self.quiesce.tearingDown();
     }
 
