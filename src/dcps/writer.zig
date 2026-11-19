@@ -206,6 +206,13 @@ pub const DataWriterImpl = struct {
     /// its checks are armed for. Set once, at creation.
     timers_changed: ?Hook = null,
 
+    /// What is read of `qos`'s changeable policies without `qos_mu`, by the
+    /// timer checks and unregistration: `set_qos` swaps those policies in
+    /// under it (`cacheChangeable`). The DEADLINE period in ns, 0 for none.
+    deadline_ns: std.atomic.Value(i64) = .init(0),
+    /// WRITER_DATA_LIFECYCLE's autodispose_unregistered_instances.
+    autodispose: std.atomic.Value(bool) = .init(true),
+
     /// Monotonic timestamp of the last successful write; used by DEADLINE/LIVELINESS checks.
     /// Initialized to creation time so the first deadline window starts at entity creation.
     last_write_ns: std.atomic.Value(i64),
@@ -306,6 +313,7 @@ pub const DataWriterImpl = struct {
         self.listener_ex_box = listener_box;
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);
+        self.cacheChangeable();
         // Wire up the StatusCondition.
         const sc = try waitset.StatusConditionImpl.init(
             alloc,
@@ -592,7 +600,7 @@ pub const DataWriterImpl = struct {
         source_timestamp: history_mod.RtpsTimestamp,
         key_hash: [16]u8,
     ) !void {
-        const kind: history_mod.ChangeKind = if (self.qos.writer_data_lifecycle.autodispose_unregistered_instances)
+        const kind: history_mod.ChangeKind = if (self.autodispose.load(.monotonic))
             .not_alive_disposed
         else
             .not_alive_unregistered;
@@ -955,9 +963,8 @@ pub const DataWriterImpl = struct {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
 
-        const dl = self.qos.deadline.period;
-        if (durationIsActive(dl)) {
-            const period_ns = @as(i64, dl.sec) * std.time.ns_per_s + @as(i64, dl.nanosec);
+        const period_ns = self.deadline_ns.load(.monotonic);
+        if (period_ns > 0) {
             const last = self.last_write_ns.load(.monotonic);
             if (now_ns - last >= period_ns) {
                 self.last_write_ns.store(now_ns, .monotonic);
@@ -980,8 +987,8 @@ pub const DataWriterImpl = struct {
     pub fn nextTimerDueFn(ctx: *anyopaque) ?i64 {
         const self: *Self = @ptrCast(@alignCast(ctx));
         var next: ?i64 = null;
-        const dl = self.qos.deadline.period;
-        if (durationIsActive(dl)) next = earlier(next, self.last_write_ns.load(.monotonic) + durationNs(dl));
+        const period_ns = self.deadline_ns.load(.monotonic);
+        if (period_ns > 0) next = earlier(next, self.last_write_ns.load(.monotonic) + period_ns);
         const ll = self.qos.liveliness.lease_duration;
         if (durationIsActive(ll)) next = earlier(next, self.liveliness_last_ns.load(.monotonic) + durationNs(ll));
         return next;
@@ -1162,14 +1169,24 @@ pub const DataWriterImpl = struct {
                 new_qos.deinit(self.alloc);
                 return DDS.RETCODE_ALREADY_DELETED;
             }
-            self.qos.deinit(self.alloc);
-            self.qos = new_qos;
+            // Only the changeable policies: the others are read without
+            // `qos_mu`.
+            qos_change.swapWriterChangeable(&self.qos, &new_qos);
+            new_qos.deinit(self.alloc);
+            self.cacheChangeable();
             // A shorter deadline may fall due sooner.
             if (self.timers_changed) |h| h.run(h.ctx);
         }
         // As for a reader: announced without `qos_mu`.
         if (parent) |p| if (self.enabled.load(.acquire)) p.announceDataWriter(self.instance_handle);
         return DDS.RETCODE_OK;
+    }
+
+    /// Copies into `deadline_ns` and `autodispose` what they cache of `qos`.
+    fn cacheChangeable(self: *Self) void {
+        const dl = self.qos.deadline.period;
+        self.deadline_ns.store(if (durationIsActive(dl)) durationNs(dl) else 0, .monotonic);
+        self.autodispose.store(self.qos.writer_data_lifecycle.autodispose_unregistered_instances, .monotonic);
     }
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.DataWriterQos) DDS.ReturnCode_t {
@@ -1401,7 +1418,7 @@ pub const DataWriterImpl = struct {
         return switch (kind) {
             .ALIVE_WRITE_KIND => .alive,
             .DISPOSE_WRITE_KIND => .not_alive_disposed,
-            .UNREGISTER_WRITE_KIND => if (self.qos.writer_data_lifecycle.autodispose_unregistered_instances)
+            .UNREGISTER_WRITE_KIND => if (self.autodispose.load(.monotonic))
                 .not_alive_disposed
             else
                 .not_alive_unregistered,

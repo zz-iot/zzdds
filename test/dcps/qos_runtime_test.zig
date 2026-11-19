@@ -922,6 +922,32 @@ test "time_based_filter: samples within minimum_separation are suppressed" {
     try testing.expectEqualSlices(u8, &PAYLOAD_A, samples[0]);
 }
 
+test "time_based_filter: set_qos changes the separation for samples received after" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(dw_qos, dr_qos);
+
+    dr_qos.time_based_filter.minimum_separation = .{ .sec = 1, .nanosec = 0 };
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dr.toDDSDataReader().vtable.set_qos(pair.dr, &dr_qos));
+    try writeRawAt(pair.dw, &PAYLOAD_A, 10);
+    try writeRawAt(pair.dw, &PAYLOAD_B, 10);
+    fx.settle();
+
+    const samples = try drainSamples(alloc, pair.dr);
+    defer {
+        for (samples) |s| alloc.free(s);
+        alloc.free(samples);
+    }
+    try testing.expectEqual(@as(usize, 1), samples.len);
+}
+
 test "time_based_filter: sample after minimum_separation is delivered" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
@@ -1282,6 +1308,30 @@ test "deadline: inactive (period = 0) — never fires" {
     fx.dp_impl.checkTimers();
     fx.settle();
     try testing.expectEqual(@as(i32, 0), count);
+}
+
+test "deadline: set_qos gives a writer and a reader a deadline, which then falls due" {
+    const alloc = testing.allocator;
+    var fx = try TimerFixture.init(alloc);
+    const mc = fx.mr.manualClock();
+    defer fx.deinit();
+
+    var dw_count: i32 = 0;
+    var dr_count: i32 = 0;
+    const dw = fx.makeWriter(.{}, dwListenerDeadline(&dw_count), DDS.OFFERED_DEADLINE_MISSED_STATUS);
+    const dr = fx.makeReader(.{}, drListenerDeadline(&dr_count), DDS.REQUESTED_DEADLINE_MISSED_STATUS);
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
+    try testing.expectEqual(DDS.RETCODE_OK, dw.toDDSDataWriter().vtable.set_qos(dw, &dw_qos));
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
+    try testing.expectEqual(DDS.RETCODE_OK, dr.toDDSDataReader().vtable.set_qos(dr, &dr_qos));
+
+    mc.advance(std.time.ns_per_s);
+    fx.dp_impl.checkTimers();
+    fx.settle();
+    try testing.expectEqual(@as(i32, 1), dw_count);
+    try testing.expectEqual(@as(i32, 1), dr_count);
 }
 
 // ── LIVELINESS tests ──────────────────────────────────────────────────────────

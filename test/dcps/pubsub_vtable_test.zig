@@ -699,6 +699,39 @@ test "Subscriber: set_default_datareader_qos with user_data — clone survives r
     got.deinit(alloc);
 }
 
+// The participant's timer checks read a reader's and a writer's DEADLINE on
+// a runtime worker, and the reader's TIME_BASED_FILTER as samples arrive,
+// while `set_qos` changes them; ThreadSanitizer checks they do so safely.
+test "set_qos changes a writer's and a reader's DEADLINE while their timer checks run" {
+    var h = try Harness.init(0xB6);
+    defer h.deinit();
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
+    const topic = dp.create_topic("DeadlineChurn", "T", .{}, null, 0);
+    const desc = @as(*dcps.TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.deadline.period = .{ .sec = 0, .nanosec = 1_000_000 };
+    const dw = pub_.create_datawriter(topic, dw_qos, null, 0);
+    try testing.expect(dw.ptr != nil.nil_datawriter.ptr);
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.deadline.period = .{ .sec = 0, .nanosec = 1_000_000 };
+    const dr = sub.create_datareader(desc, dr_qos, null, 0);
+    try testing.expect(dr.ptr != nil.nil_datareader.ptr);
+
+    for (0..200) |i| {
+        const ns: u32 = if (i % 2 == 0) 2_000_000 else 1_000_000;
+        dw_qos.deadline.period.nanosec = ns;
+        try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.set_qos(dw.ptr, &dw_qos));
+        dr_qos.deadline.period.nanosec = ns;
+        dr_qos.time_based_filter.minimum_separation.nanosec = ns / 2;
+        try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.set_qos(dr.ptr, &dr_qos));
+        zzdds.util.time.sleepNs(100_000);
+    }
+}
+
 test "QoS whose policies are inconsistent creates no Topic, DataWriter or DataReader, and set_qos and set_default_*_qos return INCONSISTENT_POLICY" {
     var h = try Harness.init(0xB5);
     defer h.deinit();
