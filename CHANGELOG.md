@@ -10,6 +10,15 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-19
 
+- A DataWriter allocates its instance handles (`docs/design/handle-registries.md`) instead
+  of hashing the key hash into one, so two keys can no longer share a handle.
+  `lookup_instance` returns HANDLE_NIL for a key the writer never registered or wrote, as
+  the spec says; it used to return a handle for any key. A handle names an instance of the
+  writer that issued it: `write`, `dispose` and `unregister_instance` given another
+  writer's handle return BAD_PARAMETER. The C ABI's `zzdds_register_instance_raw` and
+  `zzdds_lookup_instance_writer` use the writer they are given (they ignored it), and
+  raw_ops's `registerInstanceRaw`, `lookupInstanceWriter` and `lookupInstanceReader` take
+  the entity and a key hash (zidl v0.3.36's generated Zig code passes them).
 - A Zig application's keyed KEEP_LAST DataWriter keeps `depth` samples per instance, as
   a C or C++ one does. The generated Zig code's write path gave the writer's history no
   instance, so it kept `depth` samples across all instances, and a late-joining

@@ -629,15 +629,19 @@ test "bootstrap: topic_as_description of NULL is NULL" {
 
 // ── register_instance_raw ─────────────────────────────────────────────────────
 
-test "bootstrap: register_instance_raw returns deterministic handle" {
-    const h1 = bootstrap.zzdds_register_instance_raw(undefined, &KEY_HASH);
-    const h2 = bootstrap.zzdds_register_instance_raw(undefined, &KEY_HASH);
-    try testing.expectEqual(h1, h2);
-    // Distinct key should produce distinct handle.
+test "bootstrap: register_instance_raw gives a key one handle per writer" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    const h1 = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
+    try testing.expect(h1 != 0);
+    try testing.expectEqual(h1, bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH));
     var other_key: [16]u8 = undefined;
     @memset(&other_key, 0x01);
-    const h3 = bootstrap.zzdds_register_instance_raw(undefined, &other_key);
-    try testing.expect(h1 != h3);
+    const h3 = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &other_key);
+    try testing.expect(h3 != 0 and h1 != h3);
 }
 
 // ── write_raw_w_timestamp ─────────────────────────────────────────────────────
@@ -696,6 +700,8 @@ test "bootstrap: lookup_instance_writer matches register_instance_raw" {
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
+    // A key never registered or written has no handle.
+    try testing.expectEqual(@as(DDS.InstanceHandle_t, 0), bootstrap.zzdds_lookup_instance_writer(pair.dw_boxed, &KEY_HASH));
     const h1 = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
     const h2 = bootstrap.zzdds_lookup_instance_writer(pair.dw_boxed, &KEY_HASH);
     try testing.expectEqual(h1, h2);
@@ -712,7 +718,7 @@ test "bootstrap: get_key_value_reader returns CDR payload after receive" {
     writeRawViaOp(pair.dw, KEY_HASH, &PAYLOAD);
     fx.settle();
 
-    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
+    const ih = bootstrap.zzdds_lookup_instance_reader(pair.dr_boxed, &KEY_HASH);
     var buf: [64]u8 = undefined;
     var len: usize = 0;
     const rc = bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, &buf, buf.len, &len);
@@ -727,6 +733,7 @@ test "bootstrap: get_key_value_reader returns -1 for unknown handle" {
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
+    // The writer's handle for a key the reader has not received.
     var dummy_key: [16]u8 = undefined;
     @memset(&dummy_key, 0xFF);
     const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &dummy_key);
@@ -748,7 +755,6 @@ test "bootstrap: lookup_instance_reader returns handle for alive instance, 0 whe
     // Known alive instance returns its handle.
     const ih = bootstrap.zzdds_lookup_instance_reader(pair.dr_boxed, &KEY_HASH);
     try testing.expect(ih != 0);
-    try testing.expectEqual(bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH), ih);
 
     // Unknown key returns 0 (HANDLE_NIL).
     var unknown_key: [16]u8 = undefined;

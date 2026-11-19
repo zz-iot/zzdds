@@ -324,11 +324,24 @@ test "sample_info: source_timestamp is propagated from writer" {
     try testing.expectEqual(@as(i32, 1_700_000_000), s.info.source_timestamp.sec);
 }
 
-test "registerInstanceRaw: returns stable nonzero handle for keyless topic" {
-    const handle = DataWriterImpl.registerInstanceRaw(NIL_KEY);
-    try testing.expect(handle != 0);
-    // Deterministic: same key → same handle.
-    try testing.expectEqual(handle, DataWriterImpl.registerInstanceRaw(NIL_KEY));
+test "registerInstance: a writer's instance has one handle; lookupInstance finds only registered ones" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(.{}, .{});
+
+    try testing.expectEqual(DDS.HANDLE_NIL, pair.dw.lookupInstance(NIL_KEY));
+    const handle = pair.dw.registerInstance(NIL_KEY);
+    try testing.expect(handle != DDS.HANDLE_NIL);
+    try testing.expectEqual(handle, pair.dw.registerInstance(NIL_KEY));
+    try testing.expectEqual(handle, pair.dw.lookupInstance(NIL_KEY));
+
+    // A write registers the instance it writes.
+    var key = NIL_KEY;
+    key[15] = 1;
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), key, &PAYLOAD);
+    const written = pair.dw.lookupInstance(key);
+    try testing.expect(written != DDS.HANDLE_NIL and written != handle);
 }
 
 // ── Keyless topic, end-to-end via a real on_data_available listener ─────────
@@ -343,7 +356,7 @@ test "registerInstanceRaw: returns stable nonzero handle for keyless topic" {
 // instance per distinct payload. This test writes three different payloads
 // and confirms that invariant end-to-end through the same
 // listener-driven on_data_available path a real subscriber uses (matching
-// zzdds-examples' zig/hello_world), not just the isolated registerInstanceRaw
+// zzdds-examples' zig/hello_world), not just the isolated registerInstance
 // mechanism above.
 
 const KeylessListenerState = struct {

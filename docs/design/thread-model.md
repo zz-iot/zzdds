@@ -37,7 +37,7 @@ Concurrent `DataWriter.write()` (and the `dispose`/`unregister_instance`/`write_
 family) from multiple application threads on a *single* writer is safe: the RTPS
 `StatefulWriter`/`StatelessWriter` layer is internally locked, and `DataWriterImpl`'s own
 per-write state (`last_sn`, the `get_key_value` key registry) is guarded
-(`src/dcps/writer.zig` — atomic `last_sn`, `key_registry_mu`). Ordering between concurrent
+(`src/dcps/writer.zig` — atomic `last_sn`, `instances_mu`). Ordering between concurrent
 writes is not defined — they interleave — but no write is lost or corrupted.
 
 ## Single-Threaded Use

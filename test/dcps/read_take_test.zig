@@ -391,8 +391,8 @@ test "readNextInstanceRaw: iterates instances in handle order" {
     _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), KEY_B, &PAYLOAD);
     fx.settle();
 
-    const ih_a = DataWriterImpl.registerInstanceRaw(KEY_A);
-    const ih_b = DataWriterImpl.registerInstanceRaw(KEY_B);
+    const ih_a = pair.dr.lookupInstance(KEY_A).?;
+    const ih_b = pair.dr.lookupInstance(KEY_B).?;
     const first_ih = @min(ih_a, ih_b);
     const second_ih = @max(ih_a, ih_b);
 
@@ -420,7 +420,7 @@ test "getKeyValueRaw (reader): returns CDR payload for known alive instance" {
     _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), KEY_A, &PAYLOAD);
     fx.settle();
 
-    const ih = DataWriterImpl.registerInstanceRaw(KEY_A);
+    const ih = pair.dr.lookupInstance(KEY_A).?;
     const kv = pair.dr.getKeyValueRaw(ih);
     try testing.expect(kv != null);
     try testing.expectEqualSlices(u8, &PAYLOAD, kv.?);
@@ -438,7 +438,7 @@ test "getKeyValueRaw (reader): returns null for unknown handle" {
 
 // ── lookupInstance ────────────────────────────────────────────────────────────
 
-test "lookupInstance: true for alive instance, false for unknown" {
+test "lookupInstance: the handle of an alive instance, null for an unknown key" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
@@ -447,9 +447,12 @@ test "lookupInstance: true for alive instance, false for unknown" {
     _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), KEY_A, &PAYLOAD);
     fx.settle();
 
-    const ih_a = DataWriterImpl.registerInstanceRaw(KEY_A);
-    try testing.expect(pair.dr.lookupInstance(ih_a));
-    try testing.expect(!pair.dr.lookupInstance(0x7FFF_FFFE));
+    const ih_a = pair.dr.lookupInstance(KEY_A).?;
+    try testing.expect(ih_a != DDS.HANDLE_NIL);
+    const s = pair.dr.readNextInstanceRaw(0).?;
+    defer alloc.free(s.data);
+    try testing.expectEqual(ih_a, s.info.instance_handle);
+    try testing.expectEqual(@as(?DDS.InstanceHandle_t, null), pair.dr.lookupInstance(KEY_B));
 }
 
 // ── getKeyValueRaw (writer) ───────────────────────────────────────────────────
@@ -463,7 +466,7 @@ test "getKeyValueRaw (writer): returns CDR payload after alive write" {
     _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), KEY_A, &PAYLOAD);
     fx.settle();
 
-    const ih = DataWriterImpl.registerInstanceRaw(KEY_A);
+    const ih = pair.dw.lookupInstance(KEY_A);
     const kv = pair.dw.getKeyValueRaw(ih);
     try testing.expect(kv != null);
     try testing.expectEqualSlices(u8, &PAYLOAD, kv.?);
@@ -475,7 +478,8 @@ test "getKeyValueRaw (writer): returns null for handle with no prior write" {
     defer fx.deinit();
     const pair = fx.makeWriterReader(.{}, .{});
 
-    const ih = DataWriterImpl.registerInstanceRaw(KEY_A);
+    const ih = pair.dw.registerInstance(KEY_A);
+    try testing.expect(ih != DDS.HANDLE_NIL);
     try testing.expect(pair.dw.getKeyValueRaw(ih) == null);
 }
 
@@ -628,8 +632,8 @@ test "takeNextInstanceWithReadConditionRaw: instance selection skips a non-match
     _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), KEY_A, &PAYLOAD);
     _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), KEY_B, &PAYLOAD);
     fx.settle();
-    const ih_a = DataWriterImpl.registerInstanceRaw(KEY_A);
-    const ih_b = DataWriterImpl.registerInstanceRaw(KEY_B);
+    const ih_a = pair.dr.lookupInstance(KEY_A).?;
+    const ih_b = pair.dr.lookupInstance(KEY_B).?;
     const first_ih = @min(ih_a, ih_b);
     const excluded_ih = first_ih; // whichever instance sorts first gets excluded below.
 

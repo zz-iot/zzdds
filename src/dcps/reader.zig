@@ -2224,14 +2224,14 @@ pub const DataReaderImpl = struct {
         return null;
     }
 
-    /// Return true if `handle` refers to a known ALIVE instance.
-    pub fn lookupInstance(self: *Self, handle: DDS.InstanceHandle_t) bool {
+    /// lookup_instance: the handle of the key hash's instance if it is ALIVE,
+    /// or null.
+    pub fn lookupInstance(self: *Self, key_hash: [16]u8) ?DDS.InstanceHandle_t {
         self.mu.lock();
         defer self.mu.unlock();
-        if (self.seen_instances.get(handle)) |entry| {
-            return entry.instance_state == DDS.ALIVE_INSTANCE_STATE;
-        }
-        return false;
+        const handle = writer_mod.keyHashToHandle(key_hash);
+        const entry = self.seen_instances.get(handle) orelse return null;
+        return if (entry.instance_state == DDS.ALIVE_INSTANCE_STATE) handle else null;
     }
 
     /// Non-destructively read samples matching the given state masks.
