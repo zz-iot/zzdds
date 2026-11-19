@@ -1,8 +1,8 @@
 # Developer Notes
 
-## Zig 0.17.0 API Changes
+## Zig 0.17.1 API Changes
 
-This codebase targets Zig 0.17.0. The following stdlib APIs changed from earlier releases
+This codebase targets Zig 0.17.1. The following stdlib APIs changed from earlier releases
 and are handled throughout the source:
 
 | Old API | Replacement used here |

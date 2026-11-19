@@ -22,7 +22,7 @@ code; this is not a generic IDL value editor or a resource/profile builder.
 
 ## Build and run
 
-From the zzdds repository root, using Zig 0.17.0 and the pinned zidl
+From the zzdds repository root, using Zig 0.17.1 and the pinned zidl
 release (the shell commands below show Linux artifact names; the smoke
 runner selects native filenames on Linux/macOS/Windows):
 
