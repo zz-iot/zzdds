@@ -1078,8 +1078,8 @@ test "changeKindFromWriteKind: UNREGISTER_WRITE_KIND maps through autodispose_un
 }
 
 test "write_raw: an explicit instance_handle that doesn't match the key hash is rejected" {
-    // Coverage gap #3 (src/dcps/writer.zig L1044): the
-    // `handle != HANDLE_NIL and handle != registerInstanceRaw(kh)`
+    // Coverage gap #3 (vtWriteRaw): the
+    // `handle != HANDLE_NIL and !handleNamesKey(handle, kh)`
     // mismatch-rejection branch was untested -- every existing write_raw
     // test passed HANDLE_NIL (which always skips this check).
     var fx = try SingleFixture.init(alloc);
@@ -1092,15 +1092,20 @@ test "write_raw: an explicit instance_handle that doesn't match the key hash is 
     var payload_buf = [_]u8{0x02};
     var payload_seq = DDS.OctetSeq{ ._buffer = &payload_buf, ._length = payload_buf.len, ._maximum = payload_buf.len, ._release = false };
     const ts = DDS.Time_t{ .sec = DDS.TIME_INVALID_SEC, .nanosec = DDS.TIME_INVALID_NSEC };
-    const real_handle = DataWriterImpl.registerInstanceRaw(key_hash_bytes);
-    const wrong_handle = real_handle + 1;
-    const rc = dw.vtable.write_raw(dw.ptr, &key_hash_seq, wrong_handle, &payload_seq, .ALIVE_WRITE_KIND, &ts);
-    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, rc);
+    const impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+    const real_handle = impl.registerInstance(key_hash_bytes);
+    // Another instance's handle, and one never issued.
+    const other_handle = impl.registerInstance(@as([16]u8, @splat(9)));
+    for ([_]DDS.InstanceHandle_t{ other_handle, real_handle + 1 }) |wrong_handle| {
+        const rc = dw.vtable.write_raw(dw.ptr, &key_hash_seq, wrong_handle, &payload_seq, .ALIVE_WRITE_KIND, &ts);
+        try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, rc);
+    }
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.write_raw(dw.ptr, &key_hash_seq, real_handle, &payload_seq, .ALIVE_WRITE_KIND, &ts));
 }
 
 test "publish_loan_raw: an explicit instance_handle that doesn't match the key hash is rejected" {
     // Coverage gap #3, publish_loan_raw's own copy of the same check
-    // (src/dcps/writer.zig L1124).
+    // (vtPublishLoanRaw).
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
     const dw = fx.makeWriter(.{}, null, 0);
@@ -1111,8 +1116,8 @@ test "publish_loan_raw: an explicit instance_handle that doesn't match the key h
 
     var key_hash_bytes = @as([16]u8, @splat(7));
     const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
-    const real_handle = DataWriterImpl.registerInstanceRaw(key_hash_bytes);
-    const wrong_handle = real_handle + 1;
+    const impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+    const wrong_handle = impl.registerInstance(key_hash_bytes) + 1;
     const rc = dw.vtable.publish_loan_raw(dw.ptr, &cdr_payload, &key_hash, wrong_handle, .ALIVE_WRITE_KIND);
     try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, rc);
 
@@ -1124,12 +1129,12 @@ test "publish_loan_raw: an explicit instance_handle that doesn't match the key h
 
 // ── Regression: concurrent write() on one DataWriter ──────────────────────────
 
-test "concurrent write_raw on one DataWriter keeps key_registry and last_sn consistent" {
+test "concurrent write_raw on one DataWriter keeps its instances and last_sn consistent" {
     // Regression for the stress `instance` scenario finding: DataWriterImpl.writeRaw
-    // mutated `key_registry` (a HashMapUnmanaged) and `last_sn` with no lock, so
+    // mutated its key registry (a HashMapUnmanaged) and `last_sn` with no lock, so
     // concurrent write() on one DataWriter -- spec-legal -- raced on the map's
     // grow/insert (TSan) and could abort on its SafetyLock. Now guarded by
-    // `key_registry_mu` + an atomic `last_sn` (the RTPS layer under `proto_writer`
+    // `instances_mu` + an atomic `last_sn` (the RTPS layer under `proto_writer`
     // was already internally locked). Consistency check here; the data-race half
     // is caught by the `-Dsanitize-thread` lane running this same file.
     const N_THREADS = 6;
@@ -1170,7 +1175,7 @@ test "concurrent write_raw on one DataWriter keeps key_registry and last_sn cons
         fn run(c: @This()) void {
             while (!c.stop.load(.acquire)) {
                 const kh = std.mem.zeroes([16]u8);
-                _ = c.impl.getKeyValueRaw(DataWriterImpl.registerInstanceRaw(kh));
+                _ = c.impl.getKeyValueRaw(c.impl.lookupInstance(kh));
                 std.Thread.yield() catch {};
             }
         }
@@ -1194,7 +1199,7 @@ test "concurrent write_raw on one DataWriter keeps key_registry and last_sn cons
             var kh = std.mem.zeroes([16]u8);
             std.mem.writeInt(u32, kh[0..4], tid, .little);
             std.mem.writeInt(u32, kh[4..8], i, .little);
-            if (impl.getKeyValueRaw(DataWriterImpl.registerInstanceRaw(kh)) != null) found += 1;
+            if (impl.getKeyValueRaw(impl.lookupInstance(kh)) != null) found += 1;
         }
     }
     try testing.expectEqual(@as(usize, N_THREADS * PER_THREAD), found);

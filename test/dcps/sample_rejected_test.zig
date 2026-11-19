@@ -135,7 +135,7 @@ const Fixture = struct {
 };
 
 fn write(dw: *DataWriterImpl, key: [16]u8) !void {
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, key, &PAYLOAD);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), key, &PAYLOAD);
 }
 
 // ── Listener helpers (C callback struct form) ─────────────────────────────────

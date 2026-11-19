@@ -380,6 +380,24 @@ addition to or removal from the known set until the callbacks reporting it retur
 DCPS and SEDP see discoveries and losses in order. Probe callbacks are fired after
 releasing `writer.mu`.
 
+**Instance and entity handles are allocated, not hashed (2026-11-18).**
+Folding a 16-byte key hash or GUID into a 31-bit handle (`keyHashToHandle`,
+`guidToHandle`, `topicToHandle`) lets distinct instances or entities share a handle, and
+per-instance QoS then treats two instances as one. Hashing was never a decision; it dates
+from the initial commit. Handles come instead from registries: a key-to-slot hash map
+(`std.AutoHashMap`, default hashing) plus a dense slot array, owning both directions. A
+handle is `(generation << 22) | (slot + 1)`: positive, never `HANDLE_NIL`, at most
+4,194,303 live entries, and a stale handle is detected until its slot has been reused 512
+times (slots are reused first in, first out). Each DataReader and DataWriter has an
+instance registry, as the spec scopes instance handles to the entity; each participant
+has one registry for every entity it names, local or discovered, which built-in readers
+use too, so the built-in topics, `get_matched_*`, `ignore_*` and
+`SampleInfo.publication_handle` agree. A registry is guarded by the lock of the tables it
+replaces and bounded by RESOURCE_LIMITS `max_instances` where that applies. `ArrayHashMap`
+was rejected: its index cannot serve as a handle once entries are removed, and it was
+slower from 100,000 entries. Study, measurements and order of work:
+[`design/handle-registries.md`](design/handle-registries.md).
+
 ---
 
 ## Logging and Tracing

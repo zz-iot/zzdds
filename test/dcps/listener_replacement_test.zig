@@ -87,7 +87,7 @@ const Fixture = struct {
     /// Writes one sample and delivers it (a no-op settle on the default
     /// build, which delivers inside the write).
     fn write(self: *Fixture, dw: *DataWriterImpl) void {
-        _ = dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD) catch {};
+        _ = dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &PAYLOAD) catch {};
         self.mr.settle();
     }
 };

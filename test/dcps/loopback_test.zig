@@ -130,7 +130,7 @@ fn runLoopback(
     // trimming -- are durably settled before the reader can possibly match"
     // an actual invariant instead of a hopeful one.
     for (payloads, key_hashes) |p, kh| {
-        _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), kh, kh, p);
+        _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), kh, p);
     }
 
     // ── Reader participant ────────────────────────────────────────────────────
@@ -421,7 +421,6 @@ test "loopback: incompatible QoS — best_effort writer vs reliable reader" {
     _ = try dw_impl.writeRaw(
         .alive,
         RtpsTimestamp.now(),
-        history_mod.INSTANCE_HANDLE_NIL,
         std.mem.zeroes([16]u8),
         &PAYLOAD_1,
     );
@@ -508,7 +507,7 @@ test "loopback: a single participant's own writer and reader on the same topic m
     try std.testing.expect(dr_impl.matchedWriterCount() > 0);
 
     const p: []const u8 = &PAYLOAD_1;
-    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), ZERO_KEY, ZERO_KEY, p);
+    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), ZERO_KEY, p);
 
     const received = try collectSamples(alloc, dr_impl, 1, 20 * std.time.ns_per_s);
     defer {

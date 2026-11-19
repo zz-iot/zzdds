@@ -203,7 +203,6 @@ fn writeRaw(dw: *DataWriterImpl, payload: []const u8) !void {
     _ = try dw.writeRaw(
         .alive,
         RtpsTimestamp.now(),
-        history_mod.INSTANCE_HANDLE_NIL,
         std.mem.zeroes([16]u8),
         payload,
     );

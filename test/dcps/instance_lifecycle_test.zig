@@ -150,7 +150,7 @@ const Fixture = struct {
 };
 
 fn writeAlive(dw: *DataWriterImpl) !void {
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &PAYLOAD);
 }
 
 fn takeOne(dr: *DataReaderImpl) !zzdds.dcps.TakenSample {
@@ -219,7 +219,7 @@ test "sample_info: dispose delivers NOT_ALIVE_DISPOSED, valid_data=false" {
     defer alloc.free(alive.data);
 
     // Dispose the instance.
-    try pair.dw.disposeRaw(RtpsTimestamp.now(), NIL_IH, NIL_KEY);
+    try pair.dw.disposeRaw(RtpsTimestamp.now(), NIL_KEY);
     fx.settle();
 
     const disposed = try takeOne(pair.dr);
@@ -242,7 +242,7 @@ test "sample_info: alive after dispose gets NEW_VIEW (resurrection)" {
     fx.settle();
     const s1 = try takeOne(pair.dr);
     defer alloc.free(s1.data);
-    try pair.dw.disposeRaw(RtpsTimestamp.now(), NIL_IH, NIL_KEY);
+    try pair.dw.disposeRaw(RtpsTimestamp.now(), NIL_KEY);
     fx.settle();
     const disposed = try takeOne(pair.dr);
     defer alloc.free(disposed.data);
@@ -273,7 +273,7 @@ test "sample_info: unregister (autodispose=false) delivers NOT_ALIVE_NO_WRITERS"
     const alive = try takeOne(pair.dr);
     defer alloc.free(alive.data);
 
-    try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_IH, NIL_KEY);
+    try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_KEY);
     fx.settle();
 
     const unreg = try takeOne(pair.dr);
@@ -298,7 +298,7 @@ test "sample_info: unregister (autodispose=true) delivers NOT_ALIVE_DISPOSED" {
     const alive = try takeOne(pair.dr);
     defer alloc.free(alive.data);
 
-    try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_IH, NIL_KEY);
+    try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_KEY);
     fx.settle();
 
     const unreg = try takeOne(pair.dr);
@@ -315,7 +315,7 @@ test "sample_info: source_timestamp is propagated from writer" {
 
     const pair = fx.makeWriterReader(.{}, .{});
     const ts = RtpsTimestamp{ .seconds = 1_700_000_000, .fraction = 0 };
-    _ = try pair.dw.writeRaw(.alive, ts, NIL_IH, NIL_KEY, &PAYLOAD);
+    _ = try pair.dw.writeRaw(.alive, ts, NIL_KEY, &PAYLOAD);
     fx.settle();
 
     const s = try takeOne(pair.dr);
@@ -324,11 +324,24 @@ test "sample_info: source_timestamp is propagated from writer" {
     try testing.expectEqual(@as(i32, 1_700_000_000), s.info.source_timestamp.sec);
 }
 
-test "registerInstanceRaw: returns stable nonzero handle for keyless topic" {
-    const handle = DataWriterImpl.registerInstanceRaw(NIL_KEY);
-    try testing.expect(handle != 0);
-    // Deterministic: same key → same handle.
-    try testing.expectEqual(handle, DataWriterImpl.registerInstanceRaw(NIL_KEY));
+test "registerInstance: a writer's instance has one handle; lookupInstance finds only registered ones" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(.{}, .{});
+
+    try testing.expectEqual(DDS.HANDLE_NIL, pair.dw.lookupInstance(NIL_KEY));
+    const handle = pair.dw.registerInstance(NIL_KEY);
+    try testing.expect(handle != DDS.HANDLE_NIL);
+    try testing.expectEqual(handle, pair.dw.registerInstance(NIL_KEY));
+    try testing.expectEqual(handle, pair.dw.lookupInstance(NIL_KEY));
+
+    // A write registers the instance it writes.
+    var key = NIL_KEY;
+    key[15] = 1;
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), key, &PAYLOAD);
+    const written = pair.dw.lookupInstance(key);
+    try testing.expect(written != DDS.HANDLE_NIL and written != handle);
 }
 
 // ── Keyless topic, end-to-end via a real on_data_available listener ─────────
@@ -343,7 +356,7 @@ test "registerInstanceRaw: returns stable nonzero handle for keyless topic" {
 // instance per distinct payload. This test writes three different payloads
 // and confirms that invariant end-to-end through the same
 // listener-driven on_data_available path a real subscriber uses (matching
-// zzdds-examples' zig/hello_world), not just the isolated registerInstanceRaw
+// zzdds-examples' zig/hello_world), not just the isolated registerInstance
 // mechanism above.
 
 const KeylessListenerState = struct {
@@ -400,9 +413,9 @@ test "keyless topic: varying-content alive samples are one instance, delivered i
     payload2[4] = 0x20;
     var payload3 = PAYLOAD;
     payload3[4] = 0x30;
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &payload1);
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &payload2);
-    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &payload3);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &payload1);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &payload2);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_KEY, &payload3);
     fx.settle();
 
     // Delivered in write order, via the listener, not by polling.

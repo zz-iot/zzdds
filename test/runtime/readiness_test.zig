@@ -682,7 +682,7 @@ const NetPair = struct {
 
     fn write(self: *NetPair, i: usize) !void {
         const payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, @truncate(i) };
-        _ = try self.dw.writeRaw(.alive, RtpsTimestamp.now(), history.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &payload);
+        _ = try self.dw.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &payload);
     }
 
     /// Sample `i` padded to `len` bytes.
@@ -691,7 +691,7 @@ const NetPair = struct {
         defer alloc.free(payload);
         @memset(payload, @truncate(i));
         payload[0..5].* = .{ 0x00, 0x01, 0x00, 0x00, @truncate(i) };
-        _ = try self.dw.writeRaw(.alive, RtpsTimestamp.now(), history.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), payload);
+        _ = try self.dw.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), payload);
     }
 
     /// The participants' TCP transports, when their user data uses TCP.

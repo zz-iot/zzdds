@@ -133,7 +133,6 @@ const Harness = struct {
             .coherent_committed_ready = false,
             .mu = .{},
             .subscriber_presentation = self.sub.qos.presentation,
-            .seen_instances = .empty,
         };
         try self.sub.readers.append(self.alloc, dr);
         return dr;

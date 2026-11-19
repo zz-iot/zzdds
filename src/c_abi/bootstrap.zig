@@ -71,14 +71,21 @@ pub export fn zzdds_topic_as_description(topic: ?*anyopaque) callconv(.c) ?*anyo
 
 // ── Instance-handle / key-hash lookup helpers ────────────────────────────────
 
-/// Return the DDS instance handle for a key hash without writing.
-/// Always succeeds (deterministic hash mapping).
+/// register_instance: the handle of the key hash's instance on `writer`,
+/// registering it if it is not; 0 (HANDLE_NIL) if it cannot be.
 pub export fn zzdds_register_instance_raw(
     writer: *anyopaque,
     key_hash: *const [16]u8,
 ) callconv(.c) DDS.InstanceHandle_t {
-    _ = writer;
-    return DataWriterImpl.registerInstanceRaw(key_hash.*);
+    const impl = writerImpl(writer) orelse return DDS.HANDLE_NIL;
+    return impl.registerInstance(key_hash.*);
+}
+
+fn writerImpl(writer: *anyopaque) ?*DataWriterImpl {
+    if (isNullHandle(writer)) return null;
+    const w = zidl_bindings.unboxAsView(DDS.DataWriter, writer);
+    if (nil.isNil(w)) return null;
+    return @ptrCast(@alignCast(w.ptr));
 }
 
 /// Copy the stored CDR payload for `handle` into `buf[0..buf_size]`.
@@ -102,13 +109,14 @@ pub export fn zzdds_get_key_value_writer(
     return 0;
 }
 
-/// Look up the instance handle for a key hash (always deterministic).
+/// lookup_instance: the handle of the key hash's instance on `writer`, or 0
+/// (HANDLE_NIL) if it was never registered or written.
 pub export fn zzdds_lookup_instance_writer(
     writer: *anyopaque,
     key_hash: *const [16]u8,
 ) callconv(.c) DDS.InstanceHandle_t {
-    _ = writer;
-    return DataWriterImpl.registerInstanceRaw(key_hash.*);
+    const impl = writerImpl(writer) orelse return DDS.HANDLE_NIL;
+    return impl.lookupInstance(key_hash.*);
 }
 
 /// Copy the stored CDR payload for `handle` into `buf[0..buf_size]`.
@@ -141,7 +149,5 @@ pub export fn zzdds_lookup_instance_reader(
     const r = zidl_bindings.unboxAsView(DDS.DataReader, reader);
     if (nil.isNil(r)) return 0;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
-    // Compute handle from key hash and check if it's known alive.
-    const handle = DataWriterImpl.registerInstanceRaw(key_hash.*);
-    return if (impl.lookupInstance(handle)) handle else 0;
+    return impl.lookupInstance(key_hash.*) orelse DDS.HANDLE_NIL;
 }

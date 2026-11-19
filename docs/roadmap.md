@@ -285,29 +285,21 @@ Forward-looking only: known gaps, planned features, and open design questions.
 
   Hashing was never a recorded decision (both functions date from the initial commit);
   it is stateless, not meaningfully faster than one map lookup per sample. Plan:
-  1. **Bounded study of registry patterns**, sized to the codebase's current needs and
-     those the specs foresee (concurrency, broker), not a general survey. Inventory the
-     existing maps (key types, directions, lifetimes, guarding lock, hot paths); review
-     what Zig's standard library provides (`HashMap`/`AutoHashMap`, `ArrayHashMap`,
-     hash contexts, `std.hash`) against hand-rolled options, with benchmarks where it
-     matters; and settle reusable patterns: standard hash contexts for GUIDs, prefixes and
-     entity IDs, and a registry that owns both directions so they cannot drift (a hash
-     map from key to handle plus a dense array indexed by handle, rather than two hash
-     maps). Decide handle lifetime: never reclaim, or reclaim with per-slot generation
-     counters so a stale handle in a queued or loaned sample is detected; generation bits
-     share the 32-bit `InstanceHandle_t`. Respect the concurrency specs' locking rules and
-     `design/allocator-strategy.md` (bound instance registries by RESOURCE_LIMITS
-     `max_instances`). Record the outcome in `docs/decisions.md`.
-  2. **Fix instance handles with the chosen pattern**, as the study's primary use case:
-     per-reader/per-writer allocation (the DDS spec scopes instance handles to the
-     entity), plus anything else that fits the pattern cleanly. Endpoint handles need a
-     participant-wide registry so handles from the built-in topics, `get_matched_*`,
-     `SampleInfo` and `ignore_*` agree; once it exists the two collision workarounds can
-     go. Handles never go on the wire, so there is no interop or IDL change; check tests
-     that assume a writer and a reader share a handle for the same key.
-  3. **Follow-ons** the study identifies (other lookups such as locators by GUID prefix,
-     or further investigation) become their own roadmap items, migrated when that code
-     is next worked on rather than in one sweep.
+  1. **Study: done (2026-11-18).** Registries: a key-to-slot `std.AutoHashMap` plus a
+     dense slot array; handles carry a slot and a 9-bit generation; one registry per
+     DataReader and DataWriter for instances, one per participant for every entity it
+     names. Inventory, measurements and design in
+     [`design/handle-registries.md`](design/handle-registries.md); decision in
+     `decisions.md`.
+  2. **Instance registries: done (2026-11-19).** DataReader and DataWriter allocate
+     their instance handles; the writer's `lookup_instance` returns `HANDLE_NIL` for a key
+     never registered or written. Built-in readers give their samples the entity handles
+     the participant supplies, still `guidToHandle` and `topicToHandle` until step 3.
+  3. **The participant's entity registry**, replacing `guidToHandle` and `topicToHandle`
+     and the two collision workarounds.
+  4. **Follow-ons**, each its own item once step 3 lands: reclaiming instances, bounded by
+     RESOURCE_LIMITS `max_instances` (no reader or writer forgets an instance today); the
+     participant's `discovered_*` lists, searched linearly by GUID or name.
 
 ### Selective CDR parse (`deserialize_selected`) — deferred follow-ups
 

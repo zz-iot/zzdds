@@ -464,7 +464,6 @@ test "vtDeleteContained (Participant): all-or-nothing -- refuses and tears down 
 // ── Write-loan tests (Phase C) ──────────────────────────────────────────────
 
 const WL_KEY: [16]u8 = std.mem.zeroes([16]u8);
-const WL_IH: history_mod.InstanceHandle = history_mod.INSTANCE_HANDLE_NIL;
 
 fn wlMakeWriter(fx: *Fixture, name: [:0]const u8, qos: DDS.DataWriterQos) *zzdds.dcps.DataWriterImpl {
     const topic = fx.dp.create_topic(name, "T", .{}, null, 0);
@@ -484,7 +483,7 @@ test "loanForWrite/publishLoan: round trip tracks outstanding_loans, frees buffe
     buf[0] = 0x42;
 
     const before = dw_impl.proto_writer.cacheLen();
-    _ = try dw_impl.publishLoan(.alive, time_mod.RtpsTimestamp.now(), WL_IH, WL_KEY, buf, buf.len);
+    _ = try dw_impl.publishLoan(.alive, time_mod.RtpsTimestamp.now(), WL_KEY, buf, buf.len);
     try testing.expectEqual(@as(usize, 0), dw_impl.outstanding_loans.load(.monotonic));
     try testing.expectEqual(before + 1, dw_impl.proto_writer.cacheLen());
 }
@@ -512,11 +511,11 @@ test "publishLoan: a failed publish (RESOURCE_LIMITS) still fully releases the l
 
     // Fill the one available slot with a plain write so the cache is at its limit.
     const PAYLOAD: [5]u8 = .{ 0x00, 0x01, 0x00, 0x00, 0x01 };
-    _ = try dw_impl.writeRaw(.alive, time_mod.RtpsTimestamp.now(), WL_IH, WL_KEY, &PAYLOAD);
+    _ = try dw_impl.writeRaw(.alive, time_mod.RtpsTimestamp.now(), WL_KEY, &PAYLOAD);
 
     const buf = try dw_impl.loanForWrite(1);
     try testing.expectEqual(@as(usize, 1), dw_impl.outstanding_loans.load(.monotonic));
-    try testing.expectError(error.OutOfResources, dw_impl.publishLoan(.alive, time_mod.RtpsTimestamp.now(), WL_IH, WL_KEY, buf, buf.len));
+    try testing.expectError(error.OutOfResources, dw_impl.publishLoan(.alive, time_mod.RtpsTimestamp.now(), WL_KEY, buf, buf.len));
     // The loan is fully released despite the failure -- nothing left pending to retry.
     try testing.expectEqual(@as(usize, 0), dw_impl.outstanding_loans.load(.monotonic));
 }

@@ -27,6 +27,7 @@ const ListenerBox = listener_box_mod.ListenerBox;
 const listener_fallback = @import("../util/listener_fallback.zig");
 const publisher_mod = @import("publisher.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
+const handle_registry = @import("handle_registry.zig");
 const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 const listener_lane = @import("listener_lane.zig");
 const extensions_mod = @import("../c_abi/extensions.zig");
@@ -78,6 +79,8 @@ fn baseFromListenerEx(l: ZZDDS.DataWriterListenerEx) DDS.DataWriterListener {
         .on_publication_matched = l.on_publication_matched,
     };
 }
+
+const InstanceRegistry = handle_registry.HandleRegistry([16]u8, ?[]u8);
 
 pub const DataWriterImpl = struct {
     alloc: std.mem.Allocator,
@@ -224,10 +227,12 @@ pub const DataWriterImpl = struct {
     /// Read by livelinessLastNsFn / participant.zig's WLP accumulation.
     wlp_last_assert_ns: std.atomic.Value(i64),
 
-    /// Maps instance_handle → last alive CDR payload for get_key_value support.
-    /// Populated on the first alive write per instance; never overwritten.
-    key_registry: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, []u8) = .empty,
-    /// Guards `key_registry` only. `writeRaw` mutates it (insert-only) from
+    /// The writer's instances, by key hash (docs/design/handle-registries.md).
+    /// Each holds the payload of its first alive write, for get_key_value,
+    /// or null until then; the payload is never replaced, and instances are
+    /// not yet removed.
+    instances: InstanceRegistry = .empty,
+    /// Guards `instances` only. `writeRaw` mutates it (insert-only) from
     /// the application thread(s) -- concurrent `write()` on one DataWriter is
     /// spec-legal, and the RTPS layer (`proto_writer`) is already internally
     /// locked, so this map plus `last_sn` were the last unsynchronised writer
@@ -237,7 +242,7 @@ pub const DataWriterImpl = struct {
     /// reads/writes, never held across a callback", and `writeRaw` takes no
     /// other lock. Entries are inserted once and never replaced, so a `[]u8`
     /// value handed out by `getKeyValueRaw` stays valid after unlock.
-    key_registry_mu: Mutex = .{},
+    instances_mu: Mutex = .{},
 
     /// One box for the whole object, shared across every interface view
     /// (DataWriter, Entity, and ZZDDS.DataWriter — see src/c_abi/extensions.zig)
@@ -353,10 +358,10 @@ pub const DataWriterImpl = struct {
         self.c_abi.free(self.alloc);
         self.qos.deinit(self.alloc);
         {
-            var it = self.key_registry.valueIterator();
-            while (it.next()) |v| self.alloc.free(v.*);
+            var it = self.instances.iterator();
+            while (it.next()) |e| if (e.value.*) |kv| self.alloc.free(kv);
         }
-        self.key_registry.deinit(self.alloc);
+        self.instances.deinit(self.alloc);
         // NOTE: proto_writer lifecycle is owned by the participant (via
         // pubDestroyProtoWriter callback), not by DataWriterImpl.
         const pinned = self.parent_pinned;
@@ -386,7 +391,6 @@ pub const DataWriterImpl = struct {
         self: *Self,
         kind: history_mod.ChangeKind,
         source_timestamp: history_mod.RtpsTimestamp,
-        instance_handle: history_mod.InstanceHandle,
         key_hash: [16]u8,
         data: []const u8,
     ) !history_mod.SequenceNumber {
@@ -411,21 +415,10 @@ pub const DataWriterImpl = struct {
             }
         }
 
-        const sn = try self.proto_writer.write(kind, source_timestamp, instance_handle, key_hash, data);
+        // An alive write registers its instance, if not already registered.
+        if (kind == .alive) self.registerWrittenInstance(key_hash, data) catch return error.OutOfResources;
+        const sn = try self.proto_writer.write(kind, source_timestamp, key_hash, key_hash, data);
         self.last_sn.store(sn, .monotonic);
-        if (kind == .alive) {
-            const ih = keyHashToHandle(key_hash);
-            self.key_registry_mu.lock();
-            defer self.key_registry_mu.unlock();
-            if (!self.key_registry.contains(ih)) {
-                const stored = self.alloc.dupe(u8, data) catch null;
-                if (stored) |s| {
-                    self.key_registry.put(self.alloc, ih, s) catch {
-                        self.alloc.free(s);
-                    };
-                }
-            }
-        }
         const now_ns = self.timer_clock.nowNs();
         self.last_write_ns.store(now_ns, .monotonic);
         // AUTOMATIC: any write() counts as a liveliness assertion (for this
@@ -472,7 +465,6 @@ pub const DataWriterImpl = struct {
         self: *Self,
         kind: history_mod.ChangeKind,
         source_timestamp: history_mod.RtpsTimestamp,
-        instance_handle: history_mod.InstanceHandle,
         key_hash: [16]u8,
         buf: []u8,
         used_len: usize,
@@ -481,7 +473,7 @@ pub const DataWriterImpl = struct {
             self.alloc.free(buf);
             _ = self.outstanding_loans.fetchSub(1, .monotonic);
         }
-        return self.writeRaw(kind, source_timestamp, instance_handle, key_hash, buf[0..used_len]);
+        return self.writeRaw(kind, source_timestamp, key_hash, buf[0..used_len]);
     }
 
     /// Cancel a previously-loaned buffer (from `loanForWrite`) without
@@ -511,28 +503,54 @@ pub const DataWriterImpl = struct {
         return self.proto_writer.matchedReaderCount();
     }
 
-    /// Compute a stable DDS instance handle from a 16-byte key hash.
-    /// For keyless types the key hash is all zeros; all calls return the same handle.
-    pub fn registerInstanceRaw(key_hash: [16]u8) DDS.InstanceHandle_t {
-        return keyHashToHandle(key_hash);
+    fn registerWrittenInstance(self: *Self, key_hash: [16]u8, data: []const u8) error{ OutOfMemory, OutOfHandles }!void {
+        self.instances_mu.lock();
+        defer self.instances_mu.unlock();
+        const e = try self.instances.getOrPut(self.alloc, key_hash);
+        if (!e.found_existing) e.value.* = null;
+        // Kept for get_key_value; a write that cannot keep it still succeeds,
+        // and the next one tries again.
+        if (e.value.* == null) e.value.* = self.alloc.dupe(u8, data) catch null;
     }
 
-    /// Return the stored CDR payload for the given instance handle, or null if
-    /// no alive write has been made for this instance.
-    /// The returned slice stays valid for the life of the writer: entries are
-    /// inserted once and never replaced (see `key_registry_mu`). The lock only
-    /// guards against a concurrent `writeRaw` insert reallocating the map's
-    /// index while we look up.
+    /// register_instance: the handle of the key hash's instance, registering
+    /// it if it is not; HANDLE_NIL if it cannot be. For a keyless topic the
+    /// key hash is all zeros, so there is one instance.
+    pub fn registerInstance(self: *Self, key_hash: [16]u8) DDS.InstanceHandle_t {
+        self.instances_mu.lock();
+        defer self.instances_mu.unlock();
+        const e = self.instances.getOrPut(self.alloc, key_hash) catch return DDS.HANDLE_NIL;
+        if (!e.found_existing) e.value.* = null;
+        return e.handle;
+    }
+
+    /// lookup_instance: the handle of the key hash's instance, or HANDLE_NIL
+    /// if it was never registered or written.
+    pub fn lookupInstance(self: *Self, key_hash: [16]u8) DDS.InstanceHandle_t {
+        self.instances_mu.lock();
+        defer self.instances_mu.unlock();
+        return self.instances.handleOfKey(key_hash) orelse DDS.HANDLE_NIL;
+    }
+
+    /// Whether `handle` names the key hash's instance, as a write, dispose or
+    /// unregister given both requires.
+    fn handleNamesKey(self: *Self, handle: DDS.InstanceHandle_t, key_hash: [16]u8) bool {
+        self.instances_mu.lock();
+        defer self.instances_mu.unlock();
+        const key = self.instances.keyOf(handle) orelse return false;
+        return std.mem.eql(u8, &key, &key_hash);
+    }
+
+    /// The payload of the first alive write of the instance `handle` names,
+    /// or null if there was none or `handle` names no instance of this writer.
+    /// The slice stays valid for the life of the writer: it is never replaced
+    /// or freed before then. The lock only guards the registry while a
+    /// concurrent `writeRaw` may grow it.
     pub fn getKeyValueRaw(self: *Self, handle: DDS.InstanceHandle_t) ?[]u8 {
-        self.key_registry_mu.lock();
-        defer self.key_registry_mu.unlock();
-        return self.key_registry.get(handle);
-    }
-
-    /// Look up the instance handle for a given key hash. Returns HANDLE_NIL if
-    /// no alive write has been made for this key.
-    pub fn lookupInstanceRaw(key_hash: [16]u8) DDS.InstanceHandle_t {
-        return keyHashToHandle(key_hash);
+        self.instances_mu.lock();
+        defer self.instances_mu.unlock();
+        const kv = self.instances.get(handle) orelse return null;
+        return kv.*;
     }
 
     /// Send a NOT_ALIVE_DISPOSED change for the given instance.
@@ -540,13 +558,12 @@ pub const DataWriterImpl = struct {
     pub fn disposeRaw(
         self: *Self,
         source_timestamp: history_mod.RtpsTimestamp,
-        instance_handle: history_mod.InstanceHandle,
         key_hash: [16]u8,
     ) !void {
         _ = try self.proto_writer.write(
             .not_alive_disposed,
             source_timestamp,
-            instance_handle,
+            key_hash,
             key_hash,
             &.{},
         );
@@ -557,14 +574,13 @@ pub const DataWriterImpl = struct {
     pub fn unregisterRaw(
         self: *Self,
         source_timestamp: history_mod.RtpsTimestamp,
-        instance_handle: history_mod.InstanceHandle,
         key_hash: [16]u8,
     ) !void {
         const kind: history_mod.ChangeKind = if (self.qos.writer_data_lifecycle.autodispose_unregistered_instances)
             .not_alive_disposed
         else
             .not_alive_unregistered;
-        _ = try self.proto_writer.write(kind, source_timestamp, instance_handle, key_hash, &.{});
+        _ = try self.proto_writer.write(kind, source_timestamp, key_hash, key_hash, &.{});
     }
 
     pub fn toDDSDataWriter(self: *Self) DDS.DataWriter {
@@ -1392,7 +1408,7 @@ pub const DataWriterImpl = struct {
         const payload = cdr_payload orelse return DDS.RETCODE_BAD_PARAMETER;
         const kh = keyHashFromOctetSeq(kh_seq) orelse return DDS.RETCODE_BAD_PARAMETER;
         const change_kind = self.changeKindFromWriteKind(kind) orelse return DDS.RETCODE_BAD_PARAMETER;
-        if (handle != DDS.HANDLE_NIL and handle != registerInstanceRaw(kh)) {
+        if (handle != DDS.HANDLE_NIL and !self.handleNamesKey(handle, kh)) {
             return DDS.RETCODE_BAD_PARAMETER;
         }
         // Regression for a real concurrent use-after-free (Greptile PR #69
@@ -1405,7 +1421,7 @@ pub const DataWriterImpl = struct {
         if (!self.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
         defer self.releaseQuiesce();
         const data = if (payload._buffer) |b| b[0..payload._length] else &[_]u8{};
-        _ = self.writeRaw(change_kind, rtpsTimestampFromRaw(source_timestamp), kh, kh, data) catch |err| return switch (err) {
+        _ = self.writeRaw(change_kind, rtpsTimestampFromRaw(source_timestamp), kh, data) catch |err| return switch (err) {
             error.OutOfResources => DDS.RETCODE_OUT_OF_RESOURCES,
             error.Timeout => DDS.RETCODE_TIMEOUT,
             else => DDS.RETCODE_ERROR,
@@ -1480,7 +1496,7 @@ pub const DataWriterImpl = struct {
         const kh_seq = key_hash orelse return DDS.RETCODE_BAD_PARAMETER;
         const kh = keyHashFromOctetSeq(kh_seq) orelse return DDS.RETCODE_BAD_PARAMETER;
         const change_kind = self.changeKindFromWriteKind(kind) orelse return DDS.RETCODE_BAD_PARAMETER;
-        if (handle != DDS.HANDLE_NIL and handle != registerInstanceRaw(kh)) {
+        if (handle != DDS.HANDLE_NIL and !self.handleNamesKey(handle, kh)) {
             return DDS.RETCODE_BAD_PARAMETER;
         }
         // A null buffer means this isn't a value loan_raw() actually
@@ -1498,7 +1514,7 @@ pub const DataWriterImpl = struct {
         // every path.
         defer self.releaseQuiesce();
         defer self.proto_writer.quiesceRelease();
-        _ = self.publishLoan(change_kind, time_mod.RtpsTimestamp.now(), kh, kh, full_buf, used_len) catch |err| return switch (err) {
+        _ = self.publishLoan(change_kind, time_mod.RtpsTimestamp.now(), kh, full_buf, used_len) catch |err| return switch (err) {
             error.OutOfResources => DDS.RETCODE_OUT_OF_RESOURCES,
             error.Timeout => DDS.RETCODE_TIMEOUT,
             else => DDS.RETCODE_ERROR,
@@ -1548,18 +1564,6 @@ pub const DataWriterImpl = struct {
 };
 
 // ── GUID helpers ──────────────────────────────────────────────────────────────
-
-/// FNV-1a hash of a 16-byte key hash → nonzero positive i32 instance handle.
-/// For keyless topics the key hash is all zeros; all calls return the same handle.
-pub fn keyHashToHandle(key_hash: [16]u8) DDS.InstanceHandle_t {
-    var h: u32 = 2166136261;
-    for (key_hash) |b| {
-        h ^= b;
-        h *%= 16777619;
-    }
-    const v: i32 = @intCast(h & 0x7FFF_FFFF);
-    return if (v == 0) 1 else v;
-}
 
 /// FNV-1a hash of a GUID's 16 bytes → nonzero positive i32 instance handle.
 pub fn guidToHandle(guid: Guid) DDS.InstanceHandle_t {

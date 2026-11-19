@@ -32,7 +32,6 @@ fn writeNilKey(dw: *DataWriterImpl, payload: []const u8) !void {
     _ = try dw.writeRaw(
         .alive,
         RtpsTimestamp.now(),
-        history_mod.INSTANCE_HANDLE_NIL,
         std.mem.zeroes([16]u8),
         payload,
     );
@@ -42,7 +41,6 @@ fn writeNilKeyKind(dw: *DataWriterImpl, kind: history_mod.ChangeKind, payload: [
     _ = try dw.writeRaw(
         kind,
         RtpsTimestamp.now(),
-        history_mod.INSTANCE_HANDLE_NIL,
         std.mem.zeroes([16]u8),
         payload,
     );
@@ -385,7 +383,7 @@ test "TypeSupport: non-nil inline key_hash takes precedence over TypeSupport" {
 
     var kh_bb = std.mem.zeroes([16]u8);
     kh_bb[0] = 0xBB;
-    _ = try dw_a.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, kh_bb, &PAYLOAD_A);
+    _ = try dw_a.writeRaw(.alive, RtpsTimestamp.now(), kh_bb, &PAYLOAD_A);
     try writeNilKey(dw_b, &PAYLOAD_B); // TypeSupport → 0xAA
     fx.settle();
 

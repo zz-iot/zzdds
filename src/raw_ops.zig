@@ -183,7 +183,7 @@ pub fn writeRaw(
     if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
     defer impl.releaseQuiesce();
     const ck = toChangeKind(kind, impl);
-    _ = try impl.writeRaw(ck, time_mod.RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, key_hash, data);
+    _ = try impl.writeRaw(ck, time_mod.RtpsTimestamp.now(), key_hash, data);
 }
 
 /// Write a pre-serialized CDR payload with an explicit source timestamp.
@@ -200,14 +200,16 @@ pub fn writeRawWithTimestamp(
     const ck = toChangeKind(kind, impl);
     const t = time_mod.Time{ .sec = ts.sec, .nanosec = ts.nanosec };
     const rtps_ts = time_mod.RtpsTimestamp.fromTime(t);
-    _ = try impl.writeRaw(ck, rtps_ts, history_mod.INSTANCE_HANDLE_NIL, key_hash, data);
+    _ = try impl.writeRaw(ck, rtps_ts, key_hash, data);
 }
 
-/// Compute a stable instance handle for a given key hash without writing.
-pub fn registerInstanceRaw(
-    key_hash: [16]u8,
-) DDS.InstanceHandle_t {
-    return DataWriterImpl.registerInstanceRaw(key_hash);
+/// register_instance: the handle of the key hash's instance on this writer,
+/// registering it if it is not; HANDLE_NIL if it cannot be.
+pub fn registerInstanceRaw(writer: DDS.DataWriter, key_hash: [16]u8) DDS.InstanceHandle_t {
+    const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
+    if (!impl.acquireQuiesce()) return DDS.HANDLE_NIL;
+    defer impl.releaseQuiesce();
+    return impl.registerInstance(key_hash);
 }
 
 /// Return the stored CDR payload for the given instance handle, or null if
@@ -223,11 +225,13 @@ pub fn getKeyValueRawWriter(
     return impl.getKeyValueRaw(handle);
 }
 
-/// Look up the instance handle for a key hash.  Always succeeds (deterministic
-/// hash → handle mapping); returns the handle whether or not any alive write
-/// has been made.
-pub fn lookupInstanceWriter(key_hash: [16]u8) DDS.InstanceHandle_t {
-    return DataWriterImpl.registerInstanceRaw(key_hash);
+/// lookup_instance: the handle of the key hash's instance on this writer, or
+/// HANDLE_NIL if it was never registered or written.
+pub fn lookupInstanceWriter(writer: DDS.DataWriter, key_hash: [16]u8) DDS.InstanceHandle_t {
+    const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
+    if (!impl.acquireQuiesce()) return DDS.HANDLE_NIL;
+    defer impl.releaseQuiesce();
+    return impl.lookupInstance(key_hash);
 }
 
 // ── Reader operations ─────────────────────────────────────────────────────────
@@ -567,16 +571,13 @@ pub fn getKeyValueRawReader(
     return impl.getKeyValueRaw(handle);
 }
 
-/// Return the instance handle for `handle` if it is a known ALIVE instance,
-/// or HANDLE_NIL (0) otherwise.
-pub fn lookupInstanceReader(
-    reader: DDS.DataReader,
-    handle: DDS.InstanceHandle_t,
-) ?DDS.InstanceHandle_t {
+/// lookup_instance: the handle of the key hash's instance on this reader if
+/// it is ALIVE, or null.
+pub fn lookupInstanceReader(reader: DDS.DataReader, key_hash: [16]u8) ?DDS.InstanceHandle_t {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     if (!impl.acquireQuiesce()) return null;
     defer impl.releaseQuiesce();
-    return if (impl.lookupInstance(handle)) handle else null;
+    return impl.lookupInstance(key_hash);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

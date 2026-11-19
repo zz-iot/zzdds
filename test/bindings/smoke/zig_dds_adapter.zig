@@ -67,7 +67,7 @@ pub fn writeRawWithTimestamp(_: DDS.DataWriter, kind: WriteKind, key_hash: [16]u
     last_key_hash = key_hash;
 }
 
-pub fn registerInstanceRaw(_: [16]u8) DDS.InstanceHandle_t {
+pub fn registerInstanceRaw(_: DDS.DataWriter, _: [16]u8) DDS.InstanceHandle_t {
     return 0;
 }
 
@@ -75,7 +75,7 @@ pub fn getKeyValueRawWriter(_: DDS.DataWriter, _: DDS.InstanceHandle_t) ?[]u8 {
     return null;
 }
 
-pub fn lookupInstanceWriter(_: [16]u8) DDS.InstanceHandle_t {
+pub fn lookupInstanceWriter(_: DDS.DataWriter, _: [16]u8) DDS.InstanceHandle_t {
     return 0;
 }
 
@@ -137,7 +137,7 @@ pub fn getKeyValueRawReader(_: DDS.DataReader, _: DDS.InstanceHandle_t) ?[]u8 {
     return null;
 }
 
-pub fn lookupInstanceReader(_: DDS.DataReader, _: DDS.InstanceHandle_t) ?DDS.InstanceHandle_t {
+pub fn lookupInstanceReader(_: DDS.DataReader, _: [16]u8) ?DDS.InstanceHandle_t {
     return null;
 }
 
