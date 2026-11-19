@@ -431,7 +431,7 @@ pub const SpdpEndpoints = struct {
         local: *const ParticipantAnnouncement,
         callbacks: *const Callbacks,
     ) !void {
-        self.callbacks = callbacks;
+        // `callbacks` is published with the writer, below.
         self.data_reachable = local.data_reachable;
 
         // Fix the GUID prefix now that we know it.
@@ -517,8 +517,12 @@ pub const SpdpEndpoints = struct {
             }
         }
 
+        // The receive path takes nothing until `callbacks` is set (see
+        // processSpdpPayload): SEDP listens first, and relays a peer's
+        // unicast announcement here before this runs.
         self.mu.lock();
         self.writer = new_writer;
+        self.callbacks = callbacks;
         self.mu.unlock();
         writer_published = true;
 
@@ -730,10 +734,15 @@ pub const SpdpEndpoints = struct {
         payload: []const u8,
         vendor_id: header_mod.VendorId,
     ) void {
-        // Ignore our own announcements.
+        // Ignore our own announcements, and any before start(): SEDP relays
+        // a peer's unicast announcement from before then, which with no
+        // callbacks would make the peer known without discovering it, so its
+        // later announcements would not either. The peer announces again.
         self.mu.lock();
         const own_writer_guid_prefix = if (self.writer) |w| w.guid.prefix else null;
+        const started = self.callbacks != null;
         self.mu.unlock();
+        if (!started) return;
         if (own_writer_guid_prefix) |p| {
             if (p.eql(guid_prefix)) return;
         }
