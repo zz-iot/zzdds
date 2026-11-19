@@ -82,6 +82,10 @@ pub const RtpsProtocolWriter = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Now, while the owner's runtime and transport are alive: an
+        // outstanding write loan can hold this writer past its participant,
+        // and the teardown below then touches neither.
+        self.writer.stopHeartbeat();
         self.quiesce.beginTeardown(self, reallyDeinit);
     }
 

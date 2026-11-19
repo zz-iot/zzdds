@@ -1009,12 +1009,13 @@ test "delete_publisher: a loan racing the TOCTOU window before the real deinit c
     // pub_impl (and its child writer's protocol writer, via
     // destroy_proto_writer inside the deinit loop above) are now gone --
     // but dw_impl survives, kept alive solely by the loan's transferred
-    // quiesce refs. Publishing the loan must still succeed: the proof this
-    // scenario is actually safe.
+    // quiesce refs. Publishing the loan on the deleted writer sends nothing,
+    // but consumes the loan safely and frees the writer.
     var key_hash_bytes = @as([16]u8, @splat(4));
     const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
     const rc = dw.vtable.publish_loan_raw(dw.ptr, &cdr_payload, &key_hash, DDS.HANDLE_NIL, .ALIVE_WRITE_KIND);
-    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, rc);
+    try testing.expect(cdr_payload._buffer == null);
 }
 
 // ── kcov coverage sweep (2026-08-24): closing gaps 1-4 from the fresh

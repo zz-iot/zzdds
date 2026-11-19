@@ -10,6 +10,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-19
 
+- A reader or writer deleted by a cascade (a factory's `release`, `zzdds_destroy_factory`)
+  while it has an outstanding loan keeps its handle until the last loan comes back, so C++
+  and Java can return it; the return frees the entity. Every other operation on it returns
+  `ALREADY_DELETED` (nil for an entity), and `publish_loan_raw` returns the loan and
+  `ALREADY_DELETED`. A deleted writer's protocol writer stops its heartbeat at deletion.
+  Under `-Ddebug-allocator`, the leak check waits for such entities.
 - A DataReader allocates its instance handles too, so two instances can no longer share
   a handle, and with it their KEEP_LAST history, instance state, TIME_BASED_FILTER window
   and owner. Each built-in topic sample now names its own participant or topic: all

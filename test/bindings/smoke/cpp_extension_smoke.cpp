@@ -209,6 +209,28 @@ int main() {
         CHECK(own->destroy() == ::DDS::RETCODE_PRECONDITION_NOT_MET);
     }
 
+    // A loan outlives the cascade that deletes its writer: dropping the owner
+    // deletes the writer, whose wrapper still returns the loan, freeing it.
+    {
+        std::shared_ptr<::DDS::DataWriter> loaned;
+        DDS_OctetSeq loan{};
+        {
+            auto own = zzdds::DomainParticipantFactory::create();
+            CHECK(own);
+            auto dp = own->create_participant(domain, ::DDS::DomainParticipantQos::default_value(), nullptr, 0);
+            CHECK(dp);
+            auto t = dp->create_topic("CppLoanCascade", "CppLoanCascadeType", ::DDS::TopicQos::default_value(), nullptr, 0);
+            auto p = dp->create_publisher(::DDS::PublisherQos::default_value(), nullptr, 0);
+            CHECK(t && p);
+            loaned = p->create_datawriter(t, ::DDS::DataWriterQos::default_value(), nullptr, 0);
+            CHECK(loaned);
+            CHECK(loaned->loan_raw(4, loan) == ::DDS::RETCODE_OK);
+        }
+        CHECK(loaned->get_publisher() == nullptr);
+        CHECK(loaned->assert_liveliness() == ::DDS::RETCODE_ALREADY_DELETED);
+        CHECK(loaned->return_loan_raw(loan) == ::DDS::RETCODE_OK);
+    }
+
     // The process-wide factory: one borrowed wrapper until delete_instance,
     // which refuses while it has participants; dropping it releases nothing.
     CHECK(::DDS::DomainParticipantFactory::delete_instance() == ::DDS::RETCODE_OK);

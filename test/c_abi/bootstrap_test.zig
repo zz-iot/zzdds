@@ -1974,6 +1974,30 @@ test "factory: delete_contained_entities deletes every participant, or none whil
     try testing.expect(factory.lookup_participant(test_domain.get()).ptr == zzdds.dcps.NIL_PTR);
 }
 
+test "factory: release with a write loan out leaves the writer to take the loan back" {
+    const own = try createOwn();
+    const factory = own.vtable.as_DomainParticipantFactory(own.ptr);
+    const dp = DDS_DomainParticipantFactory_create_participant_for_test(factory, test_domain.get(), null);
+    try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);
+    const ext_dp = zidl_bindings.unboxAsView(ZZDDS.DomainParticipant, extensions.DDS_DomainParticipant_as_zzdds_DomainParticipant(dp.vtable.get_c_abi_handle(dp.ptr)).?);
+    try testing.expectEqual(DDS.RETCODE_OK, ext_dp.register_type_support("KeylessSmoke"));
+    const topic = dp.create_topic("FactoryReleaseLoan", "KeylessSmoke", .{}, null, 0);
+    var qos: DDS.DataWriterQos = .{};
+    qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    const dw = dp.create_publisher(.{}, null, 0).create_datawriter(topic, qos, null, 0);
+    try testing.expect(dw.ptr != zzdds.dcps.NIL_PTR);
+    const dw_handle = dw.vtable.get_c_abi_handle(dw.ptr);
+    var loan = DDS.OctetSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.loan_raw(dw.ptr, 4, &loan));
+
+    // The cascade tears the participant down, its transport included; the
+    // writer and its protocol writer stay until the loan comes back.
+    own.vtable.release(own.ptr);
+    try testing.expect(!zidl_bindings.isEntityBoxRetired(dw_handle));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, dw.assert_liveliness());
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.return_loan_raw(dw.ptr, &loan));
+}
+
 const FactoryDceThread = struct {
     factory: DDS.DomainParticipantFactory,
     rc: std.atomic.Value(DDS.ReturnCode_t) = .init(-1),
