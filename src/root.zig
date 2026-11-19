@@ -184,6 +184,7 @@ test {
     _ = @import("dcps/nil.zig");
     _ = @import("dcps/topic.zig");
     _ = @import("dcps/waitset.zig");
+    _ = @import("dcps/handle_registry.zig");
     _ = @import("dcps/writer.zig");
     _ = @import("dcps/reader.zig");
     _ = @import("dcps/publisher.zig");
