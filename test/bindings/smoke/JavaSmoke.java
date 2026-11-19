@@ -225,10 +225,32 @@ public class JavaSmoke {
         check(Dcps.DDS.DomainParticipantFactory.delete_instance() == ok, "delete_instance()");
     }
 
+    // A loan outlives the cascade that deletes its writer: closing the owner
+    // deletes the writer, whose wrapper still returns the loan, freeing it.
+    static void checkLoanOutlivesCascade(int domain) {
+        Dcps.DDS.DataWriter loaned;
+        java.nio.ByteBuffer loan;
+        try (Zzdds.zzdds.DomainParticipantFactory own = Zzdds.zzdds.DomainParticipantFactory.create()) {
+            Dcps.DDS.DomainParticipant dp = own.create_participant(domain, null, null, 0);
+            check(dp != null, "create_participant for the loan cascade");
+            Dcps.DDS.Topic t = dp.create_topic("JavaLoanCascade", "JavaLoanCascadeType", null, null, 0);
+            Dcps.DDS.Publisher p = dp.create_publisher(null, null, 0);
+            check(t != null && p != null, "create_topic/create_publisher for the loan cascade");
+            loaned = p.create_datawriter(t, null, null, 0);
+            check(loaned != null, "create_datawriter for the loan cascade");
+            loan = loaned.loan_raw(4);
+            check(loan != null, "loan_raw() before the cascade");
+        }
+        check(loaned.get_publisher() == null, "a writer deleted with a loan out has no publisher");
+        check(loaned.assert_liveliness() == Dcps.DDS.RETCODE_ALREADY_DELETED.value, "a writer deleted with a loan out refuses other operations");
+        check(loaned.return_loan_raw(loan) == Dcps.DDS.RETCODE_OK.value, "return_loan_raw() after the cascade");
+    }
+
     public static void main(String[] args) throws Exception {
         System.out.println("Java binding smoke test:");
         checkGeneratedConstruction();
         checkFactoryConstruction(0);
+        checkLoanOutlivesCascade(0);
 
         Dcps.DDS.DomainParticipantFactory factory =
             io.zzdds.ext.Zzdds.zzdds.DomainParticipantFactory.create();

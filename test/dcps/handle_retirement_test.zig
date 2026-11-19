@@ -1,6 +1,8 @@
 const std = @import("std");
 const dds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
+const ZZDDS = dds.ZZDDS;
+const extensions = dds.c_abi.extensions;
 const rt = @import("zidl_bindings");
 const testing = std.testing;
 const alloc = testing.allocator;
@@ -211,5 +213,121 @@ test "cascading deletion retires topics while a deleted reader still pins them" 
     try observed.expect_once();
     native.releaseQuiesce();
     held = false;
+    try observed.expect_once();
+}
+
+// A cascade deletes a reader or writer with a loan out. Its handle stays
+// usable until the last loan comes back, so a binding can return it, and is
+// retired when that frees it. Every other operation is ALREADY_DELETED.
+
+/// Tears the fixture down with a cascade (the factory deletes its
+/// participants), not with delete_participant, which a loan would refuse.
+fn cascade(f: *Fixture) void {
+    f.factory.deinit();
+}
+
+fn finish(f: *Fixture) void {
+    f.discovery.deinit();
+    f.transport.deinit();
+    f.delivery.deinit();
+    alloc.destroy(f.delivery);
+}
+
+test "a writer deleted with loans out keeps its handle until the last loan comes back" {
+    var f = try Fixture.init();
+    defer finish(&f);
+    const pub_ = f.participant.create_publisher(.{}, null, 0);
+    const writer = pub_.create_datawriter(f.topic, .{}, null, 0);
+    const writer_handle = handle(writer);
+    var observed: Observed = .{ .handles = &.{writer_handle} };
+    try observed.start();
+    defer observed.stop();
+    var returned = DDS.OctetSeq{};
+    var published = DDS.OctetSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, writer.vtable.loan_raw(writer.ptr, 4, &returned));
+    try testing.expectEqual(DDS.RETCODE_OK, writer.vtable.loan_raw(writer.ptr, 4, &published));
+    returned._buffer.?[0..4].* = .{ 1, 2, 3, 4 };
+
+    cascade(&f);
+    try testing.expectEqual(@as(u32, 0), observed.calls[0].load(.acquire));
+    try testing.expect(!rt.isEntityBoxRetired(writer_handle));
+    try testing.expectEqual(@as(u8, 4), returned._buffer.?[3]);
+
+    var qos: DDS.DataWriterQos = .{};
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, writer.get_qos(&qos));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, writer.assert_liveliness());
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, writer.enable());
+    try testing.expect(writer.get_publisher().ptr == rt.NIL_PTR);
+    try testing.expect(writer.get_topic().ptr == rt.NIL_PTR);
+    try testing.expect(writer.get_statuscondition().ptr == rt.NIL_PTR);
+    try testing.expectEqual(DDS.HANDLE_NIL, writer.get_instance_handle());
+    var another = DDS.OctetSeq{};
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, writer.vtable.loan_raw(writer.ptr, 4, &another));
+
+    // So is every operation of its zzdds view.
+    const zwriter: ZZDDS.DataWriter = .{ .ptr = writer.ptr, .vtable = &extensions.writer_vtable };
+    var guid: ZZDDS.RtpsGuid = undefined;
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, zwriter.vtable.get_rtps_guid(zwriter.ptr, &guid));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, zwriter.vtable.get_matched_subscription_rtps_guid(zwriter.ptr, 1, &guid));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, zwriter.vtable.set_listener_ex(zwriter.ptr, null, 0));
+
+    // Publishing a loan on a deleted writer consumes it and sends nothing.
+    var key_hash_bytes = @as([16]u8, @splat(0));
+    const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, writer.vtable.publish_loan_raw(writer.ptr, &published, &key_hash, DDS.HANDLE_NIL, .ALIVE_WRITE_KIND));
+    try testing.expect(published._buffer == null);
+    try testing.expect(!rt.isEntityBoxRetired(writer_handle));
+
+    // The last loan's return frees the writer, its protocol writer, publisher
+    // and topic (the testing allocator checks), and retires the handle once.
+    try testing.expectEqual(DDS.RETCODE_OK, writer.vtable.return_loan_raw(writer.ptr, &returned));
+    try observed.expect_once();
+}
+
+test "a reader deleted with a loan out keeps its handle until the loan comes back" {
+    var f = try Fixture.init();
+    defer finish(&f);
+    const sub = f.participant.create_subscriber(.{}, null, 0);
+    const topic: *dds.dcps.TopicImpl = @ptrCast(@alignCast(f.topic.ptr));
+    const reader = sub.create_datareader(topic.toTopicDescription(), .{}, null, 0);
+    const status_handle = handle(reader.get_statuscondition());
+    const reader_handle = handle(reader);
+    var observed: Observed = .{ .handles = &.{ reader_handle, status_handle } };
+    try observed.start();
+    defer observed.stop();
+    const native: *dds.dcps.DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    native.pushCdr(&[_]u8{ 0x00, 0x01, 0x00, 0x00, 0x5A });
+    var payloads = DDS.OctetSeqSeq{};
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, reader.vtable.take_raw(reader.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, dds.dcps.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+    try testing.expectEqual(@as(u32, 1), payloads._length);
+
+    cascade(&f);
+    // Its status condition went with it; the reader's own handle stays.
+    try testing.expectEqual(@as(u32, 0), observed.calls[0].load(.acquire));
+    try testing.expectEqual(@as(u32, 1), observed.calls[1].load(.acquire));
+    try testing.expectEqual(@as(u8, 0x5A), payloads._buffer.?[0]._buffer.?[4]);
+
+    var qos: DDS.DataReaderQos = .{};
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, reader.get_qos(&qos));
+    try testing.expect(reader.get_subscriber().ptr == rt.NIL_PTR);
+    try testing.expect(reader.get_topicdescription().ptr == rt.NIL_PTR);
+    var more = DDS.OctetSeqSeq{};
+    var more_hashes = DDS.OctetSeq{};
+    var more_infos = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, reader.vtable.take_raw(reader.ptr, &more, &more_hashes, &more_infos, DDS.HANDLE_NIL, dds.dcps.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+
+    // So is every operation of its zzdds view.
+    const zreader: ZZDDS.DataReader = .{ .ptr = reader.ptr, .vtable = &extensions.reader_vtable };
+    var guid: ZZDDS.RtpsGuid = undefined;
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, zreader.vtable.get_rtps_guid(zreader.ptr, &guid));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, zreader.vtable.get_matched_publication_rtps_guid(zreader.ptr, 1, &guid));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, zreader.vtable.set_listener_ex(zreader.ptr, null, 0));
+    var serialized: ZZDDS.SerializedSample = undefined;
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, zreader.vtable.take_serialized(zreader.ptr, &serialized));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, zreader.vtable.take_next_instance_serialized(zreader.ptr, DDS.HANDLE_NIL, &serialized));
+
+    try testing.expectEqual(DDS.RETCODE_OK, reader.vtable.return_loan_raw(reader.ptr, &payloads, &hashes, &infos));
     try observed.expect_once();
 }

@@ -173,6 +173,7 @@ test {
     _ = @import("rtps/unmatched_cache.zig");
     _ = @import("util/time.zig");
     _ = @import("util/guid_gen.zig");
+    _ = @import("util/debug_gpa.zig");
     _ = @import("util/sock.zig");
     _ = @import("util/mutex.zig");
     _ = @import("util/listener_box.zig");

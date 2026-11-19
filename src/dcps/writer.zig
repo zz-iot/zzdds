@@ -22,6 +22,7 @@ const topic_mod = @import("topic.zig");
 const time_mod = @import("../util/time.zig");
 const Hook = @import("../runtime/core.zig").Hook;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
+const debug_gpa = @import("../util/debug_gpa.zig");
 const listener_box_mod = @import("../util/listener_box.zig");
 const ListenerBox = listener_box_mod.ListenerBox;
 const listener_fallback = @import("../util/listener_fallback.zig");
@@ -140,6 +141,8 @@ pub const DataWriterImpl = struct {
     /// refcount -- but it's still atomic since publish/cancel isn't
     /// guaranteed to happen under any particular lock.
     outstanding_loans: std.atomic.Value(usize) = .init(0),
+    /// Deleted with a loan out on the debug allocator: see `deinit`.
+    holds_leak_check: bool = false,
     /// Set once at init, then only via `vtSetListener`/`setListenerEx`.
     /// A discovery- or timer-thread dispatch can read it (in
     /// `resolveListener`) concurrently with an application `set_listener`
@@ -332,7 +335,18 @@ pub const DataWriterImpl = struct {
         self.quiesce.close();
         // Hold no entity lock here: the listener may call back into it.
         self.listeners.awaitIdle();
-        self.c_abi.retire();
+        // Its handle stays usable while it has an outstanding loan, which
+        // keeps it allocated, so a binding can still return the loan; every
+        // other operation returns ALREADY_DELETED (`deleted`). Freeing it
+        // retires the handle (`CachedCAbiHandle.free`). Only a cascade
+        // deletes a writer with a loan out: delete_datawriter refuses. The
+        // debug allocator's leak check then waits for it.
+        if (self.outstanding_loans.load(.acquire) == 0) {
+            self.c_abi.retire();
+        } else if (debug_gpa.owns(self.alloc)) {
+            debug_gpa.retain();
+            self.holds_leak_check = true;
+        }
         if (self.status_cond) |sc| sc.c_abi.retire();
         self.topic_use.end();
         self.quiesce.beginTeardown(self, reallyDeinit);
@@ -367,12 +381,14 @@ pub const DataWriterImpl = struct {
         const pinned = self.parent_pinned;
         const publisher = self.publisher;
         const topic_use = self.topic_use;
+        const holds_leak_check = self.holds_leak_check;
         self.alloc.destroy(self);
         topic_use.release();
         // Drop the parent-publisher lifetime ref taken in init(). After
         // destroy(self) so a reentrant PublisherImpl.reallyDeinit (if this
         // was its last ref) never sees this half-freed writer.
         if (pinned) publisher_mod.PublisherImpl.quiesceReleaseFn(publisher.ptr);
+        if (holds_leak_check) debug_gpa.release();
     }
 
     /// Write a pre-serialized CDR payload (4-byte encap header + CDR bytes).
@@ -1064,6 +1080,7 @@ pub const DataWriterImpl = struct {
 
     fn vtEnable(ctx: *anyopaque) DDS.ReturnCode_t {
         const self = cast(ctx);
+        if (self.deleted()) return DDS.RETCODE_ALREADY_DELETED;
         if (self.enabled.load(.acquire)) return DDS.RETCODE_OK;
         if (nil.isNil(self.publisher)) return DDS.RETCODE_PRECONDITION_NOT_MET;
         const pub_: *publisher_mod.PublisherImpl = @ptrCast(@alignCast(self.publisher.ptr));
@@ -1077,25 +1094,43 @@ pub const DataWriterImpl = struct {
     }
 
     /// NOT_ENABLED precondition, mirroring participant.zig's identical helper.
+    /// Deleted: only an outstanding loan keeps a deleted writer's handle
+    /// usable (see `retireHandles`), and only so the loan can come back.
+    /// The zzdds extension view (src/c_abi/extensions.zig) checks it too.
+    pub fn deleted(self: *Self) bool {
+        return self.quiesce.tearingDown();
+    }
+
+    /// ALREADY_DELETED for a deleted writer, else NOT_ENABLED until enabled.
     fn checkEnabledPrecondition(self: *Self) DDS.ReturnCode_t {
+        if (self.deleted()) return DDS.RETCODE_ALREADY_DELETED;
+        return self.checkEnabled();
+    }
+
+    /// For returning a loan, which a deleted writer still takes.
+    fn checkEnabled(self: *Self) DDS.ReturnCode_t {
         return if (self.enabled.load(.acquire)) DDS.RETCODE_OK else DDS.RETCODE_NOT_ENABLED;
     }
 
     fn vtGetStatusCond(ctx: *anyopaque) DDS.StatusCondition {
         const self = cast(ctx);
+        if (self.deleted()) return nil.nil_status_condition;
         if (self.status_cond) |sc| return sc.toDDSStatusCondition();
         return nil.nil_status_condition;
     }
 
     fn vtGetStatusChanges(ctx: *anyopaque) DDS.StatusMask {
         const self = cast(ctx);
+        if (self.deleted()) return 0;
         self.mu.lock();
         defer self.mu.unlock();
         return self.status_changes;
     }
 
     fn vtGetHandle(ctx: *anyopaque) DDS.InstanceHandle_t {
-        return cast(ctx).instance_handle;
+        const self = cast(ctx);
+        if (self.deleted()) return DDS.HANDLE_NIL;
+        return self.instance_handle;
     }
 
     /// The immutable policies cannot change, even before `enable`: the
@@ -1139,6 +1174,7 @@ pub const DataWriterImpl = struct {
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.DataWriterQos) DDS.ReturnCode_t {
         const self = cast(ctx);
+        if (self.deleted()) return DDS.RETCODE_ALREADY_DELETED;
         self.qos_mu.lock();
         defer self.qos_mu.unlock();
         qos.* = self.qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
@@ -1157,6 +1193,7 @@ pub const DataWriterImpl = struct {
 
     fn vtGetListener(ctx: *anyopaque) DDS.DataWriterListener {
         const self = cast(ctx);
+        if (self.deleted()) return nil.nil_dw_listener;
         self.listener_mu.lock();
         defer self.listener_mu.unlock();
         return listener_box_mod.handOut(baseFromListenerEx(self.listener_ex_box.listener));
@@ -1165,11 +1202,15 @@ pub const DataWriterImpl = struct {
     // Neither navigational getter below is gated on enabled state -- see
     // publisher.zig's vtGetParticipant comment for why.
     fn vtGetTopic(ctx: *anyopaque) DDS.Topic {
-        return cast(ctx).topic;
+        const self = cast(ctx);
+        if (self.deleted()) return nil.nil_topic;
+        return self.topic;
     }
 
     fn vtGetPublisher(ctx: *anyopaque) DDS.Publisher {
-        return cast(ctx).publisher;
+        const self = cast(ctx);
+        if (self.deleted()) return nil.nil_publisher;
+        return self.publisher;
     }
 
     fn vtWaitForAck(ctx: *anyopaque, timeout: *const DDS.Duration_t) DDS.ReturnCode_t {
@@ -1488,7 +1529,14 @@ pub const DataWriterImpl = struct {
         kind: DDS.WriteKind,
     ) DDS.ReturnCode_t {
         {
-            const rc = cast(ctx).checkEnabledPrecondition();
+            const self = cast(ctx);
+            // A deleted writer publishes nothing, but the loan is consumed,
+            // as on every other path: returned, and ALREADY_DELETED.
+            if (self.deleted()) {
+                const rc = vtReturnLoanRaw(ctx, cdr_payload);
+                return if (rc == DDS.RETCODE_OK) DDS.RETCODE_ALREADY_DELETED else rc;
+            }
+            const rc = self.checkEnabledPrecondition();
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);
@@ -1524,7 +1572,8 @@ pub const DataWriterImpl = struct {
 
     fn vtReturnLoanRaw(ctx: *anyopaque, cdr_payload: ?*DDS.OctetSeq) DDS.ReturnCode_t {
         {
-            const rc = cast(ctx).checkEnabledPrecondition();
+            // A deleted writer still takes its loans back.
+            const rc = cast(ctx).checkEnabled();
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);

@@ -29,6 +29,7 @@ const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 const Hook = @import("../runtime/core.zig").Hook;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
+const debug_gpa = @import("../util/debug_gpa.zig");
 const listener_box_mod = @import("../util/listener_box.zig");
 const ListenerBox = listener_box_mod.ListenerBox;
 const listener_fallback = @import("../util/listener_fallback.zig");
@@ -484,6 +485,8 @@ pub const DataReaderImpl = struct {
     /// happens from arbitrary caller threads without `mu` held (mirrors
     /// `EntityQuiesce`'s own unlocked-release model), so this must be atomic.
     outstanding_loans: std.atomic.Value(usize) = .init(0),
+    /// Deleted with a loan out on the debug allocator: see `deinit`.
+    holds_leak_check: bool = false,
     /// Maps a `take_raw`/`read_raw` loan-mode batch's outer descriptor array
     /// (`OctetSeqSeq._buffer`'s pointer identity -- see docs/design/raw-loan-api.md,
     /// "Owner handles") to the `[]*PendingChange` array `pinSamplesForLoan`/
@@ -711,6 +714,12 @@ pub const DataReaderImpl = struct {
         // Hold no entity lock here: the listener may call back into it.
         self.listeners.awaitIdle();
         self.retireHandles();
+        // An outstanding loan can keep this reader allocated past its
+        // factory, so the debug allocator's leak check waits for it.
+        if (self.outstanding_loans.load(.acquire) != 0 and debug_gpa.owns(self.alloc)) {
+            debug_gpa.retain();
+            self.holds_leak_check = true;
+        }
         self.topic_use.end();
         self.quiesce.beginTeardown(self, reallyDeinit);
     }
@@ -718,8 +727,14 @@ pub const DataReaderImpl = struct {
     /// This reader is being deleted, and with it every condition it still
     /// owns, even when its storage is pinned. `mu` keeps a condition deleted
     /// concurrently from being freed under this.
+    ///
+    /// Its own handle stays usable while it has an outstanding loan, which
+    /// keeps it allocated, so a binding can still return the loan; every
+    /// other operation returns ALREADY_DELETED (`deleted`). Freeing it
+    /// retires the handle (`CachedCAbiHandle.free`). Only a cascade deletes
+    /// a reader with a loan out: delete_datareader refuses.
     pub fn retireHandles(self: *Self) void {
-        self.c_abi.retire();
+        if (self.outstanding_loans.load(.acquire) == 0) self.c_abi.retire();
         if (self.status_cond) |sc| sc.c_abi.retire();
         self.mu.lock();
         defer self.mu.unlock();
@@ -831,10 +846,12 @@ pub const DataReaderImpl = struct {
         const pinned = self.parent_pinned;
         const subscriber = self.subscriber;
         const topic_use = self.topic_use;
+        const holds_leak_check = self.holds_leak_check;
         if (self.get_field_fn) |getter| if (getter.release) |release| release(getter.ctx);
         self.alloc.destroy(self);
         topic_use.release();
         if (pinned) subscriber_mod.SubscriberImpl.quiesceReleaseFn(subscriber.ptr);
+        if (holds_leak_check) debug_gpa.release();
     }
 
     /// Free the instances and what they hold.
@@ -3097,6 +3114,7 @@ pub const DataReaderImpl = struct {
 
     fn vtEnable(ctx: *anyopaque) DDS.ReturnCode_t {
         const self = cast(ctx);
+        if (self.deleted()) return DDS.RETCODE_ALREADY_DELETED;
         if (self.enabled.load(.acquire)) return DDS.RETCODE_OK;
         if (nil.isNil(self.subscriber)) return DDS.RETCODE_PRECONDITION_NOT_MET;
         const sub_: *subscriber_mod.SubscriberImpl = @ptrCast(@alignCast(self.subscriber.ptr));
@@ -3110,25 +3128,43 @@ pub const DataReaderImpl = struct {
     }
 
     /// NOT_ENABLED precondition, mirroring participant.zig's identical helper.
+    /// Deleted: only an outstanding loan keeps a deleted reader's handle
+    /// usable (see `retireHandles`), and only so the loan can come back.
+    /// The zzdds extension view (src/c_abi/extensions.zig) checks it too.
+    pub fn deleted(self: *Self) bool {
+        return self.quiesce.tearingDown();
+    }
+
+    /// ALREADY_DELETED for a deleted reader, else NOT_ENABLED until enabled.
     fn checkEnabledPrecondition(self: *Self) DDS.ReturnCode_t {
+        if (self.deleted()) return DDS.RETCODE_ALREADY_DELETED;
+        return self.checkEnabled();
+    }
+
+    /// For returning a loan, which a deleted reader still takes.
+    fn checkEnabled(self: *Self) DDS.ReturnCode_t {
         return if (self.enabled.load(.acquire)) DDS.RETCODE_OK else DDS.RETCODE_NOT_ENABLED;
     }
 
     fn vtGetStatusCond(ctx: *anyopaque) DDS.StatusCondition {
         const self = cast(ctx);
+        if (self.deleted()) return nil.nil_status_condition;
         if (self.status_cond) |sc| return sc.toDDSStatusCondition();
         return nil.nil_status_condition;
     }
 
     fn vtGetStatusChanges(ctx: *anyopaque) DDS.StatusMask {
         const self = cast(ctx);
+        if (self.deleted()) return 0;
         self.mu.lock();
         defer self.mu.unlock();
         return self.status_changes;
     }
 
     fn vtGetHandle(ctx: *anyopaque) DDS.InstanceHandle_t {
-        return cast(ctx).instance_handle;
+        const self = cast(ctx);
+        if (self.deleted()) return DDS.HANDLE_NIL;
+        return self.instance_handle;
     }
 
     fn vtCreateReadCondition(
@@ -3264,7 +3300,9 @@ pub const DataReaderImpl = struct {
         }
     }
 
-    fn vtDeleteReadCondition(_: *anyopaque, a_condition: DDS.ReadCondition) DDS.ReturnCode_t {
+    fn vtDeleteReadCondition(ctx: *anyopaque, a_condition: DDS.ReadCondition) DDS.ReturnCode_t {
+        // Its conditions went with it.
+        if (cast(ctx).deleted()) return DDS.RETCODE_ALREADY_DELETED;
         // A NULL condition from C arrives as the nil.
         if (nil.isNil(a_condition)) return DDS.RETCODE_BAD_PARAMETER;
         // Destroy the condition via its vtable — ReadConditionImpl.deinit()/
@@ -3330,6 +3368,7 @@ pub const DataReaderImpl = struct {
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.DataReaderQos) DDS.ReturnCode_t {
         const self = cast(ctx);
+        if (self.deleted()) return DDS.RETCODE_ALREADY_DELETED;
         self.qos_mu.lock();
         defer self.qos_mu.unlock();
         qos.* = self.qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
@@ -3374,6 +3413,7 @@ pub const DataReaderImpl = struct {
 
     fn vtGetListener(ctx: *anyopaque) DDS.DataReaderListener {
         const self = cast(ctx);
+        if (self.deleted()) return nil.nil_dr_listener;
         self.listener_mu.lock();
         defer self.listener_mu.unlock();
         return listener_box_mod.handOut(baseFromListenerEx(self.listener_ex_box.listener));
@@ -3570,11 +3610,15 @@ pub const DataReaderImpl = struct {
     // Neither navigational getter below is gated on enabled state -- see
     // publisher.zig's vtGetParticipant comment for why.
     fn vtGetTopicDesc(ctx: *anyopaque) DDS.TopicDescription {
-        return cast(ctx).topic_desc;
+        const self = cast(ctx);
+        if (self.deleted()) return nil.nil_topic_description;
+        return self.topic_desc;
     }
 
     fn vtGetSubscriber(ctx: *anyopaque) DDS.Subscriber {
-        return cast(ctx).subscriber;
+        const self = cast(ctx);
+        if (self.deleted()) return nil.nil_subscriber;
+        return self.subscriber;
     }
 
     fn vtGetSampleRejected(ctx: *anyopaque, status: *DDS.SampleRejectedStatus) DDS.ReturnCode_t {
@@ -4220,7 +4264,8 @@ pub const DataReaderImpl = struct {
     /// independently owns its own buffer, freed directly here).
     fn vtReturnLoanRaw(ctx: *anyopaque, cdr_payloads: ?*DDS.OctetSeqSeq, key_hashes: ?*DDS.OctetSeq, sample_infos: ?*DDS.SampleInfoSeq) DDS.ReturnCode_t {
         {
-            const rc = cast(ctx).checkEnabledPrecondition();
+            // A deleted reader still takes its loans back.
+            const rc = cast(ctx).checkEnabled();
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);

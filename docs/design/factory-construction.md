@@ -2,9 +2,9 @@
 
 ## Status
 
-Proposal, with five decisions (below), all made: `get_instance` comes with the rest, in
+Implemented, with five decisions (below), all made: `get_instance` comes with the rest, in
 one zidl release (3), and `release` retires a reader's or writer's handle on its last
-loan's return (5). Follows WaitSet and GuardCondition onto zidl's
+loan's return (5). The factory work is in #173; decision 5 is in its own PR. Follows WaitSet and GuardCondition onto zidl's
 `@standalone` construction ([#167](https://github.com/zz-iot/zzdds/pull/167), zidl
 `docs/design/standalone-construction.md`). A throwaway prototype of the constructor half is
 on the local branch `proto-factory-standalone` (557bb74); its findings are recorded here.
@@ -175,36 +175,41 @@ through each participant.
   allocations for a read loan and 15 for a write loan in the probes.
 - **Not checked:** publishing a write loan (`publish_loan_raw`) after the cascade, which
   would try to send through a participant whose transport is being torn down. The probes
-  only cancelled it.
+  only cancelled it. (Now refused: see below.)
 
 ### Retiring on the last loan
 
-Checked by reading the code; not yet implemented.
+Implemented. A deleted reader's or writer's own handle is retired at deletion only when it
+has no outstanding loan, and otherwise when its last loan's return frees it.
 
-- **Identity stays safe.** zzdds retires a handle again when the entity is finally freed
+- **Identity stays safe.** zzdds retires the handle when the entity is finally freed
   (`CachedCAbiHandle.free`), before the handle's box is freed, so the C++ and Java identity
   caches drop it before its address can be reused (the #124 hazard).
 - **The call that frees it is safe.** The generated C function copies the handle's pointer
   and vtable before calling, so `return_loan_raw` freeing the reader during the call touches
   nothing freed afterwards.
-- **zzdds must refuse everything else.** Many reader and writer operations check neither
-  deletion nor the quiesce guard: `enable`, `get_topicdescription`, `get_subscriber`,
-  `get_qos`, the status getters, and `get_matched_*`, which reaches the protocol endpoint. A
-  deleted reader or writer returns `ALREADY_DELETED` (NULL for an entity) from each, except
-  `return_loan_raw`. `publish_loan_raw` already consumes the loan on every path; on a deleted
-  writer it discards it and returns `ALREADY_DELETED`. This also defines C's behaviour in the
-  same case.
-- **Only when a loan is out.** `retireHandles` skips the entity's own handle only while it has
-  outstanding loans; its conditions are retired at deletion as now. An ordinary
-  `delete_datareader` or `delete_datawriter` refuses while a loan is out, so only a cascade
-  reaches this.
-- **`-Ddebug-allocator`.** `FactoryLeakCheck` checks when the last factory goes, and would
-  report a loan-pinned entity. It checks when the last such entity is freed instead.
+- **Everything else is refused.** A deleted reader or writer returns `ALREADY_DELETED`, or
+  nil for an entity (NULL in C), from every operation except `return_loan_raw`:
+  `checkEnabledPrecondition` checks deletion first, and the getters that skip it (`enable`,
+  `get_qos`, `get_listener`, the parent and topic getters, `get_statuscondition`,
+  `get_status_changes`, `get_instance_handle`, `delete_readcondition`) check it themselves.
+  `publish_loan_raw` on a deleted writer returns the loan and `ALREADY_DELETED`. Its
+  conditions are retired at deletion, as before.
+- **Only when a loan is out.** An ordinary `delete_datareader` or `delete_datawriter`
+  refuses while a loan is out, so only a cascade reaches this.
+- **The protocol writer stops at deletion.** A write loan keeps the protocol writer
+  allocated past its participant, and its teardown used to cancel its heartbeat on the
+  participant's runtime and transport. `RtpsProtocolWriter.deinit` now stops the heartbeat
+  when the writer is deleted, as SEDP does for its own writers, so the later teardown only
+  frees memory. The protocol reader has no timers.
+- **`-Ddebug-allocator`.** A deleted reader or writer with a loan out holds the leak check
+  (`util/debug_gpa.zig`) as a factory does, so the check runs when the last of them is
+  freed.
 - **Allocator lifetime.** A factory's custom allocator must outlive its outstanding loans,
   not just the factory.
-- **Still to verify:** the teardown that runs when a loan comes back after its participant
-  is gone (the protocol endpoint's own teardown included), under the DebugAllocator or
-  Valgrind. The probes used Zig's testing allocator, which does not detect use after free.
+- **A narrow race remains.** A loan taken on another thread while a cascade deletes its
+  entity can be counted only after the entity's handle was retired; C++ and Java then
+  cannot return that loan, as before this change.
 
 ## What zidl needs
 
@@ -260,7 +265,7 @@ without the ownership parts.
 **Minor: the default allocator.** The generated `create_with_allocator(NULL)` resolves NULL to
 zidl's default allocator before calling zzdds. zzdds's `-Ddebug-allocator` currently routes
 factories created with NULL through its DebugAllocator and checks them for leaks
-(`FactoryLeakCheck`), and the generated path hides that NULL. `get_instance` is zzdds's own
+(its leak check, `util/debug_gpa.zig`), and the generated path hides that NULL. `get_instance` is zzdds's own
 code and is unaffected. Either zzdds recognizes zidl's default allocator, or zidl passes the
 raw `ZidlAllocator` pointer to constructors that ask for it. *Recommendation: decide during
 implementation.*
@@ -393,7 +398,7 @@ In `extensions.zig`, beside the constructors:
 - **Independent of `create`.** Factories of one's own are separate `FactoryOwner`s. They
   neither see nor affect the instance.
 - **`-Ddebug-allocator`.** `get_instance` is zzdds's code, so its instance goes through the
-  DebugAllocator and `FactoryLeakCheck` as `zzdds_create_factory()` does today. A program
+  DebugAllocator and its leak check as `zzdds_create_factory()` does. A program
   checked for leaks must call `delete_instance`.
 
 ### zidl tests
