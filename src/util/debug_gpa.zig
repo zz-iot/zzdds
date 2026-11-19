@@ -10,9 +10,19 @@
 //! stack traces, so reports name no allocation or free site. Recording one
 //! holds the allocator's lock for the capture, which serializes every thread
 //! in the process.
+//!
+//! A factory on this allocator also makes it the process-wide C ABI
+//! allocator (`zidl_cdr_set_allocator`), unless the app registered one: the
+//! sequences and strings an entity hands a C caller come from the entity's
+//! allocator, and the generated `{Type}_free` functions free them through
+//! the process-wide one. The leak check then also counts what C callers
+//! still hold. A block allocated before then came from libc, and goes back
+//! to it (`blocks`).
 
 const std = @import("std");
 const build_options = @import("build_options");
+const zidl_bindings = @import("zidl_bindings");
+const ZidlAllocator = zidl_bindings.ZidlAllocator;
 const Mutex = @import("mutex.zig").Mutex;
 const listener_lane = @import("../dcps/listener_lane.zig");
 
@@ -20,19 +30,95 @@ const config: std.heap.DebugAllocatorConfig = if (build_options.debug_allocator_
 var gpa: std.heap.DebugAllocator(config) = .{};
 var leak_check: LeakCheck = .{};
 
+/// Through the same C ABI adapter a generated C free uses, so a block passes
+/// the same alignment wherever it is allocated or freed.
 pub fn allocator() std.mem.Allocator {
-    return gpa.allocator();
+    return zidl_bindings.toAllocator(&c_abi_allocator);
 }
 
 /// Whether `alloc` is this allocator.
 pub fn owns(alloc: std.mem.Allocator) bool {
-    return build_options.debug_allocator and alloc.ptr == @as(*anyopaque, @ptrCast(&gpa));
+    return build_options.debug_allocator and alloc.ptr == @as(*anyopaque, @ptrCast(@constCast(&c_abi_allocator)));
 }
 
 /// Holds off the leak check: by a factory on this allocator, from before it
 /// allocates anything, or by an entity freed after its factory.
 pub fn retain() void {
     leak_check.retain();
+}
+
+/// Makes this the process-wide C ABI allocator, if the app has not
+/// registered one. Called by each factory on this allocator, before it
+/// allocates anything, and never undone: whatever was allocated through it
+/// must be freed through it.
+pub fn registerForCAbi() void {
+    if (!build_options.c_abi) return;
+    c_abi_mu.lock();
+    defer c_abi_mu.unlock();
+    if (c_abi_registered) return;
+    c_abi_registered = true;
+    if (zidl_cdr_get_allocator() == null) zidl_cdr_set_allocator(&c_abi_allocator);
+}
+
+extern fn zidl_cdr_get_allocator() callconv(.c) ?*const ZidlAllocator;
+extern fn zidl_cdr_set_allocator(allocator: ?*const ZidlAllocator) callconv(.c) void;
+
+var c_abi_mu: Mutex = .{};
+var c_abi_registered = false;
+
+const c_abi_allocator: ZidlAllocator = .{
+    .ctx = null,
+    .alloc = cAbiAlloc,
+    .resize = cAbiResize,
+    .free = cAbiFree,
+};
+
+// Every address this allocator handed out: true while the block is live.
+// Before a factory registers it, a C ABI block comes from libc (zidl_cdr's
+// default), and may be freed or resized through this allocator afterwards:
+// its address is not in here, and it goes back to libc. A freed address
+// stays, so freeing it again still reaches the DebugAllocator, which reports
+// it. Kept on libc, outside the leak check.
+var blocks: std.AutoHashMapUnmanaged(usize, bool) = .empty;
+var blocks_mu: Mutex = .{};
+
+const Provenance = enum { live, freed, libc };
+
+fn provenance(p: [*]u8, comptime freeing: bool) Provenance {
+    blocks_mu.lock();
+    defer blocks_mu.unlock();
+    const live = blocks.getPtr(@intFromPtr(p)) orelse return .libc;
+    if (!live.*) return .freed;
+    if (freeing) live.* = false;
+    return .live;
+}
+
+// A C caller may ask for zero bytes, which a Zig allocator does not take;
+// such a block is one byte here, the same on every call for it.
+fn cAbiAlloc(_: ?*anyopaque, len: usize, alignment: usize) callconv(.c) ?[*]u8 {
+    const p = gpa.allocator().rawAlloc(@max(len, 1), .fromByteUnits(alignment), @returnAddress()) orelse return null;
+    blocks_mu.lock();
+    defer blocks_mu.unlock();
+    blocks.put(std.heap.c_allocator, @intFromPtr(p), true) catch {
+        gpa.allocator().rawFree(p[0..@max(len, 1)], .fromByteUnits(alignment), @returnAddress());
+        return null;
+    };
+    return p;
+}
+
+// A libc block is never resized in place: the caller moves it instead.
+fn cAbiResize(_: ?*anyopaque, ptr: ?[*]u8, old_len: usize, new_len: usize, alignment: usize) callconv(.c) bool {
+    const p = ptr orelse return false;
+    if (provenance(p, false) == .libc) return false;
+    return gpa.allocator().rawResize(p[0..@max(old_len, 1)], .fromByteUnits(alignment), @max(new_len, 1), @returnAddress());
+}
+
+fn cAbiFree(_: ?*anyopaque, ptr: ?[*]u8, len: usize, alignment: usize) callconv(.c) void {
+    const p = ptr orelse return;
+    switch (provenance(p, true)) {
+        .libc => std.c.free(p),
+        .live, .freed => gpa.allocator().rawFree(p[0..@max(len, 1)], .fromByteUnits(alignment), @returnAddress()),
+    }
 }
 
 /// Checks for leaks if this was the last hold.

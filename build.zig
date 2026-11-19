@@ -438,6 +438,8 @@ pub fn build(b: *std.Build) void {
         opts.addOption(bool, "content_subscription_profile", content_subscription_profile);
         opts.addOption(bool, "debug_allocator", debug_allocator);
         opts.addOption(bool, "debug_allocator_stack_traces", debug_allocator_stack_traces);
+        // Whether the codec's C ABI (zidl_cdr_set_allocator and friends) is linked.
+        opts.addOption(bool, "c_abi", need_c_abi);
     }
     // A ThreadSanitizer build is position-independent *executable* code, so
     // Zig gives the codec archive's thread-locals local-exec TLS, which a
@@ -896,6 +898,8 @@ pub fn build(b: *std.Build) void {
         c_alloc_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
         c_alloc_smoke_mod.addIncludePath(b.path("include"));
         c_alloc_smoke_mod.linkLibrary(zzdds_lib);
+        // zzdds.dll does not export zidl-cdr's C API (see the JNI glue below).
+        if (target.result.os.tag == .windows) linkCdr(c_alloc_smoke_mod, cdr_lib.?);
         const c_alloc_smoke = b.addExecutable(.{ .name = "zzdds_c_allocator_smoke", .root_module = c_alloc_smoke_mod });
         binding_smoke_step.dependOn(&b.addRunArtifact(c_alloc_smoke).step);
 
@@ -1357,8 +1361,11 @@ pub fn build(b: *std.Build) void {
         // install subdirectories) avoid that collision entirely. Java
         // forbids a named package from referencing the unnamed one, which
         // is why dcps.idl gets a real package too, not just the extension.
+        // --java-jni-cdr-allocator: what the JNI glue builds is released by
+        // the generated C frees, which go through zidl-cdr's allocator
+        // (--zig-generate-c-api-cdr-allocator above).
         const gen_dcps_java = b.addRunArtifact(zidl_exe);
-        gen_dcps_java.addArgs(&.{ "-b", "java", "--generate-interfaces", "--java-jni-library", "zzdds_jni", "--java-package", "io.zzdds.dcps", "--handle-retire-hook", "zzdds_handle_retire", "--handle-retire-query", "zzdds_handle_retire_is_retired", "--java-jni-onload-hook", "zzdds_java_on_load", "-o" });
+        gen_dcps_java.addArgs(&.{ "-b", "java", "--generate-interfaces", "--java-jni-library", "zzdds_jni", "--java-package", "io.zzdds.dcps", "--handle-retire-hook", "zzdds_handle_retire", "--handle-retire-query", "zzdds_handle_retire_is_retired", "--java-jni-onload-hook", "zzdds_java_on_load", "--java-jni-cdr-allocator", "-o" });
         const gen_java_dir = gen_dcps_java.addOutputDirectoryArg("zzdds-java-binding");
         if (xtypes) gen_dcps_java.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
         gen_dcps_java.addFileArg(dcps_idl);
@@ -1447,6 +1454,12 @@ pub fn build(b: *std.Build) void {
             zzdds_jni_mod.addIncludePath(.{ .cwd_relative = jni_inc.base });
             zzdds_jni_mod.addIncludePath(.{ .cwd_relative = jni_inc.platform });
             zzdds_jni_mod.linkLibrary(zzdds_lib_for_reuse.?);
+            // The JNI glue allocates through zidl_cdr_alloc
+            // (--java-jni-cdr-allocator). libzzdds.so exports it, so the glue
+            // shares the library's process-wide allocator; zzdds.dll does not
+            // (C consumers link zidl_cdr.lib themselves), so on Windows the
+            // glue has its own copy, which allocates with malloc as before.
+            if (target.result.os.tag == .windows) linkCdr(zzdds_jni_mod, cdr_lib.?);
             const zzdds_jni_lib = b.addLibrary(.{
                 .name = "zzdds_jni",
                 .linkage = .dynamic,

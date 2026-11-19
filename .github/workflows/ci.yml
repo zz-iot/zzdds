@@ -96,6 +96,11 @@ jobs:
       - name: DebugAllocator lane (default allocator path only, additive to the matrix above)
         run: zig build test -Ddebug-allocator=true
 
+      # The C ABI is not in `zig build test`: what C and C++ callers free goes
+      # through the DebugAllocator only here.
+      - name: C/C++ binding smoke tests (DebugAllocator)
+        run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true -Ddebug-allocator=true
+
   # ── Unit tests: remaining platforms (independent of interop) ──────────────
   test-other:
     name: ${{ matrix.name }}

@@ -1372,7 +1372,10 @@ fn createFactoryWith(allocator: ?std.mem.Allocator) !ZZDDS.DomainParticipantFact
         debug_gpa.allocator()
     else
         std.heap.c_allocator;
-    if (build_options.debug_allocator and on_debug_gpa) debug_gpa.retain();
+    if (build_options.debug_allocator and on_debug_gpa) {
+        debug_gpa.retain();
+        debug_gpa.registerForCAbi();
+    }
     errdefer if (build_options.debug_allocator and on_debug_gpa) debug_gpa.release();
     const owner = try alloc.create(FactoryOwner);
     errdefer alloc.destroy(owner);

@@ -17,6 +17,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 // Atomic: on the shared runtime the factory's worker threads allocate and
 // free through this allocator too.
@@ -47,6 +48,15 @@ static void track_free(void *ctx, void *ptr, size_t len, size_t alignment) {
 }
 
 int main(void) {
+    /* C ABI blocks made before any factory, from libc: under -Ddebug-allocator
+     * the first default factory registers the DebugAllocator process-wide,
+     * and these must still be freed and moved correctly after that. */
+    void *early = zidl_cdr_alloc(32);
+    char *early_str = zidl_cdr_strdup("early");
+    void *early_moved = zidl_cdr_alloc(16);
+    assert(early != NULL && early_str != NULL && early_moved != NULL);
+    memset(early_moved, 0x5A, 16);
+
     ZidlAllocator tracking = {NULL, track_alloc, track_resize, track_free};
 
     zzdds_DomainParticipantFactory factory = zzdds_DomainParticipantFactory_create_with_allocator(&tracking);
@@ -86,6 +96,11 @@ int main(void) {
     /* The generated strict destroy refuses while a participant remains. */
     zzdds_DomainParticipantFactory own = zzdds_DomainParticipantFactory_create();
     assert(own != NULL);
+    zidl_cdr_free(early, 32);
+    zidl_cdr_free_str(early_str);
+    unsigned char *moved = zidl_cdr_realloc(early_moved, 16, 4096);
+    assert(moved != NULL && moved[0] == 0x5A && moved[15] == 0x5A);
+    zidl_cdr_free(moved, 4096);
     DDS_DomainParticipantFactory own_dds = zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(own);
     DDS_DomainParticipant own_dp = DDS_DomainParticipantFactory_create_participant(own_dds, 0, NULL, NULL, 0);
     assert(own_dp != NULL);
