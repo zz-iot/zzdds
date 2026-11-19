@@ -10,6 +10,11 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-19
 
+- Under `-Ddebug-allocator`, a factory on the DebugAllocator also registers it as the
+  process-wide C ABI allocator, unless the app has registered one. The generated
+  `{Type}_free` functions free through that allocator, so a sequence an entity returned
+  (C++ `ContentFilteredTopic::get_expression_parameters`, say) no longer goes to libc's
+  `free`. CI now runs the C/C++ binding smoke tests with `-Ddebug-allocator`.
 - A reader or writer deleted by a cascade (a factory's `release`, `zzdds_destroy_factory`)
   while it has an outstanding loan keeps its handle until the last loan comes back, so C++
   and Java can return it; the return frees the entity. Every other operation on it,

@@ -438,6 +438,8 @@ pub fn build(b: *std.Build) void {
         opts.addOption(bool, "content_subscription_profile", content_subscription_profile);
         opts.addOption(bool, "debug_allocator", debug_allocator);
         opts.addOption(bool, "debug_allocator_stack_traces", debug_allocator_stack_traces);
+        // Whether the codec's C ABI (zidl_cdr_set_allocator and friends) is linked.
+        opts.addOption(bool, "c_abi", need_c_abi);
     }
     // A ThreadSanitizer build is position-independent *executable* code, so
     // Zig gives the codec archive's thread-locals local-exec TLS, which a

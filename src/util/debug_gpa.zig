@@ -10,9 +10,17 @@
 //! stack traces, so reports name no allocation or free site. Recording one
 //! holds the allocator's lock for the capture, which serializes every thread
 //! in the process.
+//!
+//! A factory on this allocator also makes it the process-wide C ABI
+//! allocator (`zidl_cdr_set_allocator`), unless the app registered one: the
+//! sequences and strings an entity hands a C caller come from the entity's
+//! allocator, and the generated `{Type}_free` functions free them through
+//! the process-wide one. The leak check then also counts what C callers
+//! still hold.
 
 const std = @import("std");
 const build_options = @import("build_options");
+const ZidlAllocator = @import("zidl_bindings").ZidlAllocator;
 const Mutex = @import("mutex.zig").Mutex;
 const listener_lane = @import("../dcps/listener_lane.zig");
 
@@ -33,6 +41,48 @@ pub fn owns(alloc: std.mem.Allocator) bool {
 /// allocates anything, or by an entity freed after its factory.
 pub fn retain() void {
     leak_check.retain();
+}
+
+/// Makes this the process-wide C ABI allocator, if the app has not
+/// registered one. Called by each factory on this allocator, before it
+/// allocates anything, and never undone: whatever was allocated through it
+/// must be freed through it.
+pub fn registerForCAbi() void {
+    if (!build_options.c_abi) return;
+    c_abi_mu.lock();
+    defer c_abi_mu.unlock();
+    if (c_abi_registered) return;
+    c_abi_registered = true;
+    if (zidl_cdr_get_allocator() == null) zidl_cdr_set_allocator(&c_abi_allocator);
+}
+
+extern fn zidl_cdr_get_allocator() callconv(.c) ?*const ZidlAllocator;
+extern fn zidl_cdr_set_allocator(allocator: ?*const ZidlAllocator) callconv(.c) void;
+
+var c_abi_mu: Mutex = .{};
+var c_abi_registered = false;
+
+const c_abi_allocator: ZidlAllocator = .{
+    .ctx = null,
+    .alloc = cAbiAlloc,
+    .resize = cAbiResize,
+    .free = cAbiFree,
+};
+
+// A C caller may ask for zero bytes, which a Zig allocator does not take;
+// such a block is one byte here, the same on every call for it.
+fn cAbiAlloc(_: ?*anyopaque, len: usize, alignment: usize) callconv(.c) ?[*]u8 {
+    return gpa.allocator().rawAlloc(@max(len, 1), .fromByteUnits(alignment), @returnAddress());
+}
+
+fn cAbiResize(_: ?*anyopaque, ptr: ?[*]u8, old_len: usize, new_len: usize, alignment: usize) callconv(.c) bool {
+    const p = ptr orelse return false;
+    return gpa.allocator().rawResize(p[0..@max(old_len, 1)], .fromByteUnits(alignment), @max(new_len, 1), @returnAddress());
+}
+
+fn cAbiFree(_: ?*anyopaque, ptr: ?[*]u8, len: usize, alignment: usize) callconv(.c) void {
+    const p = ptr orelse return;
+    gpa.allocator().rawFree(p[0..@max(len, 1)], .fromByteUnits(alignment), @returnAddress());
 }
 
 /// Checks for leaks if this was the last hold.

@@ -97,7 +97,8 @@ exposed to the app) is correct to route through the entity's own `get_allocator(
 generated free has no entity parameter to ask. **This is the one place the design is not
 fully closed**: it's correct only as long as an entity's own `_with_allocator` allocator
 matches whatever's registered process-wide — true for every existing example, not
-structurally enforced. Closing it fully would need `{Type}_free()` itself to take an entity
+structurally enforced. (`-Ddebug-allocator`, which picks the default factory's allocator,
+registers it process-wide too: see `src/util/debug_gpa.zig`.) Closing it fully would need `{Type}_free()` itself to take an entity
 parameter, a real C-ABI shape change not undertaken here.
 
 **Process-wide (Category 2).** `zidl_cdr_get_allocator()` (paired with the pre-existing
