@@ -3,18 +3,29 @@
  *
  * Driven by scripts/verify_release_bundle.py through both supported
  * consumption paths (pkg-config and CMake find_package(ZZDDS)). Deliberately
- * tiny: it only has to force a real link against the bundled libzzdds +
- * libzidl_cdr and execute one runtime call, proving the symbols resolve and
- * the shared library actually loads from a prefix that was renamed and moved
- * after the build. Functional DDS coverage is examples/{c,cpp}/hello_world
+ * tiny: it only has to force a real link against the bundled libzzdds and
+ * execute a few runtime calls, proving the symbols resolve and the shared
+ * library actually loads from a prefix that was renamed and moved after the
+ * build. The zidl-cdr calls cover both halves of its C API (zidl_cdr.c and
+ * the Zig wire functions), which libzzdds must export: the bundle ships no
+ * other copy. Functional DDS coverage is examples/{c,cpp}/hello_world
  * (built by the same script against the same bundle) plus the test-bindings
  * and examples CI jobs.
  */
 #include "zzdds_c.h"
+#include "zidl_cdr.h"
 
 #include <stdio.h>
 
 int main(void) {
+    ZidlCdrWriter writer;
+    if (zidl_cdr_writer_init(&writer, ZIDL_XCDR1) != ZIDL_CDR_OK ||
+        zidl_cdr_write_u32(&writer, 42u) != ZIDL_CDR_OK) {
+        fprintf(stderr, "FAIL: zidl-cdr writer through libzzdds\n");
+        return 1;
+    }
+    zidl_cdr_writer_deinit(&writer);
+
     zzdds_DomainParticipantFactory factory = zzdds_DomainParticipantFactory_create();
     if (factory == NULL) {
         fprintf(stderr, "FAIL: zzdds_DomainParticipantFactory_create() returned the nil sentinel\n");

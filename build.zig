@@ -672,42 +672,11 @@ pub fn build(b: *std.Build) void {
 
         // Share the codec archive across SDK exports and binding consumers.
         const zidl_cdr_lib = cdr_lib.?;
-        const zidl_cdr_mod = zidl_cdr_lib.root_module;
 
-        // Install libzidl_cdr.a. On macOS the archive that `Step.Compile`'s
-        // own (GNU-format) archiver writes has member offsets Apple's ld64
-        // rejects -- "64-bit mach-o member 'zidl_cdr.o' not 8-byte aligned".
-        // zig cc / LLD tolerate it (so linking it into libzzdds and the
-        // binding smoke tests below is fine), but a downstream C/C++ consumer
-        // building against the installed tree with Apple clang/ld cannot link
-        // it. Re-pack the same object with the `zig ar` subcommand, whose
-        // Darwin-format output is 8-byte aligned. Works when cross-compiling a
-        // macOS bundle from a non-macOS host too. See ziglang/zig#1981.
-        if (target.result.os.tag == .macos) {
-            const zidl_cdr_obj = b.addObject(.{
-                .name = "zidl_cdr",
-                .root_module = zidl_cdr_mod,
-                .use_llvm = if (sanitize_thread) true else null,
-            });
-            zidl_cdr_obj.bundle_compiler_rt = true;
-            zidl_cdr_obj.bundle_ubsan_rt = true;
-            const repack = b.addSystemCommand(&.{ b.graph.zig_exe, "ar", "-rcs", "--format=darwin" });
-            const fixed_a = repack.addOutputFileArg("libzidl_cdr.a");
-            repack.addArtifactArg(zidl_cdr_obj);
-            const install_fixed_a = b.addInstallFileWithDir(fixed_a, .lib, "libzidl_cdr.a");
-            b.getInstallStep().dependOn(&install_fixed_a.step);
-        } else if (target.result.os.tag == .windows and target.result.abi != .msvc) {
-            // C/C++ applications on Windows link the installed archive with
-            // MSVC, which only accepts one built for an MSVC-ABI target (an
-            // archive for Zig's default GNU ABI fails with LNK1143). zzdds.dll
-            // and the Zig-linked tests keep the archive for `target`.
-            const msvc_target = b.resolveTargetQuery(.{ .cpu_arch = target.result.cpu.arch, .os_tag = .windows, .abi = .msvc });
-            const msvc_dep = b.dependency("zidl", .{ .target = msvc_target, .optimize = optimize });
-            const msvc_runtime = runtimeModules(b, zidl_dep, msvc_dep, msvc_target, optimize, false);
-            b.installArtifact(cdrLibrary(b, zidl_dep, msvc_runtime.codec, msvc_target, optimize, false));
-        } else {
-            b.installArtifact(zidl_cdr_lib);
-        }
+        // No zidl-cdr archive is installed. libzzdds contains zidl-cdr and
+        // exports its whole C API, and C/C++ consumers link that one copy
+        // (the CMake package's ZZDDS::zidl_cdr forwards to ZZDDS::zzdds), so a
+        // process has one zidl-cdr and one zidl-cdr allocator.
 
         // Build libzzdds as a shared library exposing the C ABI surface.
         const zzdds_lib = b.addLibrary(.{
@@ -821,10 +790,8 @@ pub fn build(b: *std.Build) void {
             // consumer (the JNI glue, a C app) allocating what a generated
             // `_free` here frees must use this library's process-wide
             // allocator, not a copy of its own.
-            // Both halves: a consumer still linking ZZDDS::zidl_cdr would
-            // otherwise pull the archive's Zig half in for the wire calls,
-            // and with it a second copy of zidl_cdr.c, whose symbols
-            // zzdds.lib now also defines (LNK2005).
+            // Both halves, C and Zig: C/C++ consumers get all of zidl-cdr
+            // from here, as no archive is installed.
             run_gen_def.addFileArg(zidl_dep.path("packages/zidl-cdr/src/zidl_cdr.c"));
             run_gen_def.addFileArg(zidl_dep.path("packages/zidl-cdr/src/shared_primitives.zig"));
             zzdds_lib.win32_module_definition = zzdds_def;
@@ -877,7 +844,8 @@ pub fn build(b: *std.Build) void {
             .file = gen_smoke_c_dir.path(b, "binding_smoke_cdr.c"),
             .flags = &.{ "-std=c99", "-Wall" },
         });
-        linkCdr(c_smoke_mod, cdr_lib.?);
+        // zidl-cdr comes from libzzdds, as for any C consumer.
+        c_smoke_mod.sanitize_thread = sanitize_thread;
         c_smoke_mod.addIncludePath(gen_smoke_c_dir);
         c_smoke_mod.addIncludePath(gen_c_dir);
         c_smoke_mod.addIncludePath(gen_zzdds_c_dir);
@@ -932,7 +900,8 @@ pub fn build(b: *std.Build) void {
                 .file = gen_smoke_cpp_dir.path(b, "binding_smoke_cdr.cpp"),
                 .flags = &.{ "-std=c++17", "-Wall" },
             });
-            linkCdr(cpp_smoke_mod, cdr_lib.?);
+            // zidl-cdr comes from libzzdds, as for any C++ consumer.
+            cpp_smoke_mod.sanitize_thread = sanitize_thread;
 
             // Binding smoke test for zzdds_cpp.hpp's allocator-injection surfaces
             // (factory bootstrap + C++ wrapper-object PMR allocation), including
@@ -1137,7 +1106,7 @@ pub fn build(b: *std.Build) void {
             \\Name: zzdds
             \\Description: Zenzen DDS — DDS implementation for Zig/C/C++
             \\Version: {s}
-            \\Libs: -L${{libdir}} -lzzdds -lzidl_cdr
+            \\Libs: -L${{libdir}} -lzzdds
             \\Cflags: -I${{includedir}}
             \\
         , .{zzdds_version});
@@ -1211,21 +1180,15 @@ pub fn build(b: *std.Build) void {
             \\    endif()
             \\endif()
             \\
+            \\# zidl-cdr's C API is part of libzzdds, which exports it: linking
+            \\# that one copy keeps a second zidl-cdr, and a second allocator,
+            \\# out of the program. ZZDDS::zidl_cdr stays for projects that name
+            \\# it, and forwards to ZZDDS::zzdds.
             \\if(NOT TARGET ZZDDS::zidl_cdr)
-            \\    add_library(ZZDDS::zidl_cdr STATIC IMPORTED)
-            \\    find_library(_ZZDDS_CDR_LIB
-            \\        NAMES zidl_cdr
-            \\        HINTS "${{_ZZDDS_PREFIX}}/lib"
-            \\        NO_DEFAULT_PATH
-            \\    )
-            \\    if(NOT _ZZDDS_CDR_LIB)
-            \\        message(FATAL_ERROR "ZZDDS: zidl_cdr library not found under ${{_ZZDDS_PREFIX}}/lib")
-            \\    endif()
+            \\    add_library(ZZDDS::zidl_cdr INTERFACE IMPORTED)
             \\    set_target_properties(ZZDDS::zidl_cdr PROPERTIES
-            \\        IMPORTED_LOCATION "${{_ZZDDS_CDR_LIB}}"
-            \\        INTERFACE_INCLUDE_DIRECTORIES "${{_ZZDDS_PREFIX}}/include"
+            \\        INTERFACE_LINK_LIBRARIES ZZDDS::zzdds
             \\    )
-            \\    unset(_ZZDDS_CDR_LIB CACHE)
             \\endif()
             \\
             \\set(ZZDDS_ZIDL_EXECUTABLE "${{_ZZDDS_PREFIX}}/bin/{s}")

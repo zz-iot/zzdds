@@ -268,8 +268,8 @@ jobs:
   #
   # release.yml previously published only a git tag + a `zig fetch` URL --
   # nothing for C/C++ consumers who don't build from source. This job builds
-  # the install tree (dynamic libzzdds + static libzidl_cdr + headers +
-  # pkgconfig + CMake package files) on each release platform and uploads it
+  # the install tree (dynamic libzzdds, which carries zidl-cdr's C API, +
+  # headers + pkgconfig + CMake package files) on each release platform and uploads it
   # as a per-platform tarball; `publish` attaches them to the GitHub release.
   #
   # Bundles are built ReleaseSafe: optimized, with Zig's safety checks and debug

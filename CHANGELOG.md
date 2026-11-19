@@ -10,6 +10,14 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-19
 
+- C and C++ programs get zidl-cdr from libzzdds alone. `zzdds.dll` now exports all of
+  zidl-cdr's C API, both `zidl_cdr.c` and the Zig wire functions, as `libzzdds.so`
+  already did. The install tree no longer ships the static `zidl_cdr` archive: in the
+  CMake package `ZZDDS::zidl_cdr` forwards to `ZZDDS::zzdds`, and `zzdds.pc` drops
+  `-lzidl_cdr`. A program, the JNI glue and libzzdds therefore share one zidl-cdr and one
+  allocator; before, on Windows, each had its own copy, so a generated `_free` in the
+  DLL could free with a different allocator from the one that allocated. The macOS
+  archive repack and the separate MSVC-ABI archive build go with the archive.
 - A DomainParticipant allocates the handles of the entities it names
   (`docs/design/handle-registries.md`) instead of hashing GUIDs and topic names into them,
   so two can no longer share a handle. A participant or endpoint that is lost and found
