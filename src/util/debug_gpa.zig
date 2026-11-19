@@ -20,7 +20,8 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const ZidlAllocator = @import("zidl_bindings").ZidlAllocator;
+const zidl_bindings = @import("zidl_bindings");
+const ZidlAllocator = zidl_bindings.ZidlAllocator;
 const Mutex = @import("mutex.zig").Mutex;
 const listener_lane = @import("../dcps/listener_lane.zig");
 
@@ -28,13 +29,15 @@ const config: std.heap.DebugAllocatorConfig = if (build_options.debug_allocator_
 var gpa: std.heap.DebugAllocator(config) = .{};
 var leak_check: LeakCheck = .{};
 
+/// Through the same C ABI adapter a generated C free uses, so a block passes
+/// the same alignment wherever it is allocated or freed.
 pub fn allocator() std.mem.Allocator {
-    return gpa.allocator();
+    return zidl_bindings.toAllocator(&c_abi_allocator);
 }
 
 /// Whether `alloc` is this allocator.
 pub fn owns(alloc: std.mem.Allocator) bool {
-    return build_options.debug_allocator and alloc.ptr == @as(*anyopaque, @ptrCast(&gpa));
+    return build_options.debug_allocator and alloc.ptr == @as(*anyopaque, @ptrCast(@constCast(&c_abi_allocator)));
 }
 
 /// Holds off the leak check: by a factory on this allocator, from before it

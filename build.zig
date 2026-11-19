@@ -1359,8 +1359,11 @@ pub fn build(b: *std.Build) void {
         // install subdirectories) avoid that collision entirely. Java
         // forbids a named package from referencing the unnamed one, which
         // is why dcps.idl gets a real package too, not just the extension.
+        // --java-jni-cdr-allocator: what the JNI glue builds is released by
+        // the generated C frees, which go through zidl-cdr's allocator
+        // (--zig-generate-c-api-cdr-allocator above).
         const gen_dcps_java = b.addRunArtifact(zidl_exe);
-        gen_dcps_java.addArgs(&.{ "-b", "java", "--generate-interfaces", "--java-jni-library", "zzdds_jni", "--java-package", "io.zzdds.dcps", "--handle-retire-hook", "zzdds_handle_retire", "--handle-retire-query", "zzdds_handle_retire_is_retired", "--java-jni-onload-hook", "zzdds_java_on_load", "-o" });
+        gen_dcps_java.addArgs(&.{ "-b", "java", "--generate-interfaces", "--java-jni-library", "zzdds_jni", "--java-package", "io.zzdds.dcps", "--handle-retire-hook", "zzdds_handle_retire", "--handle-retire-query", "zzdds_handle_retire_is_retired", "--java-jni-onload-hook", "zzdds_java_on_load", "--java-jni-cdr-allocator", "-o" });
         const gen_java_dir = gen_dcps_java.addOutputDirectoryArg("zzdds-java-binding");
         if (xtypes) gen_dcps_java.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
         gen_dcps_java.addFileArg(dcps_idl);
