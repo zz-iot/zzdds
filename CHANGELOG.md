@@ -10,6 +10,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-19
 
+- A participant no longer loses a peer that announces itself while the participant is
+  starting. SEDP listens before SPDP starts and passed a peer's unicast SPDP announcement
+  on to it; with no callbacks yet, SPDP recorded the peer without discovering it, and
+  ignored its later announcements as repeats. SPDP now drops announcements until it has
+  started, and the peer is discovered when it announces again. This was also a data race
+  (`SpdpEndpoints.start` set its callbacks with no lock), seen under ThreadSanitizer.
 - Under `-Ddebug-allocator`, a factory on the DebugAllocator also registers it as the
   process-wide C ABI allocator, unless the app has registered one. The generated
   `{Type}_free` functions free through that allocator, so a sequence an entity returned

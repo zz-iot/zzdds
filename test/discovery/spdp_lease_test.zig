@@ -172,6 +172,48 @@ test "SPDP: processSpdpPayload fires on_participant_discovered" {
     try testing.expectEqual(@as(u32, 0), tr.lost);
 }
 
+test "SPDP: an announcement relayed before start is dropped, and its peer discovered when it announces again" {
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const mt = try MockTransport.init(alloc, net, &.{});
+    defer mt.deinit();
+
+    const spdp = try SpdpEndpoints.init(alloc, mt.transport(), 0, 3000);
+    defer spdp.deinit();
+
+    var clock = ManualClock.init(0);
+    spdp.setClock(clock.clock());
+
+    const peer = prefix(0xCD);
+    const payload = try buildPayload(alloc, peer, 5000);
+    defer alloc.free(payload);
+
+    // SEDP listens before SPDP starts, and relays a peer's unicast
+    // announcement that arrives meanwhile.
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
+
+    var tr = Tracker{};
+    const c = tr.cbs();
+    const ann: ParticipantAnnouncement = .{
+        .guid = .{ .prefix = prefix(0x11), .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0xc1 } },
+        .domain_id = 0,
+        .name = "",
+        .metatraffic_unicast_locators = &.{},
+        .metatraffic_multicast_locators = &.{},
+        .default_unicast_locators = &.{},
+        .default_multicast_locators = &.{},
+        .lease_duration_ms = 5000,
+        .builtin_endpoint_set = 0,
+    };
+    try spdp.start(&ann, &c);
+    try testing.expectEqual(@as(u32, 0), tr.discovered);
+
+    spdp.processSpdpPayload(peer, 2, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    try testing.expectEqual(@as(u32, 1), tr.discovered);
+}
+
 test "SPDP: lease expiry fires on_participant_lost" {
     const alloc = testing.allocator;
 
