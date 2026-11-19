@@ -472,6 +472,53 @@ test "DCPS: DCPSPublication reports endpoint identity and disposal" {
     try testing.expectEqual(alive.info.instance_handle, disposed.info.instance_handle);
 }
 
+test "DCPS: DCPSParticipant gives each discovered participant its own instance, under its discovered handle" {
+    var h = try Harness.init(0x7B);
+    defer h.deinit();
+
+    const alloc = testing.allocator;
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+    const part_dr = dp_impl.builtin_sub.?.part_dr;
+    while (part_dr.takeRaw()) |s| alloc.free(s.data);
+
+    for ([_]u8{ 0xA1, 0xA2 }) |b| {
+        const data = iface.ParticipantData{
+            .guid = .{ .prefix = .{ .bytes = .{ b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } }, .entity_id = EntityIds.participant },
+            .domain_id = 0,
+            .name = "",
+            .metatraffic_unicast_locators = &.{},
+            .metatraffic_multicast_locators = &.{},
+            .default_unicast_locators = &.{},
+            .default_multicast_locators = &.{},
+            .lease_duration_ms = 10_000,
+            .builtin_endpoint_set = 0,
+            .vendor_id = .{ .bytes = .{ 0x00, 0x00 } },
+        };
+        dp_impl.disc_callbacks.on_participant_discovered(dp_impl.disc_callbacks.ctx, &data);
+    }
+
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| alloc.free(b[0..handles._length]);
+    };
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.get_discovered_participants(dp.ptr, &handles));
+    try testing.expectEqual(@as(u32, 2), handles._length);
+    const discovered = handles._buffer.?[0..2];
+
+    var seen: [2]DDS.InstanceHandle_t = undefined;
+    for (&seen) |*ih| {
+        const s = part_dr.takeRaw() orelse return error.NoSample;
+        defer alloc.free(s.data);
+        try testing.expectEqual(DDS.NEW_VIEW_STATE, s.info.view_state);
+        ih.* = s.info.instance_handle;
+        try testing.expect(std.mem.indexOfScalar(DDS.InstanceHandle_t, discovered, ih.*) != null);
+    }
+    try testing.expect(seen[0] != seen[1]);
+}
+
 test "DCPS: get_discovered_topics returns handle for a SEDP-discovered writer's topic" {
     var h = try Harness.init(0x0B);
     defer h.deinit();

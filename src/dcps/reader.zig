@@ -24,6 +24,7 @@ const filter_mod = @import("filter.zig");
 const topic_mod = @import("topic.zig");
 const waitset = @import("waitset.zig");
 const writer_mod = @import("writer.zig");
+const handle_registry = @import("handle_registry.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 const Hook = @import("../runtime/core.zig").Hook;
@@ -152,8 +153,8 @@ pub const PendingChange = struct {
     /// Null means no expiry (infinite lifespan or NOT_ALIVE change).
     expiry_ns: ?i64 = null,
     /// The raw 16-byte RTPS key hash this sample arrived with (`CacheChange.key_hash`,
-    /// see `onDataCb`) -- distinct from `info.instance_handle`, a lossy FNV-1a hash of
-    /// this (`writer_mod.keyHashToHandle`) that can't be reversed back to it. Needed
+    /// see `onDataCb`) -- distinct from `info.instance_handle`, the reader's handle for its instance
+    /// (`DataReaderImpl.instances`). Needed
     /// for `take_raw`/`read_raw`'s `key_hashes` output param (see dcps.idl); zero for
     /// synthetic NOT_ALIVE_NO_WRITERS injections, which have no real writer/key-hash
     /// source (see the one call site that constructs one).
@@ -269,9 +270,16 @@ pub const TakenSample = struct {
     key_hash: [16]u8 = std.mem.zeroes([16]u8),
 };
 
-/// Per-instance tracking used to compute view_state and get_key_value.
+/// A reader's instance, in its `instances` registry under the key hash
+/// (docs/design/handle-registries.md): what view_state, get_key_value,
+/// TIME_BASED_FILTER and EXCLUSIVE ownership need of it.
 const InstanceEntry = struct {
-    instance_state: DDS.InstanceStateKind,
+    /// The handle SampleInfo and the instance operations use: the registry's,
+    /// or for a built-in reader the entity's, which the participant supplies.
+    handle: DDS.InstanceHandle_t,
+    /// Null until a sample of the instance is accepted: a sample a filter
+    /// drops still registers its instance.
+    instance_state: ?DDS.InstanceStateKind = null,
     /// Full CDR payload of the first alive sample for this instance.
     /// Used by getKeyValueRaw. Null until the first alive sample arrives.
     key_cdr: ?[]u8 = null,
@@ -280,7 +288,57 @@ const InstanceEntry = struct {
     /// sample's SampleInfo at receipt time.
     disposed_generation_count: i32 = 0,
     no_writers_generation_count: i32 = 0,
+    /// TIME_BASED_FILTER: source timestamp (ns) of the last sample that passed
+    /// the window. Null until one does, and again once the instance is not
+    /// alive.
+    tbf_last_ns: ?i64 = null,
+    /// EXCLUSIVE ownership: the writer that owns the instance, whose strength
+    /// is looked up in `writer_strengths` when compared, so it is never older
+    /// than the writer's. Ownership is per instance: two writers of different
+    /// instances each own their own, whatever their strengths. Null until a
+    /// writer claims it, and again once the instance is not alive or its
+    /// owner is lost.
+    owner: ?Guid = null,
+
+    const States = struct {
+        view: DDS.ViewStateKind,
+        instance_state: DDS.InstanceStateKind,
+        disposed_generation_count: i32,
+        no_writers_generation_count: i32,
+    };
+
+    /// The view_state and instance_state of a change of `kind` to this
+    /// instance, which it records.
+    fn applyChange(self: *InstanceEntry, kind: history_mod.ChangeKind) States {
+        const new_state: DDS.InstanceStateKind = switch (kind) {
+            .alive => DDS.ALIVE_INSTANCE_STATE,
+            .not_alive_disposed => DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE,
+            .not_alive_unregistered => DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE,
+        };
+        var view: DDS.ViewStateKind = DDS.NEW_VIEW_STATE;
+        if (self.instance_state) |prev| {
+            // Resurrection: instance was not alive but a new alive sample arrived.
+            const resurrected = prev != DDS.ALIVE_INSTANCE_STATE and kind == .alive;
+            if (!resurrected) view = DDS.NOT_NEW_VIEW_STATE;
+            if (resurrected) {
+                if (prev == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE) {
+                    self.disposed_generation_count += 1;
+                } else if (prev == DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE) {
+                    self.no_writers_generation_count += 1;
+                }
+            }
+        }
+        self.instance_state = new_state;
+        return .{
+            .view = view,
+            .instance_state = new_state,
+            .disposed_generation_count = self.disposed_generation_count,
+            .no_writers_generation_count = self.no_writers_generation_count,
+        };
+    }
 };
+
+const InstanceRegistry = handle_registry.HandleRegistry([16]u8, InstanceEntry);
 
 fn matchesSample(
     pc: *const PendingChange,
@@ -515,14 +573,9 @@ pub const DataReaderImpl = struct {
     // Only used when qos.ownership.kind == .EXCLUSIVE_OWNERSHIP_QOS.
     // Guarded by `mu`.
 
-    /// Ownership strength of each matched writer.
+    /// Ownership strength of each matched writer. Each instance's owner is
+    /// in its InstanceEntry.
     writer_strengths: std.AutoHashMapUnmanaged(Guid, i32) = .empty,
-    /// Per-instance ownership: maps instance handle → GUID of the current owner,
-    /// whose strength is looked up in writer_strengths when compared, so it is
-    /// never older than the writer's.  Ownership is per-instance: two writers
-    /// with different key values (different instances) are each the sole owner
-    /// of their own instance, even if one has lower strength than the other.
-    owner_map: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, Guid) = .empty,
 
     /// Per-writer set of instance handles written to via alive changes.
     /// Guarded by `mu`. Used in onWriterUnmatchingCb to synthesize NOT_ALIVE_NO_WRITERS
@@ -534,20 +587,18 @@ pub const DataReaderImpl = struct {
     /// their originating writer. Guarded by `mu` and released with the reader.
     publication_guids: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, PublicationGuidEntry) = .empty,
 
-    // ── TIME_BASED_FILTER tracking ────────────────────────────────────────────
-    // Guarded by `mu`. Per-instance: each instance independently tracks the
-    // source timestamp of its last delivered sample.
-
-    /// Source timestamp (ns) of the last sample that passed the TBF window,
-    /// keyed by instance handle. Absent = no sample delivered yet for that instance.
-    tbf_map: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, i64) = .empty,
-
-    // ── Instance lifecycle tracking ───────────────────────────────────────────
+    // ── Instances ─────────────────────────────────────────────────────────────
     // Guarded by `mu`.
 
-    /// Tracks the current instance_state for each known instance handle.
-    /// Used to determine view_state (NEW_VIEW vs NOT_NEW_VIEW) at enqueue time.
-    seen_instances: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, InstanceEntry),
+    /// The reader's instances by key hash: their handles, and their state for
+    /// view_state, get_key_value, TIME_BASED_FILTER and EXCLUSIVE ownership.
+    /// Not yet removed.
+    instances: InstanceRegistry = .empty,
+    /// A built-in reader: its instances are entities, whose handles the
+    /// participant supplies (`pushBuiltinCdr`), so that the built-in topics,
+    /// `ignore_*` and `get_discovered_*` agree. Resolving such a handle scans
+    /// the instances.
+    entity_handles: bool = false,
 
     /// One box for the whole object, shared across every interface view
     /// (DataReader, Entity, and ZZDDS.DataReader — see src/c_abi/extensions.zig)
@@ -607,7 +658,6 @@ pub const DataReaderImpl = struct {
             .timer_clock = timer_clock,
             .last_received_ns = .init(timer_clock.nowNs()),
             .subscriber_presentation = subscriber_presentation,
-            .seen_instances = .empty,
             .listeners = .init(alloc, .{
                 .ctx = undefined,
                 .acquire = quiesceAcquireFn,
@@ -765,24 +815,16 @@ pub const DataReaderImpl = struct {
         self.coherent_writers.deinit(self.alloc);
         for (self.coherent_committed.items) |*cs| cs.deinit(self.alloc);
         self.coherent_committed.deinit(self.alloc);
-        self.tbf_map.deinit(self.alloc);
         self.writer_strengths.deinit(self.alloc);
         self.writer_liveliness.deinit(self.alloc);
         self.writer_lifespans.deinit(self.alloc);
-        self.owner_map.deinit(self.alloc);
         {
             var wi_it = self.writer_instances.valueIterator();
             while (wi_it.next()) |inner| inner.deinit(self.alloc);
         }
         self.writer_instances.deinit(self.alloc);
         self.publication_guids.deinit(self.alloc);
-        {
-            var si_it = self.seen_instances.valueIterator();
-            while (si_it.next()) |entry| {
-                if (entry.key_cdr) |kc| self.alloc.free(kc);
-            }
-        }
-        self.seen_instances.deinit(self.alloc);
+        self.deinitInstances(self.alloc);
         self.qos.deinit(self.alloc);
         // NOTE: proto_reader lifecycle is owned by the participant (via
         // subDestroyProtoReader callback), not by DataReaderImpl.
@@ -795,91 +837,72 @@ pub const DataReaderImpl = struct {
         if (pinned) subscriber_mod.SubscriberImpl.quiesceReleaseFn(subscriber.ptr);
     }
 
-    /// Determine view_state and instance_state for an incoming change.
-    /// Must be called with `mu` held.
-    fn determineStatesLocked(
-        self: *Self,
-        ih: DDS.InstanceHandle_t,
-        kind: history_mod.ChangeKind,
-    ) struct {
-        view: DDS.ViewStateKind,
-        instance_state: DDS.InstanceStateKind,
-        disposed_generation_count: i32,
-        no_writers_generation_count: i32,
-    } {
-        const new_state: DDS.InstanceStateKind = switch (kind) {
-            .alive => DDS.ALIVE_INSTANCE_STATE,
-            .not_alive_disposed => DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE,
-            .not_alive_unregistered => DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE,
-        };
-        if (self.seen_instances.getPtr(ih)) |entry| {
-            // Resurrection: instance was not alive but a new alive sample arrived.
-            const was_not_alive = entry.instance_state != DDS.ALIVE_INSTANCE_STATE;
-            const view: DDS.ViewStateKind = if (was_not_alive and kind == .alive)
-                DDS.NEW_VIEW_STATE
-            else
-                DDS.NOT_NEW_VIEW_STATE;
-            if (was_not_alive and kind == .alive) {
-                if (entry.instance_state == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE) {
-                    entry.disposed_generation_count += 1;
-                } else if (entry.instance_state == DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE) {
-                    entry.no_writers_generation_count += 1;
-                }
-            }
-            entry.instance_state = new_state;
-            return .{
-                .view = view,
-                .instance_state = new_state,
-                .disposed_generation_count = entry.disposed_generation_count,
-                .no_writers_generation_count = entry.no_writers_generation_count,
-            };
-        } else {
-            self.seen_instances.put(self.alloc, ih, .{ .instance_state = new_state }) catch {};
-            return .{
-                .view = DDS.NEW_VIEW_STATE,
-                .instance_state = new_state,
-                .disposed_generation_count = 0,
-                .no_writers_generation_count = 0,
-            };
-        }
+    /// Free the instances and what they hold.
+    fn deinitInstances(self: *Self, alloc: std.mem.Allocator) void {
+        var it = self.instances.iterator();
+        while (it.next()) |e| if (e.value.key_cdr) |kc| alloc.free(kc);
+        self.instances.deinit(alloc);
     }
 
-    /// Store `data` as the key CDR for `ih` if not already set.
+    /// The instance with `key_hash`, registering it if it is new; null if it
+    /// cannot be registered. `entity_handle` is the handle of a built-in
+    /// reader's instance. The pointer is valid until the next registration.
     /// Must be called with `mu` held.
-    fn storeKeyIfNeededLocked(self: *Self, ih: DDS.InstanceHandle_t, data: []const u8) void {
-        if (self.seen_instances.getPtr(ih)) |entry| {
-            if (entry.key_cdr == null) {
-                entry.key_cdr = self.alloc.dupe(u8, data) catch null;
-            }
-        }
+    fn instanceForKeyLocked(self: *Self, key_hash: [16]u8, entity_handle: DDS.InstanceHandle_t) ?*InstanceEntry {
+        const r = self.instances.getOrPut(self.alloc, key_hash) catch return null;
+        if (!r.found_existing) r.value.* = .{ .handle = r.handle };
+        // An entity's handle can change: a lost entity's is freed, and the
+        // entity has a new one if it is discovered again.
+        if (self.entity_handles) r.value.handle = entity_handle;
+        return r.value;
     }
 
-    /// Inject a CDR sample directly, bypassing the RTPS layer.
-    /// Used by the built-in subscriber to push discovery-sourced samples.
-    /// `cdr` is borrowed; it is copied internally.
+    /// The instance `handle` names, or null. Must be called with `mu` held.
+    fn instanceOfHandleLocked(self: *Self, handle: DDS.InstanceHandle_t) ?*InstanceEntry {
+        if (!self.entity_handles) return self.instances.get(handle);
+        if (handle == DDS.HANDLE_NIL) return null;
+        var it = self.instances.iterator();
+        while (it.next()) |e| if (e.value.handle == handle) return e.value;
+        return null;
+    }
+
+    /// Store `data` as the instance's key CDR if not already set.
+    fn storeKeyIfNeeded(self: *Self, entry: *InstanceEntry, data: []const u8) void {
+        if (entry.key_cdr == null) entry.key_cdr = self.alloc.dupe(u8, data) catch null;
+    }
+
+    /// Inject a CDR sample of the keyless instance directly, bypassing the
+    /// RTPS layer. `cdr` is borrowed; it is copied internally.
     pub fn pushCdr(self: *Self, cdr: []const u8) void {
-        self.pushBuiltinCdr(cdr, std.mem.zeroes([16]u8), .alive);
+        self.pushBuiltinCdr(cdr, std.mem.zeroes([16]u8), DDS.HANDLE_NIL, .alive);
     }
 
     /// Inject a keyed built-in-topic sample or lifecycle change directly.
     /// `cdr` is copied for alive samples and ignored for non-alive changes.
+    /// `entity_handle` is the handle of the entity the sample describes, for
+    /// a built-in reader (`entity_handles`); other readers ignore it.
     pub fn pushBuiltinCdr(
         self: *Self,
         cdr: []const u8,
         key_hash: [16]u8,
+        entity_handle: DDS.InstanceHandle_t,
         kind: history_mod.ChangeKind,
     ) void {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
         const copy = self.alloc.dupe(u8, if (kind == .alive) cdr else &.{}) catch return;
         self.mu.lock();
-        const ih = writer_mod.keyHashToHandle(key_hash);
-        const states = self.determineStatesLocked(ih, kind);
+        const entry = self.instanceForKeyLocked(key_hash, entity_handle) orelse {
+            self.mu.unlock();
+            self.alloc.free(copy);
+            return;
+        };
+        const states = entry.applyChange(kind);
         const info = DDS.SampleInfo{
             .sample_state = DDS.NOT_READ_SAMPLE_STATE,
             .view_state = states.view,
             .instance_state = states.instance_state,
-            .instance_handle = ih,
+            .instance_handle = entry.handle,
             .valid_data = kind == .alive,
             .disposed_generation_count = states.disposed_generation_count,
             .no_writers_generation_count = states.no_writers_generation_count,
@@ -1019,14 +1042,6 @@ pub const DataReaderImpl = struct {
         // adding the match first delivers any samples that arrived before it.
         self.rememberPublicationGuidLocked(change.writer_guid);
 
-        // Compute instance handle first — needed by both ownership and resource-limit checks.
-        const ih = writer_mod.keyHashToHandle(change.key_hash);
-
-        // Track writer→instance before any filter so that ownership-dropped writes
-        // still mark the instance as covered (prevents spurious NOT_ALIVE_NO_WRITERS
-        // when the owner leaves but another writer is still publishing to the instance).
-        if (change.kind == .alive) trackWriterInstanceLocked(self, change.writer_guid, ih);
-
         // COHERENT SETS: a sample counts toward its writer's set arriving
         // complete even if a filter below drops it -- RTPS 2.5 §8.7.6 leaves
         // samples filtered by content or time out of what the reader must
@@ -1034,6 +1049,18 @@ pub const DataReaderImpl = struct {
         // writer's previous one.  So track it before filtering.
         const coherent_queued = self.subscriber_presentation.coherent_access and
             self.trackCoherentLocked(change, false);
+
+        // The sample's instance, registered by its first sample even if a
+        // filter below drops it: ownership and writer tracking need it. A
+        // reader that cannot register it drops the sample.
+        const entry = self.instanceForKeyLocked(change.key_hash, DDS.HANDLE_NIL) orelse
+            return self.dropSampleUnlock(copy, coherent_queued);
+        const ih = entry.handle;
+
+        // Track writer→instance before any filter so that ownership-dropped writes
+        // still mark the instance as covered (prevents spurious NOT_ALIVE_NO_WRITERS
+        // when the owner leaves but another writer is still publishing to the instance).
+        if (change.kind == .alive) trackWriterInstanceLocked(self, change.writer_guid, ih);
 
         // OWNERSHIP: per-instance exclusive ownership check.
         // A writer owns an instance if it is the highest-strength writer that has
@@ -1043,13 +1070,13 @@ pub const DataReaderImpl = struct {
         if (self.qos.ownership.kind == .EXCLUSIVE_OWNERSHIP_QOS) {
             const incoming_strength = self.writer_strengths.get(change.writer_guid) orelse 0;
             const accepted = blk: {
-                if (self.owner_map.getPtr(ih)) |owner| {
+                if (entry.owner) |owner| {
                     if (owner.eql(change.writer_guid)) {
                         // Same writer — always accept.
                         break :blk true;
-                    } else if (incoming_strength > (self.writer_strengths.get(owner.*) orelse 0)) {
+                    } else if (incoming_strength > (self.writer_strengths.get(owner) orelse 0)) {
                         // Higher strength — take ownership of this instance.
-                        owner.* = change.writer_guid;
+                        entry.owner = change.writer_guid;
                         break :blk true;
                     } else {
                         // Lower or equal strength from a different writer — drop.
@@ -1057,7 +1084,7 @@ pub const DataReaderImpl = struct {
                     }
                 } else {
                     // No owner yet for this instance — first writer claims it.
-                    self.owner_map.put(self.alloc, ih, change.writer_guid) catch {};
+                    entry.owner = change.writer_guid;
                     break :blk true;
                 }
             };
@@ -1067,15 +1094,15 @@ pub const DataReaderImpl = struct {
         // TIME_BASED_FILTER: suppress alive samples whose source timestamp is within
         // minimum_separation of the last accepted sample for this instance.
         // Lifecycle changes (dispose/unregister) bypass TBF: suppressing them would
-        // leave instance state stuck as ALIVE and leak tbf_map/owner_map entries.
-        // tbf_map is updated only after a successful append (below), so a sample
-        // rejected by CFT, resource-limits, or OOM does not advance the window.
+        // leave instance state stuck as ALIVE and its window and owner set.
+        // The window is updated only after a successful append (below), so a sample
+        // rejected by CFT, resource-limits, or OOM does not advance it.
         const min_sep = self.qos.time_based_filter.minimum_separation;
         const tbf_active = change.kind == .alive and (min_sep.sec != 0 or min_sep.nanosec != 0);
         const tbf_src_ns: i64 = if (tbf_active) change.source_timestamp.toTime().toNs() else 0;
         if (tbf_active) {
             const sep_ns = @as(i64, min_sep.sec) * std.time.ns_per_s + @as(i64, min_sep.nanosec);
-            if (self.tbf_map.get(ih)) |last| {
+            if (entry.tbf_last_ns) |last| {
                 if (tbf_src_ns - last < sep_ns) return self.dropSampleUnlock(copy, coherent_queued);
             }
         }
@@ -1083,7 +1110,7 @@ pub const DataReaderImpl = struct {
         // CONTENT_FILTER: only alive samples are filtered. Lifecycle changes
         // (dispose/unregister) must pass through regardless of the expression so
         // that the subscriber's instance state machine stays consistent and the
-        // per-instance tbf_map/owner_map cleanup below is reached.
+        // per-instance window and owner cleanup below is reached.
         if (self.cft_filter) |*cft| {
             if (change.kind == .alive and !cft.matches(change.data))
                 return self.dropSampleUnlock(copy, coherent_queued);
@@ -1099,8 +1126,8 @@ pub const DataReaderImpl = struct {
             // is incomplete anyway.
             const wip = self.coherent_wip.getPtr(change.writer_guid) orelse
                 return self.dropSampleUnlock(copy, coherent_queued);
-            const states = self.determineStatesLocked(ih, change.kind);
-            if (change.kind == .alive) self.storeKeyIfNeededLocked(ih, copy);
+            const states = entry.applyChange(change.kind);
+            if (change.kind == .alive) self.storeKeyIfNeeded(entry, copy);
             const src_time = change.source_timestamp.toTime();
             const coh_expiry: ?i64 = if (change.kind == .alive)
                 // Prefer this sample's own PID_LIFESPAN inline QoS (RTPS §8.7.2 Table
@@ -1131,10 +1158,10 @@ pub const DataReaderImpl = struct {
                 .expiry_ns = coh_expiry,
                 .key_hash = change.key_hash,
             };
-            if (tbf_active) self.tbf_map.put(self.alloc, ih, tbf_src_ns) catch {};
+            if (tbf_active) entry.tbf_last_ns = tbf_src_ns;
             if (change.kind != .alive) {
-                _ = self.tbf_map.remove(ih);
-                _ = self.owner_map.remove(ih);
+                entry.tbf_last_ns = null;
+                entry.owner = null;
             }
             wip.samples.append(self.alloc, pc) catch {
                 // The set can no longer arrive complete.
@@ -1242,8 +1269,8 @@ pub const DataReaderImpl = struct {
         }
 
         // Build SampleInfo from the CacheChange.
-        const states = self.determineStatesLocked(ih, change.kind);
-        if (change.kind == .alive) self.storeKeyIfNeededLocked(ih, copy);
+        const states = entry.applyChange(change.kind);
+        if (change.kind == .alive) self.storeKeyIfNeeded(entry, copy);
         const src_time = change.source_timestamp.toTime();
         const expiry: ?i64 = if (change.kind == .alive)
             // See the coherent-set branch above: inline PID_LIFESPAN takes
@@ -1279,12 +1306,11 @@ pub const DataReaderImpl = struct {
             return self.dropSampleUnlock(copy, coherent_queued);
         };
         // Stamp the TBF window now that the sample is committed to pending.
-        if (tbf_active) self.tbf_map.put(self.alloc, ih, tbf_src_ns) catch {};
-        // Instance going non-alive: release per-instance filter/ownership state.
-        // If the instance is later re-registered, fresh entries will be created.
+        if (tbf_active) entry.tbf_last_ns = tbf_src_ns;
+        // Instance going non-alive: release its window and owner.
         if (change.kind != .alive) {
-            _ = self.tbf_map.remove(ih);
-            _ = self.owner_map.remove(ih);
+            entry.tbf_last_ns = null;
+            entry.owner = null;
         }
         self.markDataAvailableLocked();
         // Wake any ReadCondition WaitSets while mu is held (safe: wakeNotify
@@ -1664,20 +1690,17 @@ pub const DataReaderImpl = struct {
             self.liveliness_last_handle = writer_mod.guidToHandle(guid);
             self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
         }
-        // Release ownership of any instances this writer held.  Collect keys
-        // first (can't remove while iterating), then remove.  The next sample
-        // from any remaining writer for those instances will re-claim them.
-        var to_remove: std.ArrayListUnmanaged(DDS.InstanceHandle_t) = .empty;
-        defer to_remove.deinit(self.alloc);
+        // Release ownership of any instances this writer held.  The next
+        // sample from any remaining writer for those instances will re-claim
+        // them.
         {
-            var it = self.owner_map.iterator();
-            while (it.next()) |entry| {
-                if (entry.value_ptr.eql(guid)) {
-                    to_remove.append(self.alloc, entry.key_ptr.*) catch {};
-                }
+            var it = self.instances.iterator();
+            while (it.next()) |e| {
+                if (e.value.owner) |owner| if (owner.eql(guid)) {
+                    e.value.owner = null;
+                };
             }
         }
-        for (to_remove.items) |ih| _ = self.owner_map.remove(ih);
 
         // Synthesize NOT_ALIVE_NO_WRITERS for each instance this writer had
         // published to that no longer has any other live writer.
@@ -1699,7 +1722,7 @@ pub const DataReaderImpl = struct {
                 }
                 if (covered) continue;
                 // Instance already non-alive (disposed/unregistered) — skip.
-                const si = self.seen_instances.get(ih) orelse continue;
+                const si = self.instanceOfHandleLocked(ih) orelse continue;
                 if (si.instance_state != DDS.ALIVE_INSTANCE_STATE) continue;
                 // Build synthetic change. A real wire DISPOSE/UNREGISTER always carries
                 // at least a valid CDR encapsulation header (RTPS Ch. 10), even when the
@@ -1713,7 +1736,7 @@ pub const DataReaderImpl = struct {
                 // a synthesized NOT_ALIVE_NO_WRITERS can fire this early). XCDR1 LE, no
                 // options, matches every other binding's default representation.
                 const empty = self.alloc.dupe(u8, &.{ 0x00, 0x01, 0x00, 0x00 }) catch continue;
-                const states = self.determineStatesLocked(ih, .not_alive_unregistered);
+                const states = si.applyChange(.not_alive_unregistered);
                 const now = time_mod.Time.now();
                 const pc = self.alloc.create(PendingChange) catch {
                     self.alloc.free(empty);
@@ -1919,7 +1942,7 @@ pub const DataReaderImpl = struct {
     /// Computes sample_rank/generation_rank/absolute_generation_rank for a just-collected
     /// batch (DDS spec §2.2.2.5.4). O(n²) is fine — batch size is bounded by max_samples /
     /// resource limits, same precedent as the KEEP_LAST/resource-limit checks in onDataCb.
-    /// Must be called with `mu` held (reads `seen_instances` for the live baseline).
+    /// Must be called with `mu` held (reads the instance for the live baseline).
     fn finalizeGenerationRanksLocked(self: *Self, out: []TakenSample) void {
         for (out, 0..) |*s, i| {
             const ih = s.info.instance_handle;
@@ -1934,7 +1957,7 @@ pub const DataReaderImpl = struct {
             }
             s.info.sample_rank = sample_rank;
             s.info.generation_rank = std.math.lossyCast(i32, mrsic_sum - this_sum);
-            const live_sum: i64 = if (self.seen_instances.get(ih)) |entry|
+            const live_sum: i64 = if (self.instanceOfHandleLocked(ih)) |entry|
                 @as(i64, entry.disposed_generation_count) + entry.no_writers_generation_count
             else
                 this_sum;
@@ -2218,10 +2241,8 @@ pub const DataReaderImpl = struct {
     pub fn getKeyValueRaw(self: *Self, handle: DDS.InstanceHandle_t) ?[]u8 {
         self.mu.lock();
         defer self.mu.unlock();
-        if (self.seen_instances.get(handle)) |entry| {
-            return entry.key_cdr;
-        }
-        return null;
+        const entry = self.instanceOfHandleLocked(handle) orelse return null;
+        return entry.key_cdr;
     }
 
     /// lookup_instance: the handle of the key hash's instance if it is ALIVE,
@@ -2229,9 +2250,8 @@ pub const DataReaderImpl = struct {
     pub fn lookupInstance(self: *Self, key_hash: [16]u8) ?DDS.InstanceHandle_t {
         self.mu.lock();
         defer self.mu.unlock();
-        const handle = writer_mod.keyHashToHandle(key_hash);
-        const entry = self.seen_instances.get(handle) orelse return null;
-        return if (entry.instance_state == DDS.ALIVE_INSTANCE_STATE) handle else null;
+        const entry = self.instances.getByKey(key_hash) orelse return null;
+        return if (entry.instance_state == DDS.ALIVE_INSTANCE_STATE) entry.handle else null;
     }
 
     /// Non-destructively read samples matching the given state masks.
@@ -2302,7 +2322,7 @@ pub const DataReaderImpl = struct {
             }
             pc.info.sample_rank = sample_rank;
             pc.info.generation_rank = std.math.lossyCast(i32, mrsic_sum - this_sum);
-            const live_sum: i64 = if (self.seen_instances.get(ih)) |entry|
+            const live_sum: i64 = if (self.instanceOfHandleLocked(ih)) |entry|
                 @as(i64, entry.disposed_generation_count) + entry.no_writers_generation_count
             else
                 this_sum;
@@ -4315,7 +4335,6 @@ test "coherent access: WaitSet trigger survives multiple queued committed sets (
         .coherent_committed_ready = false,
         .mu = .{},
         .subscriber_presentation = pres,
-        .seen_instances = .empty,
     };
     defer {
         var it = dr.coherent_wip.valueIterator();
@@ -4331,11 +4350,7 @@ test "coherent access: WaitSet trigger survives multiple queued committed sets (
             alloc.destroy(pc);
         }
         dr.pending.deinit(alloc);
-        {
-            var _si = dr.seen_instances.valueIterator();
-            while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
-        }
-        dr.seen_instances.deinit(alloc);
+        dr.deinitInstances(alloc);
         dr.retired_listeners.deinit(alloc);
         dr.listener_ex_box.releaseHold(alloc);
     }
@@ -4413,18 +4428,13 @@ test "takeRaw: expired LIFESPAN sample is silently discarded" {
         .coherent_committed = .empty,
         .coherent_committed_ready = false,
         .mu = .{},
-        .seen_instances = .empty,
     };
     defer {
         for (dr.pending.items) |pc| pc.quiesce.beginTeardown(pc, PendingChange.reallyFree);
         dr.pending.deinit(alloc);
         dr.coherent_wip.deinit(alloc);
         dr.coherent_committed.deinit(alloc);
-        {
-            var _si = dr.seen_instances.valueIterator();
-            while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
-        }
-        dr.seen_instances.deinit(alloc);
+        dr.deinitInstances(alloc);
         dr.retired_listeners.deinit(alloc);
         dr.listener_ex_box.releaseHold(alloc);
     }
@@ -4464,7 +4474,6 @@ fn mkTestReaderForGenerationTests(alloc: std.mem.Allocator, clock: *time_test.Ma
         .coherent_committed = .empty,
         .coherent_committed_ready = false,
         .mu = .{},
-        .seen_instances = .empty,
     };
 }
 
@@ -4473,50 +4482,46 @@ fn deinitTestReader(dr: *DataReaderImpl, alloc: std.mem.Allocator) void {
     dr.pending.deinit(alloc);
     dr.coherent_wip.deinit(alloc);
     dr.coherent_committed.deinit(alloc);
-    {
-        var _si = dr.seen_instances.valueIterator();
-        while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
-    }
-    dr.seen_instances.deinit(alloc);
+    dr.deinitInstances(alloc);
     dr.retired_listeners.deinit(alloc);
     dr.listener_ex_box.releaseHold(alloc);
 }
 
-test "determineStatesLocked: disposed_generation_count increments only on resurrection from DISPOSED" {
+test "InstanceEntry.applyChange: disposed_generation_count increments only on resurrection from DISPOSED" {
     const alloc = testing.allocator;
     var clock = time_test.ManualClock.init(0);
     var dr = mkTestReaderForGenerationTests(alloc, &clock);
     defer deinitTestReader(&dr, alloc);
 
-    const ih: DDS.InstanceHandle_t = 1;
+    var entry: InstanceEntry = .{ .handle = 1 };
 
-    const s1 = dr.determineStatesLocked(ih, .alive);
+    const s1 = entry.applyChange(.alive);
     try testing.expectEqual(@as(i32, 0), s1.disposed_generation_count);
     try testing.expectEqual(@as(i32, 0), s1.no_writers_generation_count);
 
     // Disposing does not itself bump the counter — only resurrection does.
-    const s2 = dr.determineStatesLocked(ih, .not_alive_disposed);
+    const s2 = entry.applyChange(.not_alive_disposed);
     try testing.expectEqual(@as(i32, 0), s2.disposed_generation_count);
 
-    const s3 = dr.determineStatesLocked(ih, .alive);
+    const s3 = entry.applyChange(.alive);
     try testing.expectEqual(DDS.NEW_VIEW_STATE, s3.view);
     try testing.expectEqual(@as(i32, 1), s3.disposed_generation_count);
     try testing.expectEqual(@as(i32, 0), s3.no_writers_generation_count);
 }
 
-test "determineStatesLocked: no_writers_generation_count increments only on resurrection from NO_WRITERS" {
+test "InstanceEntry.applyChange: no_writers_generation_count increments only on resurrection from NO_WRITERS" {
     const alloc = testing.allocator;
     var clock = time_test.ManualClock.init(0);
     var dr = mkTestReaderForGenerationTests(alloc, &clock);
     defer deinitTestReader(&dr, alloc);
 
-    const ih: DDS.InstanceHandle_t = 2;
+    var entry: InstanceEntry = .{ .handle = 2 };
 
-    _ = dr.determineStatesLocked(ih, .alive);
-    const s2 = dr.determineStatesLocked(ih, .not_alive_unregistered);
+    _ = entry.applyChange(.alive);
+    const s2 = entry.applyChange(.not_alive_unregistered);
     try testing.expectEqual(@as(i32, 0), s2.no_writers_generation_count);
 
-    const s3 = dr.determineStatesLocked(ih, .alive);
+    const s3 = entry.applyChange(.alive);
     try testing.expectEqual(DDS.NEW_VIEW_STATE, s3.view);
     try testing.expectEqual(@as(i32, 0), s3.disposed_generation_count);
     try testing.expectEqual(@as(i32, 1), s3.no_writers_generation_count);
@@ -4528,7 +4533,7 @@ test "readRaw: sample_rank/generation_rank/absolute_generation_rank span a gener
     var dr = mkTestReaderForGenerationTests(alloc, &clock);
     defer deinitTestReader(&dr, alloc);
 
-    const ih: DDS.InstanceHandle_t = 7;
+    const ih = dr.instanceForKeyLocked(std.mem.zeroes([16]u8), DDS.HANDLE_NIL).?.handle;
 
     // Three samples for the same instance, spanning one dispose/resurrect cycle:
     // gen 0 (alive) -> gen 0 (dispose) -> gen 1 (alive again).
@@ -4558,7 +4563,7 @@ test "readRaw: sample_rank/generation_rank/absolute_generation_rank span a gener
     try dr.pending.append(alloc, pc2);
 
     // Live instance state matches the most recent (highest-generation) sample.
-    try dr.seen_instances.put(alloc, ih, .{ .instance_state = DDS.ALIVE_INSTANCE_STATE, .disposed_generation_count = 1, .no_writers_generation_count = 0 });
+    dr.instanceOfHandleLocked(ih).?.* = .{ .handle = ih, .instance_state = DDS.ALIVE_INSTANCE_STATE, .disposed_generation_count = 1, .no_writers_generation_count = 0 };
 
     var out: std.ArrayListUnmanaged(TakenSample) = .empty;
     defer {
@@ -4588,7 +4593,7 @@ test "takeRaw: absolute_generation_rank reflects live generation ahead of a stal
     var dr = mkTestReaderForGenerationTests(alloc, &clock);
     defer deinitTestReader(&dr, alloc);
 
-    const ih: DDS.InstanceHandle_t = 9;
+    const ih = dr.instanceForKeyLocked(std.mem.zeroes([16]u8), DDS.HANDLE_NIL).?.handle;
     const d = try alloc.dupe(u8, &.{0xAA});
     const pc = try alloc.create(PendingChange);
     pc.* = .{
@@ -4599,7 +4604,7 @@ test "takeRaw: absolute_generation_rank reflects live generation ahead of a stal
     try dr.pending.append(alloc, pc);
     // Instance has since disposed and resurrected once more, advancing the live count
     // past what this still-queued sample was stamped with at receipt time.
-    try dr.seen_instances.put(alloc, ih, .{ .instance_state = DDS.ALIVE_INSTANCE_STATE, .disposed_generation_count = 1, .no_writers_generation_count = 0 });
+    dr.instanceOfHandleLocked(ih).?.* = .{ .handle = ih, .instance_state = DDS.ALIVE_INSTANCE_STATE, .disposed_generation_count = 1, .no_writers_generation_count = 0 };
 
     const taken = dr.takeRaw() orelse return error.TestExpectedNonNull;
     defer alloc.free(taken.data);
@@ -4778,7 +4783,6 @@ test "late read and query conditions retire while reader storage remains pinned"
         .coherent_committed = .empty,
         .coherent_committed_ready = false,
         .mu = .{},
-        .seen_instances = .empty,
     };
 
     // Simulate vtCreateReadCondition's opening move: a create call has
@@ -4878,7 +4882,6 @@ test "vtDeleteReadCondition: winning the race removes the condition before reall
         .coherent_committed = .empty,
         .coherent_committed_ready = false,
         .mu = .{},
-        .seen_instances = .empty,
     };
 
     // Create and track a real condition up front -- single-threaded, no
@@ -4960,7 +4963,6 @@ test "vtCreateReadCondition: refuses to create once reader teardown has started"
         .coherent_committed = .empty,
         .coherent_committed_ready = false,
         .mu = .{},
-        .seen_instances = .empty,
     };
 
     // Hold a spare reference so deinit() below sets the tearing-down flag
@@ -5007,7 +5009,6 @@ test "vtDeleteReadCondition: backs off entirely once reader teardown has started
         .coherent_committed = .empty,
         .coherent_committed_ready = false,
         .mu = .{},
-        .seen_instances = .empty,
     };
 
     // Create and track a real condition up front, single-threaded.
@@ -5080,7 +5081,6 @@ test "ReadConditionImpl.deinit: a direct call (bypassing delete_readcondition) a
         .coherent_committed = .empty,
         .coherent_committed_ready = false,
         .mu = .{},
-        .seen_instances = .empty,
     };
 
     const rc = try waitset.ReadConditionImpl.init(

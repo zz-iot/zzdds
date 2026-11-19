@@ -10,6 +10,11 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-19
 
+- A DataReader allocates its instance handles too, so two instances can no longer share
+  a handle, and with it their KEEP_LAST history, instance state, TIME_BASED_FILTER window
+  and owner. Each built-in topic sample now names its own participant or topic: all
+  DCPSParticipant samples were one instance, as were all DCPSTopic samples, under a handle
+  `get_discovered_participants` and `get_discovered_topics` did not return.
 - A DataWriter allocates its instance handles (`docs/design/handle-registries.md`) instead
   of hashing the key hash into one, so two keys can no longer share a handle.
   `lookup_instance` returns HANDLE_NIL for a key the writer never registered or wrote, as

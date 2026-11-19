@@ -125,7 +125,14 @@ entity that hands it out. Handles never go on the wire, so there is no interop o
 change.
 
 - **DataReader**, under `mu`, keyed by key hash. The slot holds what `seen_instances`,
-  `tbf_map` and `owner_map` hold today, so a sample costs one lookup. `writer_instances`
+  `tbf_map` and `owner_map` held, so a sample costs one lookup. A sample registers its
+  instance before the filters, as ownership and the writer-instance tracking need it, so
+  an instance can have no accepted sample yet (its instance state is then unset).
+- **Built-in DataReaders** keep their instances' state in the same kind of registry, keyed
+  by the entity's GUID or topic key, but the handle each instance shows is the entity's,
+  which the participant passes with the sample (`pushBuiltinCdr`); resolving one scans
+  the reader's few instances. Participant and topic samples carried an all-zero key, so
+  every participant (or topic) was one instance; they now carry their own. `writer_instances`
   keeps its shape with unique handles. KEEP_LAST and RESOURCE_LIMITS still scan `pending`
   by handle; the registry's live count can replace the O(n²) distinct-instance count.
 - **DataWriter**, under `key_registry_mu` (renamed), keyed by key hash. `register_instance`
@@ -145,8 +152,8 @@ its publishers, subscribers, topics, DataWriters and DataReaders, and the partic
 endpoints and topics it discovers. Publishers and subscribers have no GUID and take keyless
 entries. The factory's and participant's counters go.
 
-- Built-in readers take their samples' handles from it rather than from an instance
-  registry of their own, so the built-in topics, `get_matched_*`, `get_discovered_*`,
+- Built-in readers show its handles on their samples (they are given them with each
+  sample), so the built-in topics, `get_matched_*`, `get_discovered_*`,
   `ignore_*` and `SampleInfo.publication_handle` agree.
 - A reader learns a matched writer's handle with the match and keeps it with the writer's
   other per-writer state, so a sample's `publication_handle` is found under the reader's
@@ -162,9 +169,10 @@ entries. The factory's and participant's counters go.
 
 1. **This study.**
 2. **Instance registries** for DataReader and DataWriter, with `lookup_instance`
-   returning `HANDLE_NIL` for unknown keys.
-3. **The participant's entity registry**, then removing `guidToHandle`, `topicToHandle`,
-   `keyHashToHandle` and their re-export from `dcps/root.zig`.
+   returning `HANDLE_NIL` for unknown keys. Done 2026-11-19; the writer's needs zidl's
+   generated Zig code to pass the writer (`registerInstanceRaw(dw, key_hash)`).
+3. **The participant's entity registry**, then removing `guidToHandle`, `topicToHandle` and
+   their re-export from `dcps/root.zig` (`keyHashToHandle` went in step 2).
 4. **Follow-ons**, each its own roadmap item: instance reclamation bounded by
    `max_instances`; the linear `discovered_*` lists.
 

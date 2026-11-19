@@ -291,9 +291,10 @@ Forward-looking only: known gaps, planned features, and open design questions.
      names. Inventory, measurements and design in
      [`design/handle-registries.md`](design/handle-registries.md); decision in
      `decisions.md`.
-  2. **Instance registries** for DataReader and DataWriter. The writer's
-     `lookup_instance` then returns `HANDLE_NIL` for a key never registered or written
-     (today it returns the hash, and ignores which writer is asked).
+  2. **Instance registries: done (2026-11-19).** DataReader and DataWriter allocate
+     their instance handles; the writer's `lookup_instance` returns `HANDLE_NIL` for a key
+     never registered or written. Built-in readers give their samples the entity handles
+     the participant supplies, still `guidToHandle` and `topicToHandle` until step 3.
   3. **The participant's entity registry**, replacing `guidToHandle` and `topicToHandle`
      and the two collision workarounds.
   4. **Follow-ons**, each its own item once step 3 lands: reclaiming instances, bounded by

@@ -82,7 +82,7 @@ fn dataTransportCanReach(ctx: *anyopaque, loc: *const Locator) bool {
 
 // ── Noop ProtocolReader for built-in subscriber DataReaders ──────────────────
 //
-// Built-in DataReaders receive samples via pushCdr() from discovery callbacks,
+// Built-in DataReaders receive samples via pushBuiltinCdr() from discovery callbacks,
 // not through the RTPS state machine. They carry a noop ProtocolReader so that
 // DataReaderImpl.init() can call setDataCallback() without crashing.
 
@@ -375,6 +375,10 @@ const BuiltinSubscriberState = struct {
         );
         n_ok = 4;
 
+        // Their instances are entities, whose handles the participant gives
+        // them, so the built-in topics agree with get_discovered_* and ignore_*.
+        for (readers) |r| r.entity_handles = true;
+
         // Pre-reserve capacity so appends below are infallible.
         self.sub.mu.lock();
         self.sub.readers.ensureUnusedCapacity(alloc, 4) catch {
@@ -424,7 +428,7 @@ const BuiltinSubscriberState = struct {
 // ── Built-in topic CDR serialization helpers ──────────────────────────────────
 //
 // Called from discovery callbacks AFTER releasing participant.mu, so that
-// DataReaderImpl.pushCdr() (which fires listener callbacks) does not run
+// DataReaderImpl.pushBuiltinCdr() (which fires listener callbacks) does not run
 // with participant.mu held.
 
 fn pushBuiltinParticipantCdr(
@@ -446,7 +450,7 @@ fn pushBuiltinParticipantCdr(
         } },
     };
     DDS.ParticipantBuiltinTopicData.serialize(&w, v) catch return;
-    dr.pushCdr(buf.items);
+    dr.pushBuiltinCdr(buf.items, guidKeyHash(data.guid), writer_mod.guidToHandle(data.guid), .alive);
 }
 
 fn qosReliability(kind: u8) DDS.ReliabilityQosPolicy {
@@ -513,9 +517,7 @@ fn pushBuiltinPublicationCdr(
         } },
     };
     DDS.PublicationBuiltinTopicData.serialize(&w, v) catch return;
-    var key_hash: [16]u8 = undefined;
-    @memcpy(&key_hash, std.mem.asBytes(&data.guid));
-    dr.pushBuiltinCdr(buf.items, key_hash, .alive);
+    dr.pushBuiltinCdr(buf.items, guidKeyHash(data.guid), writer_mod.guidToHandle(data.guid), .alive);
 }
 
 fn pushBuiltinSubscriptionCdr(
@@ -566,15 +568,18 @@ fn pushBuiltinSubscriptionCdr(
         } },
     };
     DDS.SubscriptionBuiltinTopicData.serialize(&w, v) catch return;
+    dr.pushBuiltinCdr(buf.items, guidKeyHash(data.guid), writer_mod.guidToHandle(data.guid), .alive);
+}
+
+/// A built-in reader's key for an entity: the entity's GUID.
+fn guidKeyHash(guid: Guid) [16]u8 {
     var key_hash: [16]u8 = undefined;
-    @memcpy(&key_hash, std.mem.asBytes(&data.guid));
-    dr.pushBuiltinCdr(buf.items, key_hash, .alive);
+    @memcpy(&key_hash, std.mem.asBytes(&guid));
+    return key_hash;
 }
 
 fn pushBuiltinEndpointDisposed(dr: *reader_mod.DataReaderImpl, guid: Guid) void {
-    var key_hash: [16]u8 = undefined;
-    @memcpy(&key_hash, std.mem.asBytes(&guid));
-    dr.pushBuiltinCdr(&.{}, key_hash, .not_alive_disposed);
+    dr.pushBuiltinCdr(&.{}, guidKeyHash(guid), writer_mod.guidToHandle(guid), .not_alive_disposed);
 }
 
 fn pushBuiltinTopicCdr(
@@ -587,7 +592,11 @@ fn pushBuiltinTopicCdr(
     var w = zidl_cdr.CdrWriter(.xcdr1).init(&buf, alloc);
     w.writeEncapHeader() catch return;
     DDS.TopicBuiltinTopicData.serialize(&w, v) catch return;
-    dr.pushCdr(buf.items);
+    // A topic's key is its name's; its handle is its name's and type's, as
+    // get_discovered_topics gives it.
+    var key_hash = std.mem.zeroes([16]u8);
+    @memcpy(key_hash[0..@sizeOf(DDS.BuiltinTopicKey_t)], std.mem.asBytes(&v.key));
+    dr.pushBuiltinCdr(buf.items, key_hash, topicToHandle(v.name, v.type_name), .alive);
 }
 
 /// Deterministic BuiltinTopicKey_t derived from the topic name.

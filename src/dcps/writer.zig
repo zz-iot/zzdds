@@ -1565,18 +1565,6 @@ pub const DataWriterImpl = struct {
 
 // ── GUID helpers ──────────────────────────────────────────────────────────────
 
-/// FNV-1a hash of a 16-byte key hash → nonzero positive i32 instance handle.
-/// For keyless topics the key hash is all zeros; all calls return the same handle.
-pub fn keyHashToHandle(key_hash: [16]u8) DDS.InstanceHandle_t {
-    var h: u32 = 2166136261;
-    for (key_hash) |b| {
-        h ^= b;
-        h *%= 16777619;
-    }
-    const v: i32 = @intCast(h & 0x7FFF_FFFF);
-    return if (v == 0) 1 else v;
-}
-
 /// FNV-1a hash of a GUID's 16 bytes → nonzero positive i32 instance handle.
 pub fn guidToHandle(guid: Guid) DDS.InstanceHandle_t {
     const bytes = std.mem.asBytes(&guid);
