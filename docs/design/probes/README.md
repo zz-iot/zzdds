@@ -62,6 +62,15 @@ with each extensibility (the schema uses final):
 | Marker, one exception | 120 | 92 | 88 |
 | Envelope, empty body/features | 52 | 28 | 24 |
 
+## Handle registry benchmark
+
+`handle_registry_bench.zig` measures what the [handle registries](../handle-registries.md)
+replace: the cost of reaching an instance's state from its key hash through today's 31-bit
+fold and maps keyed by it, against a registry and `ArrayHashMap`, from 1,000 to 1,000,000
+instances, and how often the fold collides. Run it with
+`zig run -OReleaseFast docs/design/probes/handle_registry_bench.zig`. It is not built by
+`zig build`.
+
 ## Review-era evidence (not on `main`)
 
 The specification review also used bounded models, a synchronization prototype and a
