@@ -90,6 +90,9 @@ pub const MatchCurrency = struct {
 /// What SEDP tells the protocol layer about a newly-matched remote reader.
 pub const MatchedReaderInfo = struct {
     guid: Guid,
+    /// The reader's DCPS handle, which the local participant gave it
+    /// (`DDS.InstanceHandle_t`; 0 is HANDLE_NIL). Never sent.
+    handle: i32 = 0,
     unicast_locators: []const Locator,
     multicast_locators: []const Locator,
     expects_inline_qos: bool,
@@ -111,6 +114,9 @@ pub const MatchedReaderInfo = struct {
 /// What SEDP tells the protocol layer about a newly-matched remote writer.
 pub const MatchedWriterInfo = struct {
     guid: Guid,
+    /// The writer's DCPS handle, which the local participant gave it
+    /// (`DDS.InstanceHandle_t`; 0 is HANDLE_NIL). Never sent.
+    handle: i32 = 0,
     unicast_locators: []const Locator,
     multicast_locators: []const Locator,
     reliability: ReliabilityKind,
@@ -593,7 +599,7 @@ pub const WriterMatchCallback = struct {
 pub const ReaderMatchCallback = struct {
     ctx: *anyopaque,
     /// `is_new` unless the match refreshes an existing one.
-    on_reader_matching: *const fn (ctx: *anyopaque, guid: Guid, is_new: bool) void,
+    on_reader_matching: *const fn (ctx: *anyopaque, guid: Guid, handle: i32, is_new: bool) void,
     on_reader_unmatching: *const fn (ctx: *anyopaque, guid: Guid) void,
 };
 

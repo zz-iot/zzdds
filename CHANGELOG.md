@@ -10,6 +10,18 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-19
 
+- A DomainParticipant allocates the handles of the entities it names
+  (`docs/design/handle-registries.md`) instead of hashing GUIDs and topic names into them,
+  so two can no longer share a handle. A participant or endpoint that is lost and found
+  again gets a new handle, and the old one names nothing. A Topic's handle is the one its
+  DCPSTopic sample and `get_discovered_topics` give; before, it came from a separate
+  counter. Handles are scoped to the participant, so every participant's own handle is the
+  same. `ignore_publication` and `ignore_subscription` record the endpoint's GUID, so an
+  ignore outlives the handle. A handle that names no DataWriter or DataReader now returns
+  BAD_PARAMETER, as `ignore_participant` and `ignore_topic` already did. An endpoint can
+  therefore be ignored only once it is discovered. `get_matched_subscription_rtps_guid`
+  and `get_matched_publication_rtps_guid` no longer return PRECONDITION_NOT_MET, which
+  reported a collision. `zzdds.dcps.guidToHandle` is removed.
 - A participant no longer loses a peer that announces itself while the participant is
   starting. SEDP listens before SPDP starts and passed a peer's unicast SPDP announcement
   on to it; with no callbacks yet, SPDP recorded the peer without discovering it, and

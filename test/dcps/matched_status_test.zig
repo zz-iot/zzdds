@@ -782,6 +782,7 @@ test "sub data: a sample delivered when its writer is matched already resolves i
     // Matching the writer delivers it, before the writer-matched callback.
     _ = try pr.addMatchedWriter(&.{
         .guid = writer_guid,
+        .handle = 42,
         .unicast_locators = &.{},
         .multicast_locators = &.{},
         .reliability = .reliable,
@@ -790,7 +791,7 @@ test "sub data: a sample delivered when its writer is matched already resolves i
     fx.settle();
     try testing.expectEqual(@as(usize, 1), check.calls);
     try testing.expectEqual(@as(u32, 1), check.taken);
-    try testing.expectEqual(zzdds.dcps.guidToHandle(writer_guid), check.publication_handle);
+    try testing.expectEqual(@as(DDS.InstanceHandle_t, 42), check.publication_handle);
     try testing.expectEqual(DDS.RETCODE_OK, check.rc);
     try testing.expectEqualSlices(u8, std.mem.asBytes(&writer_guid), &check.guid.value);
 }

@@ -158,7 +158,7 @@ const Harness = struct {
 
     fn destroyProtoReader(_: *anyopaque, _: DDS.InstanceHandle_t) void {}
     fn registerIncompatQos(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i32) void) void {}
-    fn registerMatchedNotify(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, DDS.InstanceHandle_t, bool) void) void {}
+    fn registerMatchedNotify(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque) void) void {}
     fn prepareReaders(_: *anyopaque, _: []const DDS.InstanceHandle_t, _: []const []const u8, _: []const u8, _: DDS.PresentationQosPolicy) anyerror!void {}
     fn prepareReaderQos(_: *anyopaque, _: DDS.InstanceHandle_t, _: *const DDS.DataReaderQos) anyerror!void {}
     fn announceReader(_: *anyopaque, _: DDS.InstanceHandle_t) void {}

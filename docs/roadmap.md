@@ -268,38 +268,19 @@ Forward-looking only: known gaps, planned features, and open design questions.
     reflection, and every one of zzdds's own `examples/`/`stress-tests/` registrations
     passes it — see `CHANGELOG.md` 2026-09-14. Closed; not a gap anymore.
 
-- **Hashed handles collide; replace them with allocated handles ("registries").**
-  `keyHashToHandle` and `guidToHandle` (`src/dcps/writer.zig`) fold a 16-byte key hash or
-  GUID into a 31-bit FNV-1a value. `topicToHandle` (`participant.zig`) does the same for
-  discovered topics. Distinct values can share a handle, and the chance grows with count:
-  - *Instance handles (data loss).* KEEP_LAST trimming, OWNERSHIP, TIME_BASED_FILTER,
-    instance state and the writer's key registry are all keyed on the instance handle, so
-    two colliding instances silently become one; with depth 1, one evicts the other's
-    sample. The chance of any collision is about 2% at 10,000 instances on a topic and
-    90% at 100,000.
-  - *Endpoint handles (ambiguity).* `get_matched_*_data`, `ignore_publication`/
-    `ignore_subscription`, `SampleInfo.publication_handle` and the matched/liveliness
-    `last_*_handle` fields become ambiguous. Low risk at realistic endpoint counts; two
-    sites already detect it (`DataReaderImpl.publication_guids`, and
-    `get_matched_subscription_rtps_guid` returning PRECONDITION_NOT_MET).
-
-  Hashing was never a recorded decision (both functions date from the initial commit);
-  it is stateless, not meaningfully faster than one map lookup per sample. Plan:
-  1. **Study: done (2026-11-18).** Registries: a key-to-slot `std.AutoHashMap` plus a
-     dense slot array; handles carry a slot and a 9-bit generation; one registry per
-     DataReader and DataWriter for instances, one per participant for every entity it
-     names. Inventory, measurements and design in
-     [`design/handle-registries.md`](design/handle-registries.md); decision in
-     `decisions.md`.
-  2. **Instance registries: done (2026-11-19).** DataReader and DataWriter allocate
-     their instance handles; the writer's `lookup_instance` returns `HANDLE_NIL` for a key
-     never registered or written. Built-in readers give their samples the entity handles
-     the participant supplies, still `guidToHandle` and `topicToHandle` until step 3.
-  3. **The participant's entity registry**, replacing `guidToHandle` and `topicToHandle`
-     and the two collision workarounds.
-  4. **Follow-ons**, each its own item once step 3 lands: reclaiming instances, bounded by
-     RESOURCE_LIMITS `max_instances` (no reader or writer forgets an instance today); the
-     participant's `discovered_*` lists, searched linearly by GUID or name.
+- **Instances are never reclaimed.** Instance handles are allocated
+  ([`design/handle-registries.md`](design/handle-registries.md), 2026-11-19), but no
+  DataReader or DataWriter forgets an instance: memory grows with every instance a topic
+  has ever had. Reclaim a reader's instance once it is not alive, has no samples and is not
+  loaned, and a writer's on `unregister_instance`, bounded by RESOURCE_LIMITS
+  `max_instances`; the registries' generations keep handles already given out safe. The
+  reader's `max_instances` check still counts the distinct instances in `pending` with an
+  O(n²) scan, which the registry's live count can replace.
+- **The participant's `discovered_*` lists are searched linearly.**
+  `discovered_participants`, `discovered_writers`, `discovered_readers` and
+  `discovered_topics` are searched by GUID or name in many loops in `participant.zig`,
+  and freeing an entity's handle scans them too (`releaseGuidHandleIfGoneLocked`). Fine at
+  realistic counts; index them by GUID and name when it is not.
 
 ### Selective CDR parse (`deserialize_selected`) — deferred follow-ups
 
@@ -376,7 +357,7 @@ or an optimisation on an already-improved path):
 - **Zig: `dcps/root.zig` publicly re-exports implementation types.** Zig has no
   package-private visibility, so `DomainParticipantFactoryImpl`, `DomainParticipantImpl`,
   `PublisherImpl`, `SubscriberImpl`, `SubscriberParticipantCbs`, `DataWriterImpl`,
-  `guidToHandle`, `DataReaderImpl`, `PendingChange`, `CoherentWipEntry`, `TakenSample`,
+  `DataReaderImpl`, `PendingChange`, `CoherentWipEntry`, `TakenSample`,
   `TopicImpl`, `ContentFilteredTopicImpl`, `WaitSetImpl`, `GuardConditionImpl`,
   `StatusConditionImpl`, `ReadConditionImpl`, `QueryConditionImpl`, `DataNotifyFn` and
   `WakeupHandle` are reachable as `zzdds.dcps.*`, which let application code cast into

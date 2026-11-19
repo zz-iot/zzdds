@@ -520,23 +520,9 @@ fn writerGetMatchedSubscriptionRtpsGuid(
         return DDS.RETCODE_BAD_PARAMETER;
     const writer: *DataWriterImpl = @ptrCast(@alignCast(ctx));
     if (writer.deleted()) return DDS.RETCODE_ALREADY_DELETED;
-    var guids: std.ArrayListUnmanaged(proto.Guid) = .empty;
-    defer guids.deinit(writer.alloc);
-    writer.proto_writer.listMatchedReaders(writer.alloc, &guids) catch
-        return DDS.RETCODE_OUT_OF_RESOURCES;
-    var match: ?proto.Guid = null;
-    for (guids.items) |guid| {
-        if (writer_mod.guidToHandle(guid) != subscription_handle) continue;
-        if (match) |existing| {
-            if (!std.meta.eql(existing, guid)) return DDS.RETCODE_PRECONDITION_NOT_MET;
-        }
-        match = guid;
-    }
-    if (match) |guid| {
-        writeGuid(out, guid);
-        return DDS.RETCODE_OK;
-    }
-    return DDS.RETCODE_NO_DATA;
+    const guid = writer.matchedSubscriptionGuid(subscription_handle) orelse return DDS.RETCODE_NO_DATA;
+    writeGuid(out, guid);
+    return DDS.RETCODE_OK;
 }
 
 fn writerAsDds(ctx: *anyopaque) DDS.DataWriter {
@@ -740,10 +726,7 @@ fn readerGetMatchedPublicationRtpsGuid(
         return DDS.RETCODE_BAD_PARAMETER;
     const reader: *DataReaderImpl = @ptrCast(@alignCast(ctx));
     if (reader.deleted()) return DDS.RETCODE_ALREADY_DELETED;
-    const guid = reader.resolvePublicationGuid(publication_handle) catch |err| return switch (err) {
-        error.HandleCollision => DDS.RETCODE_PRECONDITION_NOT_MET,
-        error.NoData => DDS.RETCODE_NO_DATA,
-    };
+    const guid = reader.resolvePublicationGuid(publication_handle) orelse return DDS.RETCODE_NO_DATA;
     writeGuid(out, guid);
     return DDS.RETCODE_OK;
 }

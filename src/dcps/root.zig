@@ -9,7 +9,6 @@ pub const PublisherImpl = @import("publisher.zig").PublisherImpl;
 pub const SubscriberImpl = @import("subscriber.zig").SubscriberImpl;
 pub const SubscriberParticipantCbs = @import("subscriber.zig").ParticipantCbs;
 pub const DataWriterImpl = @import("writer.zig").DataWriterImpl;
-pub const guidToHandle = @import("writer.zig").guidToHandle;
 pub const DataReaderImpl = @import("reader.zig").DataReaderImpl;
 pub const PendingChange = @import("reader.zig").PendingChange;
 pub const CoherentWipEntry = @import("reader.zig").CoherentWipEntry;

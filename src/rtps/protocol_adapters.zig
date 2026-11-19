@@ -213,7 +213,7 @@ pub const RtpsProtocolWriter = struct {
 
         fn install(ctx: *anyopaque, is_new: bool) void {
             const c: *ReaderCommit = @ptrCast(@alignCast(ctx));
-            if (c.cb) |cb| cb.on_reader_matching(cb.ctx, c.info.guid, is_new);
+            if (c.cb) |cb| cb.on_reader_matching(cb.ctx, c.info.guid, c.info.handle, is_new);
         }
     };
 
