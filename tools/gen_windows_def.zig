@@ -11,7 +11,12 @@
 //! whatever's already exported (Zig's own `export fn` C-ABI surface), not
 //! a replacement, so this only adds coverage.
 //!
-//! Usage: gen_windows_def <output.def> <input.c> [input.c ...]
+//! A `.zig` input is scanned for its top-level `export fn`s instead: the
+//! zidl-cdr archive's Zig half (shared_primitives.zig) is linked into
+//! zzdds.dll as a separate static library, so -fdll-export-fns, which only
+//! applies to zzdds's own module, doesn't export it either.
+//!
+//! Usage: gen_windows_def <output.def> <input.c|input.zig> [...]
 //!
 //! Parses each input file line by line for zidl's own generated shape:
 //! every top-level function it emits is a single physical line, starting
@@ -64,6 +69,17 @@ fn extractFunctionName(line: []const u8) ?[]const u8 {
     return name;
 }
 
+/// The name of a Zig `export fn` declared at column 0, or null.
+fn extractZigExportName(line: []const u8) ?[]const u8 {
+    const prefix = "export fn ";
+    if (!std.mem.startsWith(u8, line, prefix)) return null;
+    const rest = line[prefix.len..];
+    var end: usize = 0;
+    while (end < rest.len and (std.ascii.isAlphanumeric(rest[end]) or rest[end] == '_')) end += 1;
+    if (end == 0 or end == rest.len or rest[end] != '(') return null;
+    return rest[0..end];
+}
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
@@ -74,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
     const stderr = &stderr_fw.interface;
 
     if (args.len < 3) {
-        try stderr.writeAll("usage: gen_windows_def <output.def> <input.c> [input.c ...]\n");
+        try stderr.writeAll("usage: gen_windows_def <output.def> <input.c|input.zig> [...]\n");
         try stderr.flush();
         std.process.exit(1);
     }
@@ -90,9 +106,10 @@ pub fn main(init: std.process.Init) !void {
         var r = f.reader(io, &read_buf);
         const data = try r.interface.allocRemaining(arena, .unlimited);
 
+        const extract = if (std.mem.endsWith(u8, in_path, ".zig")) &extractZigExportName else &extractFunctionName;
         var line_it = std.mem.splitScalar(u8, data, '\n');
         while (line_it.next()) |line| {
-            if (extractFunctionName(line)) |name| {
+            if (extract(line)) |name| {
                 try names.put(name, {});
             }
         }
@@ -118,4 +135,12 @@ test "a public definition is exported and a static one is not" {
     try testing.expectEqual(null, extractFunctionName("static int DDS_Duration_t_deserialize_bounded_impl(ZidlCdrReader *_r, DDS_Duration_t *_v) {"));
     try testing.expectEqual(null, extractFunctionName("static int DDS_Duration_t_deserialize_bounded_impl(ZidlCdrReader *_r, DDS_Duration_t *_v);"));
     try testing.expectEqual(null, extractFunctionName("    int _rc = f(&_local, _v); {"));
+}
+
+test "a Zig export fn is exported and anything else is not" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("zidl_cdr_write_u8", extractZigExportName("export fn zidl_cdr_write_u8(w: *Writer, value: u8) c_int {\r").?);
+    try testing.expectEqual(null, extractZigExportName("fn helper(w: *Writer) c_int {"));
+    try testing.expectEqual(null, extractZigExportName("extern fn zidl_cdr_alloc(size: usize) ?[*]u8;"));
+    try testing.expectEqual(null, extractZigExportName("    export fn nested() void {}"));
 }
