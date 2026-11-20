@@ -689,10 +689,6 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtDeleteDataReader(ctx: *anyopaque, a_datareader: DDS.DataReader) DDS.ReturnCode_t {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return rc;
-        }
         const self = cast(ctx);
         const r = found: {
             self.mu.lock();
@@ -731,10 +727,6 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtDeleteContained(ctx: *anyopaque) DDS.ReturnCode_t {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return rc;
-        }
         const self = cast(ctx);
         var taken: std.ArrayListUnmanaged(*reader_mod.DataReaderImpl) = undefined;
         {
@@ -757,10 +749,6 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtLookupDataReader(ctx: *anyopaque, topic_name: [*:0]const u8) DDS.DataReader {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return nil.nil_datareader;
-        }
         const self = cast(ctx);
         const tn_s = std.mem.span(topic_name);
         self.mu.lock();

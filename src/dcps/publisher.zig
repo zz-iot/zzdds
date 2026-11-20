@@ -695,10 +695,6 @@ pub const PublisherImpl = struct {
     }
 
     fn vtDeleteDataWriter(ctx: *anyopaque, a_datawriter: DDS.DataWriter) DDS.ReturnCode_t {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return rc;
-        }
         const self = cast(ctx);
         const w = found: {
             self.mu.lock();
@@ -737,10 +733,6 @@ pub const PublisherImpl = struct {
     }
 
     fn vtLookupDataWriter(ctx: *anyopaque, topic_name: [*:0]const u8) DDS.DataWriter {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return nil.nil_datawriter;
-        }
         const self = cast(ctx);
         const tn_s = std.mem.span(topic_name);
         self.mu.lock();
@@ -754,10 +746,6 @@ pub const PublisherImpl = struct {
     }
 
     fn vtDeleteContained(ctx: *anyopaque) DDS.ReturnCode_t {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return rc;
-        }
         const self = cast(ctx);
         var taken: std.ArrayListUnmanaged(*writer_mod.DataWriterImpl) = undefined;
         {

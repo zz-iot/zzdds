@@ -398,6 +398,29 @@ was rejected: its index cannot serve as a handle once entries are removed, and i
 slower from 100,000 entries. Study, measurements and order of work:
 [`design/handle-registries.md`](design/handle-registries.md).
 
+**What a disabled entity takes follows DDS 1.4 §2.2.2.1.1.7, the same for every entity.**
+That section lets a disabled entity take: setting and getting its QoS, default QoS and
+listener; `get_statuscondition`; factory operations; `get_status_changes` and the other
+get-status operations; and lookups. It adds that deleting a disabled entity through its
+factory is legal. Every other operation returns NOT_ENABLED. Each class's own section
+(§2.2.2.2 to §2.2.2.5) restates this more narrowly and unevenly: the Publisher's exempts
+`create_datawriter` and `delete_datawriter`, the Subscriber's only `create_datareader`,
+and none mentions status getters, lookups, conditions or `delete_contained_entities`.
+Those lists say other operations "may" return NOT_ENABLED, so following the general rule
+satisfies both. zzdds reads them as incomplete restatements of it, and the Subscriber's
+missing `delete_datareader` as an omission. So, on every entity:
+- factory operations are taken: every `create_*` and `delete_*`, conditions included,
+  and `delete_contained_entities`;
+- lookups are taken: `lookup_topicdescription`, `find_topic` (which finds local topics
+  while discovery is not running), `lookup_datawriter`, `lookup_datareader`,
+  `lookup_instance`, and the `contains_entity` extension;
+- get-status operations are taken, and return the initial status, which does not change
+  while the entity is disabled;
+- anything else returns NOT_ENABLED. An operation with no return code says so the way
+  it reports any failure: `register_instance` returns HANDLE_NIL. Getters of a name, an
+  owner or a related entity (`get_participant`, `get_topic`, `get_name`, ...) are not
+  gated: they cannot fail.
+
 ---
 
 ## Logging and Tracing

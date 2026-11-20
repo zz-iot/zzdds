@@ -86,7 +86,7 @@ test "Topic: enable returns RETCODE_OK, idempotent when already enabled" {
     try testing.expectEqual(DDS.RETCODE_OK, topic.vtable.enable(topic.ptr));
 }
 
-test "Topic: created under a participant with autoenable_created_entities=false starts disabled, rejects get_inconsistent_topic_status with NOT_ENABLED, and enable() makes it work" {
+test "Topic: created under a participant with autoenable_created_entities=false starts disabled, takes get_inconsistent_topic_status, and enable() enables it" {
     const alloc = testing.allocator;
     var delivery = try IntraProcessDelivery.init(alloc);
     defer delivery.deinit();
@@ -105,11 +105,15 @@ test "Topic: created under a participant with autoenable_created_entities=false 
     try testing.expect(topic.ptr != nil.nil_topic.ptr);
     defer _ = dp.vtable.delete_topic(dp.ptr, topic);
 
+    // A disabled entity takes its get-status operations (§2.2.2.1.1.7), and
+    // a Topic has no other kind, so its flag shows it is disabled.
+    const impl: *zzdds.dcps.TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    try testing.expect(!impl.enabled.load(.acquire));
     var status: DDS.InconsistentTopicStatus = undefined;
-    try testing.expectEqual(DDS.RETCODE_NOT_ENABLED, topic.vtable.get_inconsistent_topic_status(topic.ptr, &status));
+    try testing.expectEqual(DDS.RETCODE_OK, topic.vtable.get_inconsistent_topic_status(topic.ptr, &status));
 
     try testing.expectEqual(DDS.RETCODE_OK, topic.vtable.enable(topic.ptr));
-    try testing.expectEqual(DDS.RETCODE_OK, topic.vtable.get_inconsistent_topic_status(topic.ptr, &status));
+    try testing.expect(impl.enabled.load(.acquire));
 }
 
 test "Topic: get_name and get_type_name return correct strings" {

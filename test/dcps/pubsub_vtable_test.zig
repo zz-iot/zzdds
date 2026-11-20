@@ -795,11 +795,10 @@ test "Publisher: set_qos while DataWriters are created and coherent sets end" {
         const t = try std.Thread.spawn(.{}, Churn.run, .{ pub_, true, &stop });
         defer t.join();
         defer stop.store(true, .release);
-        // Left to delete_contained_entities: a disabled Publisher's
-        // delete_datawriter returns NOT_ENABLED.
         for (0..200) |_| {
             const dw = pub_.create_datawriter(topic, .{}, null, 0);
             try testing.expect(dw.ptr != nil.nil_datawriter.ptr);
+            try testing.expectEqual(DDS.RETCODE_OK, pub_.delete_datawriter(dw));
         }
     }
 
@@ -834,10 +833,10 @@ test "Subscriber: set_qos while DataReaders are created and accesses begin and e
         const t = try std.Thread.spawn(.{}, Churn.run, .{ sub, true, &stop });
         defer t.join();
         defer stop.store(true, .release);
-        // Left to delete_contained_entities, as for the Publisher.
         for (0..200) |_| {
             const dr = sub.create_datareader(desc, .{}, null, 0);
             try testing.expect(dr.ptr != nil.nil_datareader.ptr);
+            try testing.expectEqual(DDS.RETCODE_OK, sub.delete_datareader(dr));
         }
     }
 
@@ -852,6 +851,166 @@ test "Subscriber: set_qos while DataReaders are created and accesses begin and e
             try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.begin_access(sub.ptr));
             try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.end_access(sub.ptr));
         }
+    }
+}
+
+// DDS 1.4 §2.2.2.1.1.7: a disabled entity takes its factory operations
+// (every create_* and delete_*, and delete_contained_entities), lookups and
+// get-status operations, besides its QoS, listener and status condition.
+// Anything else returns NOT_ENABLED (docs/decisions.md).
+test "A disabled tree takes factory, lookup and get-status operations at every level, and nothing else" {
+    var h = try Harness.init(0xBC);
+    defer h.deinit();
+    const dp = disabledParticipant(&h);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+    const zero: DDS.Duration_t = .{ .sec = 0, .nanosec = 0 };
+
+    // DomainParticipant.
+    const topic = dp.create_topic("DisabledTree", "T", .{}, null, 0);
+    try testing.expect(topic.ptr != nil.nil_topic.ptr);
+    try testing.expect(dp.lookup_topicdescription("DisabledTree").ptr != dcps.NIL_PTR);
+    const found = dp.vtable.find_topic(dp.ptr, "DisabledTree", &zero);
+    try testing.expect(found.ptr != nil.nil_topic.ptr);
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.delete_topic(dp.ptr, found));
+    const cft = dp.create_contentfilteredtopic("DisabledTreeCft", topic, "", &DDS.StringSeq{});
+    try testing.expect(cft.ptr != dcps.NIL_PTR);
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.delete_contentfilteredtopic(dp.ptr, cft));
+    var now: DDS.Time_t = undefined;
+    try testing.expectEqual(DDS.RETCODE_NOT_ENABLED, dp.vtable.get_current_time(dp.ptr, &now));
+    try testing.expectEqual(DDS.RETCODE_NOT_ENABLED, dp.vtable.ignore_participant(dp.ptr, DDS.HANDLE_NIL));
+
+    // Topic.
+    var inconsistent = DDS.InconsistentTopicStatus{};
+    try testing.expectEqual(DDS.RETCODE_OK, topic.vtable.get_inconsistent_topic_status(topic.ptr, &inconsistent));
+
+    // Publisher and DataWriter.
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    try testing.expect(dp.vtable.contains_entity(dp.ptr, pub_.vtable.get_instance_handle(pub_.ptr)));
+    const dw = pub_.create_datawriter(topic, .{}, null, 0);
+    try testing.expect(dw.ptr != nil.nil_datawriter.ptr);
+    try testing.expectEqual(dw.ptr, pub_.lookup_datawriter("DisabledTree").ptr);
+    var lost = DDS.LivelinessLostStatus{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.get_liveliness_lost_status(dw.ptr, &lost));
+    var offered_missed = DDS.OfferedDeadlineMissedStatus{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.get_offered_deadline_missed_status(dw.ptr, &offered_missed));
+    var offered_incompatible = DDS.OfferedIncompatibleQosStatus{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.get_offered_incompatible_qos_status(dw.ptr, &offered_incompatible));
+    offered_incompatible.policies.deinit(alloc);
+    var pub_matched = DDS.PublicationMatchedStatus{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.get_publication_matched_status(dw.ptr, &pub_matched));
+    try testing.expectEqual(DDS.HANDLE_NIL, zzdds.registerInstanceRaw(dw, @splat(0)));
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.delete_datawriter(dw));
+    _ = pub_.create_datawriter(topic, .{}, null, 0);
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.delete_contained_entities(pub_.ptr));
+    try testing.expectEqual(DDS.RETCODE_NOT_ENABLED, pub_.vtable.begin_coherent_changes(pub_.ptr));
+
+    // Subscriber and DataReader.
+    const sub = dp.create_subscriber(.{}, null, 0);
+    const desc = @as(*dcps.TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
+    const dr = sub.create_datareader(desc, .{}, null, 0);
+    try testing.expect(dr.ptr != nil.nil_datareader.ptr);
+    try testing.expectEqual(dr.ptr, sub.lookup_datareader("DisabledTree").ptr);
+    var rejected = DDS.SampleRejectedStatus{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.get_sample_rejected_status(dr.ptr, &rejected));
+    var changed = DDS.LivelinessChangedStatus{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.get_liveliness_changed_status(dr.ptr, &changed));
+    var requested_missed = DDS.RequestedDeadlineMissedStatus{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.get_requested_deadline_missed_status(dr.ptr, &requested_missed));
+    var requested_incompatible = DDS.RequestedIncompatibleQosStatus{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.get_requested_incompatible_qos_status(dr.ptr, &requested_incompatible));
+    requested_incompatible.policies.deinit(alloc);
+    var sub_matched = DDS.SubscriptionMatchedStatus{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.get_subscription_matched_status(dr.ptr, &sub_matched));
+    var sample_lost = DDS.SampleLostStatus{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.get_sample_lost_status(dr.ptr, &sample_lost));
+    const rc = dr.create_readcondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    try testing.expect(rc.ptr != dcps.NIL_PTR);
+    try testing.expectEqual(DDS.RETCODE_OK, dr.delete_readcondition(rc));
+    _ = dr.create_readcondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    _ = dr.create_querycondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, "", &DDS.StringSeq{});
+    const dr_impl: *dcps.DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+    try testing.expectEqual(@as(usize, 2), dr_impl.read_conditions.items.len);
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.delete_contained_entities(dr.ptr));
+    try testing.expectEqual(@as(usize, 0), dr_impl.read_conditions.items.len);
+    try testing.expectEqual(DDS.RETCODE_NOT_ENABLED, dr.vtable.wait_for_historical_data(dr.ptr, &zero));
+    try testing.expectEqual(DDS.RETCODE_OK, sub.delete_datareader(dr));
+    _ = sub.create_datareader(desc, .{}, null, 0);
+    try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.delete_contained_entities(sub.ptr));
+    try testing.expectEqual(DDS.RETCODE_NOT_ENABLED, sub.vtable.begin_access(sub.ptr));
+
+    // Back up the tree, still disabled.
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.delete_publisher(dp.ptr, pub_));
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.delete_subscriber(dp.ptr, sub));
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.delete_topic(dp.ptr, topic));
+    _ = dp.create_publisher(.{}, null, 0);
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.delete_contained_entities(dp.ptr));
+}
+
+test "DataReader: delete_contained_entities deletes its ReadConditions and QueryConditions when enabled too" {
+    var h = try Harness.init(0xBD);
+    defer h.deinit();
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+    const topic = dp.create_topic("ReaderContained", "T", .{}, null, 0);
+    const desc = @as(*dcps.TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
+    const dr = dp.create_subscriber(.{}, null, 0).create_datareader(desc, .{}, null, 0);
+    _ = dr.create_readcondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    _ = dr.create_querycondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, "", &DDS.StringSeq{});
+    const dr_impl: *dcps.DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+    try testing.expectEqual(@as(usize, 2), dr_impl.read_conditions.items.len);
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.delete_contained_entities(dr.ptr));
+    try testing.expectEqual(@as(usize, 0), dr_impl.read_conditions.items.len);
+}
+
+// The reader's deletion can start while delete_contained_entities is part
+// way through its conditions. The test's own quiesce reference keeps the
+// reader allocated past it, as a call in flight does, and the testing
+// allocator finds any condition that neither of them freed.
+test "DataReader: delete_contained_entities racing delete_datareader frees every condition once" {
+    try skipUnderValgrind();
+    var h = try Harness.init(0xBE);
+    defer h.deinit();
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+    const topic = dp.create_topic("ReaderContainedRace", "T", .{}, null, 0);
+    const desc = @as(*dcps.TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
+    const sub = dp.create_subscriber(.{}, null, 0);
+    const Race = struct {
+        go: std.atomic.Value(bool) = .init(false),
+        sub: DDS.Subscriber,
+        dr: DDS.DataReader,
+        rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+        fn wait(r: *@This()) void {
+            while (!r.go.load(.acquire)) std.atomic.spinLoopHint();
+        }
+        fn deleteReader(r: *@This()) void {
+            r.wait();
+            _ = r.sub.delete_datareader(r.dr);
+        }
+        fn deleteContained(r: *@This()) void {
+            r.wait();
+            r.rc = r.dr.vtable.delete_contained_entities(r.dr.ptr);
+        }
+    };
+    for (0..30) |_| {
+        const dr = sub.create_datareader(desc, .{}, null, 0);
+        try testing.expect(dr.ptr != nil.nil_datareader.ptr);
+        for (0..100) |_| {
+            _ = dr.create_readcondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+            _ = dr.create_querycondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, "", &DDS.StringSeq{});
+        }
+        const dr_impl: *dcps.DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+        try testing.expect(dr_impl.acquireQuiesce());
+        var race: Race = .{ .sub = sub, .dr = dr };
+        const a = try std.Thread.spawn(.{}, Race.deleteContained, .{&race});
+        const b = try std.Thread.spawn(.{}, Race.deleteReader, .{&race});
+        race.go.store(true, .release);
+        a.join();
+        b.join();
+        try testing.expect(race.rc == DDS.RETCODE_OK or race.rc == DDS.RETCODE_ALREADY_DELETED);
+        dr_impl.releaseQuiesce();
     }
 }
 
