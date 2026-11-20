@@ -721,14 +721,21 @@ test "set_qos changes a writer's and a reader's DEADLINE while their timer check
     const dr = sub.create_datareader(desc, dr_qos, null, 0);
     try testing.expect(dr.ptr != nil.nil_datareader.ptr);
 
-    for (0..200) |i| {
+    // Until the checks have missed each deadline a few times, so they ran
+    // throughout. Each set_qos also brings the next check forward.
+    var dw_missed = DDS.OfferedDeadlineMissedStatus{};
+    var dr_missed = DDS.RequestedDeadlineMissedStatus{};
+    var i: usize = 0;
+    while (dw_missed.total_count < 20 or dr_missed.total_count < 20) : (i += 1) {
+        try testing.expect(i < 10_000_000);
         const ns: u32 = if (i % 2 == 0) 2_000_000 else 1_000_000;
         dw_qos.deadline.period.nanosec = ns;
         try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.set_qos(dw.ptr, &dw_qos));
         dr_qos.deadline.period.nanosec = ns;
         dr_qos.time_based_filter.minimum_separation.nanosec = ns / 2;
         try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.set_qos(dr.ptr, &dr_qos));
-        zzdds.util.time.sleepNs(100_000);
+        _ = dw.vtable.get_offered_deadline_missed_status(dw.ptr, &dw_missed);
+        _ = dr.vtable.get_requested_deadline_missed_status(dr.ptr, &dr_missed);
     }
 }
 
