@@ -36,10 +36,10 @@ import Foreign.Storable (pokeByteOff, peekByteOff)
 import System.Exit (exitFailure)
 import System.IO (hFlush, stdout)
 
-foreign import ccall "zzdds_create_factory"
-  c_zzdds_create_factory :: IO (Ptr ())
-foreign import ccall "zzdds_destroy_factory"
-  c_zzdds_destroy_factory :: Ptr () -> IO ()
+foreign import ccall "zzdds_DomainParticipantFactory_create"
+  c_zzdds_DomainParticipantFactory_create :: IO (Ptr ())
+foreign import ccall "zzdds_DomainParticipantFactory_release"
+  c_zzdds_DomainParticipantFactory_release :: Ptr () -> IO ()
 foreign import ccall "zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory"
   c_factory_as_dds :: Ptr () -> IO (Ptr ())
 foreign import ccall "DDS_DomainParticipantFactory_create_participant"
@@ -110,9 +110,9 @@ main = do
     putStrLn "[callback] release_listener_data fired"
     hFlush stdout
 
-  factory <- c_zzdds_create_factory
+  factory <- c_zzdds_DomainParticipantFactory_create
   when (factory == nullPtr) $ do
-    putStrLn "FAIL: zzdds_create_factory() returned NULL"
+    putStrLn "FAIL: zzdds_DomainParticipantFactory_create() returned NULL"
     exitFailure
 
   ddsFactory <- c_factory_as_dds factory
@@ -170,7 +170,7 @@ main = do
           putStrLn "FAIL: expected >= 5 deadline-missed callbacks in 8s"
           exitFailure
         else do
-          c_zzdds_destroy_factory factory
+          c_zzdds_DomainParticipantFactory_release factory
           finalReleases <- readIORef releasesRef
           putStrLn $ "[main] teardown done; release_listener_data fired " ++ show finalReleases ++ " time(s)"
           putStrLn "PASS"

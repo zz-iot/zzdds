@@ -29,7 +29,7 @@ namespace detail {
 // until zidl can construct them from a DDS_* handle.)
 //
 // Unlike the factory (a bootstrap singleton constructed directly from
-// zzdds_create_factory(), never via another entity's factory method), these
+// zzdds_DomainParticipantFactory_create(), never via another entity's factory method), these
 // four *are* constructed via the ordinary generic entity path --
 // DomainParticipant::create_topic() and friends, whose generated
 // implementation only ever has a DDS_Topic/DDS_DataWriter/... handle to
@@ -674,29 +674,6 @@ private:
 
 } // namespace detail
 
-/**
- * Deprecated: use zzdds::DomainParticipantFactory::create(), which this
- * calls, or ::DDS::DomainParticipantFactory::get_instance() for the
- * process-wide factory. Dropping the last reference to the factory deletes
- * every participant it still has, and everything in them.
- */
-[[deprecated("use zzdds::DomainParticipantFactory::create()")]]
-inline std::shared_ptr<DomainParticipantFactory> create_factory()
-{
-    return DomainParticipantFactory::create();
-}
-
-/**
- * Deprecated: use zzdds::DomainParticipantFactory::create(allocator). Every
- * allocation the factory and everything it creates makes goes through
- * `allocator`, which must outlive them. nullptr is the default allocator.
- */
-[[deprecated("use zzdds::DomainParticipantFactory::create(allocator)")]]
-inline std::shared_ptr<DomainParticipantFactory> create_factory(const ZidlAllocator* allocator)
-{
-    return DomainParticipantFactory::create(allocator);
-}
-
 namespace detail {
 
 // The generated DDS::WaitSet::create() boxes its new WaitSet through this
@@ -856,8 +833,8 @@ private:
  * Resolve `path` as a zzdds TOML config file and install the result as the
  * process-wide configuration, entirely through `allocator` (nullptr for the
  * default, libc malloc/free) -- see zzdds_process_configure_from_file's
- * contract in zzdds_c.h. Call this before create_factory()/
- * create_factory(allocator), with the SAME allocator you'll pass to the
+ * contract in zzdds_c.h. Call this before DomainParticipantFactory::create()/
+ * create(allocator), with the SAME allocator you'll pass to the
  * latter, to avoid the ambient lazy-default path's libc malloc use for the
  * process-wide config's own persistent storage.
  */

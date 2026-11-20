@@ -100,9 +100,9 @@ func goOnRelease(listenerData unsafe.Pointer) {
 func main() {
 	fmt.Printf("[main] pid=%d main_goroutine_id=%d GOMAXPROCS=%d\n", os.Getpid(), mainGoID, runtime.GOMAXPROCS(0))
 
-	factory := C.zzdds_create_factory()
+	factory := C.zzdds_DomainParticipantFactory_create()
 	if factory == nil {
-		fmt.Println("FAIL: zzdds_create_factory() returned nil")
+		fmt.Println("FAIL: zzdds_DomainParticipantFactory_create() returned nil")
 		os.Exit(1)
 	}
 	ddsFactory := C.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory)
@@ -166,7 +166,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	C.zzdds_destroy_factory(factory)
+	C.zzdds_DomainParticipantFactory_release(factory)
 	fmt.Printf("[main] teardown done; release_listener_data fired %d time(s)\n", atomic.LoadInt64(&releases))
 	fmt.Println("PASS")
 }

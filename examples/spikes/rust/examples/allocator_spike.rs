@@ -25,11 +25,11 @@ fn main() {
 
         // Every allocation the factory and everything it creates makes is
         // now routed through the pool -- same contract as the C/C++
-        // examples' zzdds_create_factory_with_allocator usage, just called
+        // examples' zzdds_DomainParticipantFactory_create_with_allocator usage, just called
         // from Rust across the same C ABI, no bindgen, no unstable
         // features.
-        let factory = ffi::zzdds_create_factory_with_allocator(allocator);
-        assert!(!factory.is_null(), "zzdds_create_factory_with_allocator returned NULL");
+        let factory = ffi::zzdds_DomainParticipantFactory_create_with_allocator(allocator);
+        assert!(!factory.is_null(), "zzdds_DomainParticipantFactory_create_with_allocator returned NULL");
         println!("[allocator_spike] factory created under static-pool allocator");
 
         // WaitSet/GuardCondition: the two condition-family types with no
@@ -70,7 +70,7 @@ fn main() {
         ffi::DDS_WaitSet_detach_condition(waitset, guard_cond);
         ffi::DDS_GuardCondition_destroy(guard);
         ffi::DDS_WaitSet_destroy(waitset);
-        ffi::zzdds_destroy_factory(factory);
+        ffi::zzdds_DomainParticipantFactory_release(factory);
 
         println!("PASS");
     }

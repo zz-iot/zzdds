@@ -61,10 +61,10 @@ def load_and_declare():
     zzdds.DDS_WaitSet_wait.restype = ctypes.c_int
     zzdds.DDS_WaitSet_wait.argtypes = [c_void_p, ctypes.POINTER(DDS_ConditionSeq), ctypes.POINTER(DDS_Duration_t)]
 
-    zzdds.zzdds_create_factory.restype = c_void_p
-    zzdds.zzdds_create_factory.argtypes = []
-    zzdds.zzdds_destroy_factory.restype = None
-    zzdds.zzdds_destroy_factory.argtypes = [c_void_p]
+    zzdds.zzdds_DomainParticipantFactory_create.restype = c_void_p
+    zzdds.zzdds_DomainParticipantFactory_create.argtypes = []
+    zzdds.zzdds_DomainParticipantFactory_release.restype = None
+    zzdds.zzdds_DomainParticipantFactory_release.argtypes = [c_void_p]
     zzdds.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory.restype = c_void_p
     zzdds.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory.argtypes = [c_void_p]
     zzdds.DDS_DomainParticipantFactory_create_participant.restype = c_void_p
@@ -151,9 +151,9 @@ def run_typesupport_ctx():
     zzdds, _, _, CTX_DEINIT_FN, KEY_HASH_CTX_FN = load_and_declare()
     null_key_hash_fn = ctypes.cast(0, KEY_HASH_CTX_FN)
 
-    factory = zzdds.zzdds_create_factory()
+    factory = zzdds.zzdds_DomainParticipantFactory_create()
     if not factory:
-        sys.exit("FAIL: zzdds_create_factory() returned NULL")
+        sys.exit("FAIL: zzdds_DomainParticipantFactory_create() returned NULL")
     dds_factory = zzdds.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory)
     dp = zzdds.DDS_DomainParticipantFactory_create_participant(dds_factory, 95, None, None, 0)
     if not dp:
@@ -210,7 +210,7 @@ def run_typesupport_ctx():
     if state["deinit_b_fired"]:
         sys.exit("FAIL: deinit_b fired too early -- only deinit_a should have fired so far")
 
-    zzdds.zzdds_destroy_factory(factory)
+    zzdds.zzdds_DomainParticipantFactory_release(factory)
 
     if not state["deinit_b_fired"]:
         sys.exit("FAIL: deinit_b never fired on participant teardown")

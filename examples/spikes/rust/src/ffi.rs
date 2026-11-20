@@ -186,8 +186,8 @@ impl DDS_SampleInfoSeq {
 }
 
 unsafe extern "C" {
-    pub fn zzdds_create_factory() -> ZzddsDomainParticipantFactory;
-    pub fn zzdds_destroy_factory(factory: ZzddsDomainParticipantFactory);
+    pub fn zzdds_DomainParticipantFactory_create() -> ZzddsDomainParticipantFactory;
+    pub fn zzdds_DomainParticipantFactory_release(factory: ZzddsDomainParticipantFactory);
     pub fn zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(
         factory: ZzddsDomainParticipantFactory,
     ) -> DDS_DomainParticipantFactory;
@@ -295,7 +295,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     // ── Allocator-spike additions ──
 
-    pub fn zzdds_create_factory_with_allocator(
+    pub fn zzdds_DomainParticipantFactory_create_with_allocator(
         allocator: *const ZidlAllocator,
     ) -> ZzddsDomainParticipantFactory;
 

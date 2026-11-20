@@ -856,7 +856,7 @@ pub fn build(b: *std.Build) void {
         binding_smoke_step.dependOn(&b.addRunArtifact(c_smoke).step);
 
         // Plain-C counterpart to cpp_allocator_smoke.cpp below: proves
-        // zzdds_create_factory_with_allocator's C-ABI allocator injection
+        // zzdds_DomainParticipantFactory_create_with_allocator's C-ABI allocator injection
         // reaches every downstream allocation. No generated per-sample-type
         // CDR code needed (unlike c_smoke above) -- this only exercises
         // factory/participant lifecycle, not serialization.

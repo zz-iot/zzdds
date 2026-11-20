@@ -113,7 +113,7 @@ static void *zzdds_java_require_unboxed(JNIEnv *env, jobject obj, const char *pa
 
 /* ── Lazily-cached (jclass, "(J)V" ctor jmethodID) pairs ─────────────────
  *
- * createFactory()/asZzddsDataWriter() each resolve their target class once
+ * asZzddsFactory()/asZzddsDataWriter() each resolve their target class once
  * and cache it in a `static` local for subsequent calls. Without
  * synchronization, two threads racing on the *first* call can interleave:
  * one observes the other's non-NULL `cls` (a plain store, visible as soon
@@ -223,24 +223,6 @@ static bool zzdds_java_require_instance_of_any(JNIEnv *env, jobject obj, zzdds_j
     jclass iae = (*env)->FindClass(env, "java/lang/IllegalArgumentException");
     if (iae != NULL) (*env)->ThrowNew(env, iae, param_name);
     return false;
-}
-
-/* ── Factory bootstrap ──────────────────────────────────────────────────
- *
- * There is no IDL-level "get the singleton DomainParticipantFactory"
- * operation (see zzdds/docs/language-bindings.md) — every zzdds binding
- * bootstraps through this same hand-written zzdds_create_factory() call
- * (C/C++ examples do the same thing via zzdds_c.h directly).
- */
-JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createFactory(JNIEnv *env, jclass self_cls) {
-    (void)self_cls;
-    zzdds_DomainParticipantFactory zf = zzdds_create_factory();
-    if (zf == NULL) return NULL;
-    DDS_DomainParticipantFactory df = zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(zf);
-
-    static zzdds_java_class_cache cache = {0};
-    if (!zzdds_java_get_or_cache_class(env, &cache, "io/zzdds/dcps/DomainParticipantFactoryImpl")) return NULL;
-    return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)df);
 }
 
 /* ── WaitSet condition-attachment keepalive ──────────────────────────────
@@ -833,7 +815,7 @@ JNIEXPORT jboolean JNICALL Java_io_zzdds_runtime_ZzddsRuntime_cftMatchSample(
 /* ── zzdds extension-view narrowing ─────────────────────────────────────
  * See ZzddsRuntime.asZzddsDataWriter's javadoc / include/zzdds_c.h's
  * DDS_DataWriter_as_zzdds_DataWriter. Boxes into io.zzdds.ext.DataWriterImpl
- * — cached jclass/jmethodID the same way createFactory() caches
+ * — cached jclass/jmethodID the same way asZzddsFactory() caches
  * DomainParticipantFactoryImpl's. */
 JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_asZzddsDataWriter(
     JNIEnv *env, jclass self_cls, jobject writer)
@@ -920,9 +902,8 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_configureFromFile(
     return (jint)rc;
 }
 
-/* Same narrowing as asZzddsDataWriter above, for the factory createFactory()
- * itself always boxes as the base io/zzdds/dcps/DomainParticipantFactoryImpl
- * view -- see that function's own doc comment. */
+/* Same narrowing as asZzddsDataWriter above, for a factory boxed as the base
+ * io/zzdds/dcps/DomainParticipantFactoryImpl view, such as get_instance()'s. */
 JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_asZzddsFactory(
     JNIEnv *env, jclass self_cls, jobject factory)
 {

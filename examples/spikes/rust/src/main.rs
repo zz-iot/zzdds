@@ -16,8 +16,8 @@ const MAGIC: u64 = 0xFEEDFACECAFEBEEF;
 
 fn main() {
     unsafe {
-        let factory = ffi::zzdds_create_factory();
-        assert!(!factory.is_null(), "zzdds_create_factory() returned NULL");
+        let factory = ffi::zzdds_DomainParticipantFactory_create();
+        assert!(!factory.is_null(), "zzdds_DomainParticipantFactory_create() returned NULL");
         let dds_factory = ffi::zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory);
 
         let dp = ffi::DDS_DomainParticipantFactory_create_participant(
@@ -138,7 +138,7 @@ fn main() {
 
         println!("[main] loan returned via Drop, not an explicit call -- correct usage confirmed");
 
-        ffi::zzdds_destroy_factory(factory);
+        ffi::zzdds_DomainParticipantFactory_release(factory);
         println!("PASS");
     }
 }

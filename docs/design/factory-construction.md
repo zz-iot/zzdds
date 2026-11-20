@@ -4,10 +4,11 @@
 
 Implemented, with five decisions (below), all made: `get_instance` comes with the rest, in
 one zidl release (3), and `release` retires a reader's or writer's handle on its last
-loan's return (5). The factory work is in #173; decision 5 is in its own PR. Follows WaitSet and GuardCondition onto zidl's
+loan's return (5). The factory work is in #173; decision 5 is in its own PR. rmw_zzdds
+moved to the generated functions in rmw_zzdds#19, and the deprecated functions are now removed. Follows WaitSet and GuardCondition onto zidl's
 `@standalone` construction ([#167](https://github.com/zz-iot/zzdds/pull/167), zidl
 `docs/design/standalone-construction.md`). A throwaway prototype of the constructor half is
-on the local branch `proto-factory-standalone` (557bb74); its findings are recorded here.
+was on a local branch, since deleted; its findings are recorded here.
 
 ## Today
 

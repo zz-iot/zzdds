@@ -129,5 +129,6 @@ A process-wide `zzdds.toml` (this directory) supplies a
 that example's README for the general config-file explanation. Both
 programs call `zzdds::process_configure_from_file()` (`zzdds_cpp.hpp`, a
 thin wrapper over the C-ABI's `zzdds_process_configure_from_file`) with
-`&static_pool_allocator` before `create_factory(&static_pool_allocator)`,
+`&static_pool_allocator` before
+`zzdds::DomainParticipantFactory::create(&static_pool_allocator)`,
 so config resolution itself also stays off the libc heap.

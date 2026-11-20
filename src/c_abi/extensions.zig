@@ -752,33 +752,6 @@ fn readerGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
     return impl.c_abi.get(impl.alloc, ctx, &DataReaderImpl.views);
 }
 
-pub export fn zzdds_create_factory() callconv(.c) ?*anyopaque {
-    return zzdds_create_factory_with_allocator(null);
-}
-
-/// Same as zzdds_create_factory, but every allocation the factory and
-/// everything it ever creates makes (participants, topics, writers, readers,
-/// history cache entries, ...) is routed through `allocator` instead of the
-/// default std.heap.c_allocator (libc malloc) — every concrete impl already
-/// stores `self.alloc`, inherited from whatever created it, so this one
-/// injection point is sufficient for the whole Zig core; nothing downstream
-/// needs its own separate configuration surface. Pass NULL for the default.
-/// `allocator` must outlive the factory returned here and everything created
-/// through it — see ZidlAllocator's contract in zidl_allocator.h.
-pub export fn zzdds_create_factory_with_allocator(allocator: ?*const zidl_bindings.ZidlAllocator) callconv(.c) ?*anyopaque {
-    const r: ZZDDS.DomainParticipantFactory = createFactory(allocator) catch |err| {
-        std.log.err("zzdds_create_factory_with_allocator: {}", .{err});
-        return null;
-    };
-    return r.vtable.get_c_abi_handle(r.ptr);
-}
-
-pub export fn zzdds_destroy_factory(factory: ?*anyopaque) callconv(.c) void {
-    const f = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, factory orelse return);
-    if (f.ptr == nil.NIL_PTR) return;
-    f.vtable.deinit(f.ptr);
-}
-
 // The generated C API of dcps.idl and zzdds.idl: zidl writes the functions,
 // and each module's exportCAbi exports them with what only zzdds knows. Only
 // a build generating the C ABI has them.
@@ -962,7 +935,7 @@ pub export fn zzdds_waitset_attach_condition_with_release(
 }
 
 /// Explicitly install the process-wide configuration. Must be called before
-/// any factory has been created in this process (zzdds_create_factory
+/// any factory has been created in this process (creating one
 /// resolves+commits the ambient default lazily on first use if this was never
 /// called) — returns RETCODE_PRECONDITION_NOT_MET if a process-wide config is
 /// already installed either way. See config/process.zig.
@@ -991,11 +964,11 @@ pub export fn zzdds_process_configure(config: *const ZZDDS.ProcessConfig) callco
 /// Resolve `path` as a zzdds TOML config file and install the result as the
 /// process-wide configuration, in one step — entirely through `allocator`
 /// (NULL for the default, `std.heap.c_allocator`). This is the actual,
-/// C/C++-usable way to avoid `zzdds_create_factory_with_allocator`'s ambient
+/// C/C++-usable way to avoid `zzdds_DomainParticipantFactory_create_with_allocator`'s ambient
 /// lazy-default path (`config/process.zig`'s `getForNewFactory`), which
 /// always resolves through `std.heap.c_allocator` regardless of the
 /// allocator passed to it: call this first, with the SAME allocator you'll
-/// later pass to `zzdds_create_factory_with_allocator`, and the process-wide
+/// later pass to `zzdds_DomainParticipantFactory_create_with_allocator`, and the process-wide
 /// singleton's own persistent storage will live in that allocator for the
 /// rest of the process's lifetime instead.
 ///
@@ -1043,11 +1016,11 @@ pub export fn zzdds_process_configure_from_file(
 // second, address-distinct copy.
 
 /// Only valid for participants created through a FactoryOwner factory (i.e., via
-/// zzdds_create_factory → create_participant_ex). Returns NULL for NULL, or for any
+/// zzdds_DomainParticipantFactory_create → create_participant_ex). Returns NULL for NULL, or for any
 /// handle not issued by this implementation.
 pub export fn DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(factory: ?*anyopaque) callconv(.c) ?*anyopaque {
     // factory_vtable methods cast ctx to *FactoryOwner, so this conversion is
-    // only valid for handles that were originally issued by zzdds_create_factory
+    // only valid for handles that were originally issued by a FactoryOwner
     // (which sets vtable = &dds_factory_vtable via the generated as_DomainParticipantFactory export).
     const f = zidl_bindings.unboxAsView(DDS.DomainParticipantFactory, factory orelse return null);
     if (f.vtable != &dds_factory_vtable) return null;
@@ -1056,7 +1029,7 @@ pub export fn DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(fac
 }
 
 /// Only valid for participants created through a FactoryOwner factory (i.e., via
-/// zzdds_create_factory → create_participant_ex). Returns NULL for NULL, or for any
+/// zzdds_DomainParticipantFactory_create → create_participant_ex). Returns NULL for NULL, or for any
 /// handle not issued by this implementation.
 pub export fn DDS_DomainParticipant_as_zzdds_DomainParticipant(participant: ?*anyopaque) callconv(.c) ?*anyopaque {
     const p = zidl_bindings.unboxAsView(DDS.DomainParticipant, participant orelse return null);
@@ -1340,7 +1313,9 @@ pub export fn zzdds_cft_match_sample(
     return impl.matchSample(accessor);
 }
 
-fn createFactory(allocator: ?*const zidl_bindings.ZidlAllocator) !ZZDDS.DomainParticipantFactory {
+/// A new factory of one's own, as `zzdds_DomainParticipantFactory_create[_with_allocator]`
+/// makes; `null` is zzdds's default allocator.
+pub fn createFactory(allocator: ?*const zidl_bindings.ZidlAllocator) !ZZDDS.DomainParticipantFactory {
     return createFactoryWith(if (allocator) |a| zidl_bindings.toAllocator(a) else null);
 }
 
@@ -1478,7 +1453,7 @@ fn factorySetDefaultParticipantConfig(ctx: *anyopaque, config: *const ZZDDS.Doma
 /// c_allocator-owned too, regardless of which allocator this factory itself
 /// was created with (owner.alloc) — decoupling the caller-facing contract
 /// from the factory's own internal allocator is what makes repeated calls
-/// safe on a factory created via zzdds_create_factory_with_allocator(custom):
+/// safe on a factory created with a custom allocator:
 /// freeing/filling *config with owner.alloc would free caller-supplied,
 /// c_allocator-owned memory through the wrong allocator (or vice versa on a
 /// second call), an invalid free / memory corruption either way.
@@ -1514,7 +1489,7 @@ fn factorySetDefaultParticipantQos(ctx: *anyopaque, qos: *const DDS.DomainPartic
 /// existing content with c_allocator before writing the cloned default —
 /// this used to say that but actually free/fill with owner.alloc instead, an
 /// allocator mismatch on a factory created via
-/// zzdds_create_factory_with_allocator(custom) (same class of bug as
+/// a custom allocator (same class of bug as
 /// factoryGetDefaultParticipantConfig above; found while fixing that one).
 fn factoryGetDefaultParticipantQos(ctx: *anyopaque, qos: *DDS.DomainParticipantQos) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
@@ -1570,7 +1545,7 @@ fn factoryDestroy(ctx: *anyopaque) DDS.ReturnCode_t {
 }
 
 /// The `@finalizer`: deletes every participant and everything in it, then
-/// the factory, as `zzdds_destroy_factory` always has.
+/// the factory.
 fn factoryRelease(ctx: *anyopaque) void {
     factoryDeinit(ctx);
 }

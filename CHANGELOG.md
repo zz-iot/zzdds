@@ -10,6 +10,14 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-20
 
+- **Breaking:** the deprecated factory functions are removed, now that rmw_zzdds uses the
+  generated ones (rmw_zzdds#19). In C, use `zzdds_DomainParticipantFactory_create` and
+  `_create_with_allocator` instead of `zzdds_create_factory` and `_with_allocator`, and
+  `zzdds_DomainParticipantFactory_release` instead of `zzdds_destroy_factory`. In C++, use
+  `zzdds::DomainParticipantFactory::create([allocator])` instead of `zzdds::create_factory`.
+  In Java, use `Zzdds.zzdds.DomainParticipantFactory.create()` instead of
+  `ZzddsRuntime.createFactory`. Zig's `zzdds.createFactory` and the language spikes now
+  use the generated construction too. CI tests against rmw_zzdds at its #19 merge.
 - A disabled entity takes what DDS 1.4 §2.2.2.1.1.7 lets it take, the same on every entity
   (`docs/decisions.md`). Deleting from a disabled DomainParticipant, Publisher or
   Subscriber now works: `delete_publisher`, `delete_subscriber`, `delete_topic`,

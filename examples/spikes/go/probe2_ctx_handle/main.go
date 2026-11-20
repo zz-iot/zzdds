@@ -133,9 +133,9 @@ func main() {
 	}
 	fmt.Printf("[main] mode=%s\n", mode)
 
-	factory := C.zzdds_create_factory()
+	factory := C.zzdds_DomainParticipantFactory_create()
 	if factory == nil {
-		fmt.Println("FAIL: zzdds_create_factory() returned nil")
+		fmt.Println("FAIL: zzdds_DomainParticipantFactory_create() returned nil")
 		os.Exit(1)
 	}
 	ddsFactory := C.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory)
@@ -198,7 +198,7 @@ func main() {
 	fmt.Printf("[main] reader created, waiting for %d ticks with GC+heap-churn between each...\n", tickCount)
 	time.Sleep(time.Duration(int64(tickCount+2) * deadlineNsec))
 
-	C.zzdds_destroy_factory(factory)
+	C.zzdds_DomainParticipantFactory_release(factory)
 	if mode == "handle" {
 		handle.Delete()
 	}

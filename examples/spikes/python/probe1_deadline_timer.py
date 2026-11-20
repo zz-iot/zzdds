@@ -65,12 +65,12 @@ def load_libs():
 
 
 def declare_signatures(zzdds, shim):
-    zzdds.zzdds_create_factory.restype = c_void_p
-    zzdds.zzdds_create_factory.argtypes = []
+    zzdds.zzdds_DomainParticipantFactory_create.restype = c_void_p
+    zzdds.zzdds_DomainParticipantFactory_create.argtypes = []
 
 
-    zzdds.zzdds_destroy_factory.restype = None
-    zzdds.zzdds_destroy_factory.argtypes = [c_void_p]
+    zzdds.zzdds_DomainParticipantFactory_release.restype = None
+    zzdds.zzdds_DomainParticipantFactory_release.argtypes = [c_void_p]
 
     zzdds.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory.restype = c_void_p
     zzdds.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory.argtypes = [c_void_p]
@@ -176,9 +176,9 @@ def main():
     listener.on_sample_lost = ON_SAMPLE_LOST_CB(0)
     listener.release_listener_data = release_listener_data
 
-    factory = zzdds.zzdds_create_factory()
+    factory = zzdds.zzdds_DomainParticipantFactory_create()
     if not factory:
-        sys.exit("FAIL: zzdds_create_factory() returned NULL")
+        sys.exit("FAIL: zzdds_DomainParticipantFactory_create() returned NULL")
 
     dds_factory = zzdds.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory)
     dp = zzdds.DDS_DomainParticipantFactory_create_participant(dds_factory, DOMAIN_ID, None, None, 0)
@@ -224,7 +224,7 @@ def main():
         sys.exit("FAIL: every callback ran on the main thread's native id -- "
                   "timer thread callback delivery was not actually exercised")
 
-    zzdds.zzdds_destroy_factory(factory)
+    zzdds.zzdds_DomainParticipantFactory_release(factory)
     print(f"[main] teardown done; release_listener_data fired {state['releases']} time(s) total")
     print("PASS")
 

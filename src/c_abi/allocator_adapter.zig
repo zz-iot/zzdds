@@ -4,7 +4,7 @@
 //! Zig code wants to hand a real `std.mem.Allocator` (e.g. a
 //! `std.heap.DebugAllocator` instance, or `std.testing.allocator`) into a
 //! C-ABI entry point that only accepts a `*const ZidlAllocator` (e.g.
-//! `zzdds_create_factory_with_allocator`).
+//! `zzdds_DomainParticipantFactory_create_with_allocator`).
 //!
 //! Kept zzdds-local rather than upstreamed into `zidl_bindings` itself: `zidl` is
 //! a pinned/versioned dependency, and upstreaming this would require a
