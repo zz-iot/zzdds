@@ -440,6 +440,73 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # ── release bundle ───────────────────────────────────────────────────────
+  #
+  # Builds the install tree as release.yml's package-libs job does, packs it,
+  # and runs scripts/verify_release_bundle.py on the tarball, so a change that
+  # breaks a consumer of the prebuilt bundle fails here rather than at the
+  # next release: the CMake package, pkg-config, the relocated libzzdds and the
+  # C API it exports, the Java SDK. Linux and macOS only: pkg-config and
+  # libzzdds.dylib are checked nowhere else in this workflow, while the
+  # examples job already builds Windows C/C++ consumers against the CMake
+  # package. --require-pkg-config, so a runner without pkg-config fails
+  # rather than skipping the check. macOS builds the hello_world pairs but
+  # does not run them (--skip-example-run), as package-libs does.
+  release-bundle:
+    name: release bundle / ${{ matrix.name }}
+    needs: test-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+          - name: macos-arm64
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out zzdds
+        uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: "0.17.1"
+
+      - name: Install JDK (Java SDK and JNI)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Python (Java runtime and bundle verification)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pkg-config (macOS)
+        if: runner.os == 'macOS'
+        run: command -v pkg-config || brew install pkgconf
+
+      - name: Build install tree (as package-libs)
+        run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true -Doptimize=ReleaseSafe install
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mv zig-out "zzdds-ci-${{ matrix.name }}"
+          tar -czf "zzdds-ci-${{ matrix.name }}.tar.gz" "zzdds-ci-${{ matrix.name }}"
+
+      - name: Verify bundle is consumable
+        run: |
+          set -euo pipefail
+          args=""
+          [ "${{ runner.os }}" = "macOS" ] && args="--skip-example-run"
+          python scripts/verify_release_bundle.py --bundle "zzdds-ci-${{ matrix.name }}.tar.gz" \
+            --with-java --require-pkg-config $args
+
   # ── integration tests ────────────────────────────────────────────────────
   #
   # One matrix leg per scenario, each running its own fully self-contained
