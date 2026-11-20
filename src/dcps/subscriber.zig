@@ -16,6 +16,7 @@ const topic_mod = @import("topic.zig");
 const filter_mod = @import("filter.zig");
 const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
+const DefaultQos = @import("default_qos.zig").DefaultQos;
 const time_mod = @import("../util/time.zig");
 const Hook = @import("../runtime/core.zig").Hook;
 const ListenerGroup = @import("listener_lane.zig").Group;
@@ -210,7 +211,7 @@ pub const SubscriberImpl = struct {
     data_on_readers: std.atomic.Value(bool) = .init(false),
     status_cond: ?*waitset.StatusConditionImpl,
 
-    default_dr_qos: DDS.DataReaderQos,
+    default_dr_qos: DefaultQos(DDS.DataReaderQos),
 
     /// Active DataReader instances owned by this subscriber; guarded by `mu`.
     readers: std.ArrayListUnmanaged(*reader_mod.DataReaderImpl),
@@ -261,7 +262,7 @@ pub const SubscriberImpl = struct {
             .instance_handle = handle,
             .status_changes = 0,
             .status_cond = null,
-            .default_dr_qos = .{},
+            .default_dr_qos = .{ .value = .{} },
             .readers = .empty,
             .mu = .{},
         };
@@ -271,7 +272,7 @@ pub const SubscriberImpl = struct {
         errdefer self.qos.deinit(alloc);
         // See config/generated.zig's applyQosDefaults doc comment: this is the
         // one place a config-file QosDefaults value reaches get_default_datareader_qos().
-        generated_config_mod.applyQosDefaults(&self.default_dr_qos, &qos_defaults);
+        generated_config_mod.applyQosDefaults(&self.default_dr_qos.value, &qos_defaults);
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
         self.status_cond = sc;
         return self;
@@ -1470,15 +1471,13 @@ pub const SubscriberImpl = struct {
     fn vtSetDefaultDrQos(ctx: *anyopaque, qos: *const DDS.DataReaderQos) DDS.ReturnCode_t {
         const self = cast(ctx);
         if (!qos_change.consistent(DDS.DataReaderQos, qos)) return DDS.RETCODE_INCONSISTENT_POLICY;
-        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        self.default_dr_qos.deinit(self.alloc);
-        self.default_dr_qos = new_qos;
+        self.default_dr_qos.set(self.alloc, qos) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetDefaultDrQos(ctx: *anyopaque, qos: *DDS.DataReaderQos) DDS.ReturnCode_t {
         const self = cast(ctx);
-        qos.* = self.default_dr_qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        qos.* = self.default_dr_qos.get(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 

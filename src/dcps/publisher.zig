@@ -20,6 +20,7 @@ const ZZDDS = @import("zzdds_ext_generated").zzdds;
 const extensions_mod = @import("../c_abi/extensions.zig");
 const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
+const DefaultQos = @import("default_qos.zig").DefaultQos;
 const time_mod = @import("../util/time.zig");
 const Hook = @import("../runtime/core.zig").Hook;
 const ListenerGroup = @import("listener_lane.zig").Group;
@@ -187,7 +188,7 @@ pub const PublisherImpl = struct {
     status_changes: DDS.StatusMask,
     status_cond: ?*waitset.StatusConditionImpl,
 
-    default_dw_qos: DDS.DataWriterQos,
+    default_dw_qos: DefaultQos(DDS.DataWriterQos),
 
     /// Active DataWriter instances owned by this publisher; guarded by `mu`.
     writers: std.ArrayListUnmanaged(*writer_mod.DataWriterImpl),
@@ -248,7 +249,7 @@ pub const PublisherImpl = struct {
             .status_changes = 0,
             .status_cond = null,
             // The DDS RELIABILITY QoS default: a writer blocks up to 100 ms.
-            .default_dw_qos = .{ .reliability = .{ .max_blocking_time = .{ .sec = 0, .nanosec = 100 * std.time.ns_per_ms } } },
+            .default_dw_qos = .{ .value = .{ .reliability = .{ .max_blocking_time = .{ .sec = 0, .nanosec = 100 * std.time.ns_per_ms } } } },
             .writers = .empty,
             .mu = .{},
             .coherent_depth = 0,
@@ -261,7 +262,7 @@ pub const PublisherImpl = struct {
         errdefer self.qos.deinit(alloc);
         // See config/generated.zig's applyQosDefaults doc comment: this is the
         // one place a config-file QosDefaults value reaches get_default_datawriter_qos().
-        generated_config_mod.applyQosDefaults(&self.default_dw_qos, &qos_defaults);
+        generated_config_mod.applyQosDefaults(&self.default_dw_qos.value, &qos_defaults);
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
         self.status_cond = sc;
         return self;
@@ -1102,15 +1103,13 @@ pub const PublisherImpl = struct {
     fn vtSetDefaultDwQos(ctx: *anyopaque, qos: *const DDS.DataWriterQos) DDS.ReturnCode_t {
         const self = cast(ctx);
         if (!qos_change.consistent(DDS.DataWriterQos, qos)) return DDS.RETCODE_INCONSISTENT_POLICY;
-        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        self.default_dw_qos.deinit(self.alloc);
-        self.default_dw_qos = new_qos;
+        self.default_dw_qos.set(self.alloc, qos) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetDefaultDwQos(ctx: *anyopaque, qos: *DDS.DataWriterQos) DDS.ReturnCode_t {
         const self = cast(ctx);
-        qos.* = self.default_dw_qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        qos.* = self.default_dw_qos.get(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 

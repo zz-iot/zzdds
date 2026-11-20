@@ -32,6 +32,7 @@ const filter_mod = @import("filter.zig");
 const qos_change = @import("qos_change.zig");
 const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
+const DefaultQos = @import("default_qos.zig").DefaultQos;
 const adapters = @import("../rtps/protocol_adapters.zig");
 const history_mod = @import("../rtps/history.zig");
 const guid_mod = @import("../rtps/guid.zig");
@@ -1112,9 +1113,9 @@ pub const DomainParticipantImpl = struct {
     /// Populated by registerTypeSupport(); consulted when a received change has no inline key_hash.
     type_support_registry: std.StringHashMapUnmanaged(TypeSupport),
 
-    default_pub_qos: DDS.PublisherQos,
-    default_sub_qos: DDS.SubscriberQos,
-    default_topic_qos: DDS.TopicQos,
+    default_pub_qos: DefaultQos(DDS.PublisherQos),
+    default_sub_qos: DefaultQos(DDS.SubscriberQos),
+    default_topic_qos: DefaultQos(DDS.TopicQos),
 
     /// Entity ID counter; protected by `mu`.  Wraps at 2^24.
     next_entity_key: u32,
@@ -1130,12 +1131,13 @@ pub const DomainParticipantImpl = struct {
     disc_callbacks: disc.Callbacks,
     /// `discovery.start()` succeeded: deinit stops it. A plugin serves one
     /// participant at a time, so one that never started must not stop
-    /// another's. Changed with `user_data_mu` held.
+    /// another's. Changed with `qos_mu` held.
     discovery_started: bool = false,
-    /// Held while `set_qos` changes USER_DATA and announces it, and while
+    /// Guards `qos`, which `set_qos` replaces under it. Also held while
+    /// `set_qos` announces a change of USER_DATA, and while
     /// `discovery_started` changes, so a change either reaches discovery
     /// or is seen by its start.
-    user_data_mu: Mutex = .{},
+    qos_mu: Mutex = .{},
 
     /// Port on which we listen for user DataWriter traffic.
     /// 0 = not yet chosen (before start()).
@@ -1294,9 +1296,9 @@ pub const DomainParticipantImpl = struct {
             .builtin_sub = null,
             .type_info_registry = .empty,
             .type_support_registry = .empty,
-            .default_pub_qos = .{},
-            .default_sub_qos = .{},
-            .default_topic_qos = .{},
+            .default_pub_qos = .{ .value = .{} },
+            .default_sub_qos = .{ .value = .{} },
+            .default_topic_qos = .{ .value = .{} },
             .next_entity_key = 1,
             .disc_callbacks = .{
                 .ctx = self,
@@ -1333,7 +1335,7 @@ pub const DomainParticipantImpl = struct {
         // resolved config's QosDefaults -- previously computed by
         // toRuntimeConfig and stored on self.config, but never read again by
         // any entity-creation path (see config/schema.zig's QosDefaults doc).
-        generated_config_mod.applyQosDefaults(&self.default_topic_qos, &self.config.qos);
+        generated_config_mod.applyQosDefaults(&self.default_topic_qos.value, &self.config.qos);
         self.builtin_sub = BuiltinSubscriberState.init(alloc, self) catch null;
         return self;
     }
@@ -1586,8 +1588,8 @@ pub const DomainParticipantImpl = struct {
             null;
 
         const user_data = blk: {
-            self.user_data_mu.lock();
-            defer self.user_data_mu.unlock();
+            self.qos_mu.lock();
+            defer self.qos_mu.unlock();
             break :blk try self.alloc.dupe(u8, userDataBytes(&self.qos.user_data));
         };
         defer self.alloc.free(user_data);
@@ -1608,8 +1610,8 @@ pub const DomainParticipantImpl = struct {
         };
         try self.discovery.start(&ann, &self.disc_callbacks);
         {
-            self.user_data_mu.lock();
-            defer self.user_data_mu.unlock();
+            self.qos_mu.lock();
+            defer self.qos_mu.unlock();
             self.discovery_started = true;
             // Changed while discovery started.
             const now = userDataBytes(&self.qos.user_data);
@@ -1769,8 +1771,8 @@ pub const DomainParticipantImpl = struct {
         if (self.locator_handler_set) self.discovery_transport.setLocatorChangeHandler(null);
         self.locator_handler_set = false;
         const started = blk: {
-            self.user_data_mu.lock();
-            defer self.user_data_mu.unlock();
+            self.qos_mu.lock();
+            defer self.qos_mu.unlock();
             defer self.discovery_started = false;
             break :blk self.discovery_started;
         };
@@ -5648,7 +5650,7 @@ pub const DomainParticipantImpl = struct {
         // parent isn't enabled (see vtEnable's PRECONDITION_NOT_MET check) --
         // a disabled participant with the (spec-default) true QoS must not
         // silently produce an already-enabled child.
-        p.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
+        p.enabled.store(self.autoenableChildren(), .release);
         self.mu.lock();
         self.publishers.append(self.alloc, p) catch {
             self.mu.unlock();
@@ -5718,7 +5720,7 @@ pub const DomainParticipantImpl = struct {
         ) catch return nil.nil_subscriber;
         // See vtCreatePublisher's identical comment (including the
         // participant-enabled gate, PR #91 Greptile finding).
-        s.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
+        s.enabled.store(self.autoenableChildren(), .release);
         self.mu.lock();
         self.subscribers.append(self.alloc, s) catch {
             self.mu.unlock();
@@ -5808,7 +5810,7 @@ pub const DomainParticipantImpl = struct {
         if (self.listenerGroup()) |g| t.listeners.attach(g);
         // Gated on the participant's own enabled state too -- see
         // vtCreatePublisher's identical comment (PR #91 Greptile finding).
-        t.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
+        t.enabled.store(self.autoenableChildren(), .release);
         self.mu.lock();
         // A local TopicDescription is identified by its name (DDS 1.4
         // §2.2.2.2.1.12; DDS-XTypes 1.3 §7.6.4.1 states the restriction it
@@ -6208,8 +6210,8 @@ pub const DomainParticipantImpl = struct {
     fn vtSetQos(ctx: *anyopaque, qos: *const DDS.DomainParticipantQos) DDS.ReturnCode_t {
         const self = cast(ctx);
         var new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        self.user_data_mu.lock();
-        defer self.user_data_mu.unlock();
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
         // Announced before it takes effect, so a failure changes nothing.
         if (self.discovery_started and !qos_change.eql(DDS.UserDataQosPolicy, &self.qos.user_data, &new_qos.user_data)) {
             self.discovery.updateUserData(userDataBytes(&new_qos.user_data)) catch {
@@ -6230,8 +6232,20 @@ pub const DomainParticipantImpl = struct {
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.DomainParticipantQos) DDS.ReturnCode_t {
         const self = cast(ctx);
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
         qos.* = self.qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
+    }
+
+    /// Whether a Publisher, Subscriber or Topic created now starts enabled:
+    /// this participant is enabled, and its ENTITY_FACTORY, read under
+    /// `qos_mu`, says so.
+    fn autoenableChildren(self: *Self) bool {
+        if (!self.enabled.load(.acquire)) return false;
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
+        return self.qos.entity_factory.autoenable_created_entities;
     }
 
     fn vtSetListener(
@@ -6432,44 +6446,38 @@ pub const DomainParticipantImpl = struct {
     // create_subscriber/create_topic themselves.
     fn vtSetDefaultPubQos(ctx: *anyopaque, qos: *const DDS.PublisherQos) DDS.ReturnCode_t {
         const self = cast(ctx);
-        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        self.default_pub_qos.deinit(self.alloc);
-        self.default_pub_qos = new_qos;
+        self.default_pub_qos.set(self.alloc, qos) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetDefaultPubQos(ctx: *anyopaque, qos: *DDS.PublisherQos) DDS.ReturnCode_t {
         const self = cast(ctx);
-        qos.* = self.default_pub_qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        qos.* = self.default_pub_qos.get(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
     fn vtSetDefaultSubQos(ctx: *anyopaque, qos: *const DDS.SubscriberQos) DDS.ReturnCode_t {
         const self = cast(ctx);
-        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        self.default_sub_qos.deinit(self.alloc);
-        self.default_sub_qos = new_qos;
+        self.default_sub_qos.set(self.alloc, qos) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetDefaultSubQos(ctx: *anyopaque, qos: *DDS.SubscriberQos) DDS.ReturnCode_t {
         const self = cast(ctx);
-        qos.* = self.default_sub_qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        qos.* = self.default_sub_qos.get(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
     fn vtSetDefaultTopicQos(ctx: *anyopaque, qos: *const DDS.TopicQos) DDS.ReturnCode_t {
         const self = cast(ctx);
         if (!qos_change.consistent(DDS.TopicQos, qos)) return DDS.RETCODE_INCONSISTENT_POLICY;
-        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        self.default_topic_qos.deinit(self.alloc);
-        self.default_topic_qos = new_qos;
+        self.default_topic_qos.set(self.alloc, qos) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetDefaultTopicQos(ctx: *anyopaque, qos: *DDS.TopicQos) DDS.ReturnCode_t {
         const self = cast(ctx);
-        qos.* = self.default_topic_qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        qos.* = self.default_topic_qos.get(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 

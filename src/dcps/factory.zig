@@ -14,6 +14,7 @@ const DDS = @import("zzdds_generated").DDS;
 const nil = @import("nil.zig");
 const participant_mod = @import("participant.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
+const DefaultQos = @import("default_qos.zig").DefaultQos;
 const guid_gen = @import("../util/guid_gen.zig");
 const config_mod = @import("../config/schema.zig");
 const generated_config_mod = @import("../config/generated.zig");
@@ -36,8 +37,11 @@ pub const DomainParticipantFactoryImpl = struct {
     security: SecurityPlugins,
     config: config_mod.Config,
     guid_strategy: GuidStrategy,
+    /// Replaced by `set_qos` and read under `qos_mu`.
     factory_qos: DDS.DomainParticipantFactoryQos,
-    default_dp_qos: DDS.DomainParticipantQos,
+    /// A leaf, guarding `factory_qos`.
+    qos_mu: Mutex = .{},
+    default_dp_qos: DefaultQos(DDS.DomainParticipantQos),
     /// See `setTraceSink`.
     trace_sink: ?trace_mod.Sink = null,
 
@@ -85,7 +89,7 @@ pub const DomainParticipantFactoryImpl = struct {
             .config = config,
             .guid_strategy = guid_strategy,
             .factory_qos = .{},
-            .default_dp_qos = .{},
+            .default_dp_qos = .{ .value = .{} },
             .participants = .empty,
             .mu = .{},
         };
@@ -325,7 +329,9 @@ pub const DomainParticipantFactoryImpl = struct {
         // on any failure path below doesn't free config — the caller retains ownership
         // and handles cleanup on error.
 
-        p.enabled.store(self.factory_qos.entity_factory.autoenable_created_entities, .release);
+        // Read once, so the participant is started exactly when it is enabled.
+        const autoenable = self.autoenableCreated();
+        p.enabled.store(autoenable, .release);
 
         // Start discovery; if it fails we still own the participant and must clean up.
         // Deferred entirely when created disabled (ENTITY_FACTORY QoS) -- enable()
@@ -337,7 +343,7 @@ pub const DomainParticipantFactoryImpl = struct {
         // entity_factory, not its own -- NOT from `qos.entity_factory`, which is
         // the QoS being applied to the new participant itself and has no
         // factory-level meaning here.
-        if (self.factory_qos.entity_factory.autoenable_created_entities) {
+        if (autoenable) {
             p.start() catch {
                 self.freeParticipant(p);
                 return null;
@@ -404,28 +410,38 @@ pub const DomainParticipantFactoryImpl = struct {
 
     fn vtSetDefaultDpQos(ctx: *anyopaque, qos: *const DDS.DomainParticipantQos) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        self.default_dp_qos.deinit(self.alloc);
-        self.default_dp_qos = new_qos;
+        self.default_dp_qos.set(self.alloc, qos) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetDefaultDpQos(ctx: *anyopaque, qos: *DDS.DomainParticipantQos) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        qos.* = self.default_dp_qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        qos.* = self.default_dp_qos.get(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
     fn vtSetQos(ctx: *anyopaque, qos: *const DDS.DomainParticipantFactoryQos) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
         self.factory_qos = qos.*;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.DomainParticipantFactoryQos) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
         qos.* = self.factory_qos;
         return DDS.RETCODE_OK;
+    }
+
+    /// Whether a participant created now starts enabled: the factory's
+    /// ENTITY_FACTORY, read under `qos_mu`.
+    fn autoenableCreated(self: *Self) bool {
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
+        return self.factory_qos.entity_factory.autoenable_created_entities;
     }
 
     fn vtDeinit(ctx: *anyopaque) void {

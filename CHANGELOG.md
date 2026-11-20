@@ -10,6 +10,16 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-20
 
+- The default QoS operations are safe to call from several threads at once:
+  `set_default_participant_qos`, `set_default_publisher_qos`, `set_default_subscriber_qos`,
+  `set_default_topic_qos`, `set_default_datawriter_qos` and `set_default_datareader_qos`, and
+  their `get_default_*_qos`. Each replaced its value with no lock, so two replacements
+  could free the same value, and a copy could read one being freed. So could a
+  DomainParticipant's `get_qos`, while `set_qos` replaced its QoS, and creating a
+  Publisher, Subscriber or Topic read its ENTITY_FACTORY without the lock. The
+  DomainParticipantFactory's `set_qos` and `get_qos` now take a lock too, and
+  `create_participant` reads its ENTITY_FACTORY once, so a participant is started
+  exactly when it is created enabled.
 - A Publisher's or Subscriber's `set_qos` no longer races with the operations that read
   its PRESENTATION: creating a DataWriter or DataReader, `end_coherent_changes`,
   `begin_access` and `end_access`. `set_qos` replaced the whole QoS under its lock, and
