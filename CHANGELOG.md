@@ -10,6 +10,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-19
 
+- A DataReader's or DataWriter's `set_qos` no longer races with the threads that read its
+  QoS. It replaced the whole QoS under its lock, while the timer checks, the receive path
+  and the write path read it without that lock; ThreadSanitizer caught the deadline check
+  doing so. `set_qos` now changes only the policies that may change, so the rest are
+  never written after creation, and the changeable values those paths read (DEADLINE,
+  TIME_BASED_FILTER, autodispose) are kept as atomics it updates.
 - C and C++ programs get zidl-cdr from libzzdds alone. `zzdds.dll` now exports all of
   zidl-cdr's C API, both `zidl_cdr.c` and the Zig wire functions, as `libzzdds.so`
   already did. The install tree no longer ships the static `zidl_cdr` archive: in the

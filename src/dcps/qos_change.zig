@@ -93,6 +93,32 @@ pub fn readerImmutableChanged(old: *const DDS.DataReaderQos, new: *const DDS.Dat
     return immutableChanged(DDS.DataReaderQos, reader_immutable, old, new);
 }
 
+/// Swaps `new`'s changeable policies into a DataWriter's `qos`, leaving its
+/// immutable ones untouched; `new` then holds the replaced ones, for the
+/// caller to free. Call with no immutable policy changed
+/// (`writerImmutableChanged`). The immutable policies are never written
+/// after creation, so they may be read without the lock `set_qos` holds.
+pub fn swapWriterChangeable(qos: *DDS.DataWriterQos, new: *DDS.DataWriterQos) void {
+    swapChangeable(DDS.DataWriterQos, writer_immutable, qos, new);
+}
+
+/// `swapWriterChangeable`, for a DataReader.
+pub fn swapReaderChangeable(qos: *DDS.DataReaderQos, new: *DDS.DataReaderQos) void {
+    swapChangeable(DDS.DataReaderQos, reader_immutable, qos, new);
+}
+
+fn swapChangeable(comptime T: type, comptime immutable: anytype, qos: *T, new: *T) void {
+    inline for (@typeInfo(T).@"struct".field_names) |name| {
+        if (comptime isNamed(immutable, name)) continue;
+        std.mem.swap(@FieldType(T, name), &@field(qos, name), &@field(new, name));
+    }
+}
+
+fn isNamed(comptime names: anytype, comptime name: []const u8) bool {
+    inline for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
 fn immutableChanged(comptime T: type, comptime names: anytype, old: *const T, new: *const T) bool {
     inline for (names) |name| {
         if (comptime !@hasField(T, name)) continue;
@@ -159,6 +185,25 @@ test "a writer's mutable policies change freely, its immutable ones do not" {
     try std.testing.expect(!writerImmutableChanged(&old, &new));
     new.history.depth = 7;
     try std.testing.expect(writerImmutableChanged(&old, &new));
+}
+
+test "set_qos swaps in only the changeable policies, and the caller frees the replaced ones" {
+    const alloc = std.testing.allocator;
+    var qos = DDS.DataWriterQos{};
+    qos.history.depth = 5;
+    var user_data = [_]u8{ 1, 2, 3 };
+    var new = try (DDS.DataWriterQos{
+        .deadline = .{ .period = .{ .sec = 2, .nanosec = 0 } },
+        .user_data = .{ .value = .{ ._buffer = &user_data, ._length = 3, ._maximum = 3 } },
+    }).clone(alloc);
+    swapWriterChangeable(&qos, &new);
+    try std.testing.expectEqual(@as(i32, 2), qos.deadline.period.sec);
+    try std.testing.expectEqual(@as(u32, 3), qos.user_data.value._length);
+    // Immutable: untouched, though `new` had the default.
+    try std.testing.expectEqual(@as(i32, 5), qos.history.depth);
+    try std.testing.expectEqual(@as(i32, 0), new.deadline.period.sec);
+    new.deinit(alloc);
+    qos.deinit(alloc);
 }
 
 test "a KEEP_LAST history deeper than its per-instance limit, or a per-instance limit above max_samples, is inconsistent; unlimited ones never are" {

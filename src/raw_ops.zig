@@ -48,7 +48,7 @@ fn toChangeKind(kind: WriteKind, impl: *DataWriterImpl) history_mod.ChangeKind {
     return switch (kind) {
         .alive => .alive,
         .dispose => .not_alive_disposed,
-        .unregister => if (impl.qos.writer_data_lifecycle.autodispose_unregistered_instances)
+        .unregister => if (impl.autodispose.load(.monotonic))
             .not_alive_disposed
         else
             .not_alive_unregistered,

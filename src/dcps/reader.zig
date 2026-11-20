@@ -119,6 +119,10 @@ const WriterLivelinessEntry = struct {
     kind: u8,
 };
 
+fn durationNs(d: DDS.Duration_t) i64 {
+    return @as(i64, d.sec) * std.time.ns_per_s + @as(i64, d.nanosec);
+}
+
 fn durationIsActive(d: DDS.Duration_t) bool {
     if (d.sec == 0 and d.nanosec == 0) return false;
     if (d.sec == DDS.DURATION_INFINITE_SEC and d.nanosec == DDS.DURATION_INFINITE_NSEC) return false;
@@ -460,6 +464,13 @@ pub const DataReaderImpl = struct {
     /// sooner than its checks are armed for. Set once, at creation.
     timers_changed: ?Hook = null,
 
+    /// What is read of `qos`'s changeable policies without `qos_mu`, by the
+    /// timer checks and the receive path: `set_qos` swaps those policies in
+    /// under it (`cacheChangeable`). The DEADLINE period in ns, 0 for none.
+    deadline_ns: std.atomic.Value(i64) = .init(0),
+    /// TIME_BASED_FILTER's minimum separation in ns, 0 for none.
+    tbf_ns: std.atomic.Value(i64) = .init(0),
+
     /// Monotonic timestamp of the last sample received; used by DEADLINE checks.
     /// Initialized to creation time so the first deadline window starts at entity creation.
     last_received_ns: std.atomic.Value(i64),
@@ -679,6 +690,7 @@ pub const DataReaderImpl = struct {
         self.listener_ex_box = listener_box;
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);
+        self.cacheChangeable();
         // Wire up StatusCondition.
         const sc = try waitset.StatusConditionImpl.init(
             alloc,
@@ -1119,11 +1131,10 @@ pub const DataReaderImpl = struct {
         // leave instance state stuck as ALIVE and its window and owner set.
         // The window is updated only after a successful append (below), so a sample
         // rejected by CFT, resource-limits, or OOM does not advance it.
-        const min_sep = self.qos.time_based_filter.minimum_separation;
-        const tbf_active = change.kind == .alive and (min_sep.sec != 0 or min_sep.nanosec != 0);
+        const sep_ns = self.tbf_ns.load(.monotonic);
+        const tbf_active = change.kind == .alive and sep_ns != 0;
         const tbf_src_ns: i64 = if (tbf_active) change.source_timestamp.toTime().toNs() else 0;
         if (tbf_active) {
-            const sep_ns = @as(i64, min_sep.sec) * std.time.ns_per_s + @as(i64, min_sep.nanosec);
             if (entry.tbf_last_ns) |last| {
                 if (tbf_src_ns - last < sep_ns) return self.dropSampleUnlock(copy, coherent_queued);
             }
@@ -2945,9 +2956,8 @@ pub const DataReaderImpl = struct {
         defer self.quiesce.release(self, reallyDeinit);
 
         // DEADLINE check.
-        const dl = self.qos.deadline.period;
-        if (durationIsActive(dl)) {
-            const period_ns = @as(i64, dl.sec) * std.time.ns_per_s + @as(i64, dl.nanosec);
+        const period_ns = self.deadline_ns.load(.monotonic);
+        if (period_ns > 0) {
             const last = self.last_received_ns.load(.monotonic);
             if (now_ns - last >= period_ns) {
                 self.last_received_ns.store(now_ns, .monotonic);
@@ -2982,11 +2992,8 @@ pub const DataReaderImpl = struct {
     pub fn nextTimerDueFn(ctx: *anyopaque) ?i64 {
         const self: *Self = @ptrCast(@alignCast(ctx));
         var next: ?i64 = null;
-        const dl = self.qos.deadline.period;
-        if (durationIsActive(dl)) {
-            const period_ns = @as(i64, dl.sec) * std.time.ns_per_s + @as(i64, dl.nanosec);
-            next = self.last_received_ns.load(.monotonic) + period_ns;
-        }
+        const period_ns = self.deadline_ns.load(.monotonic);
+        if (period_ns > 0) next = self.last_received_ns.load(.monotonic) + period_ns;
         self.mu.lock();
         defer self.mu.unlock();
         var it = self.writer_liveliness.valueIterator();
@@ -3357,8 +3364,11 @@ pub const DataReaderImpl = struct {
                 new_qos.deinit(self.alloc);
                 return DDS.RETCODE_ALREADY_DELETED;
             }
-            self.qos.deinit(self.alloc);
-            self.qos = new_qos;
+            // Only the changeable policies: the others are read without
+            // `qos_mu`.
+            qos_change.swapReaderChangeable(&self.qos, &new_qos);
+            new_qos.deinit(self.alloc);
+            self.cacheChangeable();
             // A shorter deadline may fall due sooner.
             self.timersChanged();
         }
@@ -3366,6 +3376,14 @@ pub const DataReaderImpl = struct {
         // is announced after it (DomainParticipantImpl.beginAnnouncingLocked).
         if (parent) |p| if (self.enabled.load(.acquire)) p.announceDataReader(self.instance_handle);
         return DDS.RETCODE_OK;
+    }
+
+    /// Copies into `deadline_ns` and `tbf_ns` what they cache of `qos`.
+    fn cacheChangeable(self: *Self) void {
+        const dl = self.qos.deadline.period;
+        self.deadline_ns.store(if (durationIsActive(dl)) durationNs(dl) else 0, .monotonic);
+        const sep = self.qos.time_based_filter.minimum_separation;
+        self.tbf_ns.store(durationNs(sep), .monotonic);
     }
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.DataReaderQos) DDS.ReturnCode_t {
