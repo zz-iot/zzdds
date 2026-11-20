@@ -43,8 +43,6 @@ pub const DomainParticipantFactoryImpl = struct {
 
     /// Active participants owned by this factory; guarded by `mu`.
     participants: std.ArrayListUnmanaged(*participant_mod.DomainParticipantImpl),
-    /// Handle counter for participants; guarded by `mu`.
-    next_handle: DDS.InstanceHandle_t,
 
     mu: Mutex,
 
@@ -89,7 +87,6 @@ pub const DomainParticipantFactoryImpl = struct {
             .factory_qos = .{},
             .default_dp_qos = .{},
             .participants = .empty,
-            .next_handle = 1,
             .mu = .{},
         };
         return self;
@@ -285,12 +282,6 @@ pub const DomainParticipantFactoryImpl = struct {
         if (!self.lifetime.acquire()) return null;
         defer self.lifetime.release(self, destroy);
 
-        // Allocate a handle for this participant.
-        self.mu.lock();
-        const handle = self.next_handle;
-        self.next_handle +%= 1;
-        self.mu.unlock();
-
         // Generate a GUID prefix.
         const prefix = guid_gen.generate(self.guid_strategy);
         const guid = participant_mod.Guid{
@@ -312,7 +303,6 @@ pub const DomainParticipantFactoryImpl = struct {
             qos.*,
             if (a_listener) |l| l.* else DDS.noop_DomainParticipantListener,
             mask,
-            handle,
             self.trace_sink,
             // Timed QoS runs on the runtime's clock.
             rt.clock,

@@ -50,6 +50,13 @@ const qm_mod = @import("qos_match.zig");
 const disc_adapter = @import("../discovery/qos_adapter.zig");
 const reader_mod = @import("reader.zig");
 const writer_mod = @import("writer.zig");
+const handle_registry = @import("handle_registry.zig");
+
+/// What a participant's entity registry knows an entity by: its GUID, or,
+/// for one without (a Publisher, Subscriber, Topic or built-in DataReader),
+/// a number the participant gives it.
+const EntityKey = union(enum) { guid: Guid, serial: u64 };
+const EntityRegistry = handle_registry.HandleRegistry(EntityKey, void);
 const runtime_mod = @import("../runtime/core.zig");
 const CloseLatch = @import("../runtime/close_latch.zig").CloseLatch;
 const listener_lane = @import("listener_lane.zig");
@@ -269,7 +276,7 @@ const BuiltinSubscriberState = struct {
                 fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i32) void) void {}
             }.f,
             .register_matched_notify = struct {
-                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, DDS.InstanceHandle_t, bool) void) void {}
+                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque) void) void {}
             }.f,
             .prepare_readers = struct {
                 fn f(_: *anyopaque, _: []const DDS.InstanceHandle_t, _: []const []const u8, _: []const u8, _: DDS.PresentationQosPolicy) anyerror!void {}
@@ -435,6 +442,7 @@ fn pushBuiltinParticipantCdr(
     alloc: std.mem.Allocator,
     dr: *reader_mod.DataReaderImpl,
     data: *const disc.ParticipantData,
+    handle: DDS.InstanceHandle_t,
 ) void {
     var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(alloc);
@@ -450,7 +458,7 @@ fn pushBuiltinParticipantCdr(
         } },
     };
     DDS.ParticipantBuiltinTopicData.serialize(&w, v) catch return;
-    dr.pushBuiltinCdr(buf.items, guidKeyHash(data.guid), writer_mod.guidToHandle(data.guid), .alive);
+    dr.pushBuiltinCdr(buf.items, guidKeyHash(data.guid), handle, .alive);
 }
 
 fn qosReliability(kind: u8) DDS.ReliabilityQosPolicy {
@@ -473,6 +481,7 @@ fn pushBuiltinPublicationCdr(
     alloc: std.mem.Allocator,
     dr: *reader_mod.DataReaderImpl,
     data: *const disc.WriterData,
+    handle: DDS.InstanceHandle_t,
 ) void {
     var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(alloc);
@@ -517,13 +526,14 @@ fn pushBuiltinPublicationCdr(
         } },
     };
     DDS.PublicationBuiltinTopicData.serialize(&w, v) catch return;
-    dr.pushBuiltinCdr(buf.items, guidKeyHash(data.guid), writer_mod.guidToHandle(data.guid), .alive);
+    dr.pushBuiltinCdr(buf.items, guidKeyHash(data.guid), handle, .alive);
 }
 
 fn pushBuiltinSubscriptionCdr(
     alloc: std.mem.Allocator,
     dr: *reader_mod.DataReaderImpl,
     data: *const disc.ReaderData,
+    handle: DDS.InstanceHandle_t,
 ) void {
     var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(alloc);
@@ -568,7 +578,7 @@ fn pushBuiltinSubscriptionCdr(
         } },
     };
     DDS.SubscriptionBuiltinTopicData.serialize(&w, v) catch return;
-    dr.pushBuiltinCdr(buf.items, guidKeyHash(data.guid), writer_mod.guidToHandle(data.guid), .alive);
+    dr.pushBuiltinCdr(buf.items, guidKeyHash(data.guid), handle, .alive);
 }
 
 /// A built-in reader's key for an entity: the entity's GUID.
@@ -578,25 +588,26 @@ fn guidKeyHash(guid: Guid) [16]u8 {
     return key_hash;
 }
 
-fn pushBuiltinEndpointDisposed(dr: *reader_mod.DataReaderImpl, guid: Guid) void {
-    dr.pushBuiltinCdr(&.{}, guidKeyHash(guid), writer_mod.guidToHandle(guid), .not_alive_disposed);
+fn pushBuiltinEndpointDisposed(dr: *reader_mod.DataReaderImpl, guid: Guid, handle: DDS.InstanceHandle_t) void {
+    dr.pushBuiltinCdr(&.{}, guidKeyHash(guid), handle, .not_alive_disposed);
 }
 
 fn pushBuiltinTopicCdr(
     alloc: std.mem.Allocator,
     dr: *reader_mod.DataReaderImpl,
     v: DDS.TopicBuiltinTopicData,
+    handle: DDS.InstanceHandle_t,
 ) void {
     var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(alloc);
     var w = zidl_cdr.CdrWriter(.xcdr1).init(&buf, alloc);
     w.writeEncapHeader() catch return;
     DDS.TopicBuiltinTopicData.serialize(&w, v) catch return;
-    // A topic's key is its name's; its handle is its name's and type's, as
-    // get_discovered_topics gives it.
+    // A topic's key is its name's; its handle is the one
+    // get_discovered_topics gives it, for its name and type.
     var key_hash = std.mem.zeroes([16]u8);
     @memcpy(key_hash[0..@sizeOf(DDS.BuiltinTopicKey_t)], std.mem.asBytes(&v.key));
-    dr.pushBuiltinCdr(buf.items, key_hash, topicToHandle(v.name, v.type_name), .alive);
+    dr.pushBuiltinCdr(buf.items, key_hash, handle, .alive);
 }
 
 /// Deterministic BuiltinTopicKey_t derived from the topic name.
@@ -613,22 +624,6 @@ fn topicNameToKey(topic_name: []const u8) DDS.BuiltinTopicKey_t {
         v.* = @bitCast(h);
     }
     return .{ .value = vals };
-}
-
-/// Deterministic instance handle derived from topic name + type name.
-fn topicToHandle(topic_name: []const u8, type_name: []const u8) DDS.InstanceHandle_t {
-    var h: u32 = 2166136261;
-    for (topic_name) |b| {
-        h ^= b;
-        h *%= 16777619;
-    }
-    h ^= 0xFF;
-    for (type_name) |b| {
-        h ^= b;
-        h *%= 16777619;
-    }
-    const v: i32 = @intCast(h & 0x7FFF_FFFF);
-    return if (v == 0) 1 else v;
 }
 
 // ── Per-writer / per-reader tracking ─────────────────────────────────────────
@@ -689,7 +684,7 @@ const IncompatQosPending = struct {
 /// matches or unmatches.  `added` is true on match, false on unmatch.
 const MatchedNotify = struct {
     ctx: *anyopaque,
-    notify: *const fn (ctx: *anyopaque, remote_handle: DDS.InstanceHandle_t, added: bool) void,
+    notify: *const fn (ctx: *anyopaque) void,
     /// `ctx` is a `*DataReaderImpl` when true, a `*DataWriterImpl` when false —
     /// needed to reach the right `EntityQuiesce` from `onReaderDiscovered` /
     /// `onWriterDiscovered`, which release `participant.mu` before firing
@@ -1062,13 +1057,13 @@ pub const DomainParticipantImpl = struct {
     /// are silently dropped.  Owned strings.  Guarded by mu.
     ignored_topic_names: std.ArrayListUnmanaged([]const u8),
 
-    /// Handles of remote publications passed to ignore_publication().
-    /// Derived via guidToHandle(remote_writer_guid).  Guarded by mu.
-    ignored_publication_handles: std.ArrayListUnmanaged(DDS.InstanceHandle_t),
+    /// The DataWriters passed to ignore_publication(), by GUID, so that an
+    /// ignore outlives the handle.  Guarded by mu.
+    ignored_publications: std.ArrayListUnmanaged(Guid),
 
-    /// Handles of remote subscriptions passed to ignore_subscription().
-    /// Derived via guidToHandle(remote_reader_guid).  Guarded by mu.
-    ignored_subscription_handles: std.ArrayListUnmanaged(DDS.InstanceHandle_t),
+    /// The DataReaders passed to ignore_subscription(), by GUID.  Guarded by
+    /// mu.
+    ignored_subscriptions: std.ArrayListUnmanaged(Guid),
 
     /// Topics discovered via SEDP writer/reader announcements, deduped by
     /// (topic_name, type_name).  Backing strings are owned.  Guarded by mu.
@@ -1123,8 +1118,13 @@ pub const DomainParticipantImpl = struct {
 
     /// Entity ID counter; protected by `mu`.  Wraps at 2^24.
     next_entity_key: u32,
-    /// InstanceHandle counter; protected by `mu`.
-    next_handle_val: DDS.InstanceHandle_t,
+    /// The handles of every entity this participant names: itself, its
+    /// Publishers, Subscribers, Topics, DataWriters and DataReaders, and the
+    /// participants and endpoints it discovers
+    /// (docs/design/handle-registries.md). Protected by `mu`.
+    entities: EntityRegistry = .empty,
+    /// The last `EntityKey.serial` given.  Protected by `mu`.
+    last_entity_serial: u64 = 0,
 
     /// Stable heap address — passed to `discovery.start()`.
     disc_callbacks: disc.Callbacks,
@@ -1232,7 +1232,6 @@ pub const DomainParticipantImpl = struct {
         qos: DDS.DomainParticipantQos,
         listener: DDS.DomainParticipantListener,
         mask: DDS.StatusMask,
-        handle: DDS.InstanceHandle_t,
         /// Replaces the sink `config.trace` names; its scope and filter
         /// still apply. See trace.zig's `tracersFor`.
         trace_sink: ?trace_mod.Sink,
@@ -1267,7 +1266,7 @@ pub const DomainParticipantImpl = struct {
             .enabled = .init(true),
             .listener_box = undefined,
             .listener_mask = mask,
-            .instance_handle = handle,
+            .instance_handle = DDS.HANDLE_NIL, // below
             .status_changes = 0,
             .status_cond = null,
             .transport = data_transport,
@@ -1286,8 +1285,8 @@ pub const DomainParticipantImpl = struct {
             .discovered_participants = .empty,
             .ignored_prefixes = .empty,
             .ignored_topic_names = .empty,
-            .ignored_publication_handles = .empty,
-            .ignored_subscription_handles = .empty,
+            .ignored_publications = .empty,
+            .ignored_subscriptions = .empty,
             .discovered_topics = .empty,
             .discovered_writers = .empty,
             .discovered_readers = .empty,
@@ -1299,7 +1298,6 @@ pub const DomainParticipantImpl = struct {
             .default_sub_qos = .{},
             .default_topic_qos = .{},
             .next_entity_key = 1,
-            .next_handle_val = 2, // 1 is reserved for the participant's own handle
             .disc_callbacks = .{
                 .ctx = self,
                 .on_participant_discovered = onParticipantDiscovered,
@@ -1318,6 +1316,9 @@ pub const DomainParticipantImpl = struct {
             .mu = .{},
         };
         errdefer alloc.destroy(self);
+        // Its own handle is its registry's first.
+        self.instance_handle = (try self.entities.getOrPut(alloc, .{ .guid = guid })).handle;
+        errdefer self.entities.deinit(alloc);
         // From the participant's own copy of the config, which outlives the
         // tracers (they borrow its filter list).
         const tracers = trace_mod.tracersFor(&self.config.trace, trace_sink);
@@ -1914,8 +1915,8 @@ pub const DomainParticipantImpl = struct {
         self.ignored_prefixes.deinit(self.alloc);
         for (self.ignored_topic_names.items) |n| self.alloc.free(n);
         self.ignored_topic_names.deinit(self.alloc);
-        self.ignored_publication_handles.deinit(self.alloc);
-        self.ignored_subscription_handles.deinit(self.alloc);
+        self.ignored_publications.deinit(self.alloc);
+        self.ignored_subscriptions.deinit(self.alloc);
         for (self.discovered_topics.items) |dt| {
             self.alloc.free(dt.topic_name);
             self.alloc.free(dt.type_name);
@@ -1928,6 +1929,7 @@ pub const DomainParticipantImpl = struct {
         self.unmatched.deinit();
         self.settled_writers.deinit(self.alloc);
         self.discovery_gens.deinit(self.alloc);
+        self.entities.deinit(self.alloc);
 
         self.qos.deinit(self.alloc);
         self.default_pub_qos.deinit(self.alloc);
@@ -2118,13 +2120,71 @@ pub const DomainParticipantImpl = struct {
         };
     }
 
+    /// A handle for a new entity without a GUID (a Publisher, Subscriber,
+    /// Topic or built-in DataReader). HANDLE_NIL out of memory or handles.
     fn nextHandle(ctx: *anyopaque) DDS.InstanceHandle_t {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        const h = self.next_handle_val;
-        self.next_handle_val +%= 1;
-        return h;
+        return self.nextHandleLocked();
+    }
+
+    /// `nextHandle`, with `mu` held.
+    fn nextHandleLocked(self: *Self) DDS.InstanceHandle_t {
+        self.last_entity_serial += 1;
+        const r = self.entities.getOrPut(self.alloc, .{ .serial = self.last_entity_serial }) catch return DDS.HANDLE_NIL;
+        return r.handle;
+    }
+
+    /// The handle of the entity `guid`, given it now if it has none.
+    /// HANDLE_NIL out of memory or handles. With `mu` held.
+    fn guidHandleLocked(self: *Self, guid: Guid) DDS.InstanceHandle_t {
+        const r = self.entities.getOrPut(self.alloc, .{ .guid = guid }) catch return DDS.HANDLE_NIL;
+        return r.handle;
+    }
+
+    /// Frees the handle of the entity `guid` once nothing here names it: it
+    /// is neither one of this participant's DataWriters or DataReaders nor a
+    /// participant or endpoint discovered. Its handle is then stale. With
+    /// `mu` held.
+    fn releaseGuidHandleIfGoneLocked(self: *Self, guid: Guid) void {
+        const handle = self.entities.handleOfKey(.{ .guid = guid }) orelse return;
+        if (guid.prefix.eql(self.guid.prefix)) {
+            if (guid.eql(self.guid)) return;
+            const key = entityIdKey(guid.entity_id);
+            if (self.active_writers.get(key)) |aw| if (aw.guid.eql(guid)) return;
+            if (self.active_readers.get(key)) |ar| if (ar.guid.eql(guid)) return;
+        }
+        for (self.discovered_participants.items) |e| if (e.guid.eql(guid)) return;
+        for (self.discovered_writers.items) |e| if (e.guid.eql(guid)) return;
+        for (self.discovered_readers.items) |e| if (e.guid.eql(guid)) return;
+        _ = self.entities.remove(handle);
+    }
+
+    /// The DataWriter or DataReader `handle` names, if it names one. With
+    /// `mu` held.
+    fn endpointOfHandleLocked(self: *Self, comptime kind: EndpointKind, handle: DDS.InstanceHandle_t) ?Guid {
+        const guid = switch (self.entities.keyOf(handle) orelse return null) {
+            .guid => |g| g,
+            .serial => return null,
+        };
+        const k = guid.entity_id.entity_kind & 0x3F;
+        const is_kind = switch (kind) {
+            .writer => k == EntityKind.user_writer_with_key or k == EntityKind.user_writer_no_key,
+            .reader => k == EntityKind.user_reader_with_key or k == EntityKind.user_reader_no_key,
+        };
+        return if (is_kind) guid else null;
+    }
+
+    /// Whether the DataWriter or DataReader `guid` was ignored by its GUID.
+    /// With `mu` held.
+    fn ignoredEndpointLocked(self: *Self, comptime kind: EndpointKind, guid: Guid) bool {
+        const ignored = switch (kind) {
+            .writer => self.ignored_publications.items,
+            .reader => self.ignored_subscriptions.items,
+        };
+        for (ignored) |g| if (g.eql(guid)) return true;
+        return false;
     }
 
     // ── PublisherImpl callbacks ───────────────────────────────────────────────
@@ -2159,7 +2219,14 @@ pub const DomainParticipantImpl = struct {
             },
         };
         guid_out.* = guid;
-        publication_handle.* = writer_mod.guidToHandle(guid);
+        self.mu.lock();
+        publication_handle.* = self.guidHandleLocked(guid);
+        self.mu.unlock();
+        errdefer {
+            self.mu.lock();
+            self.releaseGuidHandleIfGoneLocked(guid);
+            self.mu.unlock();
+        }
 
         const cache_kind: history_mod.HistoryKind = if (qos.history.kind == .KEEP_ALL_HISTORY_QOS)
             .keep_all
@@ -2259,6 +2326,7 @@ pub const DomainParticipantImpl = struct {
         var handed_off = false;
         if (found_guid) |g| {
             _ = self.active_writers.remove(entityIdKey(g.entity_id));
+            self.releaseGuidHandleIfGoneLocked(g);
             self.withdrawDiscoveryGenLocked(g);
             handed_off = self.handOffDisposalLocked(g);
         }
@@ -2299,7 +2367,14 @@ pub const DomainParticipantImpl = struct {
             },
         };
         guid_out.* = guid;
-        subscription_handle.* = writer_mod.guidToHandle(guid);
+        self.mu.lock();
+        subscription_handle.* = self.guidHandleLocked(guid);
+        self.mu.unlock();
+        errdefer {
+            self.mu.lock();
+            self.releaseGuidHandleIfGoneLocked(guid);
+            self.mu.unlock();
+        }
 
         const r_cache_kind: history_mod.HistoryKind = if (qos.history.kind == .KEEP_ALL_HISTORY_QOS)
             .keep_all
@@ -2387,6 +2462,7 @@ pub const DomainParticipantImpl = struct {
         var handed_off = false;
         if (found_guid) |g| {
             _ = self.active_readers.remove(entityIdKey(g.entity_id));
+            self.releaseGuidHandleIfGoneLocked(g);
             self.withdrawDiscoveryGenLocked(g);
             handed_off = self.handOffDisposalLocked(g);
         }
@@ -2699,10 +2775,7 @@ pub const DomainParticipantImpl = struct {
         for (self.ignored_prefixes.items) |p| {
             if (p.eql(writer.prefix)) return;
         }
-        const handle = writer_mod.guidToHandle(writer);
-        for (self.ignored_publication_handles.items) |h| {
-            if (h == handle) return;
-        }
+        if (self.ignoredEndpointLocked(.writer, writer)) return;
         const now_ns = self.timer_clock.nowNs();
         const ttl_ns = self.unmatchedTtlNsLocked(writer.prefix);
         ctx.hold(&self.unmatched, target, now_ns, ttl_ns);
@@ -3054,6 +3127,7 @@ pub const DomainParticipantImpl = struct {
     fn onParticipantDiscovered(ctx: *anyopaque, data: *const disc.ParticipantData) void {
         const self = cast(ctx);
         var push_dr: ?*reader_mod.DataReaderImpl = null;
+        var handle: DDS.InstanceHandle_t = DDS.HANDLE_NIL;
         self.mu.lock();
         if (!data.guid.prefix.eql(self.guid.prefix)) {
             for (self.ignored_prefixes.items) |p| {
@@ -3066,23 +3140,24 @@ pub const DomainParticipantImpl = struct {
             for (self.discovered_participants.items) |*e| {
                 if (e.guid.eql(data.guid)) {
                     e.lease_ms = data.lease_duration_ms;
+                    handle = e.handle;
                     is_dup = true;
                     break;
                 }
             }
             if (!is_dup) {
-                const handle = writer_mod.guidToHandle(data.guid);
+                handle = self.guidHandleLocked(data.guid);
                 self.discovered_participants.append(
                     self.alloc,
                     .{ .guid = data.guid, .handle = handle, .vendor_id = data.vendor_id, .lease_ms = data.lease_duration_ms },
-                ) catch {};
+                ) catch self.releaseGuidHandleIfGoneLocked(data.guid);
             }
             // Discovery reports a known participant again when its
             // DCPSParticipant data changed.
             if (self.builtin_sub) |bs| push_dr = bs.part_dr;
         }
         self.mu.unlock();
-        if (push_dr) |dr| pushBuiltinParticipantCdr(self.alloc, dr, data);
+        if (push_dr) |dr| pushBuiltinParticipantCdr(self.alloc, dr, data, handle);
     }
 
     const ParticipantLostFire = struct {
@@ -3108,9 +3183,12 @@ pub const DomainParticipantImpl = struct {
 
     fn onParticipantLost(ctx: *anyopaque, guid: disc.Guid) void {
         const self = cast(ctx);
-        var lost_writers: std.ArrayListUnmanaged(Guid) = .empty;
+        // Each with its handle, for its disposal on the built-in topic once
+        // the handle is freed.
+        const Lost = struct { guid: Guid, handle: DDS.InstanceHandle_t };
+        var lost_writers: std.ArrayListUnmanaged(Lost) = .empty;
         defer lost_writers.deinit(self.alloc);
-        var lost_readers: std.ArrayListUnmanaged(Guid) = .empty;
+        var lost_readers: std.ArrayListUnmanaged(Lost) = .empty;
         defer lost_readers.deinit(self.alloc);
         var publication_dr: ?*reader_mod.DataReaderImpl = null;
         var subscription_dr: ?*reader_mod.DataReaderImpl = null;
@@ -3121,6 +3199,7 @@ pub const DomainParticipantImpl = struct {
                 break;
             }
         }
+        self.releaseGuidHandleIfGoneLocked(guid);
         // As in onWriterLost and onReaderLost, for each of its endpoints.
         self.withdrawDiscoveryGensOfLocked(guid.prefix);
         while (true) {
@@ -3132,10 +3211,16 @@ pub const DomainParticipantImpl = struct {
         }
         self.unmatched.dropPrefix(guid.prefix);
         for (self.discovered_writers.items) |entry| {
-            if (entry.guid.prefix.eql(guid.prefix)) lost_writers.append(self.alloc, entry.guid) catch {};
+            if (entry.guid.prefix.eql(guid.prefix)) lost_writers.append(self.alloc, .{
+                .guid = entry.guid,
+                .handle = self.entities.handleOfKey(.{ .guid = entry.guid }) orelse DDS.HANDLE_NIL,
+            }) catch {};
         }
         for (self.discovered_readers.items) |entry| {
-            if (entry.guid.prefix.eql(guid.prefix)) lost_readers.append(self.alloc, entry.guid) catch {};
+            if (entry.guid.prefix.eql(guid.prefix)) lost_readers.append(self.alloc, .{
+                .guid = entry.guid,
+                .handle = self.entities.handleOfKey(.{ .guid = entry.guid }) orelse DDS.HANDLE_NIL,
+            }) catch {};
         }
         if (self.builtin_sub) |bs| {
             publication_dr = bs.pub_dr;
@@ -3259,21 +3344,21 @@ pub const DomainParticipantImpl = struct {
             if (fire.lost) |l| l.on_lost(l.ctx, l.count);
             if (fire.ready_cb) |cb| cb.on_ready(cb.ctx, fire.guid, false);
             if (fire.unmatched_fn) |f| f(fire.unmatched_ctx.?, fire.guid);
-            if (fire.notify) |cb| if (fire.notify_quiesced) cb.notify(cb.ctx, writer_mod.guidToHandle(fire.guid), false);
+            if (fire.notify) |cb| if (fire.notify_quiesced) cb.notify(cb.ctx);
             if (fire.notify_quiesced) fire.notify.?.quiesceRelease();
             if (fire.reader_proto_quiesced) |p| p.quiesceRelease();
         }
         for (writer_fires.items) |fire| {
             if (fire.ready_cb) |cb| cb.on_ready(cb.ctx, fire.guid, false);
-            if (fire.notify) |cb| if (fire.notify_quiesced) cb.notify(cb.ctx, writer_mod.guidToHandle(fire.guid), false);
+            if (fire.notify) |cb| if (fire.notify_quiesced) cb.notify(cb.ctx);
             if (fire.notify_quiesced) fire.notify.?.quiesceRelease();
             if (fire.writer_proto_quiesced) |p| p.quiesceRelease();
         }
         if (all_swept) {
-            if (publication_dr) |dr| for (lost_writers.items) |endpoint_guid|
-                pushBuiltinEndpointDisposed(dr, endpoint_guid);
-            if (subscription_dr) |dr| for (lost_readers.items) |endpoint_guid|
-                pushBuiltinEndpointDisposed(dr, endpoint_guid);
+            if (publication_dr) |dr| for (lost_writers.items) |e|
+                pushBuiltinEndpointDisposed(dr, e.guid, e.handle);
+            if (subscription_dr) |dr| for (lost_readers.items) |e|
+                pushBuiltinEndpointDisposed(dr, e.guid, e.handle);
         }
     }
 
@@ -3490,13 +3575,10 @@ pub const DomainParticipantImpl = struct {
                 return;
             }
         }
-        const pub_handle = writer_mod.guidToHandle(data.guid);
-        for (self.ignored_publication_handles.items) |h| {
-            if (h == pub_handle) {
-                self.settleWriterLocked(data.guid, null);
-                self.mu.unlock();
-                return;
-            }
+        if (self.ignoredEndpointLocked(.writer, data.guid)) {
+            self.settleWriterLocked(data.guid, null);
+            self.mu.unlock();
+            return;
         }
         for (self.ignored_topic_names.items) |n| {
             if (std.mem.eql(u8, n, data.topic_name)) {
@@ -3505,6 +3587,7 @@ pub const DomainParticipantImpl = struct {
                 return;
             }
         }
+        const pub_handle = self.guidHandleLocked(data.guid);
         // Each match below is installed only while this is the writer's
         // current generation. Unless settled already, data from the writer
         // is held until every match below is made (see settleWriterLocked).
@@ -3571,6 +3654,7 @@ pub const DomainParticipantImpl = struct {
             // races it; see protocol/interface.zig's quiesce_acquire doc.
             if (!ar.proto.quiesceAcquire()) continue;
             var info = buildMatchedWriterInfo(data.guid, data.qos, data.unicast_locators, data.multicast_locators);
+            info.handle = pub_handle;
             info.prematch = self.prematchFor(ar);
             info.currency = self.matchCurrency(g, ar.guid);
             const nq = if (ar.matched_notify) |cb| cb.quiesceAcquire() else false;
@@ -3597,7 +3681,7 @@ pub const DomainParticipantImpl = struct {
             const dt = DiscoveredTopic{
                 .topic_name = tn,
                 .type_name = tt,
-                .handle = topicToHandle(data.topic_name, data.type_name),
+                .handle = self.nextHandleLocked(),
                 .reliability_kind = disc.discReliabilityKind(data.qos),
                 .durability_kind = disc.discDurabilityKind(data.qos),
                 .liveliness_kind = disc.discLivelinessKind(data.qos),
@@ -3622,7 +3706,7 @@ pub const DomainParticipantImpl = struct {
             // writer's loss or a newer announcement) is not made.
             const added = job.proto.addMatchedWriter(&job.info) catch false;
             if (job.notify) |cb| if (job.notify_quiesced) {
-                if (added) cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
+                if (added) cb.notify(cb.ctx);
                 cb.quiesceRelease();
             };
             job.proto.quiesceRelease();
@@ -3634,7 +3718,7 @@ pub const DomainParticipantImpl = struct {
         if (!self.localChangedSinceLocked(jobs.items)) self.settleWriterLocked(data.guid, gen);
         self.mu.unlock();
         if (inconsistent) self.raiseInconsistentTopics();
-        if (push_dr) |dr| pushBuiltinPublicationCdr(self.alloc, dr, data);
+        if (push_dr) |dr| pushBuiltinPublicationCdr(self.alloc, dr, data, pub_handle);
         if (push_topic_dr) |dr| if (new_topic) |dt| pushBuiltinTopicCdr(self.alloc, dr, .{
             .key = topicNameToKey(dt.topic_name),
             .name = dt.topic_name,
@@ -3644,7 +3728,7 @@ pub const DomainParticipantImpl = struct {
             .liveliness = qosLiveliness(dt.liveliness_kind),
             .ownership = qosOwnership(dt.ownership_kind),
             .destination_order = qosDestOrder(dt.dest_order_kind),
-        });
+        }, dt.handle);
     }
 
     const RemovedWriterJob = struct {
@@ -3712,6 +3796,8 @@ pub const DomainParticipantImpl = struct {
             while (ar_it2.next()) |ar| unmatchWriterLocked(ar, guid, &jobs);
             break :blk true;
         } else |_| false;
+        // Taken before the removal frees it.
+        const handle = self.entities.handleOfKey(.{ .guid = guid }) orelse DDS.HANDLE_NIL;
         if (swept) removeDiscoveredWriter(self, guid);
         // Should it come back, data from it is held again until it is
         // matched again.
@@ -3721,7 +3807,7 @@ pub const DomainParticipantImpl = struct {
         self.mu.unlock();
 
         fireRemovedWriterJobs(jobs.items, guid);
-        if (swept) if (push_dr) |dr| pushBuiltinEndpointDisposed(dr, guid);
+        if (swept) if (push_dr) |dr| pushBuiltinEndpointDisposed(dr, guid, handle);
     }
 
     /// Removes the remote writer `guid`'s match from the local reader `ar`
@@ -3755,12 +3841,11 @@ pub const DomainParticipantImpl = struct {
 
     /// Fires what `unmatchWriterLocked` collected, with `mu` released.
     fn fireRemovedWriterJobs(jobs: []const RemovedWriterJob, guid: Guid) void {
-        const remote_handle = writer_mod.guidToHandle(guid);
         for (jobs) |job| {
             if (job.lost) |l| l.on_lost(l.ctx, l.count);
             if (job.ready_cb) |cb| cb.on_ready(cb.ctx, guid, false);
             if (job.unmatched_fn) |f| f(job.unmatched_ctx.?, guid);
-            if (job.notify) |cb| if (job.notify_quiesced) cb.notify(cb.ctx, remote_handle, false);
+            if (job.notify) |cb| if (job.notify_quiesced) cb.notify(cb.ctx);
             if (job.notify_quiesced) job.notify.?.quiesceRelease();
             if (job.proto_quiesced) |p| p.quiesceRelease();
         }
@@ -3786,6 +3871,7 @@ pub const DomainParticipantImpl = struct {
         const needs_marker = if (vendor) |vid| header_mod.needsPidCoherentSetMarker(vid) else false;
         return .{
             .guid = guid,
+            .handle = self.guidHandleLocked(guid),
             .unicast_locators = unicast_locators,
             .multicast_locators = multicast_locators,
             .expects_inline_qos = false,
@@ -3814,12 +3900,9 @@ pub const DomainParticipantImpl = struct {
                 return;
             }
         }
-        const sub_handle = writer_mod.guidToHandle(data.guid);
-        for (self.ignored_subscription_handles.items) |h| {
-            if (h == sub_handle) {
-                self.mu.unlock();
-                return;
-            }
+        if (self.ignoredEndpointLocked(.reader, data.guid)) {
+            self.mu.unlock();
+            return;
         }
         for (self.ignored_topic_names.items) |n| {
             if (std.mem.eql(u8, n, data.topic_name)) {
@@ -3827,6 +3910,7 @@ pub const DomainParticipantImpl = struct {
                 return;
             }
         }
+        const sub_handle = self.guidHandleLocked(data.guid);
         // As in onWriterDiscovered.
         const gen = self.newDiscoveryGenLocked(data.guid);
         const prev_qos = self.discoveredReaderQosLocked(data.guid);
@@ -3905,7 +3989,7 @@ pub const DomainParticipantImpl = struct {
             const dt = DiscoveredTopic{
                 .topic_name = tn,
                 .type_name = tt,
-                .handle = topicToHandle(data.topic_name, data.type_name),
+                .handle = self.nextHandleLocked(),
                 .reliability_kind = disc.discReliabilityKind(data.qos),
                 .durability_kind = disc.discDurabilityKind(data.qos),
                 .liveliness_kind = disc.discLivelinessKind(data.qos),
@@ -3929,13 +4013,13 @@ pub const DomainParticipantImpl = struct {
             // just refreshes the proxy.
             const added = job.proto.addMatchedReader(&job.info) catch false;
             if (job.notify) |cb| if (job.notify_quiesced) {
-                if (added) cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
+                if (added) cb.notify(cb.ctx);
                 cb.quiesceRelease();
             };
             job.proto.quiesceRelease();
         }
         if (inconsistent) self.raiseInconsistentTopics();
-        if (push_dr) |dr| pushBuiltinSubscriptionCdr(self.alloc, dr, data);
+        if (push_dr) |dr| pushBuiltinSubscriptionCdr(self.alloc, dr, data, sub_handle);
         if (push_topic_dr) |dr| if (new_topic) |dt| pushBuiltinTopicCdr(self.alloc, dr, .{
             .key = topicNameToKey(dt.topic_name),
             .name = dt.topic_name,
@@ -3945,7 +4029,7 @@ pub const DomainParticipantImpl = struct {
             .liveliness = qosLiveliness(dt.liveliness_kind),
             .ownership = qosOwnership(dt.ownership_kind),
             .destination_order = qosDestOrder(dt.dest_order_kind),
-        });
+        }, dt.handle);
     }
 
     const RemovedReaderJob = struct {
@@ -3974,12 +4058,14 @@ pub const DomainParticipantImpl = struct {
             while (aw_it.next()) |aw| unmatchReaderLocked(aw, guid, &jobs);
             break :blk true;
         } else |_| false;
+        // Taken before the removal frees it.
+        const handle = self.entities.handleOfKey(.{ .guid = guid }) orelse DDS.HANDLE_NIL;
         if (swept) removeDiscoveredReader(self, guid);
         if (self.builtin_sub) |bs| push_dr = bs.sub_dr;
         self.mu.unlock();
 
         fireRemovedReaderJobs(jobs.items, guid);
-        if (swept) if (push_dr) |dr| pushBuiltinEndpointDisposed(dr, guid);
+        if (swept) if (push_dr) |dr| pushBuiltinEndpointDisposed(dr, guid, handle);
     }
 
     /// `unmatchWriterLocked`, for the remote reader `guid` and the local
@@ -4002,10 +4088,9 @@ pub const DomainParticipantImpl = struct {
 
     /// `fireRemovedWriterJobs`, for `unmatchReaderLocked`.
     fn fireRemovedReaderJobs(jobs: []const RemovedReaderJob, guid: Guid) void {
-        const remote_handle = writer_mod.guidToHandle(guid);
         for (jobs) |job| {
             if (job.ready_cb) |cb| cb.on_ready(cb.ctx, guid, false);
-            if (job.notify) |cb| if (job.notify_quiesced) cb.notify(cb.ctx, remote_handle, false);
+            if (job.notify) |cb| if (job.notify_quiesced) cb.notify(cb.ctx);
             if (job.notify_quiesced) job.notify.?.quiesceRelease();
             if (job.proto_quiesced) |p| p.quiesceRelease();
         }
@@ -4128,9 +4213,10 @@ pub const DomainParticipantImpl = struct {
             if (dw.guid.eql(guid)) {
                 dw.deinit(self.alloc);
                 _ = self.discovered_writers.swapRemove(i);
-                return;
+                break;
             }
         }
+        self.releaseGuidHandleIfGoneLocked(guid);
     }
 
     /// Must be called with self.mu held.
@@ -4139,9 +4225,10 @@ pub const DomainParticipantImpl = struct {
             if (dr.guid.eql(guid)) {
                 dr.deinit(self.alloc);
                 _ = self.discovered_readers.swapRemove(i);
-                return;
+                break;
             }
         }
+        self.releaseGuidHandleIfGoneLocked(guid);
     }
 
     /// Must be called with self.mu held.
@@ -4149,15 +4236,19 @@ pub const DomainParticipantImpl = struct {
         var i: usize = 0;
         while (i < self.discovered_writers.items.len) {
             if (self.discovered_writers.items[i].guid.prefix.eql(prefix)) {
+                const guid = self.discovered_writers.items[i].guid;
                 self.discovered_writers.items[i].deinit(self.alloc);
                 _ = self.discovered_writers.swapRemove(i);
+                self.releaseGuidHandleIfGoneLocked(guid);
             } else i += 1;
         }
         i = 0;
         while (i < self.discovered_readers.items.len) {
             if (self.discovered_readers.items[i].guid.prefix.eql(prefix)) {
+                const guid = self.discovered_readers.items[i].guid;
                 self.discovered_readers.items[i].deinit(self.alloc);
                 _ = self.discovered_readers.swapRemove(i);
+                self.releaseGuidHandleIfGoneLocked(guid);
             } else i += 1;
         }
     }
@@ -4263,7 +4354,6 @@ pub const DomainParticipantImpl = struct {
         info: proto.MatchedReaderInfo,
         notify: ?MatchedNotify,
         notify_quiesced: bool = false,
-        remote_guid: Guid,
         unicast_locs: []const Locator,
         multicast_locs: []const Locator,
     };
@@ -4659,14 +4749,7 @@ pub const DomainParticipantImpl = struct {
         for (self.ignored_prefixes.items) |p| {
             if (p.eql(guid.prefix)) return true;
         }
-        const handle = writer_mod.guidToHandle(guid);
-        const handles = switch (kind) {
-            .writer => self.ignored_publication_handles.items,
-            .reader => self.ignored_subscription_handles.items,
-        };
-        for (handles) |h| {
-            if (h == handle) return true;
-        }
+        if (self.ignoredEndpointLocked(kind, guid)) return true;
         for (self.ignored_topic_names.items) |n| {
             if (std.mem.eql(u8, n, topic_name)) return true;
         }
@@ -4748,10 +4831,7 @@ pub const DomainParticipantImpl = struct {
                     for (self.ignored_prefixes.items) |p| {
                         if (p.eql(dr.guid.prefix)) continue :reader_scan;
                     }
-                    const dr_sub_handle = writer_mod.guidToHandle(dr.guid);
-                    for (self.ignored_subscription_handles.items) |h| {
-                        if (h == dr_sub_handle) continue :reader_scan;
-                    }
+                    if (self.ignoredEndpointLocked(.reader, dr.guid)) continue :reader_scan;
                     for (self.ignored_topic_names.items) |n| {
                         if (std.mem.eql(u8, n, dr.topic_name)) continue :reader_scan;
                     }
@@ -4797,7 +4877,6 @@ pub const DomainParticipantImpl = struct {
                         .info = info,
                         .notify = aw.matched_notify,
                         .notify_quiesced = nq,
-                        .remote_guid = dr.guid,
                         .unicast_locs = uloc,
                         .multicast_locs = mloc,
                     }) catch {
@@ -4817,7 +4896,7 @@ pub const DomainParticipantImpl = struct {
             // just refreshes the proxy.
             const added = job.proto.addMatchedReader(&job.info) catch false;
             if (job.notify) |cb| if (job.notify_quiesced) {
-                if (added) cb.notify(cb.ctx, writer_mod.guidToHandle(job.remote_guid), true);
+                if (added) cb.notify(cb.ctx);
                 cb.quiesceRelease();
             };
             job.proto.quiesceRelease();
@@ -4833,7 +4912,6 @@ pub const DomainParticipantImpl = struct {
         info: proto.MatchedWriterInfo,
         notify: ?MatchedNotify,
         notify_quiesced: bool = false,
-        remote_guid: Guid,
         unicast_locs: []const Locator,
         multicast_locs: []const Locator,
     };
@@ -4939,10 +5017,7 @@ pub const DomainParticipantImpl = struct {
                     for (self.ignored_prefixes.items) |p| {
                         if (p.eql(dw.guid.prefix)) continue :writer_scan;
                     }
-                    const dw_pub_handle = writer_mod.guidToHandle(dw.guid);
-                    for (self.ignored_publication_handles.items) |h| {
-                        if (h == dw_pub_handle) continue :writer_scan;
-                    }
+                    if (self.ignoredEndpointLocked(.writer, dw.guid)) continue :writer_scan;
                     for (self.ignored_topic_names.items) |n| {
                         if (std.mem.eql(u8, n, dw.topic_name)) continue :writer_scan;
                     }
@@ -4982,6 +5057,7 @@ pub const DomainParticipantImpl = struct {
                     const uloc = dupeLocators(self.alloc, dw.unicast_locators);
                     const mloc = dupeLocators(self.alloc, dw.multicast_locators);
                     var info = buildMatchedWriterInfo(dw.guid, &dw.qos, uloc, mloc);
+                    info.handle = self.guidHandleLocked(dw.guid);
                     info.prematch = self.prematchFor(ar);
                     info.currency = self.matchCurrency(g, ar.guid);
                     const nq = if (ar.matched_notify) |cb| cb.quiesceAcquire() else false;
@@ -4990,7 +5066,6 @@ pub const DomainParticipantImpl = struct {
                         .info = info,
                         .notify = ar.matched_notify,
                         .notify_quiesced = nq,
-                        .remote_guid = dw.guid,
                         .unicast_locs = uloc,
                         .multicast_locs = mloc,
                     }) catch {
@@ -5010,7 +5085,7 @@ pub const DomainParticipantImpl = struct {
             // just refreshes the proxy.
             const added = job.proto.addMatchedWriter(&job.info) catch false;
             if (job.notify) |cb| if (job.notify_quiesced) {
-                if (added) cb.notify(cb.ctx, writer_mod.guidToHandle(job.remote_guid), true);
+                if (added) cb.notify(cb.ctx);
                 cb.quiesceRelease();
             };
             job.proto.quiesceRelease();
@@ -5043,7 +5118,7 @@ pub const DomainParticipantImpl = struct {
         ctx: *anyopaque,
         handle: DDS.InstanceHandle_t,
         notify_ctx: *anyopaque,
-        notify_fn: *const fn (*anyopaque, DDS.InstanceHandle_t, bool) void,
+        notify_fn: *const fn (*anyopaque) void,
     ) void {
         const self = cast(ctx);
         self.mu.lock();
@@ -5079,7 +5154,7 @@ pub const DomainParticipantImpl = struct {
         ctx: *anyopaque,
         handle: DDS.InstanceHandle_t,
         notify_ctx: *anyopaque,
-        notify_fn: *const fn (*anyopaque, DDS.InstanceHandle_t, bool) void,
+        notify_fn: *const fn (*anyopaque) void,
     ) void {
         const self = cast(ctx);
         self.mu.lock();
@@ -5611,6 +5686,7 @@ pub const DomainParticipantImpl = struct {
         for (self.publishers.items, 0..) |pp, i| {
             if (pp == p) {
                 _ = self.publishers.swapRemove(i);
+                _ = self.entities.remove(p.instance_handle);
                 break;
             }
         }
@@ -5676,6 +5752,7 @@ pub const DomainParticipantImpl = struct {
         for (self.subscribers.items, 0..) |ss, i| {
             if (ss == s) {
                 _ = self.subscribers.swapRemove(i);
+                _ = self.entities.remove(s.instance_handle);
                 break;
             }
         }
@@ -5712,7 +5789,6 @@ pub const DomainParticipantImpl = struct {
             listener_box_mod.releaseGivenPtr(a_listener);
             return nil.nil_topic;
         }
-        const handle = nextHandle(ctx);
         const tn_s = std.mem.span(topic_name);
         const tt_s = std.mem.span(type_name);
         const t = topic_mod.TopicImpl.init(
@@ -5725,7 +5801,7 @@ pub const DomainParticipantImpl = struct {
             qos.*,
             if (a_listener) |l| l.* else DDS.noop_TopicListener,
             mask,
-            handle,
+            DDS.HANDLE_NIL, // its discovered topic's, below
         ) catch return nil.nil_topic;
         t.endpoints = .{ .prepare = prepareTopicEndpoints, .announce = announceTopicEndpoints };
         t.participant_fallback = topicListenerFallback;
@@ -5766,7 +5842,11 @@ pub const DomainParticipantImpl = struct {
         new_dt: {
             for (self.discovered_topics.items) |dt| {
                 if (std.mem.eql(u8, dt.topic_name, tn_s) and
-                    std.mem.eql(u8, dt.type_name, tt_s)) break :new_dt;
+                    std.mem.eql(u8, dt.type_name, tt_s))
+                {
+                    t.instance_handle = dt.handle;
+                    break :new_dt;
+                }
             }
             const tn = self.alloc.dupe(u8, tn_s) catch break :new_dt;
             const tt = self.alloc.dupe(u8, tt_s) catch {
@@ -5776,19 +5856,22 @@ pub const DomainParticipantImpl = struct {
             const dt = DiscoveredTopic{
                 .topic_name = tn,
                 .type_name = tt,
-                .handle = topicToHandle(tn_s, tt_s),
+                .handle = self.nextHandleLocked(),
                 .reliability_kind = if (qos.reliability.kind == .RELIABLE_RELIABILITY_QOS) @as(u8, 1) else 0,
                 .durability_kind = @as(u8, @intCast(@backingInt(qos.durability.kind))),
                 .liveliness_kind = @as(u8, @intCast(@backingInt(qos.liveliness.kind))),
                 .ownership_kind = if (qos.ownership.kind == .EXCLUSIVE_OWNERSHIP_QOS) @as(u8, 1) else 0,
                 .dest_order_kind = if (qos.destination_order.kind == .BY_SOURCE_TIMESTAMP_DESTINATIONORDER_QOS) @as(u8, 1) else 0,
             };
+            t.instance_handle = dt.handle;
             self.discovered_topics.append(self.alloc, dt) catch {
                 self.alloc.free(tn);
                 self.alloc.free(tt);
                 break :new_dt;
             };
         }
+        // Out of memory, it is still given a handle.
+        if (t.instance_handle == DDS.HANDLE_NIL) t.instance_handle = self.nextHandleLocked();
         const maybe_topic_dr: ?*reader_mod.DataReaderImpl =
             if (self.builtin_sub) |bs| bs.topic_dr else null;
         self.mu.unlock();
@@ -5812,7 +5895,7 @@ pub const DomainParticipantImpl = struct {
             .history = qos.history,
             .resource_limits = qos.resource_limits,
             .ownership = qos.ownership,
-        });
+        }, t.instance_handle);
         return t.toDDSTopic();
     }
 
@@ -6238,6 +6321,7 @@ pub const DomainParticipantImpl = struct {
             if (e.handle == handle) {
                 found_prefix = e.guid.prefix;
                 _ = self.discovered_participants.swapRemove(i);
+                self.releaseGuidHandleIfGoneLocked(e.guid);
                 break;
             }
         }
@@ -6294,10 +6378,10 @@ pub const DomainParticipantImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        for (self.ignored_publication_handles.items) |h| {
-            if (h == handle) return DDS.RETCODE_OK;
-        }
-        self.ignored_publication_handles.append(self.alloc, handle) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        // Recorded by GUID, so that the ignore outlives the handle.
+        const guid = self.endpointOfHandleLocked(.writer, handle) orelse return DDS.RETCODE_BAD_PARAMETER;
+        if (self.ignoredEndpointLocked(.writer, guid)) return DDS.RETCODE_OK;
+        self.ignored_publications.append(self.alloc, guid) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         // NOTE: guards future onWriterDiscovered callbacks only. Existing matched
         // writers (already added via addMatchedWriter) are not retroactively removed.
         // This matches FastDDS/CycloneDDS behaviour; full retroactive unmatching would
@@ -6313,10 +6397,9 @@ pub const DomainParticipantImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        for (self.ignored_subscription_handles.items) |h| {
-            if (h == handle) return DDS.RETCODE_OK;
-        }
-        self.ignored_subscription_handles.append(self.alloc, handle) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        const guid = self.endpointOfHandleLocked(.reader, handle) orelse return DDS.RETCODE_BAD_PARAMETER;
+        if (self.ignoredEndpointLocked(.reader, guid)) return DDS.RETCODE_OK;
+        self.ignored_subscriptions.append(self.alloc, guid) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         // NOTE: guards future onReaderDiscovered callbacks only; see vtIgnorePublication.
         return DDS.RETCODE_OK;
     }

@@ -146,24 +146,44 @@ change.
 
 ### The participant's entity registry
 
-One per participant, under its `mu`, keyed by 16 bytes: an entity's GUID, or a topic's
-`BuiltinTopicKey`. It allocates the handles of everything the participant names: itself,
-its publishers, subscribers, topics, DataWriters and DataReaders, and the participants,
-endpoints and topics it discovers. Publishers and subscribers have no GUID and take keyless
-entries. The factory's and participant's counters go.
+One per participant, under its `mu`. It allocates the handles of everything the
+participant names: itself, its publishers, subscribers, topics, DataWriters and
+DataReaders, and the participants, endpoints and topics it discovers. An entity with a
+GUID is keyed by it; one without (a publisher, subscriber, topic or built-in DataReader) by
+a number the participant gives it (`EntityKey`). The participant's own handle is its
+registry's first, so the factory's and participant's counters go. Handles are scoped to the
+participant: every participant's own handle is the same, and a participant names another
+by a handle of its own.
 
 - Built-in readers show its handles on their samples (they are given them with each
   sample), so the built-in topics, `get_matched_*`, `get_discovered_*`,
   `ignore_*` and `SampleInfo.publication_handle` agree.
-- A reader learns a matched writer's handle with the match and keeps it with the writer's
-  other per-writer state, so a sample's `publication_handle` is found under the reader's
-  own `mu`, with no participant lock on that path.
-- A lost remote participant or endpoint frees its entry. A handle still held by an
-  application or a queued `SampleInfo` is then stale, and `get_matched_publication_data`
-  and the like return `BAD_PARAMETER` for it, as for any unmatched writer.
+- A topic's handle is its `discovered_topics` entry's, for its name and type: a Topic
+  created here takes that entry's handle, whether the topic was discovered first or not.
+  Like the entries, topic handles are not freed.
+- A matched endpoint's handle travels with the match (`MatchedWriterInfo.handle`,
+  `MatchedReaderInfo.handle`). The reader records it in its match callback, which the
+  protocol reader runs before it delivers what the writer sent before the match, and keeps
+  it with its other per-writer state (`publication_handles`), so a sample's
+  `publication_handle` is found under the reader's own `mu`, with no participant lock on
+  that path. The writer does the same for its readers (`subscription_handles`). Both keep
+  an endpoint's handle after it is unmatched, as a queued sample or a ready event can
+  still name it; a rematch replaces it.
+- A GUID's entry is freed once nothing the participant holds names it: it is not a local
+  DataWriter or DataReader, nor a discovered participant or endpoint
+  (`releaseGuidHandleIfGoneLocked`), so a local endpoint's deletion and its loss can come
+  in either order. A handle still held by an application or a queued `SampleInfo` is then
+  stale, and `get_matched_publication_data` and the like return `BAD_PARAMETER` for it, as
+  for any unmatched writer. An endpoint discovered again gets a new handle.
 - `ignore_publication` and `ignore_subscription` record the GUID the handle names, not the
-  handle, so an ignore outlives the entry.
-- The two collision workarounds go.
+  handle, so an ignore outlives the entry. A handle that names no DataWriter (or
+  DataReader) is `BAD_PARAMETER`, as `ignore_participant` and `ignore_topic` already did
+  for theirs.
+- The two collision workarounds go: `get_matched_subscription_rtps_guid` and
+  `get_matched_publication_rtps_guid` no longer return `PRECONDITION_NOT_MET`.
+- The participant's matched notification to a reader or writer loses its handle and
+  direction arguments, which neither read: the matched status changes in the match
+  callbacks above.
 
 ## Order of work
 
@@ -172,10 +192,11 @@ entries. The factory's and participant's counters go.
    returning `HANDLE_NIL` for unknown keys. Done 2026-11-19; the writer's needs zidl's
    generated Zig code to pass the writer (`registerInstanceRaw(dw, key_hash)`).
 3. **The participant's entity registry**, then removing `guidToHandle`, `topicToHandle` and
-   their re-export from `dcps/root.zig` (`keyHashToHandle` went in step 2).
+   their re-export from `dcps/root.zig` (`keyHashToHandle` went in step 2). Done
+   2026-11-19.
 4. **Follow-ons**, each its own roadmap item: instance reclamation bounded by
    `max_instances`; the linear `discovered_*` lists.
 
-Tests that compare a writer's handle with a reader's handle for the same key, or compute a
-handle with `guidToHandle` (`api_test.zig`, `ignore_test.zig`, `matched_status_test.zig`),
-change to compare keys or to read the handle back from the entity.
+Tests that computed a handle with `guidToHandle` (`api_test.zig`, `ignore_test.zig`,
+`matched_status_test.zig`) read it back from a built-in topic sample, or give it with the
+match.

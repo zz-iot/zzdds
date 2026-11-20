@@ -12,7 +12,9 @@ Steps:
   1. Structural completeness -- every file `find_package(ZZDDS)` / pkg-config /
      the C++ "three-artifact" build path needs is present (a superset of
      `package-libs`' inline check: also `bin/zidl`, `src/*.cpp`, `zzdds_c.h`,
-     `zidl_allocator.h`, the static `zidl_cdr` library).
+     `zidl_allocator.h`), and no static `zidl_cdr` library: libzzdds
+     carries zidl-cdr's C API, and a second copy would mean a second
+     allocator.
   2. Relocatability -- `zzdds.pc` and `zzdds-config.cmake` derive their prefix
      from their own location, with no absolute build path baked in.
   3. The bundled `bin/zidl` code generator runs on this platform.
@@ -31,8 +33,8 @@ Steps:
 consumer (no compiler, no run, no examples). It is a local-debugging aid for a
 host without a usable C/C++ toolchain; `release.yml` does not use it.
 
-On Windows the static library is `lib/zidl_cdr.lib`, the DLL is `bin/zzdds.dll`
-(found at run time through PATH: there is no rpath), and CMake's default Visual
+On Windows the DLL is `bin/zzdds.dll` (found at run time through PATH: there is
+no rpath) with its import library `lib/zzdds.lib`, and CMake's default Visual
 Studio generator puts executables under `<build>/Debug/`.
 """
 
@@ -122,8 +124,10 @@ def check_structure(prefix: Path) -> None:
     if not any((prefix / rel).is_file() for rel in ("bin/zidl", "bin/zidl.exe")):
         fail("bundle has no bin/zidl code generator")
 
-    if not any((prefix / rel).is_file() for rel in ("lib/libzidl_cdr.a", "lib/zidl_cdr.lib")):
-        fail("bundle has no static zidl_cdr library (looked for lib/libzidl_cdr.a, lib/zidl_cdr.lib)")
+    stale = [rel for rel in ("lib/libzidl_cdr.a", "lib/zidl_cdr.lib") if (prefix / rel).is_file()]
+    if stale:
+        fail("bundle ships a static zidl_cdr library, a second copy of the zidl-cdr libzzdds already exports: "
+             + ", ".join(stale))
 
     shared = ["lib/libzzdds.so", "lib/libzzdds.dylib", "bin/zzdds.dll", "lib/zzdds.dll"]
     if not any((prefix / rel).is_file() for rel in shared):

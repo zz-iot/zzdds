@@ -189,6 +189,12 @@ pub const DataWriterImpl = struct {
     pub_matched_current: i32 = 0,
     pub_matched_current_change: i32 = 0,
     pub_matched_last_handle: DDS.InstanceHandle_t = 0,
+    /// Each reader matched so far, with the handle the participant gave it
+    /// at the match: the matched status, `get_matched_subscriptions` and
+    /// on_reliable_reader_ready name it by that. Kept after the reader is
+    /// unmatched, as a ready event can follow; a rematch updates it. Guarded
+    /// by `mu`.
+    subscription_handles: std.AutoHashMapUnmanaged(Guid, DDS.InstanceHandle_t) = .empty,
 
     /// Cumulative count of offered-deadline-missed events; written from
     /// participant.checkTimers() (participant.mu held).
@@ -383,6 +389,7 @@ pub const DataWriterImpl = struct {
             var it = self.instances.iterator();
             while (it.next()) |e| if (e.value.*) |kv| self.alloc.free(kv);
         }
+        self.subscription_handles.deinit(self.alloc);
         self.instances.deinit(self.alloc);
         // NOTE: proto_writer lifecycle is owned by the participant (via
         // pubDestroyProtoWriter callback), not by DataWriterImpl.
@@ -628,21 +635,50 @@ pub const DataWriterImpl = struct {
         };
     }
 
-    fn onReaderMatchingCb(ctx: *anyopaque, guid: Guid, is_new: bool) void {
-        if (is_new) recordPublicationMatchedFn(ctx, guidToHandle(guid), true);
-    }
-
-    fn onReaderUnmatchingCb(ctx: *anyopaque, guid: Guid) void {
-        recordPublicationMatchedFn(ctx, guidToHandle(guid), false);
-    }
-
-    fn recordPublicationMatchedFn(ctx: *anyopaque, remote_handle: DDS.InstanceHandle_t, added: bool) void {
+    fn onReaderMatchingCb(ctx: *anyopaque, guid: Guid, handle: DDS.InstanceHandle_t, is_new: bool) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         defer self.mu.unlock();
-        self.publicationMatchedLocked(remote_handle, added);
+        // Out of memory, the reader is named HANDLE_NIL.
+        self.subscription_handles.put(self.alloc, guid, handle) catch {};
+        if (is_new) self.publicationMatchedLocked(handle, true);
+    }
+
+    fn onReaderUnmatchingCb(ctx: *anyopaque, guid: Guid) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.publicationMatchedLocked(self.subscriptionHandleLocked(guid), false);
+    }
+
+    /// `subscriptionHandleLocked`, taking `mu`.
+    fn subscriptionHandle(self: *Self, guid: Guid) DDS.InstanceHandle_t {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.subscriptionHandleLocked(guid);
+    }
+
+    /// The handle of `guid`, a reader matched now or before. With `mu` held.
+    fn subscriptionHandleLocked(self: *Self, guid: Guid) DDS.InstanceHandle_t {
+        return self.subscription_handles.get(guid) orelse DDS.HANDLE_NIL;
+    }
+
+    /// The matched reader that `handle` names, if any.
+    pub fn matchedSubscriptionGuid(self: *Self, handle: DDS.InstanceHandle_t) ?Guid {
+        if (handle == DDS.HANDLE_NIL) return null;
+        var guids: std.ArrayListUnmanaged(Guid) = .empty;
+        defer guids.deinit(self.alloc);
+        self.proto_writer.listMatchedReaders(self.alloc, &guids) catch return null;
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (guids.items) |guid| {
+            if (self.subscriptionHandleLocked(guid) == handle) return guid;
+        }
+        return null;
     }
 
     /// Caller holds `mu`.
@@ -661,11 +697,9 @@ pub const DataWriterImpl = struct {
     /// Raises on_publication_matched, if the status is still changed. The
     /// participant's matched notification for this writer, registered after
     /// a match or removal it made: the status itself changed with the
-    /// reader's proxy (readerMatchCallback), so `remote_handle` and `added`
-    /// are not needed. Must not be called with participant.mu held.
-    pub fn notifyPublicationMatched(ctx: *anyopaque, remote_handle: DDS.InstanceHandle_t, added: bool) void {
-        _ = remote_handle;
-        _ = added;
+    /// reader's proxy (readerMatchCallback). Must not be called with
+    /// participant.mu held.
+    pub fn notifyPublicationMatched(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
@@ -831,7 +865,7 @@ pub const DataWriterImpl = struct {
             if (!listener_lane.admit(box)) return;
             listener_box_mod.enterCall();
             defer listener_box_mod.leaveCall();
-            cb(guidToHandle(event.guid), event.ready, box.listener.listener_data);
+            cb(self.subscriptionHandle(event.guid), event.ready, box.listener.listener_data);
         }
     }
 
@@ -1362,7 +1396,11 @@ pub const DataWriterImpl = struct {
         const n = guids.items.len;
         if (n == 0) return DDS.RETCODE_OK;
         const buf = self.alloc.alloc(DDS.InstanceHandle_t, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        for (guids.items, 0..) |guid, i| buf[i] = guidToHandle(guid);
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            for (guids.items, 0..) |guid, i| buf[i] = self.subscriptionHandleLocked(guid);
+        }
         seq._buffer = buf.ptr;
         seq._length = @intCast(n);
         seq._maximum = @intCast(n);
@@ -1381,7 +1419,7 @@ pub const DataWriterImpl = struct {
         self.proto_writer.listMatchedReaders(self.alloc, &guids) catch
             return DDS.RETCODE_BAD_PARAMETER;
         for (guids.items) |guid| {
-            if (guidToHandle(guid) == handle) {
+            if (self.subscriptionHandle(guid) == handle) {
                 // topic_name/type_name must be duped into fresh, caller-owned
                 // storage here, not aliased to self.topic_name/self.type_name
                 // directly -- see DomainParticipantImpl.vtGetDiscoveredTopicData's
@@ -1630,19 +1668,6 @@ pub const DataWriterImpl = struct {
 };
 
 // ── GUID helpers ──────────────────────────────────────────────────────────────
-
-/// FNV-1a hash of a GUID's 16 bytes → nonzero positive i32 instance handle.
-pub fn guidToHandle(guid: Guid) DDS.InstanceHandle_t {
-    const bytes = std.mem.asBytes(&guid);
-    var h: u32 = 2166136261;
-    for (bytes) |b| {
-        h ^= b;
-        h *%= 16777619;
-    }
-    // Ensure nonzero and positive (i32 range).
-    const v: i32 = @intCast(h & 0x7FFF_FFFF);
-    return if (v == 0) 1 else v;
-}
 
 /// Stable opaque built-in-topic key derived from the complete RTPS GUID.
 /// Endpoint keys must remain distinct for endpoints sharing one participant.

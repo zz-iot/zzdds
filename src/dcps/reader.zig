@@ -596,10 +596,16 @@ pub const DataReaderImpl = struct {
     /// when a writer disappears without an explicit unregister.
     writer_instances: std.AutoHashMapUnmanaged(Guid, std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, void)) = .empty,
 
-    /// Stable publication-handle lookup for SampleInfo metadata. Associations
-    /// survive unmatching because already-queued samples can still reference
-    /// their originating writer. Guarded by `mu` and released with the reader.
-    publication_guids: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, PublicationGuidEntry) = .empty,
+    /// Each writer matched so far, with the handle the participant gave it
+    /// at the match: a sample's publication_handle, the matched and
+    /// liveliness statuses and get_matched_publications name it by that.
+    /// Kept after the writer is unmatched, as samples it sent can still be
+    /// queued; a rematch updates it. Guarded by `mu`; released with the
+    /// reader.
+    publication_handles: std.AutoHashMapUnmanaged(Guid, DDS.InstanceHandle_t) = .empty,
+    /// `publication_handles` the other way, for `resolvePublicationGuid`: a
+    /// handle given before a rematch still names its writer. Guarded by `mu`.
+    publication_guids: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, Guid) = .empty,
 
     // ── Instances ─────────────────────────────────────────────────────────────
     // Guarded by `mu`.
@@ -624,7 +630,6 @@ pub const DataReaderImpl = struct {
     /// SampleInfo may still carry the shared handle and originate from that
     /// now-unmatched writer. Returning no GUID is safer than attributing such
     /// a sample to whichever colliding writer happens to remain matched.
-    const PublicationGuidEntry = struct { guid: Guid, collision: bool = false };
     const Self = @This();
 
     pub fn init(
@@ -850,6 +855,7 @@ pub const DataReaderImpl = struct {
             while (wi_it.next()) |inner| inner.deinit(self.alloc);
         }
         self.writer_instances.deinit(self.alloc);
+        self.publication_handles.deinit(self.alloc);
         self.publication_guids.deinit(self.alloc);
         self.deinitInstances(self.alloc);
         self.qos.deinit(self.alloc);
@@ -971,25 +977,30 @@ pub const DataReaderImpl = struct {
         gop.value_ptr.put(self.alloc, ih, {}) catch {};
     }
 
-    fn rememberPublicationGuidLocked(self: *Self, guid: Guid) void {
-        const handle = writer_mod.guidToHandle(guid);
-        const entry = self.publication_guids.getOrPut(self.alloc, handle) catch return;
-        if (!entry.found_existing) {
-            entry.value_ptr.* = .{ .guid = guid };
-        } else if (!entry.value_ptr.guid.eql(guid)) {
-            entry.value_ptr.collision = true;
-        }
+    /// Records the handle the participant gave the writer `guid` at its
+    /// match. Out of memory, the writer is named HANDLE_NIL. With `mu` held.
+    fn rememberPublicationLocked(self: *Self, guid: Guid, handle: DDS.InstanceHandle_t) void {
+        self.publication_handles.put(self.alloc, guid, handle) catch return;
+        if (handle != DDS.HANDLE_NIL) self.publication_guids.put(self.alloc, handle, guid) catch {};
     }
 
-    pub fn resolvePublicationGuid(
-        self: *Self,
-        handle: DDS.InstanceHandle_t,
-    ) error{ NoData, HandleCollision }!Guid {
+    /// The handle of `guid`, a writer matched now or before. With `mu` held.
+    fn publicationHandleLocked(self: *Self, guid: Guid) DDS.InstanceHandle_t {
+        return self.publication_handles.get(guid) orelse DDS.HANDLE_NIL;
+    }
+
+    /// `publicationHandleLocked`, taking `mu`.
+    fn publicationHandle(self: *Self, guid: Guid) DDS.InstanceHandle_t {
         self.mu.lock();
         defer self.mu.unlock();
-        const entry = self.publication_guids.get(handle) orelse return error.NoData;
-        if (entry.collision) return error.HandleCollision;
-        return entry.guid;
+        return self.publicationHandleLocked(guid);
+    }
+
+    /// The writer `handle` names, matched now or before.
+    pub fn resolvePublicationGuid(self: *Self, handle: DDS.InstanceHandle_t) ?Guid {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.publication_guids.get(handle);
     }
 
     fn deferListener(self: *Self, status: DDS.StatusMask) void {
@@ -1064,12 +1075,6 @@ pub const DataReaderImpl = struct {
 
         const copy = self.alloc.dupe(u8, change.data) catch return;
         self.mu.lock();
-
-        // A sample's publication handle must resolve to its writer's GUID as
-        // soon as the sample can be taken. The writer-matched callback that
-        // also records it runs only after the protocol match is added, and
-        // adding the match first delivers any samples that arrived before it.
-        self.rememberPublicationGuidLocked(change.writer_guid);
 
         // COHERENT SETS: a sample counts toward its writer's set arriving
         // complete even if a filter below drops it -- RTPS 2.5 §8.7.6 leaves
@@ -1177,7 +1182,7 @@ pub const DataReaderImpl = struct {
                     .instance_state = states.instance_state,
                     .source_timestamp = .{ .sec = src_time.sec, .nanosec = src_time.nanosec },
                     .instance_handle = ih,
-                    .publication_handle = writer_mod.guidToHandle(change.writer_guid),
+                    .publication_handle = self.publicationHandleLocked(change.writer_guid),
                     .valid_data = change.kind == .alive,
                     .disposed_generation_count = states.disposed_generation_count,
                     .no_writers_generation_count = states.no_writers_generation_count,
@@ -1319,7 +1324,7 @@ pub const DataReaderImpl = struct {
                 .instance_state = states.instance_state,
                 .source_timestamp = .{ .sec = src_time.sec, .nanosec = src_time.nanosec },
                 .instance_handle = ih,
-                .publication_handle = writer_mod.guidToHandle(change.writer_guid),
+                .publication_handle = self.publicationHandleLocked(change.writer_guid),
                 .valid_data = change.kind == .alive,
                 .disposed_generation_count = states.disposed_generation_count,
                 .no_writers_generation_count = states.no_writers_generation_count,
@@ -1504,7 +1509,7 @@ pub const DataReaderImpl = struct {
         defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         defer self.mu.unlock();
-        self.rememberPublicationGuidLocked(info.guid);
+        self.rememberPublicationLocked(info.guid, info.handle);
         self.writer_strengths.put(self.alloc, info.guid, info.ownership_strength) catch {};
         if (info.lifespan_ns > 0)
             self.writer_lifespans.put(self.alloc, info.guid, info.lifespan_ns) catch {}
@@ -1537,7 +1542,7 @@ pub const DataReaderImpl = struct {
                 // Newly matched writer.
                 self.liveliness_alive_count += 1;
                 self.liveliness_alive_count_change += 1;
-                self.liveliness_last_handle = writer_mod.guidToHandle(info.guid);
+                self.liveliness_last_handle = self.publicationHandleLocked(info.guid);
                 self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
             } else if (!prev.?.is_alive) {
                 // Re-announced after lease expiry — same transition as onWriterAliveCb.
@@ -1545,13 +1550,13 @@ pub const DataReaderImpl = struct {
                 self.liveliness_alive_count_change += 1;
                 self.liveliness_not_alive_count -= 1;
                 self.liveliness_not_alive_count_change -= 1;
-                self.liveliness_last_handle = writer_mod.guidToHandle(info.guid);
+                self.liveliness_last_handle = self.publicationHandleLocked(info.guid);
                 self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
             }
             // else: re-announcement of an already-alive writer; update lease/timestamp only.
             self.timersChanged();
         }
-        if (is_new) self.subscriptionMatchedLocked(writer_mod.guidToHandle(info.guid), true);
+        if (is_new) self.subscriptionMatchedLocked(info.handle, true);
     }
 
     /// Raises what onWriterMatchingCb changed, once the protocol reader's
@@ -1674,7 +1679,7 @@ pub const DataReaderImpl = struct {
             self.liveliness_alive_count_change += 1;
             self.liveliness_not_alive_count -= 1;
             self.liveliness_not_alive_count_change -= 1;
-            self.liveliness_last_handle = writer_mod.guidToHandle(guid);
+            self.liveliness_last_handle = self.publicationHandleLocked(guid);
             self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
             liveliness_changed.* = true;
         }
@@ -1691,8 +1696,7 @@ pub const DataReaderImpl = struct {
         defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         defer self.mu.unlock();
-        self.subscriptionMatchedLocked(writer_mod.guidToHandle(guid), false);
-        self.rememberPublicationGuidLocked(guid);
+        self.subscriptionMatchedLocked(self.publicationHandleLocked(guid), false);
         _ = self.writer_strengths.remove(guid);
         _ = self.writer_lifespans.remove(guid);
         // Discard any in-progress coherent set from this writer.  If the writer
@@ -1715,7 +1719,7 @@ pub const DataReaderImpl = struct {
                 self.liveliness_not_alive_count -= 1;
                 self.liveliness_not_alive_count_change -= 1;
             }
-            self.liveliness_last_handle = writer_mod.guidToHandle(guid);
+            self.liveliness_last_handle = self.publicationHandleLocked(guid);
             self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
         }
         // Release ownership of any instances this writer held.  The next
@@ -1779,7 +1783,7 @@ pub const DataReaderImpl = struct {
                         .instance_state = states.instance_state,
                         .instance_handle = ih,
                         .source_timestamp = .{ .sec = now.sec, .nanosec = now.nanosec },
-                        .publication_handle = writer_mod.guidToHandle(guid),
+                        .publication_handle = self.publicationHandleLocked(guid),
                         .valid_data = false,
                         .disposed_generation_count = states.disposed_generation_count,
                         .no_writers_generation_count = states.no_writers_generation_count,
@@ -2786,11 +2790,9 @@ pub const DataReaderImpl = struct {
     /// Raises on_subscription_matched, if the status is still changed. The
     /// participant's matched notification for this reader, registered after
     /// a match or removal it made: the status itself changed with the
-    /// writer's proxy (subscriptionMatchedLocked), so `remote_handle` and
-    /// `added` are not needed. Must not be called with participant.mu held.
-    pub fn notifySubscriptionMatched(ctx: *anyopaque, remote_handle: DDS.InstanceHandle_t, added: bool) void {
-        _ = remote_handle;
-        _ = added;
+    /// writer's proxy (subscriptionMatchedLocked). Must not be called with
+    /// participant.mu held.
+    pub fn notifySubscriptionMatched(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
@@ -2977,7 +2979,7 @@ pub const DataReaderImpl = struct {
                 self.liveliness_alive_count_change -= 1;
                 self.liveliness_not_alive_count += 1;
                 self.liveliness_not_alive_count_change += 1;
-                self.liveliness_last_handle = writer_mod.guidToHandle(kv.key_ptr.*);
+                self.liveliness_last_handle = self.publicationHandleLocked(kv.key_ptr.*);
                 self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
                 liveliness_changed = true;
             }
@@ -3498,7 +3500,7 @@ pub const DataReaderImpl = struct {
             if (!listener_lane.admit(box)) return;
             listener_box_mod.enterCall();
             defer listener_box_mod.leaveCall();
-            cb(writer_mod.guidToHandle(event.guid), event.ready, box.listener.listener_data);
+            cb(self.publicationHandle(event.guid), event.ready, box.listener.listener_data);
         }
     }
 
@@ -3824,7 +3826,11 @@ pub const DataReaderImpl = struct {
         const n = guids.items.len;
         if (n == 0) return DDS.RETCODE_OK;
         const buf = self.alloc.alloc(DDS.InstanceHandle_t, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        for (guids.items, 0..) |guid, i| buf[i] = writer_mod.guidToHandle(guid);
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            for (guids.items, 0..) |guid, i| buf[i] = self.publicationHandleLocked(guid);
+        }
         seq._buffer = buf.ptr;
         seq._length = @intCast(n);
         seq._maximum = @intCast(n);
@@ -3843,7 +3849,7 @@ pub const DataReaderImpl = struct {
         self.proto_reader.listMatchedWriters(self.alloc, &guids) catch
             return DDS.RETCODE_BAD_PARAMETER;
         for (guids.items) |guid| {
-            if (writer_mod.guidToHandle(guid) == handle) {
+            if (self.publicationHandle(guid) == handle) {
                 // topic_name/type_name must be duped into fresh, caller-owned
                 // storage here, not aliased to topic_desc's own strings directly
                 // -- see DomainParticipantImpl.vtGetDiscoveredTopicData's matching

@@ -540,7 +540,7 @@ test "a reader discovered while its writer is being created is counted" {
             ctx: *anyopaque,
             handle: DDS.InstanceHandle_t,
             notify_ctx: *anyopaque,
-            notify_fn: *const fn (*anyopaque, DDS.InstanceHandle_t, bool) void,
+            notify_fn: *const fn (*anyopaque) void,
         ) void {
             original(ctx, handle, notify_ctx, notify_fn);
             harness.announceReader(reader_guid);

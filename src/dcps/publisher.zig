@@ -84,7 +84,7 @@ pub const ParticipantCbs = struct {
         ctx: *anyopaque,
         handle: DDS.InstanceHandle_t,
         notify_ctx: *anyopaque,
-        notify_fn: *const fn (notify_ctx: *anyopaque, remote_handle: DDS.InstanceHandle_t, added: bool) void,
+        notify_fn: *const fn (notify_ctx: *anyopaque) void,
     ) void,
 
     /// Have discovery prepare the announcements of the writers identified
