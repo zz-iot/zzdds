@@ -160,7 +160,9 @@ pub const PublisherImpl = struct {
     alloc: std.mem.Allocator,
     participant: DDS.DomainParticipant,
     cbs: ParticipantCbs,
-    /// Replaced under `qos_mu`; the partitions are read under it.
+    /// Replaced under `qos_mu`, and read under it: its partitions, and its
+    /// PRESENTATION through `presentationQos`, which may change until the
+    /// Publisher is enabled.
     qos: DDS.PublisherQos,
     /// Orders a QoS change against the writers' preparations, so none is
     /// prepared with partitions replaced meanwhile.
@@ -398,6 +400,14 @@ pub const PublisherImpl = struct {
         return if (self.enabled.load(.acquire)) DDS.RETCODE_OK else DDS.RETCODE_NOT_ENABLED;
     }
 
+    /// PRESENTATION, read under `qos_mu`: `set_qos` replaces the whole QoS,
+    /// and may change PRESENTATION until the Publisher is enabled.
+    fn presentationQos(self: *Self) DDS.PresentationQosPolicy {
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
+        return self.qos.presentation;
+    }
+
     fn vtGetStatusCond(ctx: *anyopaque) DDS.StatusCondition {
         const self = cast(ctx);
         if (self.status_cond) |sc| return sc.toDDSStatusCondition();
@@ -484,7 +494,7 @@ pub const PublisherImpl = struct {
             a_topic.get_name(),
             a_topic.get_type_name(),
             qos.*,
-            self.qos.presentation,
+            self.presentationQos(),
             &parts.publication_handle,
             &parts.guid,
         );
@@ -963,13 +973,15 @@ pub const PublisherImpl = struct {
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);
+        // Before `mu`, as `qos_mu` is taken first.
+        const pres = self.presentationQos();
         self.mu.lock();
         defer self.mu.unlock();
         if (self.coherent_depth == 0) return DDS.RETCODE_PRECONDITION_NOT_MET;
         self.coherent_depth -= 1;
         if (self.coherent_depth == 0) {
-            const mode: proto.CoherentFlushMode = if (self.qos.presentation.coherent_access)
-                if (self.qos.presentation.access_scope == .GROUP_PRESENTATION_QOS) .full else .coherent_only
+            const mode: proto.CoherentFlushMode = if (pres.coherent_access)
+                if (pres.access_scope == .GROUP_PRESENTATION_QOS) .full else .coherent_only
             else
                 .group_seq_only;
             // GROUP scope: the set spans every writer (RTPS 2.5 §8.7.6).  Its id is

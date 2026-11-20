@@ -174,7 +174,9 @@ pub const SubscriberImpl = struct {
     alloc: std.mem.Allocator,
     participant: DDS.DomainParticipant,
     cbs: ParticipantCbs,
-    /// Replaced under `qos_mu`; the partitions are read under it.
+    /// Replaced under `qos_mu`, and read under it: its partitions, and its
+    /// PRESENTATION through `presentationQos`, which may change until the
+    /// Subscriber is enabled.
     qos: DDS.SubscriberQos,
     /// Orders a QoS change against the readers' preparations, so none is
     /// prepared with partitions replaced meanwhile.
@@ -405,6 +407,14 @@ pub const SubscriberImpl = struct {
         return if (self.enabled.load(.acquire)) DDS.RETCODE_OK else DDS.RETCODE_NOT_ENABLED;
     }
 
+    /// PRESENTATION, read under `qos_mu`: `set_qos` replaces the whole QoS,
+    /// and may change PRESENTATION until the Subscriber is enabled.
+    fn presentationQos(self: *Self) DDS.PresentationQosPolicy {
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
+        return self.qos.presentation;
+    }
+
     fn vtGetStatusCond(ctx: *anyopaque) DDS.StatusCondition {
         const self = cast(ctx);
         if (self.status_cond) |sc| return sc.toDDSStatusCondition();
@@ -488,7 +498,7 @@ pub const SubscriberImpl = struct {
         const topic_use = self.cbs.retain_topic(self.cbs.ctx, a_topic.ptr) orelse return nil.nil_datareader;
         const topic_name = a_topic.get_name();
         const type_name = a_topic.get_type_name();
-        const presentation = self.qos.presentation;
+        const presentation = self.presentationQos();
         var subscription_handle = DDS.HANDLE_NIL;
         var guid: proto.Guid = undefined;
         const pr = self.cbs.create_proto_reader(
@@ -1305,7 +1315,7 @@ pub const SubscriberImpl = struct {
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);
-        const pres = self.qos.presentation;
+        const pres = self.presentationQos();
         if (!pres.coherent_access and !pres.ordered_access) return DDS.RETCODE_OK;
 
         // Snapshot of listener state for readers that received a coherent commit.
@@ -1416,7 +1426,7 @@ pub const SubscriberImpl = struct {
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self: *Self = @ptrCast(@alignCast(ctx));
-        const pres: DDS.PresentationQosPolicy = self.qos.presentation;
+        const pres = self.presentationQos();
         if (pres.ordered_access) {
             for (self.readers.items) |r| {
                 r.mu.lock();

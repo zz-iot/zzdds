@@ -699,10 +699,19 @@ test "Subscriber: set_default_datareader_qos with user_data — clone survives r
     got.deinit(alloc);
 }
 
+// The set_qos churn tests below are for ThreadSanitizer. Valgrind runs one
+// thread at a time, so a thread spinning on set_qos starves the one under
+// test (the Publisher test took 19 minutes in CI's memcheck job), and
+// memcheck finds no data races anyway.
+fn skipUnderValgrind() !void {
+    if (std.valgrind.runningOnValgrind() != 0) return error.SkipZigTest;
+}
+
 // The participant's timer checks read a reader's and a writer's DEADLINE on
 // a runtime worker, and the reader's TIME_BASED_FILTER as samples arrive,
 // while `set_qos` changes them; ThreadSanitizer checks they do so safely.
 test "set_qos changes a writer's and a reader's DEADLINE while their timer checks run" {
+    try skipUnderValgrind();
     var h = try Harness.init(0xB6);
     defer h.deinit();
     const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
@@ -736,6 +745,111 @@ test "set_qos changes a writer's and a reader's DEADLINE while their timer check
         try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.set_qos(dr.ptr, &dr_qos));
         _ = dw.vtable.get_offered_deadline_missed_status(dw.ptr, &dw_missed);
         _ = dr.vtable.get_requested_deadline_missed_status(dr.ptr, &dr_missed);
+    }
+}
+
+// `set_qos` replaces a Publisher's or Subscriber's whole QoS, while creating
+// a writer or reader, ending a coherent set and beginning or ending an access
+// read its PRESENTATION; ThreadSanitizer checks they do so safely. Before the
+// group is enabled, `set_qos` changes PRESENTATION itself.
+fn QosChurn(comptime Entity: type, comptime Qos: type) type {
+    return struct {
+        fn run(entity: Entity, change_presentation: bool, stop: *std.atomic.Value(bool)) void {
+            var qos = Qos{};
+            var i: usize = 0;
+            while (!stop.load(.acquire)) : (i += 1) {
+                if (change_presentation) qos.presentation.coherent_access = i % 2 == 0;
+                qos.entity_factory.autoenable_created_entities = i % 2 == 0;
+                _ = entity.set_qos(qos);
+            }
+        }
+    };
+}
+
+/// A participant whose Publishers and Subscribers start disabled.
+fn disabledParticipant(h: *Harness) DDS.DomainParticipant {
+    const dpf = h.factory.toDDSFactory();
+    var factory_qos = DDS.DomainParticipantFactoryQos{};
+    factory_qos.entity_factory.autoenable_created_entities = false;
+    _ = dpf.vtable.set_qos(dpf.ptr, &factory_qos);
+    var dp_qos = DDS.DomainParticipantQos{};
+    dp_qos.entity_factory.autoenable_created_entities = false;
+    return dpf.create_participant(test_domain.get(), dp_qos, null, 0);
+}
+
+test "Publisher: set_qos while DataWriters are created and coherent sets end" {
+    try skipUnderValgrind();
+    var h = try Harness.init(0xB7);
+    defer h.deinit();
+    const dp = disabledParticipant(&h);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    const topic = dp.create_topic("PresentationChurnW", "T", .{}, null, 0);
+    const Churn = QosChurn(DDS.Publisher, DDS.PublisherQos);
+
+    {
+        var stop: std.atomic.Value(bool) = .init(false);
+        const t = try std.Thread.spawn(.{}, Churn.run, .{ pub_, true, &stop });
+        defer t.join();
+        defer stop.store(true, .release);
+        // Left to delete_contained_entities: a disabled Publisher's
+        // delete_datawriter returns NOT_ENABLED.
+        for (0..200) |_| {
+            const dw = pub_.create_datawriter(topic, .{}, null, 0);
+            try testing.expect(dw.ptr != nil.nil_datawriter.ptr);
+        }
+    }
+
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.enable(dp.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.enable(pub_.ptr));
+    {
+        var stop: std.atomic.Value(bool) = .init(false);
+        const t = try std.Thread.spawn(.{}, Churn.run, .{ pub_, false, &stop });
+        defer t.join();
+        defer stop.store(true, .release);
+        for (0..2000) |_| {
+            try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.begin_coherent_changes(pub_.ptr));
+            try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.end_coherent_changes(pub_.ptr));
+        }
+    }
+}
+
+test "Subscriber: set_qos while DataReaders are created and accesses begin and end" {
+    try skipUnderValgrind();
+    var h = try Harness.init(0xB8);
+    defer h.deinit();
+    const dp = disabledParticipant(&h);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+    const sub = dp.create_subscriber(.{}, null, 0);
+    const topic = dp.create_topic("PresentationChurnR", "T", .{}, null, 0);
+    const desc = @as(*dcps.TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
+    const Churn = QosChurn(DDS.Subscriber, DDS.SubscriberQos);
+
+    {
+        var stop: std.atomic.Value(bool) = .init(false);
+        const t = try std.Thread.spawn(.{}, Churn.run, .{ sub, true, &stop });
+        defer t.join();
+        defer stop.store(true, .release);
+        // Left to delete_contained_entities, as for the Publisher.
+        for (0..200) |_| {
+            const dr = sub.create_datareader(desc, .{}, null, 0);
+            try testing.expect(dr.ptr != nil.nil_datareader.ptr);
+        }
+    }
+
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.enable(dp.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.enable(sub.ptr));
+    {
+        var stop: std.atomic.Value(bool) = .init(false);
+        const t = try std.Thread.spawn(.{}, Churn.run, .{ sub, false, &stop });
+        defer t.join();
+        defer stop.store(true, .release);
+        for (0..2000) |_| {
+            try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.begin_access(sub.ptr));
+            try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.end_access(sub.ptr));
+        }
     }
 }
 

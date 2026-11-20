@@ -10,6 +10,13 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-20
 
+- A Publisher's or Subscriber's `set_qos` no longer races with the operations that read
+  its PRESENTATION: creating a DataWriter or DataReader, `end_coherent_changes`,
+  `begin_access` and `end_access`. `set_qos` replaced the whole QoS under its lock, and
+  those operations read PRESENTATION without it; they now read it under the lock. Unlike
+  a reader's or writer's fixed policies, PRESENTATION may change until the Publisher or
+  Subscriber is enabled, so #184's fix, which stops rewriting the fixed policies, did not
+  apply.
 - zzdds, its examples and its test apps require Zig 0.17.1, so release tags end in
   `-zig.0.17.1`. zzdds pins zidl `v0.3.37-zig.0.17.1`. Interop CI and releases use the
   dds-rtps harness tag `zenzen-76cd6f4-zig.0.17.1`.
