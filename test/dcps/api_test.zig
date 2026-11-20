@@ -462,7 +462,7 @@ test "DCPS: DCPSPublication reports endpoint identity and disposal" {
         .prefix = .{ .bytes = .{ 0xAA, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } },
         .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x02 },
     };
-    try testing.expectEqual(dcps.guidToHandle(guid), alive.info.instance_handle);
+    try testing.expect(alive.info.instance_handle != DDS.HANDLE_NIL);
 
     dp_impl.disc_callbacks.on_writer_lost(dp_impl.disc_callbacks.ctx, guid);
     const disposed = publication_dr.takeRaw() orelse return error.NoSample;
@@ -470,6 +470,124 @@ test "DCPS: DCPSPublication reports endpoint identity and disposal" {
     try testing.expect(!disposed.info.valid_data);
     try testing.expectEqual(DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, disposed.info.instance_state);
     try testing.expectEqual(alive.info.instance_handle, disposed.info.instance_handle);
+}
+
+/// Announces the remote keyed writer `guid` on `topic`, with QoS a reliable
+/// local DataReader of the default data representation matches.
+fn fireMatchableWriter(dp_impl: *DomainParticipantImpl, guid: Guid, topic: []const u8, type_name: []const u8) void {
+    var repr = [_]i16{2}; // XCDR2, the local default
+    var q = iface.DiscoveredWriterData{
+        .reliability = .{ .kind = 2, .max_blocking_time = .{} },
+        .history = .{ .kind = 0, .depth = 1 },
+        .dataRepresentation = .{ ._maximum = 1, ._length = 1, ._buffer = &repr, ._release = false },
+    };
+    const data = iface.WriterData{
+        .guid = guid,
+        .participant_guid = .{ .prefix = guid.prefix, .entity_id = EntityIds.participant },
+        .topic_name = topic,
+        .type_name = type_name,
+        .qos = &q,
+        .unicast_locators = &.{},
+        .multicast_locators = &.{},
+        .type_object = &.{},
+    };
+    dp_impl.disc_callbacks.on_writer_discovered(dp_impl.disc_callbacks.ctx, &data);
+}
+
+test "DCPS: a discovered writer has one handle in DCPSPublication and get_matched_publications, and a new one once found again" {
+    var h = try Harness.init(0x7C);
+    defer h.deinit();
+
+    const alloc = testing.allocator;
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+
+    const sub = dp.create_subscriber(.{}, null, 0);
+    _ = dp.create_topic("HandleTopic", "HandleType", .{}, null, 0);
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    const dr = sub.create_datareader(dp.vtable.lookup_topicdescription(dp.ptr, "HandleTopic"), dr_qos, null, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+
+    const guid = Guid{
+        .prefix = .{ .bytes = .{ 0xAB, 0xCD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } },
+        .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x02 },
+    };
+    fireMatchableWriter(dp_impl, guid, "HandleTopic", "HandleType");
+    const publication_dr = dp_impl.builtin_sub.?.pub_dr;
+    const first = publication_dr.takeRaw() orelse return error.NoSample;
+    alloc.free(first.data);
+
+    var matched = DDS.InstanceHandleSeq{};
+    defer if (matched._buffer) |b| alloc.free(b[0..matched._maximum]);
+    try testing.expectEqual(RETCODE_OK, dr.vtable.get_matched_publications(dr.ptr, &matched));
+    try testing.expectEqual(@as(u32, 1), matched._length);
+    try testing.expectEqual(first.info.instance_handle, matched._buffer.?[0]);
+
+    // Lost, its handle names nothing; found again, it has a new one.
+    dp_impl.disc_callbacks.on_writer_lost(dp_impl.disc_callbacks.ctx, guid);
+    const disposed = publication_dr.takeRaw() orelse return error.NoSample;
+    alloc.free(disposed.data);
+    try testing.expectEqual(first.info.instance_handle, disposed.info.instance_handle);
+    var data = DDS.PublicationBuiltinTopicData{};
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, dr.vtable.get_matched_publication_data(dr.ptr, &data, first.info.instance_handle));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, dp.vtable.ignore_publication(dp.ptr, first.info.instance_handle));
+
+    fireMatchableWriter(dp_impl, guid, "HandleTopic", "HandleType");
+    const again = publication_dr.takeRaw() orelse return error.NoSample;
+    alloc.free(again.data);
+    try testing.expect(again.info.instance_handle != first.info.instance_handle);
+    try testing.expectEqual(RETCODE_OK, dr.vtable.get_matched_publications(dr.ptr, &matched));
+    try testing.expectEqual(@as(u32, 1), matched._length);
+    try testing.expectEqual(again.info.instance_handle, matched._buffer.?[0]);
+}
+
+test "DCPS: a Topic's handle is its DCPSTopic sample's and get_discovered_topics'" {
+    var h = try Harness.init(0x7D);
+    defer h.deinit();
+
+    const alloc = testing.allocator;
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+    const topic_dr = dp_impl.builtin_sub.?.topic_dr;
+
+    // Discovered first, the topic keeps its handle once created here.
+    fireRemoteReader(dp_impl, "SharedTopic", "SharedType");
+    const discovered = topic_dr.takeRaw() orelse return error.NoSample;
+    alloc.free(discovered.data);
+    const shared = dp.create_topic("SharedTopic", "SharedType", .{}, null, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+    const shared_handle = shared.vtable.get_instance_handle(shared.ptr);
+    try testing.expectEqual(discovered.info.instance_handle, shared_handle);
+    const created = topic_dr.takeRaw() orelse return error.NoSample;
+    alloc.free(created.data);
+    try testing.expectEqual(shared_handle, created.info.instance_handle);
+
+    // Created first, likewise.
+    const local = dp.create_topic("LocalTopic", "LocalType", .{}, null, 0);
+    const local_handle = local.vtable.get_instance_handle(local.ptr);
+    const local_sample = topic_dr.takeRaw() orelse return error.NoSample;
+    alloc.free(local_sample.data);
+    try testing.expectEqual(local_handle, local_sample.info.instance_handle);
+
+    // No two entities of the participant share a handle.
+    try testing.expect(shared_handle != local_handle);
+    try testing.expect(shared_handle != dp.vtable.get_instance_handle(dp.ptr));
+    try testing.expect(local_handle != dp.vtable.get_instance_handle(dp.ptr));
+
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| alloc.free(b[0..handles._length]);
+    };
+    try testing.expectEqual(RETCODE_OK, dp.vtable.get_discovered_topics(dp.ptr, &handles));
+    try testing.expectEqual(@as(u32, 2), handles._length);
+    const listed = handles._buffer.?[0..2];
+    try testing.expect(std.mem.indexOfScalar(DDS.InstanceHandle_t, listed, shared_handle) != null);
+    try testing.expect(std.mem.indexOfScalar(DDS.InstanceHandle_t, listed, local_handle) != null);
 }
 
 test "DCPS: DCPSParticipant gives each discovered participant its own instance, under its discovered handle" {

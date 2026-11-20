@@ -278,7 +278,7 @@ test "data held for a reader whose match a change to it superseded is taken by t
             _ = dr.vtable.get_subscription_matched_status(dr.ptr, &st);
             return st.current_count;
         }
-        const NotifyFn = *const fn (*anyopaque, DDS.InstanceHandle_t, bool) void;
+        const NotifyFn = *const fn (*anyopaque) void;
         const RegisterFn = *const fn (*anyopaque, DDS.InstanceHandle_t, *anyopaque, NotifyFn) void;
         var original: RegisterFn = undefined;
         var inner: NotifyFn = undefined;
@@ -291,9 +291,9 @@ test "data held for a reader whose match a change to it superseded is taken by t
             original(ctx, handle, notify_ctx, notifyMatched);
         }
 
-        fn notifyMatched(ctx: *anyopaque, remote: DDS.InstanceHandle_t, added: bool) void {
-            inner(ctx, remote, added);
-            if (added) onMatched();
+        fn notifyMatched(ctx: *anyopaque) void {
+            inner(ctx);
+            onMatched();
         }
 
         /// On the first match, makes the reader not matched yet request a

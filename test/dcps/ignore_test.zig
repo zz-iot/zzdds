@@ -17,7 +17,6 @@ const DomainParticipantFactoryImpl = dcps.DomainParticipantFactoryImpl;
 const DomainParticipantImpl = dcps.DomainParticipantImpl;
 const DataReaderImpl = dcps.DataReaderImpl;
 const TopicImpl = dcps.TopicImpl;
-const guidToHandle = dcps.guidToHandle;
 const nil = dcps;
 
 const Discovery = iface.Discovery;
@@ -417,6 +416,14 @@ test "ignore_publication: ignored writer not matched to reader" {
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
 
+    // Discovered before any reader, so nothing matches it yet. Its handle is
+    // the one its DCPSPublication sample carries.
+    const prefix = makePrefix(0xE2);
+    h.fireWriterDiscovered(dp_impl, prefix, "PubTopic", "T");
+    const announced = dp_impl.builtin_sub.?.pub_dr.takeRaw() orelse return error.NoSample;
+    testing.allocator.free(announced.data);
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_publication(dp.ptr, announced.info.instance_handle));
+
     const sub = dp.create_subscriber(.{}, null, 0);
     const topic = dp.create_topic("PubTopic", "T", .{}, null, 0);
     var dr_qos = DDS.DataReaderQos{};
@@ -430,15 +437,9 @@ test "ignore_publication: ignored writer not matched to reader" {
     defer _ = dp.vtable.delete_contained_entities(dp.ptr);
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
 
-    // Pre-compute the handle for the writer we will fire.
-    const prefix = makePrefix(0xE2);
-    const writer_guid = Guid{
-        .prefix = prefix,
-        .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x02 },
-    };
-    const pub_handle = guidToHandle(writer_guid);
-
-    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_publication(dp.ptr, pub_handle));
+    // Neither the reader's creation nor the writer's next announcement
+    // matches it.
+    try testing.expectEqual(@as(usize, 0), dr_impl.matchedWriterCount());
     h.fireWriterDiscovered(dp_impl, prefix, "PubTopic", "T");
     try testing.expectEqual(@as(usize, 0), dr_impl.matchedWriterCount());
 }
@@ -453,6 +454,13 @@ test "ignore_subscription: ignored reader not matched to writer" {
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
 
+    // As for ignore_publication, with the DCPSSubscription sample.
+    const prefix = makePrefix(0xE3);
+    h.fireReaderDiscovered(dp_impl, prefix, "SubTopic", "T");
+    const announced = dp_impl.builtin_sub.?.sub_dr.takeRaw() orelse return error.NoSample;
+    testing.allocator.free(announced.data);
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_subscription(dp.ptr, announced.info.instance_handle));
+
     const pub_ = dp.create_publisher(.{}, null, 0);
     const topic = dp.create_topic("SubTopic", "T", .{}, null, 0);
     var dw_qos = DDS.DataWriterQos{};
@@ -461,17 +469,29 @@ test "ignore_subscription: ignored reader not matched to writer" {
     defer _ = dp.vtable.delete_contained_entities(dp.ptr);
     const dw_impl: *dcps.DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
-    // Pre-compute the handle for the reader we will fire.
-    const prefix = makePrefix(0xE3);
-    const reader_guid = Guid{
-        .prefix = prefix,
-        .entity_id = .{ .entity_key = .{ 0, 0, 4 }, .entity_kind = 0x07 },
-    };
-    const sub_handle = guidToHandle(reader_guid);
-
-    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_subscription(dp.ptr, sub_handle));
+    try testing.expectEqual(@as(usize, 0), dw_impl.matchedReaderCount());
     h.fireReaderDiscovered(dp_impl, prefix, "SubTopic", "T");
     try testing.expectEqual(@as(usize, 0), dw_impl.matchedReaderCount());
+}
+
+test "ignore_publication and ignore_subscription refuse a handle that names no such endpoint" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+    h.fireReaderDiscovered(dp_impl, makePrefix(0xE4), "SomeTopic", "T");
+    const reader = dp_impl.builtin_sub.?.sub_dr.takeRaw() orelse return error.NoSample;
+    testing.allocator.free(reader.data);
+
+    // A reader is not a publication, nor the participant a subscription.
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, dp.vtable.ignore_publication(dp.ptr, reader.info.instance_handle));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, dp.vtable.ignore_subscription(dp.ptr, dp.vtable.get_instance_handle(dp.ptr)));
+    // Nor is a handle never given.
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, dp.vtable.ignore_publication(dp.ptr, 0x7FFF_0000));
 }
 
 // ── Retroactive-match scan vs. an ignore applied after discovery ────────────
@@ -571,8 +591,18 @@ test "ignore_publication/subscription: duplicate call is idempotent" {
     const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_publication(dp.ptr, 42));
-    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_publication(dp.ptr, 42));
-    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_subscription(dp.ptr, 42));
-    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_subscription(dp.ptr, 42));
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+    h.fireWriterDiscovered(dp_impl, makePrefix(0xE5), "SomeTopic", "T");
+    h.fireReaderDiscovered(dp_impl, makePrefix(0xE6), "SomeTopic", "T");
+    const writer = dp_impl.builtin_sub.?.pub_dr.takeRaw() orelse return error.NoSample;
+    testing.allocator.free(writer.data);
+    const reader = dp_impl.builtin_sub.?.sub_dr.takeRaw() orelse return error.NoSample;
+    testing.allocator.free(reader.data);
+
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_publication(dp.ptr, writer.info.instance_handle));
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_publication(dp.ptr, writer.info.instance_handle));
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_subscription(dp.ptr, reader.info.instance_handle));
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_subscription(dp.ptr, reader.info.instance_handle));
+    try testing.expectEqual(@as(usize, 1), dp_impl.ignored_publications.items.len);
+    try testing.expectEqual(@as(usize, 1), dp_impl.ignored_subscriptions.items.len);
 }
