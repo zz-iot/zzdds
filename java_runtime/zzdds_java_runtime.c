@@ -609,6 +609,76 @@ static void zzdds_java_ts_ctx_deinit(void *ctx_v) {
     free(ctx);
 }
 
+/* A type's key projection: its generated `static byte[]
+ * projectKeyFromCdr(byte[] sample)`. Separate from zzdds_java_ts_ctx: the
+ * participant keeps a projection, and releases it, independently of the
+ * registration, which a later registration of the type replaces. */
+typedef struct {
+    jclass cls; /* global ref */
+    jmethodID mid;
+} zzdds_java_projection_ctx;
+
+/* zzdds_project_key_fn for Java. Runs on zzdds's receive thread as well as
+ * the writing thread, so, as zzdds_java_compute_key_hash_impl, it deletes
+ * every local reference and clears any exception it causes. */
+static DDS_ReturnCode_t zzdds_java_project_key(void *ctx_v, const uint8_t *sample, size_t sample_len, uint8_t *out, size_t out_size, size_t *out_len)
+{
+    zzdds_java_projection_ctx *ctx = (zzdds_java_projection_ctx *)ctx_v;
+    JNIEnv *env = zzdds_java_get_env();
+    if (env == NULL || sample_len > INT32_MAX) return DDS_RETCODE_ERROR;
+    jbyteArray arr = (*env)->NewByteArray(env, (jsize)sample_len);
+    if (arr == NULL) {
+        (*env)->ExceptionClear(env);
+        return DDS_RETCODE_ERROR;
+    }
+    (*env)->SetByteArrayRegion(env, arr, 0, (jsize)sample_len, (const jbyte *)sample);
+    jbyteArray key = (jbyteArray)(*env)->CallStaticObjectMethod(env, ctx->cls, ctx->mid, arr);
+    (*env)->DeleteLocalRef(env, arr);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        return DDS_RETCODE_ERROR;
+    }
+    if (key == NULL) return DDS_RETCODE_ERROR;
+    jsize len = (*env)->GetArrayLength(env, key);
+    *out_len = (size_t)len;
+    DDS_ReturnCode_t rc = DDS_RETCODE_PRECONDITION_NOT_MET;
+    if ((size_t)len <= out_size) {
+        if (len > 0) (*env)->GetByteArrayRegion(env, key, 0, len, (jbyte *)out);
+        rc = DDS_RETCODE_OK;
+    }
+    (*env)->DeleteLocalRef(env, key);
+    return rc;
+}
+
+static void zzdds_java_projection_ctx_deinit(void *ctx_v)
+{
+    zzdds_java_projection_ctx *ctx = (zzdds_java_projection_ctx *)ctx_v;
+    JNIEnv *env = zzdds_java_get_env();
+    if (env != NULL) (*env)->DeleteGlobalRef(env, ctx->cls);
+    free(ctx);
+}
+
+/* Installs the type's projectKeyFromCdr as its key projection, when it has
+ * one: generated with --generate-zzdds-wrappers. Without one, an instance
+ * keeps its first sample whole. */
+static void zzdds_java_set_key_projection(JNIEnv *env, void *participant, const char *type_name, jclass typeClass)
+{
+    jmethodID mid = (*env)->GetStaticMethodID(env, typeClass, "projectKeyFromCdr", "([B)[B");
+    if (mid == NULL) {
+        (*env)->ExceptionClear(env);
+        return;
+    }
+    zzdds_java_projection_ctx *ctx = malloc(sizeof(*ctx));
+    if (ctx == NULL) return;
+    ctx->cls = (jclass)(*env)->NewGlobalRef(env, typeClass);
+    ctx->mid = mid;
+    if (ctx->cls == NULL || zzdds_set_key_projection(participant, type_name, zzdds_java_project_key, ctx, zzdds_java_projection_ctx_deinit) != DDS_RETCODE_OK) {
+        /* Not installed: the context is still ours. */
+        if (ctx->cls != NULL) (*env)->DeleteGlobalRef(env, ctx->cls);
+        free(ctx);
+    }
+}
+
 JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_registerTypeSupport(
     JNIEnv *env, jclass self_cls, jobject participant, jstring typeName, jclass typeClass)
 {
@@ -650,6 +720,7 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_registerTypeSupport(
     zzdds_compute_key_hash_ctx_fn key_only_fn = ctx->key_only_mid != NULL ? zzdds_java_compute_key_hash_key_only_ctx : NULL;
     zzdds_get_field_from_cdr_ctx_fn get_field_fn = ctx->get_field_mid != NULL ? zzdds_java_get_field_from_cdr_ctx : NULL;
     int rc = zzdds_register_type_support_ctx(p, type_name_c, zzdds_java_compute_key_hash_ctx, key_only_fn, get_field_fn, ctx, zzdds_java_ts_ctx_deinit);
+    if (rc == 0) zzdds_java_set_key_projection(env, p, type_name_c, typeClass);
     (*env)->ReleaseStringUTFChars(env, typeName, type_name_c);
 
     if (rc != 0) {
@@ -663,7 +734,7 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_registerTypeSupport(
 }
 
 JNIEXPORT jlong JNICALL Java_io_zzdds_runtime_ZzddsRuntime_registerInstanceRaw(
-    JNIEnv *env, jclass self_cls, jobject writer, jbyteArray keyHash)
+    JNIEnv *env, jclass self_cls, jobject writer, jbyteArray keyHash, jbyteArray keyCdr)
 {
     (void)self_cls;
     static zzdds_java_class_cache type_check_cache = {0};
@@ -673,24 +744,35 @@ JNIEXPORT jlong JNICALL Java_io_zzdds_runtime_ZzddsRuntime_registerInstanceRaw(
     if (w == NULL) return 0;
     jbyte hash_buf[16];
     (*env)->GetByteArrayRegion(env, keyHash, 0, 16, hash_buf);
-    return (jlong)zzdds_register_instance_raw(w, (const uint8_t *)hash_buf);
+    /* The key-only CDR is optional: a null keyCdr registers without one. */
+    jbyte *key = NULL;
+    jsize key_len = 0;
+    if (keyCdr != NULL) {
+        key_len = (*env)->GetArrayLength(env, keyCdr);
+        key = (*env)->GetByteArrayElements(env, keyCdr, NULL);
+        if (key == NULL) return 0;
+    }
+    DDS_InstanceHandle_t h = zzdds_register_instance_raw(w, (const uint8_t *)hash_buf, (const uint8_t *)key, (size_t)key_len);
+    if (key != NULL) (*env)->ReleaseByteArrayElements(env, keyCdr, key, JNI_ABORT);
+    return (jlong)h;
 }
 
-/* get_key_value's payload for `handle`'s instance on a writer (is_writer)
- * or reader, as a new byte[] in *out. Reads into a stack buffer and, for a
- * larger payload, again at the size zzdds reports: the payload is stored
- * once and never changes. Returns a DDS return code. */
-static jint zzdds_java_get_key_value(JNIEnv *env, void *entity, bool is_writer, jlong handle, jbyteArray *out)
+/* get_key_value's key for `handle`'s instance on a writer (is_writer) or
+ * reader, as a new byte[] in *out, and whether it is key-only CDR in
+ * *key_only. Reads into a stack buffer and, for a larger key, again at the
+ * size zzdds reports: a stored key never changes. Returns a DDS return code. */
+static jint zzdds_java_get_key_value(JNIEnv *env, void *entity, bool is_writer, jlong handle, jbyteArray *out, bool *key_only)
 {
     uint8_t stack_buf[4096];
     uint8_t *buf = stack_buf;
     size_t size = sizeof(stack_buf);
     size_t len = 0;
+    int key_only_c = 0;
     DDS_ReturnCode_t rc;
     for (;;) {
         rc = is_writer
-            ? zzdds_get_key_value_writer(entity, (DDS_InstanceHandle_t)handle, buf, size, &len)
-            : zzdds_get_key_value_reader(entity, (DDS_InstanceHandle_t)handle, buf, size, &len);
+            ? zzdds_get_key_value_writer(entity, (DDS_InstanceHandle_t)handle, buf, size, &len, &key_only_c)
+            : zzdds_get_key_value_reader(entity, (DDS_InstanceHandle_t)handle, buf, size, &len, &key_only_c);
         if (rc != DDS_RETCODE_PRECONDITION_NOT_MET || buf != stack_buf) break;
         buf = malloc(len);
         if (buf == NULL) return (jint)DDS_RETCODE_OUT_OF_RESOURCES;
@@ -700,13 +782,30 @@ static jint zzdds_java_get_key_value(JNIEnv *env, void *entity, bool is_writer, 
         *out = len <= INT32_MAX ? (*env)->NewByteArray(env, (jsize)len) : NULL;
         if (*out == NULL) rc = DDS_RETCODE_OUT_OF_RESOURCES;
         else (*env)->SetByteArrayRegion(env, *out, 0, (jsize)len, (const jbyte *)buf);
+        *key_only = key_only_c != 0;
     }
     if (buf != stack_buf) free(buf);
     return (jint)rc;
 }
 
+/* Puts get_key_value's key in payloadOut[0] and, if keyOnlyOut is not null,
+ * whether it is key-only CDR in keyOnlyOut[0]. */
+static jint zzdds_java_get_key_value_out(JNIEnv *env, void *entity, bool is_writer, jlong handle, jobjectArray payloadOut, jbooleanArray keyOnlyOut)
+{
+    jbyteArray payload = NULL;
+    bool key_only = false;
+    jint rc = zzdds_java_get_key_value(env, entity, is_writer, handle, &payload, &key_only);
+    if (rc != DDS_RETCODE_OK) return rc;
+    (*env)->SetObjectArrayElement(env, payloadOut, 0, payload);
+    if (keyOnlyOut != NULL) {
+        jboolean k = key_only ? JNI_TRUE : JNI_FALSE;
+        (*env)->SetBooleanArrayRegion(env, keyOnlyOut, 0, 1, &k);
+    }
+    return rc;
+}
+
 JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_getKeyValueWriter(
-    JNIEnv *env, jclass self_cls, jobject writer, jlong handle, jobjectArray payloadOut)
+    JNIEnv *env, jclass self_cls, jobject writer, jlong handle, jobjectArray payloadOut, jbooleanArray keyOnlyOut)
 {
     (void)self_cls;
     static zzdds_java_class_cache type_check_cache = {0};
@@ -715,23 +814,7 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_getKeyValueWriter(
     if (!zzdds_java_require_instance_of(env, writer, &type_check_cache, "io/zzdds/dcps/DataWriterImpl", "writer")) return (jint)DDS_RETCODE_BAD_PARAMETER;
     void *w = zzdds_java_unbox(env, writer);
     if (w == NULL) return (jint)DDS_RETCODE_BAD_PARAMETER;
-    jbyteArray payload = NULL;
-    jint rc = zzdds_java_get_key_value(env, w, true, handle, &payload);
-    if (rc == DDS_RETCODE_OK) (*env)->SetObjectArrayElement(env, payloadOut, 0, payload);
-    return rc;
-}
-
-JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_getKeyValueWriterRaw(
-    JNIEnv *env, jclass self_cls, jobject writer, jlong handle)
-{
-    (void)self_cls;
-    static zzdds_java_class_cache type_check_cache = {0};
-    if (!zzdds_java_require_non_null(env, writer, "writer")) return NULL;
-    if (!zzdds_java_require_instance_of(env, writer, &type_check_cache, "io/zzdds/dcps/DataWriterImpl", "writer")) return NULL;
-    void *w = zzdds_java_unbox(env, writer);
-    if (w == NULL) return NULL;
-    jbyteArray payload = NULL;
-    return zzdds_java_get_key_value(env, w, true, handle, &payload) == DDS_RETCODE_OK ? payload : NULL;
+    return zzdds_java_get_key_value_out(env, w, true, handle, payloadOut, keyOnlyOut);
 }
 
 JNIEXPORT jlong JNICALL Java_io_zzdds_runtime_ZzddsRuntime_lookupInstanceWriterRaw(
@@ -751,7 +834,7 @@ JNIEXPORT jlong JNICALL Java_io_zzdds_runtime_ZzddsRuntime_lookupInstanceWriterR
 /* ── get_key_value / lookup_instance (reader) ─────────────────────────── */
 
 JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_getKeyValueReader(
-    JNIEnv *env, jclass self_cls, jobject reader, jlong handle, jobjectArray payloadOut)
+    JNIEnv *env, jclass self_cls, jobject reader, jlong handle, jobjectArray payloadOut, jbooleanArray keyOnlyOut)
 {
     (void)self_cls;
     static zzdds_java_class_cache type_check_cache = {0};
@@ -760,23 +843,7 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_getKeyValueReader(
     if (!zzdds_java_require_instance_of(env, reader, &type_check_cache, "io/zzdds/dcps/DataReaderImpl", "reader")) return (jint)DDS_RETCODE_BAD_PARAMETER;
     void *r = zzdds_java_unbox(env, reader);
     if (r == NULL) return (jint)DDS_RETCODE_BAD_PARAMETER;
-    jbyteArray payload = NULL;
-    jint rc = zzdds_java_get_key_value(env, r, false, handle, &payload);
-    if (rc == DDS_RETCODE_OK) (*env)->SetObjectArrayElement(env, payloadOut, 0, payload);
-    return rc;
-}
-
-JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_getKeyValueReaderRaw(
-    JNIEnv *env, jclass self_cls, jobject reader, jlong handle)
-{
-    (void)self_cls;
-    static zzdds_java_class_cache type_check_cache = {0};
-    if (!zzdds_java_require_non_null(env, reader, "reader")) return NULL;
-    if (!zzdds_java_require_instance_of(env, reader, &type_check_cache, "io/zzdds/dcps/DataReaderImpl", "reader")) return NULL;
-    void *r = zzdds_java_unbox(env, reader);
-    if (r == NULL) return NULL;
-    jbyteArray payload = NULL;
-    return zzdds_java_get_key_value(env, r, false, handle, &payload) == DDS_RETCODE_OK ? payload : NULL;
+    return zzdds_java_get_key_value_out(env, r, false, handle, payloadOut, keyOnlyOut);
 }
 
 JNIEXPORT jlong JNICALL Java_io_zzdds_runtime_ZzddsRuntime_lookupInstanceReaderRaw(

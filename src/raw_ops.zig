@@ -204,44 +204,36 @@ pub fn writeRawWithTimestamp(
 }
 
 /// register_instance: the handle of the key hash's instance on this writer,
-/// registering it if it is not; HANDLE_NIL if it cannot be.
-pub fn registerInstanceRaw(writer: DDS.DataWriter, key_hash: [16]u8) DDS.InstanceHandle_t {
+/// registering it if it is not; HANDLE_NIL if it cannot be. `key_cdr`, the
+/// instance's key-only CDR with its encapsulation header, is its key for
+/// get_key_value if it has none yet; empty if the caller has none.
+pub fn registerInstanceRaw(writer: DDS.DataWriter, key_hash: [16]u8, key_cdr: []const u8) DDS.InstanceHandle_t {
     const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
     if (!impl.acquireQuiesce()) return DDS.HANDLE_NIL;
     defer impl.releaseQuiesce();
-    return impl.registerInstance(key_hash);
+    return impl.registerInstance(key_hash, key_cdr);
 }
 
 /// Why get_key_value failed, named for its DDS return code: the writer or
 /// reader is deleted, not yet enabled (DDS 1.4 §2.2.2.1.1.7), or the handle
-/// names no instance of it with an alive write or sample (§2.2.2.4.2.9,
-/// §2.2.2.5.3.29).
+/// names no instance of it with a key (§2.2.2.4.2.9, §2.2.2.5.3.29); or there
+/// is no memory for the copy.
 pub const GetKeyValueError = error{ AlreadyDeleted, NotEnabled, BadParameter, OutOfMemory };
 
-/// get_key_value: a copy, from `allocator`, of the stored CDR payload of the
-/// first alive write of the instance `handle` names, which a binding decodes
-/// the key fields from. Copied while the writer is held, so a concurrent
-/// delete cannot free it under the caller; the caller frees it.
-pub fn getKeyValueWriter(writer: DDS.DataWriter, handle: DDS.InstanceHandle_t, allocator: std.mem.Allocator) GetKeyValueError![]u8 {
+/// The key an instance keeps for get_key_value: key-only CDR, or a complete
+/// sample when the type has no key projection (`key_value.KeyValue`).
+pub const KeyValue = @import("dcps/key_value.zig").KeyValue;
+
+/// get_key_value: a copy, from `allocator`, of the key the instance `handle`
+/// names keeps, which a binding decodes the key fields from. Copied while
+/// the writer is held, so a concurrent delete cannot free it under the
+/// caller; the caller frees its `payload`.
+pub fn getKeyValueWriter(writer: DDS.DataWriter, handle: DDS.InstanceHandle_t, allocator: std.mem.Allocator) GetKeyValueError!KeyValue {
     const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
     if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
     defer impl.releaseQuiesce();
-    return allocator.dupe(u8, try impl.keyValue(handle));
-}
-
-/// Return the stored CDR payload for the given instance handle, or null if
-/// no alive write has been made for this instance.
-/// The slice is valid until the next write to the writer or writer deinit.
-/// Superseded by `getKeyValueWriter`, which says why it failed; kept until
-/// zidl's generated Zig calls that.
-pub fn getKeyValueRawWriter(
-    writer: DDS.DataWriter,
-    handle: DDS.InstanceHandle_t,
-) ?[]u8 {
-    const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
-    if (!impl.acquireQuiesce()) return null;
-    defer impl.releaseQuiesce();
-    return impl.getKeyValueRaw(handle);
+    const kv = try impl.keyValue(handle);
+    return .{ .payload = try allocator.dupe(u8, kv.payload), .key_only = kv.key_only };
 }
 
 /// lookup_instance: the handle of the key hash's instance on this writer, or
@@ -577,28 +569,14 @@ pub fn readFilteredRaw(
     tmp.items.len = 0;
 }
 
-/// get_key_value: as `getKeyValueWriter`, the first alive sample of the
-/// instance `handle` names on `reader`.
-pub fn getKeyValueReader(reader: DDS.DataReader, handle: DDS.InstanceHandle_t, allocator: std.mem.Allocator) GetKeyValueError![]u8 {
+/// get_key_value: as `getKeyValueWriter`, for the instance `handle` names
+/// on `reader`.
+pub fn getKeyValueReader(reader: DDS.DataReader, handle: DDS.InstanceHandle_t, allocator: std.mem.Allocator) GetKeyValueError!KeyValue {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
     defer impl.releaseQuiesce();
-    return allocator.dupe(u8, try impl.keyValue(handle));
-}
-
-/// Return the stored CDR payload for the given instance handle, or null if
-/// no alive sample has arrived for this instance.
-/// The slice is valid until the next write to this reader or reader deinit.
-/// Superseded by `getKeyValueReader`, which says why it failed; kept until
-/// zidl's generated Zig calls that.
-pub fn getKeyValueRawReader(
-    reader: DDS.DataReader,
-    handle: DDS.InstanceHandle_t,
-) ?[]u8 {
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
-    if (!impl.acquireQuiesce()) return null;
-    defer impl.releaseQuiesce();
-    return impl.getKeyValueRaw(handle);
+    const kv = try impl.keyValue(handle);
+    return .{ .payload = try allocator.dupe(u8, kv.payload), .key_only = kv.key_only };
 }
 
 /// lookup_instance: the handle of the key hash's instance on this reader if

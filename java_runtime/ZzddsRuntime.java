@@ -64,36 +64,27 @@ public final class ZzddsRuntime {
      */
     public static native int registerTypeSupport(Object participant, String typeName, Class<?> typeClass);
 
-    /** Computes the deterministic instance handle for `keyHash` -- the raw
-     * path to `register_instance`. zzdds's own instance registration has no
-     * side effects beyond this computation (see zzdds_register_instance_raw). */
-    public static native long registerInstanceRaw(Object writer, byte[] keyHash);
+    /** The raw path to `register_instance`: the handle of `keyHash`'s
+     * instance on `writer`, registering it if it is not, or 0 (HANDLE_NIL).
+     * `keyCdr`, the instance's key-only CDR with its encapsulation header, is
+     * its key for `get_key_value` if it has none yet; null if there is none. */
+    public static native long registerInstanceRaw(Object writer, byte[] keyHash, byte[] keyCdr);
 
     /** The raw path to the writer-side `get_key_value`: returns a DDS return
-     * code and, on OK, puts the stored CDR payload of the first alive write
-     * of `handle`'s instance in `payloadOut[0]`. BAD_PARAMETER for a handle
-     * with no such write, NOT_ENABLED until the writer is enabled,
-     * ALREADY_DELETED once it is deleted. */
-    public static native int getKeyValueWriter(Object writer, long handle, byte[][] payloadOut);
-
-    /** Returns the stored CDR payload for `handle`, or null on any failure.
-     * Superseded by getKeyValueWriter, which says why it failed; kept until
-     * zidl's generated Java calls that. */
-    public static native byte[] getKeyValueWriterRaw(Object writer, long handle);
+     * code and, on OK, puts the key `handle`'s instance keeps in
+     * `payloadOut[0]` and, if `keyOnlyOut` is not null, whether it is
+     * key-only CDR (else a complete sample) in `keyOnlyOut[0]`. BAD_PARAMETER
+     * for a handle whose instance has no key, NOT_ENABLED until the writer is
+     * enabled, ALREADY_DELETED once it is deleted. */
+    public static native int getKeyValueWriter(Object writer, long handle, byte[][] payloadOut, boolean[] keyOnlyOut);
 
     /** Looks up the instance handle for `keyHash` -- the raw path to the
-     * writer-side `lookup_instance`. Returns `DDS_HANDLE_NIL` (0) if no
-     * alive write has been made for that key. */
+     * writer-side `lookup_instance`. Returns `DDS_HANDLE_NIL` (0) if that
+     * key's instance was never registered or written. */
     public static native long lookupInstanceWriterRaw(Object writer, byte[] keyHash);
 
-    /** As getKeyValueWriter, for the reader-side `get_key_value`: the
-     * stored payload is the instance's first alive sample. */
-    public static native int getKeyValueReader(Object reader, long handle, byte[][] payloadOut);
-
-    /** Returns the stored CDR payload for `handle`, or null on any failure.
-     * Superseded by getKeyValueReader; kept until zidl's generated Java calls
-     * that. */
-    public static native byte[] getKeyValueReaderRaw(Object reader, long handle);
+    /** As getKeyValueWriter, for the reader-side `get_key_value`. */
+    public static native int getKeyValueReader(Object reader, long handle, byte[][] payloadOut, boolean[] keyOnlyOut);
 
     /** Looks up the instance handle for `keyHash` -- the raw path to the
      * reader-side `lookup_instance`. Returns `DDS_HANDLE_NIL` (0) if no

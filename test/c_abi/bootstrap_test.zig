@@ -635,12 +635,12 @@ test "bootstrap: register_instance_raw gives a key one handle per writer" {
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
-    const h1 = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
+    const h1 = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH, null, 0);
     try testing.expect(h1 != 0);
-    try testing.expectEqual(h1, bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH));
+    try testing.expectEqual(h1, bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH, null, 0));
     var other_key: [16]u8 = undefined;
     @memset(&other_key, 0x01);
-    const h3 = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &other_key);
+    const h3 = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &other_key, null, 0);
     try testing.expect(h3 != 0 and h1 != h3);
 }
 
@@ -652,13 +652,17 @@ test "bootstrap: register_instance_raw gives a key one handle per writer" {
 /// IDL op (the replacement for the deleted `zzdds_write_raw` bootstrap
 /// export), using the fixture pair's unboxed `pair.dw` fat pointer.
 fn writeRawViaOp(dw: DDS.DataWriter, key_hash: [16]u8, payload: []const u8) void {
+    writeKindViaOp(dw, .ALIVE_WRITE_KIND, key_hash, payload);
+}
+
+fn writeKindViaOp(dw: DDS.DataWriter, kind: DDS.WriteKind, key_hash: [16]u8, payload: []const u8) void {
     var kh = key_hash;
     var key_hash_seq = DDS.OctetSeq{ ._maximum = 16, ._length = 16, ._buffer = &kh, ._release = false };
     var pl_buf: [4096]u8 = undefined;
     @memcpy(pl_buf[0..payload.len], payload);
     var payload_seq = DDS.OctetSeq{ ._maximum = @intCast(payload.len), ._length = @intCast(payload.len), ._buffer = &pl_buf, ._release = false };
     const ts = DDS.Time_t{ .sec = DDS.TIME_INVALID_SEC, .nanosec = DDS.TIME_INVALID_NSEC };
-    _ = dw.vtable.write_raw(dw.ptr, &key_hash_seq, DDS.HANDLE_NIL, &payload_seq, .ALIVE_WRITE_KIND, &ts);
+    _ = dw.vtable.write_raw(dw.ptr, &key_hash_seq, DDS.HANDLE_NIL, &payload_seq, kind, &ts);
 }
 
 test "bootstrap: get_key_value_writer returns CDR payload after alive write" {
@@ -670,13 +674,16 @@ test "bootstrap: get_key_value_writer returns CDR payload after alive write" {
     writeRawViaOp(pair.dw, KEY_HASH, &PAYLOAD);
     fx.settle();
 
-    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
+    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH, null, 0);
     var buf: [64]u8 = undefined;
     var len: usize = 0;
-    const rc = bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &buf, buf.len, &len);
+    var key_only: c_int = -1;
+    const rc = bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &buf, buf.len, &len, &key_only);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
     try testing.expectEqual(PAYLOAD.len, len);
     try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..len]);
+    // No key projection: the instance keeps its first sample whole.
+    try testing.expectEqual(@as(c_int, 0), key_only);
 }
 
 test "bootstrap: get_key_value_writer returns BAD_PARAMETER for a handle with no alive write" {
@@ -687,12 +694,12 @@ test "bootstrap: get_key_value_writer returns BAD_PARAMETER for a handle with no
 
     var dummy_key: [16]u8 = undefined;
     @memset(&dummy_key, 0xFF);
-    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &dummy_key);
+    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &dummy_key, null, 0);
     var buf: [64]u8 = undefined;
     var len: usize = 0;
-    const rc = bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &buf, buf.len, &len);
+    const rc = bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &buf, buf.len, &len, null);
     try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, rc);
-    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, DDS.HANDLE_NIL, &buf, buf.len, &len));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, DDS.HANDLE_NIL, &buf, buf.len, &len, null));
     try testing.expectError(error.BadParameter, zzdds.getKeyValueWriter(pair.dw, ih, alloc));
 }
 
@@ -704,7 +711,7 @@ test "bootstrap: lookup_instance_writer matches register_instance_raw" {
 
     // A key never registered or written has no handle.
     try testing.expectEqual(@as(DDS.InstanceHandle_t, 0), bootstrap.zzdds_lookup_instance_writer(pair.dw_boxed, &KEY_HASH));
-    const h1 = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
+    const h1 = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH, null, 0);
     const h2 = bootstrap.zzdds_lookup_instance_writer(pair.dw_boxed, &KEY_HASH);
     try testing.expectEqual(h1, h2);
 }
@@ -717,28 +724,140 @@ test "bootstrap: get_key_value_writer reports the size of a payload that does no
 
     writeRawViaOp(pair.dw, KEY_HASH, &PAYLOAD);
     fx.settle();
-    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
+    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH, null, 0);
 
     // Too short: PRECONDITION_NOT_MET, as read for a sequence too short,
     // with the size needed.
     var small: [2]u8 = undefined;
     var len: usize = 0;
-    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &small, small.len, &len));
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &small, small.len, &len, null));
     try testing.expectEqual(PAYLOAD.len, len);
     // A NULL buffer of size 0 asks for the size the same way.
     len = 0;
-    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, null, 0, &len));
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, null, 0, &len, null));
     try testing.expectEqual(PAYLOAD.len, len);
     // Unusable arguments.
-    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, null, 8, &len));
-    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &small, small.len, null));
-    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, null, 8, &len));
-    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, &small, small.len, null));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, null, 8, &len, null));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &small, small.len, null, null));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, null, 8, &len, null));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, &small, small.len, null, null));
 
-    // The raw op returns a copy of the same payload.
+    // The raw op returns a copy of the same key.
     const copy = try zzdds.getKeyValueWriter(pair.dw, ih, alloc);
-    defer alloc.free(copy);
-    try testing.expectEqualSlices(u8, &PAYLOAD, copy);
+    defer alloc.free(copy.payload);
+    try testing.expectEqualSlices(u8, &PAYLOAD, copy.payload);
+    try testing.expect(!copy.key_only);
+}
+
+// ── What an instance keeps for get_key_value (key_value.KeyValue) ──────────
+
+/// A key-only payload no sample here equals, so each test can tell it from
+/// PAYLOAD.
+const KEY_ONLY = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0x4B };
+var no_ctx: u8 = 0;
+
+fn hashOfAny(_: *anyopaque, _: []const u8) [16]u8 {
+    return KEY_HASH;
+}
+
+fn projectToKeyOnly(_: *anyopaque, _: []const u8, allocator: std.mem.Allocator) ?[]u8 {
+    return allocator.dupe(u8, &KEY_ONLY) catch null;
+}
+
+/// Registers BootType on both participants, with a key projection when
+/// `projection` is set.
+fn registerBootType(fx: *Fixture, projection: bool) !void {
+    const ts: zzdds.dcps.TypeSupport = .{
+        .ctx = &no_ctx,
+        .compute_key_hash = hashOfAny,
+        .has_key = true,
+        .key_projection = if (projection) .{ .ctx = &no_ctx, .project = projectToKeyOnly } else null,
+    };
+    try testing.expect(zzdds.registerTypeSupport(fx.dp_w, "BootType", ts));
+    try testing.expect(zzdds.registerTypeSupport(fx.dp_r, "BootType", ts));
+}
+
+/// get_key_value through the C API: the key and its key-only flag.
+fn expectKey(boxed: *anyopaque, is_writer: bool, handle: DDS.InstanceHandle_t, expected: []const u8, expected_key_only: c_int) !void {
+    var buf: [64]u8 = undefined;
+    var len: usize = 0;
+    var key_only: c_int = -1;
+    const rc = if (is_writer)
+        bootstrap.zzdds_get_key_value_writer(boxed, handle, &buf, buf.len, &len, &key_only)
+    else
+        bootstrap.zzdds_get_key_value_reader(boxed, handle, &buf, buf.len, &len, &key_only);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expectEqualSlices(u8, expected, buf[0..len]);
+    try testing.expectEqual(expected_key_only, key_only);
+}
+
+/// The reader's handle for KEY_HASH's instance, alive or not.
+fn readerHandle(dr: DDS.DataReader) DDS.InstanceHandle_t {
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+    impl.mu.lock();
+    defer impl.mu.unlock();
+    return impl.instances.handleOfKey(KEY_HASH) orelse DDS.HANDLE_NIL;
+}
+
+test "get_key_value: with a key projection, writer and reader keep the key-only CDR, not the sample" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    try registerBootType(&fx, true);
+    const pair = fx.makeWriterReader();
+
+    writeRawViaOp(pair.dw, KEY_HASH, &PAYLOAD);
+    fx.settle();
+    try expectKey(pair.dw_boxed, true, bootstrap.zzdds_lookup_instance_writer(pair.dw_boxed, &KEY_HASH), &KEY_ONLY, 1);
+    try expectKey(pair.dr_boxed, false, bootstrap.zzdds_lookup_instance_reader(pair.dr_boxed, &KEY_HASH), &KEY_ONLY, 1);
+
+    const kv = try zzdds.getKeyValueReader(pair.dr, readerHandle(pair.dr), alloc);
+    defer alloc.free(kv.payload);
+    try testing.expectEqualSlices(u8, &KEY_ONLY, kv.payload);
+    try testing.expect(kv.key_only);
+}
+
+test "get_key_value: an instance only registered keeps register_instance's key, which a later write does not replace" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH, &KEY_ONLY, KEY_ONLY.len);
+    try testing.expect(ih != DDS.HANDLE_NIL);
+    try expectKey(pair.dw_boxed, true, ih, &KEY_ONLY, 1);
+    writeRawViaOp(pair.dw, KEY_HASH, &PAYLOAD);
+    try expectKey(pair.dw_boxed, true, ih, &KEY_ONLY, 1);
+}
+
+test "get_key_value: a dispose gives a registered instance its key on the writer, and the reader its instance's" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    // Registered without a key, then disposed: the dispose's key-only CDR.
+    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH, null, 0);
+    var buf: [64]u8 = undefined;
+    var len: usize = 0;
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &buf, buf.len, &len, null));
+    writeKindViaOp(pair.dw, .DISPOSE_WRITE_KIND, KEY_HASH, &KEY_ONLY);
+    fx.settle();
+    try expectKey(pair.dw_boxed, true, ih, &KEY_ONLY, 1);
+    // The reader knows the instance only from the dispose.
+    const rh = readerHandle(pair.dr);
+    try testing.expect(rh != DDS.HANDLE_NIL);
+    try expectKey(pair.dr_boxed, false, rh, &KEY_ONLY, 1);
+}
+
+test "get_key_value: a dispose of an instance the writer never registered keeps nothing" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    writeKindViaOp(pair.dw, .DISPOSE_WRITE_KIND, KEY_HASH, &KEY_ONLY);
+    try testing.expectEqual(DDS.HANDLE_NIL, bootstrap.zzdds_lookup_instance_writer(pair.dw_boxed, &KEY_HASH));
 }
 
 // DDS 1.4 §2.2.2.1.1.7: get_key_value is none of the operations a disabled
@@ -760,8 +879,8 @@ test "bootstrap: get_key_value returns NOT_ENABLED for a disabled writer and rea
 
     var buf: [64]u8 = undefined;
     var len: usize = 0;
-    try testing.expectEqual(DDS.RETCODE_NOT_ENABLED, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, 1, &buf, buf.len, &len));
-    try testing.expectEqual(DDS.RETCODE_NOT_ENABLED, bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, 1, &buf, buf.len, &len));
+    try testing.expectEqual(DDS.RETCODE_NOT_ENABLED, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, 1, &buf, buf.len, &len, null));
+    try testing.expectEqual(DDS.RETCODE_NOT_ENABLED, bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, 1, &buf, buf.len, &len, null));
     try testing.expectError(error.NotEnabled, zzdds.getKeyValueWriter(pair.dw, 1, alloc));
     try testing.expectError(error.NotEnabled, zzdds.getKeyValueReader(pair.dr, 1, alloc));
 }
@@ -776,7 +895,7 @@ test "bootstrap: get_key_value returns ALREADY_DELETED for a deleted writer and 
     const pair = fx.makeWriterReader();
     writeRawViaOp(pair.dw, KEY_HASH, &PAYLOAD);
     fx.settle();
-    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
+    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH, null, 0);
 
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(pair.dw.ptr));
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(pair.dr.ptr));
@@ -787,11 +906,11 @@ test "bootstrap: get_key_value returns ALREADY_DELETED for a deleted writer and 
 
     var buf: [64]u8 = undefined;
     var len: usize = 0;
-    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &buf, buf.len, &len));
-    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, &buf, buf.len, &len));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &buf, buf.len, &len, null));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, &buf, buf.len, &len, null));
     try testing.expectError(error.AlreadyDeleted, zzdds.getKeyValueWriter(pair.dw, ih, alloc));
     try testing.expectError(error.AlreadyDeleted, zzdds.getKeyValueReader(pair.dr, ih, alloc));
-    try testing.expectEqual(DDS.HANDLE_NIL, bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH));
+    try testing.expectEqual(DDS.HANDLE_NIL, bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH, null, 0));
     try testing.expectEqual(DDS.HANDLE_NIL, bootstrap.zzdds_lookup_instance_writer(pair.dw_boxed, &KEY_HASH));
     try testing.expectEqual(DDS.HANDLE_NIL, bootstrap.zzdds_lookup_instance_reader(pair.dr_boxed, &KEY_HASH));
 
@@ -813,7 +932,7 @@ test "bootstrap: get_key_value_reader returns CDR payload after receive" {
     const ih = bootstrap.zzdds_lookup_instance_reader(pair.dr_boxed, &KEY_HASH);
     var buf: [64]u8 = undefined;
     var len: usize = 0;
-    const rc = bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, &buf, buf.len, &len);
+    const rc = bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, &buf, buf.len, &len, null);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
     try testing.expectEqual(PAYLOAD.len, len);
     try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..len]);
@@ -828,10 +947,10 @@ test "bootstrap: get_key_value_reader returns BAD_PARAMETER for a handle with no
     // The writer's handle for a key the reader has not received.
     var dummy_key: [16]u8 = undefined;
     @memset(&dummy_key, 0xFF);
-    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &dummy_key);
+    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &dummy_key, null, 0);
     var buf: [64]u8 = undefined;
     var len: usize = 0;
-    const rc = bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, &buf, buf.len, &len);
+    const rc = bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, &buf, buf.len, &len, null);
     try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, rc);
     try testing.expectError(error.BadParameter, zzdds.getKeyValueReader(pair.dr, ih, alloc));
 }

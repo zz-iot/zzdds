@@ -29,6 +29,8 @@ const listener_fallback = @import("../util/listener_fallback.zig");
 const publisher_mod = @import("publisher.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const handle_registry = @import("handle_registry.zig");
+const key_value = @import("key_value.zig");
+pub const KeyValue = key_value.KeyValue;
 const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 const listener_lane = @import("listener_lane.zig");
 const extensions_mod = @import("../c_abi/extensions.zig");
@@ -81,7 +83,7 @@ fn baseFromListenerEx(l: ZZDDS.DataWriterListenerEx) DDS.DataWriterListener {
     };
 }
 
-const InstanceRegistry = handle_registry.HandleRegistry([16]u8, ?[]u8);
+const InstanceRegistry = handle_registry.HandleRegistry([16]u8, ?KeyValue);
 
 pub const DataWriterImpl = struct {
     alloc: std.mem.Allocator,
@@ -244,10 +246,16 @@ pub const DataWriterImpl = struct {
     wlp_last_assert_ns: std.atomic.Value(i64),
 
     /// The writer's instances, by key hash (docs/design/handle-registries.md).
-    /// Each holds the payload of its first alive write, for get_key_value,
-    /// or null until then; the payload is never replaced, and instances are
-    /// not yet removed.
+    /// Each holds its key for get_key_value, or null until it has one: the
+    /// key-only CDR register_instance, a dispose or an unregister passed, or
+    /// its first alive write's, projected by `key_projection` or else whole.
+    /// The first one is kept and never replaced, and instances are not yet
+    /// removed.
     instances: InstanceRegistry = .empty,
+    /// The type's projection of a sample to its key, set as the writer is
+    /// created (`key_value.KeyProjection`) and released as it is freed; null
+    /// keeps whole samples.
+    key_projection: ?key_value.KeyProjection = null,
     /// Guards `instances` only. `writeRaw` mutates it (insert-only) from
     /// the application thread(s) -- concurrent `write()` on one DataWriter is
     /// spec-legal, and the RTPS layer (`proto_writer`) is already internally
@@ -387,8 +395,9 @@ pub const DataWriterImpl = struct {
         self.qos.deinit(self.alloc);
         {
             var it = self.instances.iterator();
-            while (it.next()) |e| if (e.value.*) |kv| self.alloc.free(kv);
+            while (it.next()) |e| if (e.value.*) |kv| self.alloc.free(kv.payload);
         }
+        if (self.key_projection) |kp| kp.release();
         self.subscription_handles.deinit(self.alloc);
         self.instances.deinit(self.alloc);
         // NOTE: proto_writer lifecycle is owned by the participant (via
@@ -447,7 +456,13 @@ pub const DataWriterImpl = struct {
         }
 
         // An alive write registers its instance, if not already registered.
-        if (kind == .alive) self.registerWrittenInstance(key_hash, data) catch return error.OutOfResources;
+        // A dispose or unregister carries the key-only CDR, which a
+        // registered instance without a key yet keeps.
+        if (kind == .alive) {
+            self.registerWrittenInstance(key_hash, data) catch return error.OutOfResources;
+        } else {
+            self.keepKey(key_hash, KeyValue.ofKey(self.alloc, data));
+        }
         const sn = try self.proto_writer.write(kind, source_timestamp, key_hash, key_hash, data);
         self.last_sn.store(sn, .monotonic);
         const now_ns = self.timer_clock.nowNs();
@@ -535,26 +550,52 @@ pub const DataWriterImpl = struct {
     }
 
     fn registerWrittenInstance(self: *Self, key_hash: [16]u8, data: []const u8) error{ OutOfMemory, OutOfHandles }!void {
-        self.instances_mu.lock();
-        defer self.instances_mu.unlock();
-        const e = try self.instances.getOrPut(self.alloc, key_hash);
-        if (!e.found_existing) e.value.* = null;
-        // Kept for get_key_value; a write that cannot keep it still succeeds,
-        // and the next one tries again.
-        if (e.value.* == null) e.value.* = self.alloc.dupe(u8, data) catch null;
+        const has_key = blk: {
+            self.instances_mu.lock();
+            defer self.instances_mu.unlock();
+            const e = try self.instances.getOrPut(self.alloc, key_hash);
+            if (!e.found_existing) e.value.* = null;
+            break :blk e.value.* != null;
+        };
+        // Projected without the lock: the projection is the binding's code.
+        // A write whose key cannot be kept still succeeds, and the next one
+        // tries again.
+        if (!has_key) self.keepKey(key_hash, KeyValue.ofSample(self.key_projection, self.alloc, data));
+    }
+
+    /// Gives a registered instance `maybe_kv` if it has no key yet, and
+    /// frees it otherwise, as for an instance that is not registered.
+    fn keepKey(self: *Self, key_hash: [16]u8, maybe_kv: ?KeyValue) void {
+        const kv = maybe_kv orelse return;
+        {
+            self.instances_mu.lock();
+            defer self.instances_mu.unlock();
+            if (self.instances.getByKey(key_hash)) |value| if (value.* == null) {
+                value.* = kv;
+                return;
+            };
+        }
+        self.alloc.free(kv.payload);
     }
 
     /// register_instance: the handle of the key hash's instance, registering
     /// it if it is not; HANDLE_NIL if it cannot be, or if the writer is not
     /// enabled (its NOT_ENABLED, as it returns no code). For a keyless topic
-    /// the key hash is all zeros, so there is one instance.
-    pub fn registerInstance(self: *Self, key_hash: [16]u8) DDS.InstanceHandle_t {
+    /// the key hash is all zeros, so there is one instance. `key_cdr`, the
+    /// instance's key-only CDR, becomes its key for get_key_value if it has
+    /// none yet; empty if the caller has none.
+    pub fn registerInstance(self: *Self, key_hash: [16]u8, key_cdr: []const u8) DDS.InstanceHandle_t {
         if (!self.enabled.load(.acquire)) return DDS.HANDLE_NIL;
-        self.instances_mu.lock();
-        defer self.instances_mu.unlock();
-        const e = self.instances.getOrPut(self.alloc, key_hash) catch return DDS.HANDLE_NIL;
-        if (!e.found_existing) e.value.* = null;
-        return e.handle;
+        const handle = blk: {
+            self.instances_mu.lock();
+            defer self.instances_mu.unlock();
+            const e = self.instances.getOrPut(self.alloc, key_hash) catch return DDS.HANDLE_NIL;
+            if (!e.found_existing) e.value.* = null;
+            if (e.value.* != null) return e.handle;
+            break :blk e.handle;
+        };
+        self.keepKey(key_hash, KeyValue.ofKey(self.alloc, key_cdr));
+        return handle;
     }
 
     /// lookup_instance: the handle of the key hash's instance, or HANDLE_NIL
@@ -574,25 +615,24 @@ pub const DataWriterImpl = struct {
         return std.mem.eql(u8, &key, &key_hash);
     }
 
-    /// The payload of the first alive write of the instance `handle` names,
-    /// or null if there was none or `handle` names no instance of this writer.
-    /// The slice stays valid for the life of the writer: it is never replaced
-    /// or freed before then. The lock only guards the registry while a
-    /// concurrent `writeRaw` may grow it.
-    pub fn getKeyValueRaw(self: *Self, handle: DDS.InstanceHandle_t) ?[]u8 {
+    /// The key of the instance `handle` names, or null if it has none yet or
+    /// `handle` names no instance of this writer. Its payload stays valid for
+    /// the life of the writer: it is never replaced or freed before then. The
+    /// lock only guards the registry while a concurrent `writeRaw` may grow it.
+    pub fn storedKey(self: *Self, handle: DDS.InstanceHandle_t) ?KeyValue {
         self.instances_mu.lock();
         defer self.instances_mu.unlock();
         const kv = self.instances.get(handle) orelse return null;
         return kv.*;
     }
 
-    /// get_key_value's checks around `getKeyValueRaw`, for a caller holding
-    /// a quiesce reference: NotEnabled until enabled (DDS 1.4
-    /// §2.2.2.1.1.7), and BadParameter for a handle that names no instance
-    /// with an alive write (§2.2.2.4.2.9).
-    pub fn keyValue(self: *Self, handle: DDS.InstanceHandle_t) error{ NotEnabled, BadParameter }![]u8 {
+    /// get_key_value's checks around `storedKey`, for a caller holding a
+    /// quiesce reference: NotEnabled until enabled (DDS 1.4 §2.2.2.1.1.7),
+    /// and BadParameter for a handle that names no instance of this writer
+    /// with a key (§2.2.2.4.2.9).
+    pub fn keyValue(self: *Self, handle: DDS.InstanceHandle_t) error{ NotEnabled, BadParameter }!KeyValue {
         if (!self.enabled.load(.acquire)) return error.NotEnabled;
-        return self.getKeyValueRaw(handle) orelse error.BadParameter;
+        return self.storedKey(handle) orelse error.BadParameter;
     }
 
     /// Send a NOT_ALIVE_DISPOSED change for the given instance.

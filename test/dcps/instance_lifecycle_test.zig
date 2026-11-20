@@ -331,9 +331,9 @@ test "registerInstance: a writer's instance has one handle; lookupInstance finds
     const pair = fx.makeWriterReader(.{}, .{});
 
     try testing.expectEqual(DDS.HANDLE_NIL, pair.dw.lookupInstance(NIL_KEY));
-    const handle = pair.dw.registerInstance(NIL_KEY);
+    const handle = pair.dw.registerInstance(NIL_KEY, &.{});
     try testing.expect(handle != DDS.HANDLE_NIL);
-    try testing.expectEqual(handle, pair.dw.registerInstance(NIL_KEY));
+    try testing.expectEqual(handle, pair.dw.registerInstance(NIL_KEY, &.{}));
     try testing.expectEqual(handle, pair.dw.lookupInstance(NIL_KEY));
 
     // A write registers the instance it writes.

@@ -264,7 +264,7 @@ int main(int argc, char **argv) {
     /* -- get_key_value() round-trip on instance A's handle -- */
     SensorReading key_holder;
     memset(&key_holder, 0, sizeof(key_holder));
-    if (SensorReadingDataWriter_get_key_value(&writer, handle_a, &key_holder) != 0) {
+    if (SensorReadingDataWriter_get_key_value(&writer, &key_holder, handle_a) != DDS_RETCODE_OK) {
         fprintf(stderr, "FAIL: get_key_value() failed for sensor_id=1\n");
         return 1;
     }

@@ -25,6 +25,8 @@ const topic_mod = @import("topic.zig");
 const waitset = @import("waitset.zig");
 const writer_mod = @import("writer.zig");
 const handle_registry = @import("handle_registry.zig");
+const key_value = @import("key_value.zig");
+pub const KeyValue = key_value.KeyValue;
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 const Hook = @import("../runtime/core.zig").Hook;
@@ -285,9 +287,10 @@ const InstanceEntry = struct {
     /// Null until a sample of the instance is accepted: a sample a filter
     /// drops still registers its instance.
     instance_state: ?DDS.InstanceStateKind = null,
-    /// Full CDR payload of the first alive sample for this instance.
-    /// Used by getKeyValueRaw. Null until the first alive sample arrives.
-    key_cdr: ?[]u8 = null,
+    /// Its key for get_key_value, or null until it has one: the key-only CDR
+    /// of a dispose or unregister, or its first alive sample's, projected by
+    /// the reader's `key_projection` or else whole. Never replaced.
+    key: ?KeyValue = null,
     /// Number of times this instance has become ALIVE after being disposed / after
     /// having no writers, respectively (DDS spec §2.2.2.5.4). Stamped onto each
     /// sample's SampleInfo at receipt time.
@@ -614,6 +617,10 @@ pub const DataReaderImpl = struct {
     /// view_state, get_key_value, TIME_BASED_FILTER and EXCLUSIVE ownership.
     /// Not yet removed.
     instances: InstanceRegistry = .empty,
+    /// The type's projection of a sample to its key, set as the reader is
+    /// created (`key_value.KeyProjection`) and released as it is freed; null
+    /// keeps whole samples.
+    key_projection: ?key_value.KeyProjection = null,
     /// A built-in reader: its instances are entities, whose handles the
     /// participant supplies (`pushBuiltinCdr`), so that the built-in topics,
     /// `ignore_*` and `get_discovered_*` agree. Resolving such a handle scans
@@ -791,6 +798,8 @@ pub const DataReaderImpl = struct {
         self.listener_ex_box.releaseHold(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.c_abi.free(self.alloc);
+        // No sample is processed any more: done with the key projection.
+        if (self.key_projection) |kp| kp.release();
         // Tear down any ReadCondition/QueryCondition the app never explicitly
         // deleted via delete_readcondition(). Each condition's own teardown
         // detaches it from any WaitSet that still has it attached, removes
@@ -875,7 +884,7 @@ pub const DataReaderImpl = struct {
     /// Free the instances and what they hold.
     fn deinitInstances(self: *Self, alloc: std.mem.Allocator) void {
         var it = self.instances.iterator();
-        while (it.next()) |e| if (e.value.key_cdr) |kc| alloc.free(kc);
+        while (it.next()) |e| if (e.value.key) |kv| alloc.free(kv.payload);
         self.instances.deinit(alloc);
     }
 
@@ -901,9 +910,16 @@ pub const DataReaderImpl = struct {
         return null;
     }
 
-    /// Store `data` as the instance's key CDR if not already set.
-    fn storeKeyIfNeeded(self: *Self, entry: *InstanceEntry, data: []const u8) void {
-        if (entry.key_cdr == null) entry.key_cdr = self.alloc.dupe(u8, data) catch null;
+    /// Gives the instance its key from this change if it has none yet: an
+    /// alive sample's, projected when the type has a projection, or a
+    /// dispose's or unregister's key-only CDR. Run under `mu`, as the content
+    /// filter's field reads are; it projects once per instance.
+    fn storeKeyIfNeeded(self: *Self, entry: *InstanceEntry, kind: history_mod.ChangeKind, data: []const u8) void {
+        if (entry.key != null) return;
+        entry.key = if (kind == .alive)
+            KeyValue.ofSample(self.key_projection, self.alloc, data)
+        else
+            KeyValue.ofKey(self.alloc, data);
     }
 
     /// Inject a CDR sample of the keyless instance directly, bypassing the
@@ -1160,7 +1176,7 @@ pub const DataReaderImpl = struct {
             const wip = self.coherent_wip.getPtr(change.writer_guid) orelse
                 return self.dropSampleUnlock(copy, coherent_queued);
             const states = entry.applyChange(change.kind);
-            if (change.kind == .alive) self.storeKeyIfNeeded(entry, copy);
+            self.storeKeyIfNeeded(entry, change.kind, copy);
             const src_time = change.source_timestamp.toTime();
             const coh_expiry: ?i64 = if (change.kind == .alive)
                 // Prefer this sample's own PID_LIFESPAN inline QoS (RTPS §8.7.2 Table
@@ -1303,7 +1319,7 @@ pub const DataReaderImpl = struct {
 
         // Build SampleInfo from the CacheChange.
         const states = entry.applyChange(change.kind);
-        if (change.kind == .alive) self.storeKeyIfNeeded(entry, copy);
+        self.storeKeyIfNeeded(entry, change.kind, copy);
         const src_time = change.source_timestamp.toTime();
         const expiry: ?i64 = if (change.kind == .alive)
             // See the coherent-set branch above: inline PID_LIFESPAN takes
@@ -2267,23 +2283,23 @@ pub const DataReaderImpl = struct {
         self.finalizeGenerationRanksLocked(out.items[start..]);
     }
 
-    /// Return the stored CDR payload for the given instance handle, or null if
-    /// no alive sample has arrived for this instance.
-    /// The returned slice is valid until the next write to this reader or deinit.
-    pub fn getKeyValueRaw(self: *Self, handle: DDS.InstanceHandle_t) ?[]u8 {
+    /// The key of the instance `handle` names, or null if it has none yet or
+    /// `handle` names no instance of this reader. Its payload stays valid for
+    /// the life of the reader: it is never replaced or freed before then.
+    pub fn storedKey(self: *Self, handle: DDS.InstanceHandle_t) ?KeyValue {
         self.mu.lock();
         defer self.mu.unlock();
         const entry = self.instanceOfHandleLocked(handle) orelse return null;
-        return entry.key_cdr;
+        return entry.key;
     }
 
-    /// get_key_value's checks around `getKeyValueRaw`, for a caller holding
-    /// a quiesce reference: NotEnabled until enabled (DDS 1.4
-    /// §2.2.2.1.1.7), and BadParameter for a handle that names no instance
-    /// with an alive sample (§2.2.2.5.3.29).
-    pub fn keyValue(self: *Self, handle: DDS.InstanceHandle_t) error{ NotEnabled, BadParameter }![]u8 {
+    /// get_key_value's checks around `storedKey`, for a caller holding a
+    /// quiesce reference: NotEnabled until enabled (DDS 1.4 §2.2.2.1.1.7),
+    /// and BadParameter for a handle that names no instance of this reader
+    /// with a key (§2.2.2.5.3.29).
+    pub fn keyValue(self: *Self, handle: DDS.InstanceHandle_t) error{ NotEnabled, BadParameter }!KeyValue {
         if (!self.enabled.load(.acquire)) return error.NotEnabled;
-        return self.getKeyValueRaw(handle) orelse error.BadParameter;
+        return self.storedKey(handle) orelse error.BadParameter;
     }
 
     /// lookup_instance: the handle of the key hash's instance if it is ALIVE,

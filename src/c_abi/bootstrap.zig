@@ -18,6 +18,7 @@ const DDS = @import("zzdds_generated").DDS;
 
 const DataWriterImpl = @import("../dcps/writer.zig").DataWriterImpl;
 const DataReaderImpl = @import("../dcps/reader.zig").DataReaderImpl;
+const KeyValue = @import("../dcps/key_value.zig").KeyValue;
 const TopicImpl = @import("../dcps/topic.zig").TopicImpl;
 const nil = @import("../dcps/nil.zig");
 const zidl_bindings = @import("zidl_bindings");
@@ -76,14 +77,20 @@ pub export fn zzdds_topic_as_description(topic: ?*anyopaque) callconv(.c) ?*anyo
 
 /// register_instance: the handle of the key hash's instance on `writer`,
 /// registering it if it is not; 0 (HANDLE_NIL) if it cannot be.
+/// `key_cdr[0..key_cdr_len]`, the instance's key-only CDR with its
+/// encapsulation header, is its key for get_key_value if it has none yet;
+/// NULL and 0 if the caller has none.
 pub export fn zzdds_register_instance_raw(
     writer: *anyopaque,
     key_hash: *const [16]u8,
+    key_cdr: ?[*]const u8,
+    key_cdr_len: usize,
 ) callconv(.c) DDS.InstanceHandle_t {
     const impl = writerImpl(writer) orelse return DDS.HANDLE_NIL;
     if (!impl.acquireQuiesce()) return DDS.HANDLE_NIL;
     defer impl.releaseQuiesce();
-    return impl.registerInstance(key_hash.*);
+    const key: []const u8 = if (key_cdr) |k| k[0..key_cdr_len] else &.{};
+    return impl.registerInstance(key_hash.*, key);
 }
 
 fn writerImpl(writer: *anyopaque) ?*DataWriterImpl {
@@ -100,14 +107,16 @@ fn readerImpl(reader: *anyopaque) ?*DataReaderImpl {
     return @ptrCast(@alignCast(r.ptr));
 }
 
-/// get_key_value's payload: zzdds keeps the whole first alive sample of an
-/// instance, and a binding decodes the key fields from it. Copies it for the
-/// instance `handle` names into `buf[0..buf_size]` and sets `*len_out` to
-/// its size. Returns
+/// get_key_value's payload: the key an instance keeps (`KeyValue`), which a
+/// binding decodes the key fields from. Copies it for the instance `handle`
+/// names into `buf[0..buf_size]`, sets `*len_out` to its size and, if
+/// `key_only_out` is not NULL, `*key_only_out` to 1 for key-only CDR (the
+/// form a dispose carries) or 0 for a complete sample. Returns
 /// - OK;
 /// - BAD_PARAMETER for a NULL `writer` or `len_out`, a NULL `buf` with a
 ///   nonzero `buf_size`, or a handle that names no instance of `writer`
-///   with an alive write (DDS 1.4 §2.2.2.4.2.9);
+///   with a key (DDS 1.4 §2.2.2.4.2.9): one registered with its key-only
+///   CDR, written, disposed or unregistered has one;
 /// - ALREADY_DELETED for a deleted `writer`;
 /// - NOT_ENABLED until `writer` is enabled (§2.2.2.1.1.7);
 /// - PRECONDITION_NOT_MET when the payload does not fit in `buf_size`, as
@@ -120,9 +129,10 @@ pub export fn zzdds_get_key_value_writer(
     buf: ?[*]u8,
     buf_size: usize,
     len_out: ?*usize,
+    key_only_out: ?*c_int,
 ) callconv(.c) DDS.ReturnCode_t {
     const impl = writerImpl(writer) orelse return DDS.RETCODE_BAD_PARAMETER;
-    const out = keyValueOut(buf, buf_size, len_out) orelse return DDS.RETCODE_BAD_PARAMETER;
+    const out = keyValueOut(buf, buf_size, len_out, key_only_out) orelse return DDS.RETCODE_BAD_PARAMETER;
     if (!impl.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
     defer impl.releaseQuiesce();
     return copyKeyValue(impl.keyValue(handle), out);
@@ -141,42 +151,44 @@ pub export fn zzdds_lookup_instance_writer(
 }
 
 /// As `zzdds_get_key_value_writer`, for a reader: BAD_PARAMETER for a handle
-/// that names no instance of `reader` with an alive sample (DDS 1.4
-/// §2.2.2.5.3.29).
+/// that names no instance of `reader` with a key (DDS 1.4 §2.2.2.5.3.29),
+/// which an instance has once a sample, dispose or unregister of it arrives.
 pub export fn zzdds_get_key_value_reader(
     reader: *anyopaque,
     handle: DDS.InstanceHandle_t,
     buf: ?[*]u8,
     buf_size: usize,
     len_out: ?*usize,
+    key_only_out: ?*c_int,
 ) callconv(.c) DDS.ReturnCode_t {
     const impl = readerImpl(reader) orelse return DDS.RETCODE_BAD_PARAMETER;
-    const out = keyValueOut(buf, buf_size, len_out) orelse return DDS.RETCODE_BAD_PARAMETER;
+    const out = keyValueOut(buf, buf_size, len_out, key_only_out) orelse return DDS.RETCODE_BAD_PARAMETER;
     if (!impl.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
     defer impl.releaseQuiesce();
     return copyKeyValue(impl.keyValue(handle), out);
 }
 
-const KeyValueOut = struct { buf: ?[*]u8, size: usize, len: *usize };
+const KeyValueOut = struct { buf: ?[*]u8, size: usize, len: *usize, key_only: ?*c_int };
 
-/// The caller's buffer and length out, or null if they are unusable. A NULL
+/// The caller's buffer and outputs, or null if they are unusable. A NULL
 /// buffer is only for asking the size, with `buf_size` 0.
-fn keyValueOut(buf: ?[*]u8, buf_size: usize, len_out: ?*usize) ?KeyValueOut {
+fn keyValueOut(buf: ?[*]u8, buf_size: usize, len_out: ?*usize, key_only_out: ?*c_int) ?KeyValueOut {
     const len = len_out orelse return null;
     if (buf == null and buf_size != 0) return null;
-    return .{ .buf = buf, .size = buf_size, .len = len };
+    return .{ .buf = buf, .size = buf_size, .len = len, .key_only = key_only_out };
 }
 
-/// Copies the payload into the caller's buffer, which the caller's quiesce
-/// reference keeps the payload alive for.
-fn copyKeyValue(kv: error{ NotEnabled, BadParameter }![]u8, out: KeyValueOut) DDS.ReturnCode_t {
-    const payload = kv catch |e| return switch (e) {
+/// Copies the key into the caller's buffer, which the caller's quiesce
+/// reference keeps the stored key alive for.
+fn copyKeyValue(result: error{ NotEnabled, BadParameter }!KeyValue, out: KeyValueOut) DDS.ReturnCode_t {
+    const kv = result catch |e| return switch (e) {
         error.NotEnabled => DDS.RETCODE_NOT_ENABLED,
         error.BadParameter => DDS.RETCODE_BAD_PARAMETER,
     };
-    out.len.* = payload.len;
-    if (payload.len > out.size) return DDS.RETCODE_PRECONDITION_NOT_MET;
-    if (payload.len != 0) @memcpy(out.buf.?[0..payload.len], payload);
+    out.len.* = kv.payload.len;
+    if (out.key_only) |k| k.* = @intFromBool(kv.key_only);
+    if (kv.payload.len > out.size) return DDS.RETCODE_PRECONDITION_NOT_MET;
+    if (kv.payload.len != 0) @memcpy(out.buf.?[0..kv.payload.len], kv.payload);
     return DDS.RETCODE_OK;
 }
 

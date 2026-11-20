@@ -10,20 +10,29 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-20
 
-- `zzdds_get_key_value_writer` and `zzdds_get_key_value_reader` return DDS return codes
-  rather than `-1` and `-2`: BAD_PARAMETER for a handle that names no instance with an
-  alive write or sample (DDS 1.4 §2.2.2.4.2.9, §2.2.2.5.3.29) or a NULL argument,
+- `get_key_value` keeps each instance's key rather than its first sample, answers for every
+  instance it knows, and returns DDS return codes (`docs/decisions.md`). An instance keeps
+  the key-only CDR `register_instance` passes, or a dispose or unregister carries; or its
+  first alive sample's, projected to key-only by the type's new key projection
+  (`TypeSupport.key_projection`, or `zzdds_set_key_projection` from C, which zidl's
+  generated typesupport registers), or else kept whole. Before, it kept only the first alive
+  sample: an instance only registered, or a reader's instance known only from a dispose, got
+  BAD_PARAMETER, and each instance held a whole sample. `zzdds_register_instance_raw`,
+  `raw_ops.registerInstanceRaw` and the Java runtime's `registerInstanceRaw` take the key-only
+  CDR. `zzdds_get_key_value_writer` and `zzdds_get_key_value_reader` say whether a key is
+  key-only and return DDS return codes rather than `-1` and `-2`: BAD_PARAMETER for a handle
+  whose instance has no key (DDS 1.4 §2.2.2.4.2.9, §2.2.2.5.3.29) or a NULL argument,
   ALREADY_DELETED, NOT_ENABLED for a disabled writer or reader (§2.2.2.1.1.7), and
   PRECONDITION_NOT_MET for a buffer too small, with the size still reported; a NULL buffer
   of size 0 asks for it. They, `zzdds_register_instance_raw` and both
   `zzdds_lookup_instance_*` now hold the entity's quiesce reference while they use it, so a
-  concurrent delete cannot free it under them. New `raw_ops` `getKeyValueWriter` and
-  `getKeyValueReader` return a copy of the payload, made while they hold the writer or
-  reader, or `error.AlreadyDeleted`, `NotEnabled` or `BadParameter`, and
-  the Java runtime's new `getKeyValueWriter` and `getKeyValueReader` the return code; they
-  replace `getKeyValueRaw*`, which stay until zidl's generated code moves over. The Java
-  runtime no longer fails `get_key_value` for a sample over 4KB: it asks again at the size
-  needed.
+  concurrent delete cannot free it under them. `raw_ops` `getKeyValueWriter` and
+  `getKeyValueReader` return a copy of the key, made while they hold the writer or reader,
+  or `error.AlreadyDeleted`, `NotEnabled` or `BadParameter`, and the Java runtime's
+  `getKeyValueWriter` and `getKeyValueReader` the return code; they replace
+  `getKeyValueRaw*`. Needs zidl v0.3.38 (pinned), whose generated `get_key_value` passes the
+  return codes on, takes `(key_holder, handle)` in C and C++, and is `int
+  get_key_value(Foo key_holder, long handle)` in Java; the registry examples use them.
 - A disabled entity takes what DDS 1.4 §2.2.2.1.1.7 lets it take, the same on every entity
   (`docs/decisions.md`). Deleting from a disabled DomainParticipant, Publisher or
   Subscriber now works: `delete_publisher`, `delete_subscriber`, `delete_topic`,

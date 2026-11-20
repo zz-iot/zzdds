@@ -13,6 +13,7 @@ const proto = @import("../protocol/interface.zig");
 const reader_mod = @import("reader.zig");
 const qos_change = @import("qos_change.zig");
 const topic_mod = @import("topic.zig");
+const key_value = @import("key_value.zig");
 const filter_mod = @import("filter.zig");
 const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
@@ -37,6 +38,12 @@ const extensions_mod = @import("../c_abi/extensions.zig");
 /// Callbacks from the owning DomainParticipant, supplied at construction time.
 pub const ParticipantCbs = struct {
     ctx: *anyopaque,
+
+    /// The key projection registered for `type_name`
+    /// (`TypeSupport.key_projection`), with a reference the new endpoint
+    /// releases as it is freed; null if none, and for participants that have
+    /// no type registry.
+    key_projection: ?*const fn (ctx: *anyopaque, type_name: []const u8) ?key_value.KeyProjection = null,
 
     /// Entity::enable()'s "factory not enabled" precondition (spec: can't
     /// enable a child before its own factory entity). Reads the owning
@@ -542,6 +549,7 @@ pub const SubscriberImpl = struct {
         };
         dr.topic_use = topic_use;
         dr.timers_changed = self.cbs.timers_changed;
+        if (self.cbs.key_projection) |f| dr.key_projection = f(self.cbs.ctx, a_topic.get_type_name());
         if (self.cbs.listener_group) |g| dr.listeners.attach(g);
         self.cbs.register_incompat_qos(
             self.cbs.ctx,

@@ -15,6 +15,7 @@ const nil = @import("nil.zig");
 const proto = @import("../protocol/interface.zig");
 const writer_mod = @import("writer.zig");
 const topic_mod = @import("topic.zig");
+const key_value = @import("key_value.zig");
 const qos_change = @import("qos_change.zig");
 const ZZDDS = @import("zzdds_ext_generated").zzdds;
 const extensions_mod = @import("../c_abi/extensions.zig");
@@ -39,6 +40,12 @@ const generated_config_mod = @import("../config/generated.zig");
 /// All function pointers must remain valid for the lifetime of the PublisherImpl.
 pub const ParticipantCbs = struct {
     ctx: *anyopaque,
+
+    /// The key projection registered for `type_name`
+    /// (`TypeSupport.key_projection`), with a reference the new endpoint
+    /// releases as it is freed; null if none, and for participants that have
+    /// no type registry.
+    key_projection: ?*const fn (ctx: *anyopaque, type_name: []const u8) ?key_value.KeyProjection = null,
 
     /// Entity::enable()'s "factory not enabled" precondition (spec: can't
     /// enable a child before its own factory entity). Reads the owning
@@ -550,6 +557,7 @@ pub const PublisherImpl = struct {
         };
         dw.topic_use = parts.topic_use;
         dw.timers_changed = self.cbs.timers_changed;
+        if (self.cbs.key_projection) |f| dw.key_projection = f(self.cbs.ctx, a_topic.get_type_name());
         if (self.cbs.listener_group) |g| dw.listeners.attach(g);
         self.cbs.register_incompat_qos(
             self.cbs.ctx,

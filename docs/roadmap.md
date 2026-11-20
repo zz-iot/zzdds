@@ -345,20 +345,6 @@ or an optimisation on an already-improved path):
 
 ### Bindings
 
-- **zidl's generated `get_key_value` does not pass on the DDS return codes yet.** The C
-  API (`zzdds_get_key_value_writer`/`_reader`), `raw_ops` (`getKeyValueWriter`/`Reader`)
-  and the Java runtime (`ZzddsRuntime.getKeyValueWriter`/`Reader`) report
-  BAD_PARAMETER, ALREADY_DELETED, NOT_ENABLED and, for the C API, PRECONDITION_NOT_MET
-  for a buffer too small. zidl's generated code does not use them yet: C and C++ read
-  into a 4096-byte stack buffer, so a type whose samples are larger never gets its key,
-  and return a decode failure's own code; Java's `Foo get_key_value(long handle)` returns
-  null on any failure; Zig calls `getKeyValueRaw*` and returns `error.BadParameter` for
-  any failure. To do in zidl: C and C++ return `DDS_ReturnCode_t`, retry at the size the
-  C API reports and return RETCODE_ERROR for a payload that does not decode; Java becomes
-  `int get_key_value(Foo key_holder, long handle)`, filling key_holder's key fields; Zig
-  calls `getKeyValueWriter`/`Reader` and passes their errors on. Then a zidl release, and
-  a zzdds pin bump that removes `getKeyValueRaw*` from `raw_ops` and the Java runtime and
-  updates the registry examples.
 - **C++ application code still reaches raw C handles through `native_handle()`.** zidl's
   generated `{T}TypeSupport::register_type` and typed `{T}DataReader`/`{T}DataWriter`
   constructors take C-ABI handles (zidl roadmap, *C++ backend*), so the C++ examples

@@ -282,14 +282,39 @@ int zzdds_register_type_support_checked(DDS_DomainParticipant, const char *, zzd
  * On failure the caller retains ctx. Cleanup waits for endpoint processor and field-getter pins. */
 int zzdds_register_type_support_checked_ctx(DDS_DomainParticipant, const char *, zzdds_process_sample_ctx_fn, int has_key, zzdds_get_field_from_cdr_ctx_fn, void *ctx, void (*ctx_deinit)(void *));
 
-DDS_InstanceHandle_t zzdds_register_instance_raw(DDS_DataWriter writer, const uint8_t key_hash[16]);
+/* register_instance: the handle of the key hash's instance, registering it if
+ * it is not; 0 (DDS_HANDLE_NIL) if it cannot be. key_cdr[0..key_cdr_len], the
+ * instance's key-only CDR with its encapsulation header, is its key for
+ * get_key_value if it has none yet; NULL and 0 if the caller has none. */
+DDS_InstanceHandle_t zzdds_register_instance_raw(DDS_DataWriter writer, const uint8_t key_hash[16], const uint8_t *key_cdr, size_t key_cdr_len);
 
-/* get_key_value's payload: zzdds keeps the whole first alive sample of an
- * instance, and a binding decodes the key fields from it. Copies it for the
- * instance `handle` names into buf[0..buf_size] and sets *len_out to its size.
- * Returns DDS_RETCODE_OK; BAD_PARAMETER for a NULL writer or len_out, a NULL
- * buf with a nonzero buf_size, or a handle that names no instance with an
- * alive write; ALREADY_DELETED; NOT_ENABLED until the writer is enabled; or
+/* A type's key projection: writes the key-only CDR of the complete sample
+ * sample[0..sample_len] (both with their encapsulation header) to
+ * out[0..out_size] and its size to *out_len. Returns DDS_RETCODE_OK;
+ * PRECONDITION_NOT_MET when the key does not fit, with *out_len set to the
+ * size needed; or any other code if it cannot project the sample. Pure: it
+ * must not call DDS operations. */
+typedef DDS_ReturnCode_t (*zzdds_project_key_fn)(void *ctx, const uint8_t *sample, size_t sample_len, uint8_t *out, size_t out_size, size_t *out_len);
+
+/* Gives the type type_name, already registered on participant, a key
+ * projection, so that an instance keeps the key-only CDR of its first alive
+ * sample for get_key_value rather than the sample. Writers and readers created
+ * afterwards use it. Returns DDS_RETCODE_OK, and ctx passes to the participant,
+ * which releases it with ctx_deinit (if not NULL) as it is deleted, or at once
+ * if the type already has a projection, which it keeps. BAD_PARAMETER for a
+ * NULL participant or func, or an unregistered type, and OUT_OF_RESOURCES,
+ * leave ctx with the caller. */
+DDS_ReturnCode_t zzdds_set_key_projection(DDS_DomainParticipant participant, const char *type_name, zzdds_project_key_fn func, void *ctx, void (*ctx_deinit)(void *));
+
+/* get_key_value's payload: the key an instance keeps, which a binding decodes
+ * the key fields from. Copies it for the instance `handle` names into
+ * buf[0..buf_size], sets *len_out to its size and, if key_only_out is not
+ * NULL, *key_only_out to 1 for key-only CDR (the form a dispose carries) or 0
+ * for a complete sample. An instance has a key once it is registered with
+ * one, written, disposed or unregistered. Returns DDS_RETCODE_OK;
+ * BAD_PARAMETER for a NULL writer or len_out, a NULL buf with a nonzero
+ * buf_size, or a handle that names no instance of the writer with a key;
+ * ALREADY_DELETED; NOT_ENABLED until the writer is enabled; or
  * PRECONDITION_NOT_MET when the payload is larger than buf_size, with
  * *len_out still set: pass buf NULL and buf_size 0 to learn the size. */
 DDS_ReturnCode_t zzdds_get_key_value_writer(
@@ -297,18 +322,21 @@ DDS_ReturnCode_t zzdds_get_key_value_writer(
     DDS_InstanceHandle_t handle,
     uint8_t *buf,
     size_t buf_size,
-    size_t *len_out
+    size_t *len_out,
+    int *key_only_out
 );
 
 DDS_InstanceHandle_t zzdds_lookup_instance_writer(DDS_DataWriter writer, const uint8_t key_hash[16]);
 
-/* As zzdds_get_key_value_writer, for a reader's instance with an alive sample. */
+/* As zzdds_get_key_value_writer, for a reader's instance, which has a key once
+ * a sample, a dispose or an unregister of it has arrived. */
 DDS_ReturnCode_t zzdds_get_key_value_reader(
     DDS_DataReader reader,
     DDS_InstanceHandle_t handle,
     uint8_t *buf,
     size_t buf_size,
-    size_t *len_out
+    size_t *len_out,
+    int *key_only_out
 );
 
 DDS_InstanceHandle_t zzdds_lookup_instance_reader(DDS_DataReader reader, const uint8_t key_hash[16]);
