@@ -27,7 +27,7 @@ add_custom_target(generate_config_ping_types DEPENDS "${GENERATED_DIR}/config_pi
 add_library(config_ping_types STATIC "${GENERATED_DIR}/config_ping_cdr.c")
 add_dependencies(config_ping_types generate_config_ping_types)
 target_include_directories(config_ping_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(config_ping_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(config_ping_types PUBLIC ZZDDS::zzdds)
 
 add_executable(participant_config_pub src/publisher.c)
 if(MSVC)

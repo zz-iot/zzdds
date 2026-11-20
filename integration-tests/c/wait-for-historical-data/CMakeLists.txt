@@ -39,7 +39,7 @@ add_custom_target(generate_wait_for_historical_data_types DEPENDS "${GENERATED_D
 add_library(wait_for_historical_data_types STATIC "${GENERATED_DIR}/history_event_cdr.c")
 add_dependencies(wait_for_historical_data_types generate_wait_for_historical_data_types)
 target_include_directories(wait_for_historical_data_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(wait_for_historical_data_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(wait_for_historical_data_types PUBLIC ZZDDS::zzdds)
 
 add_executable(wait_for_historical_data_publisher src/publisher.c)
 target_link_libraries(wait_for_historical_data_publisher PRIVATE wait_for_historical_data_types ZZDDS::zzdds)

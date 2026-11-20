@@ -16,6 +16,7 @@ const topic_mod = @import("topic.zig");
 const filter_mod = @import("filter.zig");
 const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
+const DefaultQos = @import("default_qos.zig").DefaultQos;
 const time_mod = @import("../util/time.zig");
 const Hook = @import("../runtime/core.zig").Hook;
 const ListenerGroup = @import("listener_lane.zig").Group;
@@ -174,7 +175,9 @@ pub const SubscriberImpl = struct {
     alloc: std.mem.Allocator,
     participant: DDS.DomainParticipant,
     cbs: ParticipantCbs,
-    /// Replaced under `qos_mu`; the partitions are read under it.
+    /// Replaced under `qos_mu`, and read under it: its partitions, and its
+    /// PRESENTATION through `presentationQos`, which may change until the
+    /// Subscriber is enabled.
     qos: DDS.SubscriberQos,
     /// Orders a QoS change against the readers' preparations, so none is
     /// prepared with partitions replaced meanwhile.
@@ -208,7 +211,7 @@ pub const SubscriberImpl = struct {
     data_on_readers: std.atomic.Value(bool) = .init(false),
     status_cond: ?*waitset.StatusConditionImpl,
 
-    default_dr_qos: DDS.DataReaderQos,
+    default_dr_qos: DefaultQos(DDS.DataReaderQos),
 
     /// Active DataReader instances owned by this subscriber; guarded by `mu`.
     readers: std.ArrayListUnmanaged(*reader_mod.DataReaderImpl),
@@ -259,7 +262,7 @@ pub const SubscriberImpl = struct {
             .instance_handle = handle,
             .status_changes = 0,
             .status_cond = null,
-            .default_dr_qos = .{},
+            .default_dr_qos = .{ .value = .{} },
             .readers = .empty,
             .mu = .{},
         };
@@ -269,7 +272,7 @@ pub const SubscriberImpl = struct {
         errdefer self.qos.deinit(alloc);
         // See config/generated.zig's applyQosDefaults doc comment: this is the
         // one place a config-file QosDefaults value reaches get_default_datareader_qos().
-        generated_config_mod.applyQosDefaults(&self.default_dr_qos, &qos_defaults);
+        generated_config_mod.applyQosDefaults(&self.default_dr_qos.value, &qos_defaults);
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
         self.status_cond = sc;
         return self;
@@ -405,6 +408,14 @@ pub const SubscriberImpl = struct {
         return if (self.enabled.load(.acquire)) DDS.RETCODE_OK else DDS.RETCODE_NOT_ENABLED;
     }
 
+    /// PRESENTATION, read under `qos_mu`: `set_qos` replaces the whole QoS,
+    /// and may change PRESENTATION until the Subscriber is enabled.
+    fn presentationQos(self: *Self) DDS.PresentationQosPolicy {
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
+        return self.qos.presentation;
+    }
+
     fn vtGetStatusCond(ctx: *anyopaque) DDS.StatusCondition {
         const self = cast(ctx);
         if (self.status_cond) |sc| return sc.toDDSStatusCondition();
@@ -488,7 +499,7 @@ pub const SubscriberImpl = struct {
         const topic_use = self.cbs.retain_topic(self.cbs.ctx, a_topic.ptr) orelse return nil.nil_datareader;
         const topic_name = a_topic.get_name();
         const type_name = a_topic.get_type_name();
-        const presentation = self.qos.presentation;
+        const presentation = self.presentationQos();
         var subscription_handle = DDS.HANDLE_NIL;
         var guid: proto.Guid = undefined;
         const pr = self.cbs.create_proto_reader(
@@ -1305,7 +1316,7 @@ pub const SubscriberImpl = struct {
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);
-        const pres = self.qos.presentation;
+        const pres = self.presentationQos();
         if (!pres.coherent_access and !pres.ordered_access) return DDS.RETCODE_OK;
 
         // Snapshot of listener state for readers that received a coherent commit.
@@ -1416,7 +1427,7 @@ pub const SubscriberImpl = struct {
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self: *Self = @ptrCast(@alignCast(ctx));
-        const pres: DDS.PresentationQosPolicy = self.qos.presentation;
+        const pres = self.presentationQos();
         if (pres.ordered_access) {
             for (self.readers.items) |r| {
                 r.mu.lock();
@@ -1460,15 +1471,13 @@ pub const SubscriberImpl = struct {
     fn vtSetDefaultDrQos(ctx: *anyopaque, qos: *const DDS.DataReaderQos) DDS.ReturnCode_t {
         const self = cast(ctx);
         if (!qos_change.consistent(DDS.DataReaderQos, qos)) return DDS.RETCODE_INCONSISTENT_POLICY;
-        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        self.default_dr_qos.deinit(self.alloc);
-        self.default_dr_qos = new_qos;
+        self.default_dr_qos.set(self.alloc, qos) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetDefaultDrQos(ctx: *anyopaque, qos: *DDS.DataReaderQos) DDS.ReturnCode_t {
         const self = cast(ctx);
-        qos.* = self.default_dr_qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        qos.* = self.default_dr_qos.get(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 

@@ -36,7 +36,7 @@ add_library(discovery_dcps_impl STATIC
 )
 add_dependencies(discovery_dcps_impl generate_discovery_ping_types)
 target_include_directories(discovery_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(discovery_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(discovery_dcps_impl PUBLIC ZZDDS::zzdds)
 
 add_executable(discovery_pub src/publisher.cpp)
 if(MSVC)

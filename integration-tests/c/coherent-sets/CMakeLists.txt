@@ -39,7 +39,7 @@ add_custom_target(generate_coherent_sets_types DEPENDS "${GENERATED_DIR}/pose_gr
 add_library(coherent_sets_types STATIC "${GENERATED_DIR}/pose_group_cdr.c")
 add_dependencies(coherent_sets_types generate_coherent_sets_types)
 target_include_directories(coherent_sets_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(coherent_sets_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(coherent_sets_types PUBLIC ZZDDS::zzdds)
 
 add_executable(coherent_sets_pub src/publisher.c)
 target_link_libraries(coherent_sets_pub PRIVATE coherent_sets_types ZZDDS::zzdds)

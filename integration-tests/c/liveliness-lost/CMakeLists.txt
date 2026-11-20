@@ -35,7 +35,7 @@ add_custom_target(generate_liveliness_lost_types DEPENDS "${GENERATED_DIR}/livel
 add_library(liveliness_lost_types STATIC "${GENERATED_DIR}/liveliness_event_cdr.c")
 add_dependencies(liveliness_lost_types generate_liveliness_lost_types)
 target_include_directories(liveliness_lost_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(liveliness_lost_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(liveliness_lost_types PUBLIC ZZDDS::zzdds)
 
 add_executable(liveliness_lost_publisher src/publisher.c)
 target_link_libraries(liveliness_lost_publisher PRIVATE liveliness_lost_types ZZDDS::zzdds)

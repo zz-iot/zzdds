@@ -5,7 +5,9 @@
 it up. That job only checks the *contents* of the tree it just built, in place.
 This script closes the gap: it takes the finished tarball, extracts it into a
 fresh directory unrelated to the build tree, and confirms a downstream C/C++
-project can actually consume it from there.
+project can actually consume it from there. `ci.yml`'s `release-bundle` job
+runs it too, on Linux and macOS, so a pull request that breaks the bundle fails
+before the next release does.
 
 Steps:
 
@@ -27,7 +29,9 @@ Steps:
      pair exchanges its 10 samples (loads `libzzdds` from the relocated prefix:
      catches broken rpath / install-name).
   6. pkg-config -- `pkg-config --cflags --libs zzdds` from the relocated prefix
-     compiles, links and runs `test/release-bundle/consumer.c`.
+     compiles, links and runs `test/release-bundle/consumer.c`. Skipped on
+     Windows, and where pkg-config or a C compiler is missing unless
+     `--require-pkg-config` is given.
 
 `--configure-only` stops after step 4's `cmake` *configure* of the small
 consumer (no compiler, no run, no examples). It is a local-debugging aid for a
@@ -231,17 +235,21 @@ def run_hello_world_pair(build_dir: Path, prefix: Path, domain: int) -> None:
 
 # ── step 6: pkg-config ──────────────────────────────────────────────────────
 
-def check_pkgconfig(prefix: Path, work: Path) -> None:
+def check_pkgconfig(prefix: Path, work: Path, required: bool) -> None:
     if sys.platform == "win32":
         log("pkg-config: not exercised on Windows (zzdds.pc targets Unix toolchains) -- skipping")
         return
+
+    def skip(why: str) -> None:
+        if required:
+            fail(f"pkg-config: {why}, and --require-pkg-config is set")
+        log(f"pkg-config: {why} -- skipping (CMake path already covered)")
+
     if not shutil.which("pkg-config"):
-        log("pkg-config: not installed on this runner -- skipping (CMake path already covered)")
-        return
+        return skip("not installed on this runner")
     cc = os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
     if not cc:
-        log("pkg-config: no C compiler found -- skipping")
-        return
+        return skip("no C compiler found")
 
     env = dict(os.environ)
     env["PKG_CONFIG_PATH"] = str(prefix / "lib/pkgconfig") + (
@@ -318,6 +326,9 @@ def main() -> int:
                     help="comma-separated hello_world ports to build against the bundle "
                          "(default 'c,cpp'; the useful narrower value is 'c').")
     ap.add_argument("--with-java", action="store_true", help="compile/run Java hello_world using the relocated Java SDK (JDK required)")
+    ap.add_argument("--require-pkg-config", action="store_true",
+                    help="fail, rather than skip the pkg-config check, where pkg-config or a C compiler "
+                         "is missing (it is always skipped on Windows)")
     ap.add_argument("--work", type=Path, default=None, help="working directory (default: a fresh temp dir)")
     ap.add_argument("--keep", action="store_true", help="do not delete the working directory on exit")
     ap.add_argument("--domain-base", type=int, default=58,
@@ -379,7 +390,7 @@ def main() -> int:
         if args.with_java:
             check_java(prefix, args.examples_dir, args.skip_example_run, args.domain_base + 2)
 
-        check_pkgconfig(prefix, work)
+        check_pkgconfig(prefix, work, args.require_pkg_config)
 
         log("PASS")
         return 0

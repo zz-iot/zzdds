@@ -38,7 +38,7 @@ add_library(coherent_sets_dcps_impl STATIC
 )
 add_dependencies(coherent_sets_dcps_impl generate_coherent_sets_types)
 target_include_directories(coherent_sets_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(coherent_sets_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(coherent_sets_dcps_impl PUBLIC ZZDDS::zzdds)
 
 add_executable(coherent_sets_pub src/publisher.cpp)
 target_link_libraries(coherent_sets_pub PRIVATE coherent_sets_dcps_impl ZZDDS::zzdds)

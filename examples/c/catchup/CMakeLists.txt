@@ -27,7 +27,7 @@ add_custom_target(generate_catchup_types DEPENDS "${GENERATED_DIR}/catchup_sampl
 add_library(catchup_types STATIC "${GENERATED_DIR}/catchup_sample_cdr.c")
 add_dependencies(catchup_types generate_catchup_types)
 target_include_directories(catchup_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(catchup_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(catchup_types PUBLIC ZZDDS::zzdds)
 
 add_executable(catchup_pub src/publisher.c)
 if(MSVC)

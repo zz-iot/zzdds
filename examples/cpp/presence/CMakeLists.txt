@@ -40,7 +40,7 @@ add_library(presence_dcps_impl STATIC
 )
 add_dependencies(presence_dcps_impl generate_presence_types)
 target_include_directories(presence_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(presence_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(presence_dcps_impl PUBLIC ZZDDS::zzdds)
 
 add_executable(presence_pub src/publisher.cpp)
 if(MSVC)

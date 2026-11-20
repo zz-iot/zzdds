@@ -38,7 +38,7 @@ add_library(delete_contained_entities_dcps_impl STATIC
 )
 add_dependencies(delete_contained_entities_dcps_impl generate_delete_contained_entities_types)
 target_include_directories(delete_contained_entities_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(delete_contained_entities_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(delete_contained_entities_dcps_impl PUBLIC ZZDDS::zzdds)
 
 add_executable(delete_contained_entities_session src/session.cpp)
 target_link_libraries(delete_contained_entities_session PRIVATE delete_contained_entities_dcps_impl ZZDDS::zzdds)

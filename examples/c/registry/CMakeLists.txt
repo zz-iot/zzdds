@@ -27,7 +27,7 @@ add_custom_target(generate_registry_types DEPENDS "${GENERATED_DIR}/registry_sam
 add_library(registry_types STATIC "${GENERATED_DIR}/registry_sample_cdr.c")
 add_dependencies(registry_types generate_registry_types)
 target_include_directories(registry_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(registry_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(registry_types PUBLIC ZZDDS::zzdds)
 
 add_executable(registry_pub src/publisher.c)
 if(MSVC)

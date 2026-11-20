@@ -38,7 +38,7 @@ add_library(enable_defer_dcps_impl STATIC
 )
 add_dependencies(enable_defer_dcps_impl generate_enable_defer_types)
 target_include_directories(enable_defer_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(enable_defer_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(enable_defer_dcps_impl PUBLIC ZZDDS::zzdds)
 
 add_executable(enable_defer_configurer src/configurer.cpp)
 target_link_libraries(enable_defer_configurer PRIVATE enable_defer_dcps_impl ZZDDS::zzdds)

@@ -20,6 +20,7 @@ const ZZDDS = @import("zzdds_ext_generated").zzdds;
 const extensions_mod = @import("../c_abi/extensions.zig");
 const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
+const DefaultQos = @import("default_qos.zig").DefaultQos;
 const time_mod = @import("../util/time.zig");
 const Hook = @import("../runtime/core.zig").Hook;
 const ListenerGroup = @import("listener_lane.zig").Group;
@@ -160,7 +161,9 @@ pub const PublisherImpl = struct {
     alloc: std.mem.Allocator,
     participant: DDS.DomainParticipant,
     cbs: ParticipantCbs,
-    /// Replaced under `qos_mu`; the partitions are read under it.
+    /// Replaced under `qos_mu`, and read under it: its partitions, and its
+    /// PRESENTATION through `presentationQos`, which may change until the
+    /// Publisher is enabled.
     qos: DDS.PublisherQos,
     /// Orders a QoS change against the writers' preparations, so none is
     /// prepared with partitions replaced meanwhile.
@@ -185,7 +188,7 @@ pub const PublisherImpl = struct {
     status_changes: DDS.StatusMask,
     status_cond: ?*waitset.StatusConditionImpl,
 
-    default_dw_qos: DDS.DataWriterQos,
+    default_dw_qos: DefaultQos(DDS.DataWriterQos),
 
     /// Active DataWriter instances owned by this publisher; guarded by `mu`.
     writers: std.ArrayListUnmanaged(*writer_mod.DataWriterImpl),
@@ -246,7 +249,7 @@ pub const PublisherImpl = struct {
             .status_changes = 0,
             .status_cond = null,
             // The DDS RELIABILITY QoS default: a writer blocks up to 100 ms.
-            .default_dw_qos = .{ .reliability = .{ .max_blocking_time = .{ .sec = 0, .nanosec = 100 * std.time.ns_per_ms } } },
+            .default_dw_qos = .{ .value = .{ .reliability = .{ .max_blocking_time = .{ .sec = 0, .nanosec = 100 * std.time.ns_per_ms } } } },
             .writers = .empty,
             .mu = .{},
             .coherent_depth = 0,
@@ -259,7 +262,7 @@ pub const PublisherImpl = struct {
         errdefer self.qos.deinit(alloc);
         // See config/generated.zig's applyQosDefaults doc comment: this is the
         // one place a config-file QosDefaults value reaches get_default_datawriter_qos().
-        generated_config_mod.applyQosDefaults(&self.default_dw_qos, &qos_defaults);
+        generated_config_mod.applyQosDefaults(&self.default_dw_qos.value, &qos_defaults);
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
         self.status_cond = sc;
         return self;
@@ -398,6 +401,14 @@ pub const PublisherImpl = struct {
         return if (self.enabled.load(.acquire)) DDS.RETCODE_OK else DDS.RETCODE_NOT_ENABLED;
     }
 
+    /// PRESENTATION, read under `qos_mu`: `set_qos` replaces the whole QoS,
+    /// and may change PRESENTATION until the Publisher is enabled.
+    fn presentationQos(self: *Self) DDS.PresentationQosPolicy {
+        self.qos_mu.lock();
+        defer self.qos_mu.unlock();
+        return self.qos.presentation;
+    }
+
     fn vtGetStatusCond(ctx: *anyopaque) DDS.StatusCondition {
         const self = cast(ctx);
         if (self.status_cond) |sc| return sc.toDDSStatusCondition();
@@ -484,7 +495,7 @@ pub const PublisherImpl = struct {
             a_topic.get_name(),
             a_topic.get_type_name(),
             qos.*,
-            self.qos.presentation,
+            self.presentationQos(),
             &parts.publication_handle,
             &parts.guid,
         );
@@ -963,13 +974,15 @@ pub const PublisherImpl = struct {
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);
+        // Before `mu`, as `qos_mu` is taken first.
+        const pres = self.presentationQos();
         self.mu.lock();
         defer self.mu.unlock();
         if (self.coherent_depth == 0) return DDS.RETCODE_PRECONDITION_NOT_MET;
         self.coherent_depth -= 1;
         if (self.coherent_depth == 0) {
-            const mode: proto.CoherentFlushMode = if (self.qos.presentation.coherent_access)
-                if (self.qos.presentation.access_scope == .GROUP_PRESENTATION_QOS) .full else .coherent_only
+            const mode: proto.CoherentFlushMode = if (pres.coherent_access)
+                if (pres.access_scope == .GROUP_PRESENTATION_QOS) .full else .coherent_only
             else
                 .group_seq_only;
             // GROUP scope: the set spans every writer (RTPS 2.5 §8.7.6).  Its id is
@@ -1090,15 +1103,13 @@ pub const PublisherImpl = struct {
     fn vtSetDefaultDwQos(ctx: *anyopaque, qos: *const DDS.DataWriterQos) DDS.ReturnCode_t {
         const self = cast(ctx);
         if (!qos_change.consistent(DDS.DataWriterQos, qos)) return DDS.RETCODE_INCONSISTENT_POLICY;
-        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        self.default_dw_qos.deinit(self.alloc);
-        self.default_dw_qos = new_qos;
+        self.default_dw_qos.set(self.alloc, qos) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetDefaultDwQos(ctx: *anyopaque, qos: *DDS.DataWriterQos) DDS.ReturnCode_t {
         const self = cast(ctx);
-        qos.* = self.default_dw_qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        qos.* = self.default_dw_qos.get(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 

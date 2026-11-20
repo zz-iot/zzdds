@@ -33,7 +33,7 @@ add_library(catchup_dcps_impl STATIC
 )
 add_dependencies(catchup_dcps_impl generate_catchup_types)
 target_include_directories(catchup_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(catchup_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(catchup_dcps_impl PUBLIC ZZDDS::zzdds)
 
 add_executable(catchup_pub src/publisher.cpp)
 if(MSVC)

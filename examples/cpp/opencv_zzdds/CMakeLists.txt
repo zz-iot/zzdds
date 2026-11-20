@@ -45,7 +45,6 @@ target_sources(ovidds_idl PRIVATE
 )
 target_link_libraries(ovidds_idl PUBLIC
     ZZDDS::zzdds
-    ZZDDS::zidl_cdr
 )
 # Propagate the generated include directory to consumers
 target_include_directories(ovidds_idl PUBLIC

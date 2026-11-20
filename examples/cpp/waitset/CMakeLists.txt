@@ -66,7 +66,7 @@ add_library(waitset_dcps_impl STATIC
 )
 add_dependencies(waitset_dcps_impl generate_waitset_sample_types)
 target_include_directories(waitset_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(waitset_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(waitset_dcps_impl PUBLIC ZZDDS::zzdds)
 
 find_package(Threads REQUIRED)
 

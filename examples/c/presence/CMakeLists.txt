@@ -31,7 +31,7 @@ add_custom_target(generate_presence_types DEPENDS "${GENERATED_DIR}/presence_sam
 add_library(presence_types STATIC "${GENERATED_DIR}/presence_sample_cdr.c")
 add_dependencies(presence_types generate_presence_types)
 target_include_directories(presence_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(presence_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(presence_types PUBLIC ZZDDS::zzdds)
 
 add_executable(presence_pub src/publisher.c)
 if(MSVC)

@@ -39,7 +39,7 @@ add_custom_target(generate_cft_reconfigure_types DEPENDS "${GENERATED_DIR}/cft_e
 add_library(cft_reconfigure_types STATIC "${GENERATED_DIR}/cft_event_cdr.c")
 add_dependencies(cft_reconfigure_types generate_cft_reconfigure_types)
 target_include_directories(cft_reconfigure_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(cft_reconfigure_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(cft_reconfigure_types PUBLIC ZZDDS::zzdds)
 
 add_executable(cft_reconfigure_publisher src/publisher.c)
 target_link_libraries(cft_reconfigure_publisher PRIVATE cft_reconfigure_types ZZDDS::zzdds)

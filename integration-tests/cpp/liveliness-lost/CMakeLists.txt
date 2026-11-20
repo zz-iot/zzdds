@@ -38,7 +38,7 @@ add_library(liveliness_lost_dcps_impl STATIC
 )
 add_dependencies(liveliness_lost_dcps_impl generate_liveliness_lost_types)
 target_include_directories(liveliness_lost_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(liveliness_lost_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(liveliness_lost_dcps_impl PUBLIC ZZDDS::zzdds)
 
 add_executable(liveliness_lost_publisher src/publisher.cpp)
 target_link_libraries(liveliness_lost_publisher PRIVATE liveliness_lost_dcps_impl ZZDDS::zzdds)

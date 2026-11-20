@@ -38,7 +38,7 @@ add_library(cft_reconfigure_dcps_impl STATIC
 )
 add_dependencies(cft_reconfigure_dcps_impl generate_cft_reconfigure_types)
 target_include_directories(cft_reconfigure_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(cft_reconfigure_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(cft_reconfigure_dcps_impl PUBLIC ZZDDS::zzdds)
 
 add_executable(cft_reconfigure_publisher src/publisher.cpp)
 target_link_libraries(cft_reconfigure_publisher PRIVATE cft_reconfigure_dcps_impl ZZDDS::zzdds)

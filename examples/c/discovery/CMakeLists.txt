@@ -27,7 +27,7 @@ add_custom_target(generate_discovery_ping_types DEPENDS "${GENERATED_DIR}/discov
 add_library(discovery_ping_types STATIC "${GENERATED_DIR}/discovery_ping_cdr.c")
 add_dependencies(discovery_ping_types generate_discovery_ping_types)
 target_include_directories(discovery_ping_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(discovery_ping_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(discovery_ping_types PUBLIC ZZDDS::zzdds)
 
 add_executable(discovery_pub src/publisher.c)
 if(MSVC)

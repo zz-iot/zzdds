@@ -35,7 +35,7 @@ add_custom_target(generate_sample_rejected_lost_types DEPENDS "${GENERATED_DIR}/
 add_library(sample_rejected_lost_types STATIC "${GENERATED_DIR}/status_event_cdr.c")
 add_dependencies(sample_rejected_lost_types generate_sample_rejected_lost_types)
 target_include_directories(sample_rejected_lost_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(sample_rejected_lost_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(sample_rejected_lost_types PUBLIC ZZDDS::zzdds)
 
 add_executable(sample_rejected_lost_pub src/publisher.c)
 target_link_libraries(sample_rejected_lost_pub PRIVATE sample_rejected_lost_types ZZDDS::zzdds)
