@@ -545,9 +545,11 @@ pub const DataWriterImpl = struct {
     }
 
     /// register_instance: the handle of the key hash's instance, registering
-    /// it if it is not; HANDLE_NIL if it cannot be. For a keyless topic the
-    /// key hash is all zeros, so there is one instance.
+    /// it if it is not; HANDLE_NIL if it cannot be, or if the writer is not
+    /// enabled (its NOT_ENABLED, as it returns no code). For a keyless topic
+    /// the key hash is all zeros, so there is one instance.
     pub fn registerInstance(self: *Self, key_hash: [16]u8) DDS.InstanceHandle_t {
+        if (!self.enabled.load(.acquire)) return DDS.HANDLE_NIL;
         self.instances_mu.lock();
         defer self.instances_mu.unlock();
         const e = self.instances.getOrPut(self.alloc, key_hash) catch return DDS.HANDLE_NIL;
@@ -1285,10 +1287,7 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtGetLivelinessLost(ctx: *anyopaque, status: *DDS.LivelinessLostStatus) DDS.ReturnCode_t {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return rc;
-        }
+        if (cast(ctx).deleted()) return DDS.RETCODE_ALREADY_DELETED;
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -1302,10 +1301,7 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtGetDeadlineMissed(ctx: *anyopaque, status: *DDS.OfferedDeadlineMissedStatus) DDS.ReturnCode_t {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return rc;
-        }
+        if (cast(ctx).deleted()) return DDS.RETCODE_ALREADY_DELETED;
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -1319,10 +1315,7 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtGetIncompatQos(ctx: *anyopaque, status: *DDS.OfferedIncompatibleQosStatus) DDS.ReturnCode_t {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return rc;
-        }
+        if (cast(ctx).deleted()) return DDS.RETCODE_ALREADY_DELETED;
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
         defer self.mu.unlock();
@@ -1337,10 +1330,7 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtGetPubMatched(ctx: *anyopaque, status: *DDS.PublicationMatchedStatus) DDS.ReturnCode_t {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return rc;
-        }
+        if (cast(ctx).deleted()) return DDS.RETCODE_ALREADY_DELETED;
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();

@@ -10,6 +10,19 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-20
 
+- A disabled entity takes what DDS 1.4 §2.2.2.1.1.7 lets it take, the same on every entity
+  (`docs/decisions.md`). Deleting from a disabled DomainParticipant, Publisher or
+  Subscriber now works: `delete_publisher`, `delete_subscriber`, `delete_topic`,
+  `delete_contentfilteredtopic`, `delete_datawriter`, `delete_datareader` and their
+  `delete_contained_entities` returned NOT_ENABLED, so a tree built disabled could not be
+  taken apart until enabled. A disabled DataReader takes `create_readcondition` and
+  `create_querycondition`; `lookup_topicdescription`, `find_topic`, `lookup_datawriter`,
+  `lookup_datareader` and `contains_entity` work on a disabled entity; and the get-status
+  operations of a disabled Topic, DataWriter or DataReader return the initial status
+  rather than NOT_ENABLED. `get_current_time` on a disabled DomainParticipant now returns
+  NOT_ENABLED, and `register_instance` on a disabled DataWriter HANDLE_NIL. A DataReader's
+  `delete_contained_entities` deletes its ReadConditions and QueryConditions; it returned
+  OK and deleted nothing.
 - The default QoS operations are safe to call from several threads at once:
   `set_default_participant_qos`, `set_default_publisher_qos`, `set_default_subscriber_qos`,
   `set_default_topic_qos`, `set_default_datawriter_qos` and `set_default_datareader_qos`, and

@@ -345,6 +345,19 @@ or an optimisation on an already-improved path):
 
 ### Bindings
 
+- **`get_key_value` does not return DDS return codes, so a disabled entity cannot get
+  NOT_ENABLED from it.** §2.2.2.1.1.7 gives a disabled DataWriter or DataReader
+  NOT_ENABLED from `get_key_value` (`docs/decisions.md`), but the C API reports only
+  `-1` (unknown handle) and `-2` (buffer too small) from `zzdds_get_key_value_writer` and
+  `zzdds_get_key_value_reader` (`src/c_abi/bootstrap.zig`), and `raw_ops`'
+  `getKeyValueRawWriter`/`getKeyValueRawReader` only null. zidl's generated code passes
+  those on unmapped: C and C++ return the `-1`/`-2` as their result, which is not a DDS
+  return code, Java returns `null`, and Zig `error.BadParameter`. A disabled writer or
+  reader has no instances, so today it gets the unknown-handle result. To do: have the C
+  API return DDS return codes (BAD_PARAMETER for an unknown handle, NOT_ENABLED for a
+  disabled entity, and one for a buffer too small), with `raw_ops` saying which, and
+  change zidl's C, C++, Java and Zig backends to pass them on (Java and Zig as their
+  usual exception or error). Needs a zidl release and a pin bump with it.
 - **C++ application code still reaches raw C handles through `native_handle()`.** zidl's
   generated `{T}TypeSupport::register_type` and typed `{T}DataReader`/`{T}DataWriter`
   constructors take C-ABI handles (zidl roadmap, *C++ backend*), so the C++ examples

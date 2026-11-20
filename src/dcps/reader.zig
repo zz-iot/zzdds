@@ -3182,10 +3182,7 @@ pub const DataReaderImpl = struct {
         view_states: DDS.ViewStateMask,
         instance_states: DDS.InstanceStateMask,
     ) DDS.ReadCondition {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return nil.nil_readcondition;
-        }
+        if (cast(ctx).deleted()) return nil.nil_readcondition;
         const self = cast(ctx);
         // Without this, a create racing this reader's own deinit() could
         // track a new condition into read_conditions after reallyDeinit()
@@ -3230,10 +3227,7 @@ pub const DataReaderImpl = struct {
         query_expression: [*:0]const u8,
         query_parameters: ?*const DDS.StringSeq,
     ) DDS.QueryCondition {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return nil.nil_querycondition;
-        }
+        if (cast(ctx).deleted()) return nil.nil_querycondition;
         const self = cast(ctx);
         const qe_s = std.mem.span(query_expression);
         // A non-empty expression requires field-level access to evaluate.
@@ -3325,9 +3319,29 @@ pub const DataReaderImpl = struct {
         return DDS.RETCODE_OK;
     }
 
+    /// Deletes this reader's ReadConditions and QueryConditions
+    /// (§2.2.2.5.3.31), each as delete_readcondition does. A disabled
+    /// reader takes this too: it is a factory operation (§2.2.2.1.1.7).
     fn vtDeleteContained(ctx: *anyopaque) DDS.ReturnCode_t {
-        const rc = cast(ctx).checkEnabledPrecondition();
-        if (rc != DDS.RETCODE_OK) return rc;
+        const self = cast(ctx);
+        // Held throughout, as delete_readcondition holds it for its one
+        // condition, so this reader's deletion cannot reach reallyDeinit
+        // part way through: each condition is either still listed, for
+        // reallyDeinit to free, or taken here and freed before release.
+        if (!self.quiesce.acquire()) return DDS.RETCODE_ALREADY_DELETED;
+        defer self.quiesce.release(self, reallyDeinit);
+        while (true) {
+            self.mu.lock();
+            const cond = self.read_conditions.pop() orelse {
+                self.mu.unlock();
+                break;
+            };
+            self.mu.unlock();
+            // Not the condition's deinit(): its own acquire fails once this
+            // reader's deletion has begun, leaving it neither listed nor freed.
+            const rc: *waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
+            if (rc.owner_qc) |qc| qc.deinitAssumeReaderQuiescing() else rc.deinitAssumeReaderQuiescing();
+        }
         return DDS.RETCODE_OK;
     }
 
@@ -3642,10 +3656,7 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetSampleRejected(ctx: *anyopaque, status: *DDS.SampleRejectedStatus) DDS.ReturnCode_t {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return rc;
-        }
+        if (cast(ctx).deleted()) return DDS.RETCODE_ALREADY_DELETED;
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -3661,10 +3672,7 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetLivelinessChanged(ctx: *anyopaque, status: *DDS.LivelinessChangedStatus) DDS.ReturnCode_t {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return rc;
-        }
+        if (cast(ctx).deleted()) return DDS.RETCODE_ALREADY_DELETED;
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -3682,10 +3690,7 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetDeadlineMissed(ctx: *anyopaque, status: *DDS.RequestedDeadlineMissedStatus) DDS.ReturnCode_t {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return rc;
-        }
+        if (cast(ctx).deleted()) return DDS.RETCODE_ALREADY_DELETED;
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -3699,10 +3704,7 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetIncompatQos(ctx: *anyopaque, status: *DDS.RequestedIncompatibleQosStatus) DDS.ReturnCode_t {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return rc;
-        }
+        if (cast(ctx).deleted()) return DDS.RETCODE_ALREADY_DELETED;
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
         defer self.mu.unlock();
@@ -3717,10 +3719,7 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetSubMatched(ctx: *anyopaque, status: *DDS.SubscriptionMatchedStatus) DDS.ReturnCode_t {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return rc;
-        }
+        if (cast(ctx).deleted()) return DDS.RETCODE_ALREADY_DELETED;
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -3738,10 +3737,7 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetSampleLost(ctx: *anyopaque, status: *DDS.SampleLostStatus) DDS.ReturnCode_t {
-        {
-            const rc = cast(ctx).checkEnabledPrecondition();
-            if (rc != DDS.RETCODE_OK) return rc;
-        }
+        if (cast(ctx).deleted()) return DDS.RETCODE_ALREADY_DELETED;
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
