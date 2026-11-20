@@ -43,7 +43,7 @@ add_library(custom_allocator_dcps_impl STATIC
 )
 add_dependencies(custom_allocator_dcps_impl generate_sensor_types)
 target_include_directories(custom_allocator_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(custom_allocator_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(custom_allocator_dcps_impl PUBLIC ZZDDS::zzdds)
 
 add_library(static_pool_allocator STATIC src/static_pool_allocator.c)
 target_include_directories(static_pool_allocator PUBLIC src)

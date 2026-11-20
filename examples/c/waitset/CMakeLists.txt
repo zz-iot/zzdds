@@ -34,7 +34,7 @@ add_custom_target(generate_waitset_sample_types DEPENDS "${GENERATED_DIR}/waitse
 add_library(waitset_sample_types STATIC "${GENERATED_DIR}/waitset_sample_cdr.c")
 add_dependencies(waitset_sample_types generate_waitset_sample_types)
 target_include_directories(waitset_sample_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(waitset_sample_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(waitset_sample_types PUBLIC ZZDDS::zzdds)
 
 find_package(Threads REQUIRED)
 

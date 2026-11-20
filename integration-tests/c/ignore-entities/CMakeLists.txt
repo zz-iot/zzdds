@@ -35,7 +35,7 @@ add_custom_target(generate_ignore_entities_types DEPENDS "${GENERATED_DIR}/ignor
 add_library(ignore_entities_types STATIC "${GENERATED_DIR}/ignore_event_cdr.c")
 add_dependencies(ignore_entities_types generate_ignore_entities_types)
 target_include_directories(ignore_entities_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(ignore_entities_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(ignore_entities_types PUBLIC ZZDDS::zzdds)
 
 add_executable(ignore_entities_ignorer src/ignorer.c)
 target_link_libraries(ignore_entities_ignorer PRIVATE ignore_entities_types ZZDDS::zzdds)

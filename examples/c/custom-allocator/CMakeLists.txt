@@ -33,7 +33,7 @@ add_custom_target(generate_sensor_types DEPENDS "${GENERATED_DIR}/sensor.h" "${G
 add_library(sensor_types STATIC "${GENERATED_DIR}/sensor_cdr.c")
 add_dependencies(sensor_types generate_sensor_types)
 target_include_directories(sensor_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(sensor_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(sensor_types PUBLIC ZZDDS::zzdds)
 
 add_library(static_pool_allocator STATIC src/static_pool_allocator.c)
 target_include_directories(static_pool_allocator PUBLIC src)

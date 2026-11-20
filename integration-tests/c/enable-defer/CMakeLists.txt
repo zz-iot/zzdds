@@ -39,7 +39,7 @@ add_custom_target(generate_enable_defer_types DEPENDS "${GENERATED_DIR}/config_e
 add_library(enable_defer_types STATIC "${GENERATED_DIR}/config_event_cdr.c")
 add_dependencies(enable_defer_types generate_enable_defer_types)
 target_include_directories(enable_defer_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(enable_defer_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(enable_defer_types PUBLIC ZZDDS::zzdds)
 
 add_executable(enable_defer_configurer src/configurer.c)
 target_link_libraries(enable_defer_configurer PRIVATE enable_defer_types ZZDDS::zzdds)

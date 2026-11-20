@@ -31,7 +31,7 @@ add_custom_target(generate_raw_loan_types DEPENDS "${GENERATED_DIR}/loaned_ping.
 add_library(raw_loan_types STATIC "${GENERATED_DIR}/loaned_ping_cdr.c")
 add_dependencies(raw_loan_types generate_raw_loan_types)
 target_include_directories(raw_loan_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(raw_loan_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(raw_loan_types PUBLIC ZZDDS::zzdds)
 
 add_executable(raw_loan_pub src/publisher.c)
 if(MSVC)

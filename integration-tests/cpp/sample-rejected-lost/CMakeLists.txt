@@ -38,7 +38,7 @@ add_library(sample_rejected_lost_dcps_impl STATIC
 )
 add_dependencies(sample_rejected_lost_dcps_impl generate_sample_rejected_lost_types)
 target_include_directories(sample_rejected_lost_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(sample_rejected_lost_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(sample_rejected_lost_dcps_impl PUBLIC ZZDDS::zzdds)
 
 add_executable(sample_rejected_lost_pub src/publisher.cpp)
 target_link_libraries(sample_rejected_lost_pub PRIVATE sample_rejected_lost_dcps_impl ZZDDS::zzdds)

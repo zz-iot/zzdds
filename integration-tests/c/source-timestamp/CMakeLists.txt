@@ -35,7 +35,7 @@ add_custom_target(generate_source_timestamp_types DEPENDS "${GENERATED_DIR}/time
 add_library(source_timestamp_types STATIC "${GENERATED_DIR}/timestamp_event_cdr.c")
 add_dependencies(source_timestamp_types generate_source_timestamp_types)
 target_include_directories(source_timestamp_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(source_timestamp_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(source_timestamp_types PUBLIC ZZDDS::zzdds)
 
 add_executable(source_timestamp_publisher src/publisher.c)
 target_link_libraries(source_timestamp_publisher PRIVATE source_timestamp_types ZZDDS::zzdds)

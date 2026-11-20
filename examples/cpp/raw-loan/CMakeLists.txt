@@ -33,7 +33,7 @@ add_library(raw_loan_dcps_impl STATIC
 )
 add_dependencies(raw_loan_dcps_impl generate_raw_loan_types)
 target_include_directories(raw_loan_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(raw_loan_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(raw_loan_dcps_impl PUBLIC ZZDDS::zzdds)
 
 add_executable(raw_loan_pub src/publisher.cpp)
 if(MSVC)

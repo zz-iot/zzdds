@@ -33,7 +33,7 @@ add_library(registry_dcps_impl STATIC
 )
 add_dependencies(registry_dcps_impl generate_registry_types)
 target_include_directories(registry_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(registry_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(registry_dcps_impl PUBLIC ZZDDS::zzdds)
 
 add_executable(registry_pub src/publisher.cpp)
 if(MSVC)

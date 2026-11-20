@@ -39,7 +39,7 @@ add_custom_target(generate_delete_contained_entities_types DEPENDS "${GENERATED_
 add_library(delete_contained_entities_types STATIC "${GENERATED_DIR}/session_event_cdr.c")
 add_dependencies(delete_contained_entities_types generate_delete_contained_entities_types)
 target_include_directories(delete_contained_entities_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(delete_contained_entities_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(delete_contained_entities_types PUBLIC ZZDDS::zzdds)
 
 add_executable(delete_contained_entities_session src/session.c)
 target_link_libraries(delete_contained_entities_session PRIVATE delete_contained_entities_types ZZDDS::zzdds)

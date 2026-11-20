@@ -42,7 +42,7 @@ add_library(shape_dcps_impl STATIC
 )
 add_dependencies(shape_dcps_impl generate_shape_types)
 target_include_directories(shape_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(shape_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(shape_dcps_impl PUBLIC ZZDDS::zzdds)
 
 # One binary, -P/-S selects publisher/subscriber mode -- see c/shape and
 # zig/shape for why (matches the dds-rtps interop harness convention of one

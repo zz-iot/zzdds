@@ -36,7 +36,7 @@ add_library(participant_config_dcps_impl STATIC
 )
 add_dependencies(participant_config_dcps_impl generate_config_ping_types)
 target_include_directories(participant_config_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(participant_config_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(participant_config_dcps_impl PUBLIC ZZDDS::zzdds)
 
 add_executable(participant_config_pub src/publisher.cpp)
 if(MSVC)

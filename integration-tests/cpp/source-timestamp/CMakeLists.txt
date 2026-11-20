@@ -38,7 +38,7 @@ add_library(source_timestamp_dcps_impl STATIC
 )
 add_dependencies(source_timestamp_dcps_impl generate_source_timestamp_types)
 target_include_directories(source_timestamp_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(source_timestamp_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(source_timestamp_dcps_impl PUBLIC ZZDDS::zzdds)
 
 add_executable(source_timestamp_publisher src/publisher.cpp)
 target_link_libraries(source_timestamp_publisher PRIVATE source_timestamp_dcps_impl ZZDDS::zzdds)

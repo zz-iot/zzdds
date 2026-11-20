@@ -38,7 +38,7 @@ add_library(wait_for_historical_data_dcps_impl STATIC
 )
 add_dependencies(wait_for_historical_data_dcps_impl generate_wait_for_historical_data_types)
 target_include_directories(wait_for_historical_data_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(wait_for_historical_data_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(wait_for_historical_data_dcps_impl PUBLIC ZZDDS::zzdds)
 
 add_executable(wait_for_historical_data_publisher src/publisher.cpp)
 target_link_libraries(wait_for_historical_data_publisher PRIVATE wait_for_historical_data_dcps_impl ZZDDS::zzdds)

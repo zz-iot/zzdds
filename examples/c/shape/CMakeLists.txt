@@ -31,7 +31,7 @@ add_custom_target(generate_shape_types DEPENDS "${GENERATED_DIR}/shape.h" "${GEN
 add_library(shape_types STATIC "${GENERATED_DIR}/shape_cdr.c")
 add_dependencies(shape_types generate_shape_types)
 target_include_directories(shape_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(shape_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(shape_types PUBLIC ZZDDS::zzdds)
 
 # One binary, -P/-S selects publisher/subscriber mode -- matches
 # zig/shape's shape_main (itself matching dds-rtps's srcZig/shape_main.zig,

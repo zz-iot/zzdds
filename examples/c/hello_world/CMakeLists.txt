@@ -34,7 +34,7 @@ add_custom_target(generate_hello_world_types DEPENDS "${GENERATED_DIR}/hello_wor
 add_library(hello_world_types STATIC "${GENERATED_DIR}/hello_world_cdr.c")
 add_dependencies(hello_world_types generate_hello_world_types)
 target_include_directories(hello_world_types PUBLIC "${GENERATED_DIR}")
-target_link_libraries(hello_world_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(hello_world_types PUBLIC ZZDDS::zzdds)
 
 # Distinct target names from shape/custom-allocator's publisher/subscriber,
 # per docs/design/shape-reference-app.md's naming convention.

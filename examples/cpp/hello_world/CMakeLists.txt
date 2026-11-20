@@ -42,7 +42,7 @@ add_library(hello_world_dcps_impl STATIC
 )
 add_dependencies(hello_world_dcps_impl generate_hello_world_types)
 target_include_directories(hello_world_dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(hello_world_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+target_link_libraries(hello_world_dcps_impl PUBLIC ZZDDS::zzdds)
 
 add_executable(hello_world_pub src/publisher.cpp)
 if(MSVC)
