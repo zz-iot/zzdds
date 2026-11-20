@@ -284,7 +284,15 @@ int zzdds_register_type_support_checked_ctx(DDS_DomainParticipant, const char *,
 
 DDS_InstanceHandle_t zzdds_register_instance_raw(DDS_DataWriter writer, const uint8_t key_hash[16]);
 
-int zzdds_get_key_value_writer(
+/* get_key_value's payload: zzdds keeps the whole first alive sample of an
+ * instance, and a binding decodes the key fields from it. Copies it for the
+ * instance `handle` names into buf[0..buf_size] and sets *len_out to its size.
+ * Returns DDS_RETCODE_OK; BAD_PARAMETER for a NULL writer or len_out, a NULL
+ * buf with a nonzero buf_size, or a handle that names no instance with an
+ * alive write; ALREADY_DELETED; NOT_ENABLED until the writer is enabled; or
+ * PRECONDITION_NOT_MET when the payload is larger than buf_size, with
+ * *len_out still set: pass buf NULL and buf_size 0 to learn the size. */
+DDS_ReturnCode_t zzdds_get_key_value_writer(
     DDS_DataWriter writer,
     DDS_InstanceHandle_t handle,
     uint8_t *buf,
@@ -294,7 +302,8 @@ int zzdds_get_key_value_writer(
 
 DDS_InstanceHandle_t zzdds_lookup_instance_writer(DDS_DataWriter writer, const uint8_t key_hash[16]);
 
-int zzdds_get_key_value_reader(
+/* As zzdds_get_key_value_writer, for a reader's instance with an alive sample. */
+DDS_ReturnCode_t zzdds_get_key_value_reader(
     DDS_DataReader reader,
     DDS_InstanceHandle_t handle,
     uint8_t *buf,

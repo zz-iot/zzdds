@@ -70,6 +70,9 @@ pub export fn zzdds_topic_as_description(topic: ?*anyopaque) callconv(.c) ?*anyo
 }
 
 // ── Instance-handle / key-hash lookup helpers ────────────────────────────────
+//
+// Each holds the entity's quiesce reference while it uses the entity, as
+// `raw_ops` does, so a concurrent delete cannot free it part way through.
 
 /// register_instance: the handle of the key hash's instance on `writer`,
 /// registering it if it is not; 0 (HANDLE_NIL) if it cannot be.
@@ -78,6 +81,8 @@ pub export fn zzdds_register_instance_raw(
     key_hash: *const [16]u8,
 ) callconv(.c) DDS.InstanceHandle_t {
     const impl = writerImpl(writer) orelse return DDS.HANDLE_NIL;
+    if (!impl.acquireQuiesce()) return DDS.HANDLE_NIL;
+    defer impl.releaseQuiesce();
     return impl.registerInstance(key_hash.*);
 }
 
@@ -88,25 +93,39 @@ fn writerImpl(writer: *anyopaque) ?*DataWriterImpl {
     return @ptrCast(@alignCast(w.ptr));
 }
 
-/// Copy the stored CDR payload for `handle` into `buf[0..buf_size]`.
-/// Sets `*len_out` to the actual payload size.
-/// Returns 0 on success, -1 if handle unknown, -2 if buffer too small.
+fn readerImpl(reader: *anyopaque) ?*DataReaderImpl {
+    if (isNullHandle(reader)) return null;
+    const r = zidl_bindings.unboxAsView(DDS.DataReader, reader);
+    if (nil.isNil(r)) return null;
+    return @ptrCast(@alignCast(r.ptr));
+}
+
+/// get_key_value's payload: zzdds keeps the whole first alive sample of an
+/// instance, and a binding decodes the key fields from it. Copies it for the
+/// instance `handle` names into `buf[0..buf_size]` and sets `*len_out` to
+/// its size. Returns
+/// - OK;
+/// - BAD_PARAMETER for a NULL `writer` or `len_out`, a NULL `buf` with a
+///   nonzero `buf_size`, or a handle that names no instance of `writer`
+///   with an alive write (DDS 1.4 §2.2.2.4.2.9);
+/// - ALREADY_DELETED for a deleted `writer`;
+/// - NOT_ENABLED until `writer` is enabled (§2.2.2.1.1.7);
+/// - PRECONDITION_NOT_MET when the payload does not fit in `buf_size`, as
+///   `read` does for a sequence too short (§2.2.2.5.3.8). `*len_out` is
+///   still set, so a caller can pass a NULL `buf` and 0 to learn the size
+///   and call again.
 pub export fn zzdds_get_key_value_writer(
     writer: *anyopaque,
     handle: DDS.InstanceHandle_t,
-    buf: [*]u8,
+    buf: ?[*]u8,
     buf_size: usize,
-    len_out: *usize,
-) callconv(.c) c_int {
-    if (isNullHandle(writer)) return -1;
-    const w = zidl_bindings.unboxAsView(DDS.DataWriter, writer);
-    if (nil.isNil(w)) return -1;
-    const impl: *DataWriterImpl = @ptrCast(@alignCast(w.ptr));
-    const kv = impl.getKeyValueRaw(handle) orelse return -1;
-    len_out.* = kv.len;
-    if (kv.len > buf_size) return -2;
-    @memcpy(buf[0..kv.len], kv);
-    return 0;
+    len_out: ?*usize,
+) callconv(.c) DDS.ReturnCode_t {
+    const impl = writerImpl(writer) orelse return DDS.RETCODE_BAD_PARAMETER;
+    const out = keyValueOut(buf, buf_size, len_out) orelse return DDS.RETCODE_BAD_PARAMETER;
+    if (!impl.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
+    defer impl.releaseQuiesce();
+    return copyKeyValue(impl.keyValue(handle), out);
 }
 
 /// lookup_instance: the handle of the key hash's instance on `writer`, or 0
@@ -116,38 +135,59 @@ pub export fn zzdds_lookup_instance_writer(
     key_hash: *const [16]u8,
 ) callconv(.c) DDS.InstanceHandle_t {
     const impl = writerImpl(writer) orelse return DDS.HANDLE_NIL;
+    if (!impl.acquireQuiesce()) return DDS.HANDLE_NIL;
+    defer impl.releaseQuiesce();
     return impl.lookupInstance(key_hash.*);
 }
 
-/// Copy the stored CDR payload for `handle` into `buf[0..buf_size]`.
-/// Returns 0 on success, -1 if handle unknown, -2 if buffer too small.
+/// As `zzdds_get_key_value_writer`, for a reader: BAD_PARAMETER for a handle
+/// that names no instance of `reader` with an alive sample (DDS 1.4
+/// §2.2.2.5.3.29).
 pub export fn zzdds_get_key_value_reader(
     reader: *anyopaque,
     handle: DDS.InstanceHandle_t,
-    buf: [*]u8,
+    buf: ?[*]u8,
     buf_size: usize,
-    len_out: *usize,
-) callconv(.c) c_int {
-    if (isNullHandle(reader)) return -1;
-    const r = zidl_bindings.unboxAsView(DDS.DataReader, reader);
-    if (nil.isNil(r)) return -1;
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
-    const kv = impl.getKeyValueRaw(handle) orelse return -1;
-    len_out.* = kv.len;
-    if (kv.len > buf_size) return -2;
-    @memcpy(buf[0..kv.len], kv);
-    return 0;
+    len_out: ?*usize,
+) callconv(.c) DDS.ReturnCode_t {
+    const impl = readerImpl(reader) orelse return DDS.RETCODE_BAD_PARAMETER;
+    const out = keyValueOut(buf, buf_size, len_out) orelse return DDS.RETCODE_BAD_PARAMETER;
+    if (!impl.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
+    defer impl.releaseQuiesce();
+    return copyKeyValue(impl.keyValue(handle), out);
 }
 
-/// Return the instance handle for a key hash if the instance is known to this reader.
-/// Returns the handle if ALIVE, 0 (HANDLE_NIL) if unknown or not alive.
+const KeyValueOut = struct { buf: ?[*]u8, size: usize, len: *usize };
+
+/// The caller's buffer and length out, or null if they are unusable. A NULL
+/// buffer is only for asking the size, with `buf_size` 0.
+fn keyValueOut(buf: ?[*]u8, buf_size: usize, len_out: ?*usize) ?KeyValueOut {
+    const len = len_out orelse return null;
+    if (buf == null and buf_size != 0) return null;
+    return .{ .buf = buf, .size = buf_size, .len = len };
+}
+
+/// Copies the payload into the caller's buffer, which the caller's quiesce
+/// reference keeps the payload alive for.
+fn copyKeyValue(kv: error{ NotEnabled, BadParameter }![]u8, out: KeyValueOut) DDS.ReturnCode_t {
+    const payload = kv catch |e| return switch (e) {
+        error.NotEnabled => DDS.RETCODE_NOT_ENABLED,
+        error.BadParameter => DDS.RETCODE_BAD_PARAMETER,
+    };
+    out.len.* = payload.len;
+    if (payload.len > out.size) return DDS.RETCODE_PRECONDITION_NOT_MET;
+    if (payload.len != 0) @memcpy(out.buf.?[0..payload.len], payload);
+    return DDS.RETCODE_OK;
+}
+
+/// lookup_instance: the handle of the key hash's instance on `reader` if it
+/// is ALIVE, or 0 (HANDLE_NIL).
 pub export fn zzdds_lookup_instance_reader(
     reader: *anyopaque,
     key_hash: *const [16]u8,
 ) callconv(.c) DDS.InstanceHandle_t {
-    if (isNullHandle(reader)) return 0;
-    const r = zidl_bindings.unboxAsView(DDS.DataReader, reader);
-    if (nil.isNil(r)) return 0;
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
+    const impl = readerImpl(reader) orelse return DDS.HANDLE_NIL;
+    if (!impl.acquireQuiesce()) return DDS.HANDLE_NIL;
+    defer impl.releaseQuiesce();
     return impl.lookupInstance(key_hash.*) orelse DDS.HANDLE_NIL;
 }

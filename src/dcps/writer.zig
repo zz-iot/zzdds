@@ -586,6 +586,15 @@ pub const DataWriterImpl = struct {
         return kv.*;
     }
 
+    /// get_key_value's checks around `getKeyValueRaw`, for a caller holding
+    /// a quiesce reference: NotEnabled until enabled (DDS 1.4
+    /// §2.2.2.1.1.7), and BadParameter for a handle that names no instance
+    /// with an alive write (§2.2.2.4.2.9).
+    pub fn keyValue(self: *Self, handle: DDS.InstanceHandle_t) error{ NotEnabled, BadParameter }![]u8 {
+        if (!self.enabled.load(.acquire)) return error.NotEnabled;
+        return self.getKeyValueRaw(handle) orelse error.BadParameter;
+    }
+
     /// Send a NOT_ALIVE_DISPOSED change for the given instance.
     /// Does not update deadline/liveliness timestamps (lifecycle, not data).
     pub fn disposeRaw(

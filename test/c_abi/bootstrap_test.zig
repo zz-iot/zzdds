@@ -674,12 +674,12 @@ test "bootstrap: get_key_value_writer returns CDR payload after alive write" {
     var buf: [64]u8 = undefined;
     var len: usize = 0;
     const rc = bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &buf, buf.len, &len);
-    try testing.expectEqual(@as(c_int, 0), rc);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
     try testing.expectEqual(PAYLOAD.len, len);
     try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..len]);
 }
 
-test "bootstrap: get_key_value_writer returns -1 for unknown handle" {
+test "bootstrap: get_key_value_writer returns BAD_PARAMETER for a handle with no alive write" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
@@ -691,7 +691,9 @@ test "bootstrap: get_key_value_writer returns -1 for unknown handle" {
     var buf: [64]u8 = undefined;
     var len: usize = 0;
     const rc = bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &buf, buf.len, &len);
-    try testing.expectEqual(@as(c_int, -1), rc);
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, rc);
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, DDS.HANDLE_NIL, &buf, buf.len, &len));
+    try testing.expectError(error.BadParameter, zzdds.getKeyValueWriter(pair.dw, ih, alloc));
 }
 
 test "bootstrap: lookup_instance_writer matches register_instance_raw" {
@@ -705,6 +707,96 @@ test "bootstrap: lookup_instance_writer matches register_instance_raw" {
     const h1 = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
     const h2 = bootstrap.zzdds_lookup_instance_writer(pair.dw_boxed, &KEY_HASH);
     try testing.expectEqual(h1, h2);
+}
+
+test "bootstrap: get_key_value_writer reports the size of a payload that does not fit" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    writeRawViaOp(pair.dw, KEY_HASH, &PAYLOAD);
+    fx.settle();
+    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
+
+    // Too short: PRECONDITION_NOT_MET, as read for a sequence too short,
+    // with the size needed.
+    var small: [2]u8 = undefined;
+    var len: usize = 0;
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &small, small.len, &len));
+    try testing.expectEqual(PAYLOAD.len, len);
+    // A NULL buffer of size 0 asks for the size the same way.
+    len = 0;
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, null, 0, &len));
+    try testing.expectEqual(PAYLOAD.len, len);
+    // Unusable arguments.
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, null, 8, &len));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &small, small.len, null));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, null, 8, &len));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, &small, small.len, null));
+
+    // The raw op returns a copy of the same payload.
+    const copy = try zzdds.getKeyValueWriter(pair.dw, ih, alloc);
+    defer alloc.free(copy);
+    try testing.expectEqualSlices(u8, &PAYLOAD, copy);
+}
+
+// DDS 1.4 §2.2.2.1.1.7: get_key_value is none of the operations a disabled
+// entity takes, so it returns NOT_ENABLED.
+test "bootstrap: get_key_value returns NOT_ENABLED for a disabled writer and reader" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var pub_qos = DDS.PublisherQos{};
+    pub_qos.entity_factory.autoenable_created_entities = false;
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.vtable.set_qos(fx.pub_w.ptr, &pub_qos));
+    var sub_qos = DDS.SubscriberQos{};
+    sub_qos.entity_factory.autoenable_created_entities = false;
+    try testing.expectEqual(DDS.RETCODE_OK, fx.sub_r.vtable.set_qos(fx.sub_r.ptr, &sub_qos));
+    const pair = fx.makeWriterReader();
+    try testing.expect(!@as(*DataWriterImpl, @ptrCast(@alignCast(pair.dw.ptr))).enabled.load(.acquire));
+    try testing.expect(!@as(*DataReaderImpl, @ptrCast(@alignCast(pair.dr.ptr))).enabled.load(.acquire));
+
+    var buf: [64]u8 = undefined;
+    var len: usize = 0;
+    try testing.expectEqual(DDS.RETCODE_NOT_ENABLED, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, 1, &buf, buf.len, &len));
+    try testing.expectEqual(DDS.RETCODE_NOT_ENABLED, bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, 1, &buf, buf.len, &len));
+    try testing.expectError(error.NotEnabled, zzdds.getKeyValueWriter(pair.dw, 1, alloc));
+    try testing.expectError(error.NotEnabled, zzdds.getKeyValueReader(pair.dr, 1, alloc));
+}
+
+// A call in flight keeps a deleted writer or reader allocated (the test's
+// own quiesce reference stands in for it): get_key_value then returns
+// ALREADY_DELETED, and register_instance and lookup_instance HANDLE_NIL.
+test "bootstrap: get_key_value returns ALREADY_DELETED for a deleted writer and reader" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+    writeRawViaOp(pair.dw, KEY_HASH, &PAYLOAD);
+    fx.settle();
+    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
+
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(pair.dw.ptr));
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(pair.dr.ptr));
+    try testing.expect(dw_impl.acquireQuiesce());
+    try testing.expect(dr_impl.acquireQuiesce());
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.delete_datawriter(pair.dw));
+    try testing.expectEqual(DDS.RETCODE_OK, fx.sub_r.delete_datareader(pair.dr));
+
+    var buf: [64]u8 = undefined;
+    var len: usize = 0;
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &buf, buf.len, &len));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, &buf, buf.len, &len));
+    try testing.expectError(error.AlreadyDeleted, zzdds.getKeyValueWriter(pair.dw, ih, alloc));
+    try testing.expectError(error.AlreadyDeleted, zzdds.getKeyValueReader(pair.dr, ih, alloc));
+    try testing.expectEqual(DDS.HANDLE_NIL, bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH));
+    try testing.expectEqual(DDS.HANDLE_NIL, bootstrap.zzdds_lookup_instance_writer(pair.dw_boxed, &KEY_HASH));
+    try testing.expectEqual(DDS.HANDLE_NIL, bootstrap.zzdds_lookup_instance_reader(pair.dr_boxed, &KEY_HASH));
+
+    dw_impl.releaseQuiesce();
+    dr_impl.releaseQuiesce();
 }
 
 // ── get_key_value_reader / lookup_instance_reader ─────────────────────────────
@@ -722,12 +814,12 @@ test "bootstrap: get_key_value_reader returns CDR payload after receive" {
     var buf: [64]u8 = undefined;
     var len: usize = 0;
     const rc = bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, &buf, buf.len, &len);
-    try testing.expectEqual(@as(c_int, 0), rc);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
     try testing.expectEqual(PAYLOAD.len, len);
     try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..len]);
 }
 
-test "bootstrap: get_key_value_reader returns -1 for unknown handle" {
+test "bootstrap: get_key_value_reader returns BAD_PARAMETER for a handle with no alive sample" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
@@ -740,7 +832,8 @@ test "bootstrap: get_key_value_reader returns -1 for unknown handle" {
     var buf: [64]u8 = undefined;
     var len: usize = 0;
     const rc = bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, &buf, buf.len, &len);
-    try testing.expectEqual(@as(c_int, -1), rc);
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, rc);
+    try testing.expectError(error.BadParameter, zzdds.getKeyValueReader(pair.dr, ih, alloc));
 }
 
 test "bootstrap: lookup_instance_reader returns handle for alive instance, 0 when not found" {

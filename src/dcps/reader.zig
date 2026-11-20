@@ -2277,6 +2277,15 @@ pub const DataReaderImpl = struct {
         return entry.key_cdr;
     }
 
+    /// get_key_value's checks around `getKeyValueRaw`, for a caller holding
+    /// a quiesce reference: NotEnabled until enabled (DDS 1.4
+    /// §2.2.2.1.1.7), and BadParameter for a handle that names no instance
+    /// with an alive sample (§2.2.2.5.3.29).
+    pub fn keyValue(self: *Self, handle: DDS.InstanceHandle_t) error{ NotEnabled, BadParameter }![]u8 {
+        if (!self.enabled.load(.acquire)) return error.NotEnabled;
+        return self.getKeyValueRaw(handle) orelse error.BadParameter;
+    }
+
     /// lookup_instance: the handle of the key hash's instance if it is ALIVE,
     /// or null.
     pub fn lookupInstance(self: *Self, key_hash: [16]u8) ?DDS.InstanceHandle_t {

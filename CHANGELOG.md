@@ -10,6 +10,20 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-20
 
+- `zzdds_get_key_value_writer` and `zzdds_get_key_value_reader` return DDS return codes
+  rather than `-1` and `-2`: BAD_PARAMETER for a handle that names no instance with an
+  alive write or sample (DDS 1.4 §2.2.2.4.2.9, §2.2.2.5.3.29) or a NULL argument,
+  ALREADY_DELETED, NOT_ENABLED for a disabled writer or reader (§2.2.2.1.1.7), and
+  PRECONDITION_NOT_MET for a buffer too small, with the size still reported; a NULL buffer
+  of size 0 asks for it. They, `zzdds_register_instance_raw` and both
+  `zzdds_lookup_instance_*` now hold the entity's quiesce reference while they use it, so a
+  concurrent delete cannot free it under them. New `raw_ops` `getKeyValueWriter` and
+  `getKeyValueReader` return a copy of the payload, made while they hold the writer or
+  reader, or `error.AlreadyDeleted`, `NotEnabled` or `BadParameter`, and
+  the Java runtime's new `getKeyValueWriter` and `getKeyValueReader` the return code; they
+  replace `getKeyValueRaw*`, which stay until zidl's generated code moves over. The Java
+  runtime no longer fails `get_key_value` for a sample over 4KB: it asks again at the size
+  needed.
 - A disabled entity takes what DDS 1.4 §2.2.2.1.1.7 lets it take, the same on every entity
   (`docs/decisions.md`). Deleting from a disabled DomainParticipant, Publisher or
   Subscriber now works: `delete_publisher`, `delete_subscriber`, `delete_topic`,

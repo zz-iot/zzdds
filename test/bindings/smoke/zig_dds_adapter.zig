@@ -71,6 +71,12 @@ pub fn registerInstanceRaw(_: DDS.DataWriter, _: [16]u8) DDS.InstanceHandle_t {
     return 0;
 }
 
+pub const GetKeyValueError = error{ AlreadyDeleted, NotEnabled, BadParameter, OutOfMemory };
+
+pub fn getKeyValueWriter(_: DDS.DataWriter, _: DDS.InstanceHandle_t, _: std.mem.Allocator) GetKeyValueError![]u8 {
+    return error.BadParameter;
+}
+
 pub fn getKeyValueRawWriter(_: DDS.DataWriter, _: DDS.InstanceHandle_t) ?[]u8 {
     return null;
 }
@@ -131,6 +137,10 @@ pub fn readFilteredRaw(
         const copy = try std.heap.page_allocator.dupe(u8, s.data);
         try out.append(caller_alloc, .{ .data = copy, .info = s.info });
     }
+}
+
+pub fn getKeyValueReader(_: DDS.DataReader, _: DDS.InstanceHandle_t, _: std.mem.Allocator) GetKeyValueError![]u8 {
+    return error.BadParameter;
 }
 
 pub fn getKeyValueRawReader(_: DDS.DataReader, _: DDS.InstanceHandle_t) ?[]u8 {

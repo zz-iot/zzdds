@@ -69,9 +69,16 @@ public final class ZzddsRuntime {
      * side effects beyond this computation (see zzdds_register_instance_raw). */
     public static native long registerInstanceRaw(Object writer, byte[] keyHash);
 
-    /** Returns the stored key-only CDR payload for `handle`, or null if no
-     * alive write has been made for that instance -- the raw path to the
-     * writer-side `get_key_value`. */
+    /** The raw path to the writer-side `get_key_value`: returns a DDS return
+     * code and, on OK, puts the stored CDR payload of the first alive write
+     * of `handle`'s instance in `payloadOut[0]`. BAD_PARAMETER for a handle
+     * with no such write, NOT_ENABLED until the writer is enabled,
+     * ALREADY_DELETED once it is deleted. */
+    public static native int getKeyValueWriter(Object writer, long handle, byte[][] payloadOut);
+
+    /** Returns the stored CDR payload for `handle`, or null on any failure.
+     * Superseded by getKeyValueWriter, which says why it failed; kept until
+     * zidl's generated Java calls that. */
     public static native byte[] getKeyValueWriterRaw(Object writer, long handle);
 
     /** Looks up the instance handle for `keyHash` -- the raw path to the
@@ -79,9 +86,13 @@ public final class ZzddsRuntime {
      * alive write has been made for that key. */
     public static native long lookupInstanceWriterRaw(Object writer, byte[] keyHash);
 
-    /** Returns the stored CDR payload for `handle`, or null if no alive
-     * sample has arrived for that instance -- the raw path to the
-     * reader-side `get_key_value`. */
+    /** As getKeyValueWriter, for the reader-side `get_key_value`: the
+     * stored payload is the instance's first alive sample. */
+    public static native int getKeyValueReader(Object reader, long handle, byte[][] payloadOut);
+
+    /** Returns the stored CDR payload for `handle`, or null on any failure.
+     * Superseded by getKeyValueReader; kept until zidl's generated Java calls
+     * that. */
     public static native byte[] getKeyValueReaderRaw(Object reader, long handle);
 
     /** Looks up the instance handle for `keyHash` -- the raw path to the

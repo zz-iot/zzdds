@@ -186,6 +186,51 @@ public class JavaSmoke {
 
     // WaitSet and GuardCondition come from their generated constructors, and
     // wait() hands back the same GuardCondition object that was attached.
+    /** get_key_value's raw path returns a DDS return code and the stored
+     * payload, also for a payload larger than the native side's 4KB first
+     * try. The payload-or-null functions zidl's generated Java calls today
+     * still work. */
+    static void checkGetKeyValue(Dcps.DDS.DataWriter rawWriter, Dcps.DDS.DataReader rawReader,
+                                 Binding_smoke.BindingSmokeStatus sample, long readerHandle,
+                                 Dcps.DDS.DomainParticipant dp, Dcps.DDS.Publisher publisher) {
+        final int ok = Dcps.DDS.RETCODE_OK.value;
+        final int badParameter = Dcps.DDS.RETCODE_BAD_PARAMETER.value;
+        byte[][] out = new byte[1][];
+        long writerHandle = io.zzdds.runtime.ZzddsRuntime.lookupInstanceWriterRaw(rawWriter, sample.computeKeyHash());
+        check(writerHandle != 0, "lookupInstanceWriterRaw() found the written instance");
+        check(io.zzdds.runtime.ZzddsRuntime.getKeyValueWriter(rawWriter, writerHandle, out) == ok, "getKeyValueWriter() rc == OK");
+        check(out[0] != null && out[0].length > 4, "getKeyValueWriter() returned the stored payload");
+        out[0] = null;
+        check(io.zzdds.runtime.ZzddsRuntime.getKeyValueReader(rawReader, readerHandle, out) == ok, "getKeyValueReader() rc == OK");
+        check(out[0] != null && out[0].length > 4, "getKeyValueReader() returned the stored payload");
+        check(io.zzdds.runtime.ZzddsRuntime.getKeyValueWriter(rawWriter, 0L, out) == badParameter, "getKeyValueWriter() of HANDLE_NIL is BAD_PARAMETER");
+        check(io.zzdds.runtime.ZzddsRuntime.getKeyValueReader(rawReader, 0L, out) == badParameter, "getKeyValueReader() of HANDLE_NIL is BAD_PARAMETER");
+        check(io.zzdds.runtime.ZzddsRuntime.getKeyValueWriterRaw(rawWriter, writerHandle) != null, "getKeyValueWriterRaw() still returns the payload");
+        check(io.zzdds.runtime.ZzddsRuntime.getKeyValueReaderRaw(rawReader, readerHandle) != null, "getKeyValueReaderRaw() still returns the payload");
+        check(io.zzdds.runtime.ZzddsRuntime.getKeyValueWriterRaw(rawWriter, 0L) == null, "getKeyValueWriterRaw() of HANDLE_NIL is null");
+
+        // A writer keeps its first alive write, so no reader is needed.
+        check(BindingSmokeBlobTypeSupport.register(dp, null) == 0, "TypeSupport.register (blob)");
+        Dcps.DDS.Topic blobTopic = dp.create_topic("JavaSmokeBlob", "BindingSmokeBlob", null, null, 0);
+        Dcps.DDS.DataWriter blobRaw = publisher.create_datawriter(blobTopic, null, null, 0);
+        check(blobTopic != null && blobRaw != null, "create_topic/create_datawriter (blob)");
+        BindingSmokeBlobDataWriter blobWriter = new BindingSmokeBlobDataWriter(blobRaw);
+        Binding_smoke.BindingSmokeBlob blob = new Binding_smoke.BindingSmokeBlob();
+        blob.set_id(3);
+        java.util.List<Byte> data = new java.util.ArrayList<>();
+        for (int i = 0; i < 6000; i++) data.add((byte) i);
+        blob.set_data(data);
+        check(blobWriter.write(blob, 0L) == 0, "blob write() rc == 0");
+        long blobHandle = io.zzdds.runtime.ZzddsRuntime.lookupInstanceWriterRaw(blobRaw, blob.computeKeyHash());
+        out[0] = null;
+        check(io.zzdds.runtime.ZzddsRuntime.getKeyValueWriter(blobRaw, blobHandle, out) == ok, "getKeyValueWriter() of a 6000-byte sample rc == OK");
+        check(out[0] != null && out[0].length > 6000, "getKeyValueWriter() returned the whole 6000-byte sample");
+        byte[] old = io.zzdds.runtime.ZzddsRuntime.getKeyValueWriterRaw(blobRaw, blobHandle);
+        check(old != null && old.length == out[0].length, "getKeyValueWriterRaw() returns it too");
+        check(publisher.delete_datawriter(blobRaw) == 0, "delete_datawriter (blob)");
+        check(dp.delete_topic(blobTopic) == 0, "delete_topic (blob)");
+    }
+
     static void checkGeneratedConstruction() {
         int ok = Dcps.DDS.RETCODE_OK.value;
         Dcps.DDS.WaitSet ws = Dcps.DDS.WaitSet.create();
@@ -437,6 +482,9 @@ public class JavaSmoke {
             "dispose sample instance_state == NOT_ALIVE_DISPOSED_INSTANCE_STATE");
         System.out.println("  writer.dispose() via loan path: OK");
         System.out.println("  listener shared by two readers, one deleted: OK");
+
+        checkGetKeyValue(rawWriter, rawReader, sample, got.instanceHandle, dpWriter, publisher);
+        System.out.println("  get_key_value raw path, return codes and a payload over 4KB: OK");
 
         checkOneIdentity(zdSubscriber, topicReader, readerQos, writer, sample);
         System.out.println("  one listener object runs one callback at a time across readers: OK");

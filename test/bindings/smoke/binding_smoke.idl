@@ -3,3 +3,9 @@
     unsigned long count;
     string<32> label;
 };
+
+// For get_key_value of a sample larger than the bindings' 4KB first try.
+@appendable struct BindingSmokeBlob {
+    @key unsigned long id;
+    sequence<octet> data;
+};

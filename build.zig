@@ -1452,7 +1452,7 @@ pub fn build(b: *std.Build) void {
                     compile_java_smoke.addFileArg(runtime_jar.jar);
                 }
                 compile_java_smoke.addArgs(&.{"test/bindings/smoke/JavaSmoke.java"});
-                for (&[_][]const u8{ "Binding_smoke.java", "BindingSmokeStatusTypeSupport.java", "BindingSmokeStatusDataWriter.java", "BindingSmokeStatusDataReader.java" }) |f| {
+                for (&[_][]const u8{ "Binding_smoke.java", "BindingSmokeStatusTypeSupport.java", "BindingSmokeStatusDataWriter.java", "BindingSmokeStatusDataReader.java", "BindingSmokeBlobTypeSupport.java", "BindingSmokeBlobDataWriter.java", "BindingSmokeBlobDataReader.java" }) |f| {
                     compile_java_smoke.addFileArg(gen_smoke_java_dir.path(b, f));
                 }
                 for (&[_][]const u8{
