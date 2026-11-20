@@ -37,7 +37,7 @@ concurrency:
 env:
   INTEROP_RELEASE_TAG: v2.1.2026
   # Keep the fallback below and release.yml on the same harness revision.
-  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-76cd6f4' }}
+  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-76cd6f4-zig.0.17.1' }}
 
 jobs:
   design-validation:
@@ -48,7 +48,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: "0.17.0"
+          version: "0.17.1"
       - name: Schema registry, independent wire vectors and generated codec
         run: zig build test-design-models
 
@@ -69,7 +69,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: "0.17.0"
+          version: "0.17.1"
 
       - name: Run deterministic matrix (format, sleeps, debug)
         run: python3 scripts/run_deterministic_matrix.py --only format --only sleeps --only debug
@@ -88,7 +88,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: "0.17.0"
+          version: "0.17.1"
 
       - name: Run deterministic matrix (all but test-linux's steps)
         run: python3 scripts/run_deterministic_matrix.py --include-tsan --skip format --skip sleeps --skip debug
@@ -133,7 +133,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: "0.17.0"
+          version: "0.17.1"
 
       - name: Allow inbound UDP (Windows)
         if: runner.os == 'Windows'
@@ -235,7 +235,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: "0.17.0"
+          version: "0.17.1"
 
       - name: Allow inbound UDP (Windows)
         if: runner.os == 'Windows'
@@ -360,7 +360,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: "0.17.0"
+          version: "0.17.1"
 
       - name: Allow inbound UDP (Windows)
         if: runner.os == 'Windows'
@@ -503,7 +503,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: "0.17.0"
+          version: "0.17.1"
 
       - name: Install JDK (java-binding needs jni.h, not just a JRE)
         uses: actions/setup-java@v4
@@ -603,7 +603,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: "0.17.0"
+          version: "0.17.1"
 
       # ubuntu-latest's default ASLR entropy (vm.mmap_rnd_bits) is higher
       # than TSan's fixed shadow-memory layout reliably tolerates -- an
@@ -854,7 +854,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: "0.17.0"
+          version: "0.17.1"
 
       - name: Install Python
         uses: actions/setup-python@v5
@@ -963,7 +963,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: "0.17.0"
+          version: "0.17.1"
 
       - name: Install Python
         uses: actions/setup-python@v5
@@ -1024,7 +1024,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: "0.17.0"
+          version: "0.17.1"
 
       - name: Install Valgrind
         run: |
@@ -1076,7 +1076,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: "0.17.0"
+          version: "0.17.1"
 
       # Ubuntu 24.04 has no kcov package. Build unmodified upstream kcov,
       # linked to the distribution's stock libdw; no elfutils patch is needed.
@@ -1305,7 +1305,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: "0.17.0"
+          version: "0.17.1"
 
       - name: Build shape_main
         working-directory: dds-rtps/srcZig/zzdds

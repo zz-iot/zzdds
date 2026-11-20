@@ -8,6 +8,12 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-20
+
+- zzdds, its examples and its test apps require Zig 0.17.1, so release tags end in
+  `-zig.0.17.1`. zzdds pins zidl `v0.3.37-zig.0.17.1`. Interop CI and releases use the
+  dds-rtps harness tag `zenzen-76cd6f4-zig.0.17.1`.
+
 ## 2026-11-19
 
 - A DataReader's or DataWriter's `set_qos` no longer races with the threads that read its
