@@ -47,6 +47,7 @@ See each subdirectory's own `README.md` for its exact questions, findings,
 and how to build/run it.
 
 `build_all.py` builds every spike against zzdds's `zig-out` (after
-`zig build install -Dc-binding=true`) without running any, and CI runs it,
-so a C-ABI change that breaks a spike's build fails there. Only running a
+`zig build install -Dc-binding=true`), and with `--run` runs each probe
+expected to pass (not the modes a README expects to crash). CI runs it with
+`--run`, so a C-ABI change that breaks a spike fails there. Only running a
 probe checks the Python, Rust and Haskell declarations against the headers.

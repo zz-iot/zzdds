@@ -444,8 +444,10 @@ jobs:
   #
   # The Python, Go, Rust and Haskell spikes in examples/spikes call zzdds's
   # C ABI over each language's FFI, and nothing else builds them. This builds
-  # every one (running none), so a C-ABI change that breaks one fails here:
-  # a removed or renamed function, or for Go a changed signature.
+  # every one and runs each probe expected to pass, so a C-ABI change that
+  # breaks one fails here: a removed or renamed function, or a changed
+  # signature, which only running catches for the hand-written Python, Rust
+  # and Haskell declarations. The probes run one at a time, over loopback.
   spikes:
     name: language spikes
     needs: test-linux
@@ -469,8 +471,8 @@ jobs:
       - name: Build zzdds with the C binding
         run: zig build install -Dc-binding=true
 
-      - name: Build the spikes
-        run: python3 examples/spikes/build_all.py --out "$RUNNER_TEMP/spikes"
+      - name: Build the spikes and run their probes
+        run: python3 examples/spikes/build_all.py --out "$RUNNER_TEMP/spikes" --run
 
   # ── release bundle ───────────────────────────────────────────────────────
   #
