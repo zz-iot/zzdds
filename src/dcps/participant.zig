@@ -29,6 +29,7 @@ const publisher_mod = @import("publisher.zig");
 const subscriber_mod = @import("subscriber.zig");
 const topic_mod = @import("topic.zig");
 const filter_mod = @import("filter.zig");
+const key_value = @import("key_value.zig");
 const qos_change = @import("qos_change.zig");
 const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
@@ -918,6 +919,15 @@ pub const TypeSupport = struct {
     /// Optional cleanup called when the participant deinits this TypeSupport entry.
     /// Use to free any ctx allocation.  null = no cleanup needed (e.g. ctx = undefined).
     deinit: ?*const fn (ctx: *anyopaque) void = null,
+    /// Optional: projects a complete sample to its key-only CDR, so that an
+    /// instance keeps its key for get_key_value rather than its first
+    /// sample (`key_value.KeyProjection`). Writers and readers take it as
+    /// they are created. Its `ctx` is not `ctx` above and is not released
+    /// with it: it must outlive the participant, as a generated projection,
+    /// which needs no context, does. A replacing registration keeps the
+    /// projection already registered. `setKeyProjection` installs one with
+    /// a context the participant releases.
+    key_projection: ?key_value.KeyProjection = null,
     fn fieldGetter(self: TypeSupport) ?filter_mod.CdrFieldGetter {
         const func = self.get_field orelse return null;
         const pin = if (self.sample_processor) |p| (if (p.ctx == self.ctx) p else null) else null;
@@ -1112,6 +1122,13 @@ pub const DomainParticipantImpl = struct {
     /// Maps type_name → TypeSupport callbacks.
     /// Populated by registerTypeSupport(); consulted when a received change has no inline key_hash.
     type_support_registry: std.StringHashMapUnmanaged(TypeSupport),
+    /// The owners of key projection contexts `setKeyProjection` installed,
+    /// of which the participant holds one reference each, released as it is
+    /// deleted. Endpoints hold their own (`KeyProjection.retain`), so a
+    /// context outlives the participant while one still uses it, and a
+    /// registration, whose own context is freed when it is replaced, cannot
+    /// take it with it.
+    key_projection_owners: std.ArrayListUnmanaged(*key_value.ProjectionOwner) = .empty,
 
     default_pub_qos: DefaultQos(DDS.PublisherQos),
     default_sub_qos: DefaultQos(DDS.SubscriberQos),
@@ -1296,6 +1313,7 @@ pub const DomainParticipantImpl = struct {
             .builtin_sub = null,
             .type_info_registry = .empty,
             .type_support_registry = .empty,
+            .key_projection_owners = .empty,
             .default_pub_qos = .{ .value = .{} },
             .default_sub_qos = .{ .value = .{} },
             .default_topic_qos = .{ .value = .{} },
@@ -1913,6 +1931,8 @@ pub const DomainParticipantImpl = struct {
             self.alloc.free(entry.key_ptr.*);
         }
         self.type_support_registry.deinit(self.alloc);
+        for (self.key_projection_owners.items) |o| o.release();
+        self.key_projection_owners.deinit(self.alloc);
         self.discovered_participants.deinit(self.alloc);
         self.ignored_prefixes.deinit(self.alloc);
         for (self.ignored_topic_names.items) |n| self.alloc.free(n);
@@ -2035,8 +2055,58 @@ pub const DomainParticipantImpl = struct {
             self.alloc.free(gop.key_ptr.*);
             gop.key_ptr.* = owned_key;
         }
-        gop.value_ptr.* = ts;
+        var installed = ts;
+        if (gop.found_existing) {
+            if (cleanup.?.key_projection) |kept| installed.key_projection = kept;
+        }
+        gop.value_ptr.* = installed;
         return true;
+    }
+
+    /// Installs `projection` as `type_name`'s key projection
+    /// (`TypeSupport.key_projection`), for writers and readers created from
+    /// now on. `projection.ctx` is released with `release` once the
+    /// participant and every endpoint that took the projection are done with
+    /// it (`key_value.ProjectionOwner`), or at once if the type already has a
+    /// projection, which it keeps; true if it installed this one.
+    /// error.TypeNotRegistered leaves the context with the caller, as does
+    /// running out of memory.
+    pub fn setKeyProjection(
+        self: *Self,
+        type_name: []const u8,
+        projection: key_value.KeyProjection,
+        release: ?*const fn (ctx: *anyopaque) void,
+    ) error{ TypeNotRegistered, OutOfMemory }!bool {
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            const ts = self.type_support_registry.getPtr(type_name) orelse return error.TypeNotRegistered;
+            if (ts.key_projection == null) {
+                var installed = projection;
+                if (release) |f| {
+                    try self.key_projection_owners.ensureUnusedCapacity(self.alloc, 1);
+                    const owner = try key_value.ProjectionOwner.create(self.alloc, projection.ctx, f);
+                    self.key_projection_owners.appendAssumeCapacity(owner);
+                    installed.owner = owner;
+                }
+                ts.key_projection = installed;
+                return true;
+            }
+        }
+        if (release) |f| f(projection.ctx);
+        return false;
+    }
+
+    /// `ParticipantCbs.key_projection` for the Publisher and Subscriber: a
+    /// reference the new endpoint releases as it is freed.
+    fn keyProjectionFor(ctx: *anyopaque, type_name: []const u8) ?key_value.KeyProjection {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        const ts = self.type_support_registry.get(type_name) orelse return null;
+        const projection = ts.key_projection orelse return null;
+        projection.retain();
+        return projection;
     }
 
     /// Install a checked native/C registration before any topic exists. On
@@ -5304,6 +5374,7 @@ pub const DomainParticipantImpl = struct {
     fn makePubCbs(self: *Self) publisher_mod.ParticipantCbs {
         return .{
             .ctx = self,
+            .key_projection = keyProjectionFor,
             .is_participant_enabled = participantIsEnabledCb,
             .retain_topic = retainTopicUse,
             .create_proto_writer = pubCreateProtoWriter,
@@ -5325,6 +5396,7 @@ pub const DomainParticipantImpl = struct {
     fn makeSubCbs(self: *Self) subscriber_mod.ParticipantCbs {
         return .{
             .ctx = self,
+            .key_projection = keyProjectionFor,
             .is_participant_enabled = participantIsEnabledCb,
             .retain_topic = retainTopicUse,
             .create_proto_reader = subCreateProtoReader,

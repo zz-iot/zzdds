@@ -3,3 +3,16 @@
     unsigned long count;
     string<32> label;
 };
+
+// get_key_value of a large sample, whose instance keeps only its key.
+@appendable struct BindingSmokeBlob {
+    @key unsigned long id;
+    sequence<octet> data;
+};
+
+// get_key_value of a key larger than the first buffer each layer tries:
+// the key projection's 256 bytes and the Java runtime's 4096.
+@appendable struct BindingSmokeBigKey {
+    @key string name;
+    long value;
+};
