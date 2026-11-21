@@ -21,7 +21,8 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 - The language spikes build and run again: they found zzdds's install under the old
   `zzdds-examples` layout, and called `zzdds_register_type_support[_ctx]` and
   `DDS_DataReader_return_loan_raw` with older signatures (the Rust spike crashed returning
-  its loan).
+  its loan). A new CI job, `language spikes`, builds them all with
+  `examples/spikes/build_all.py`.
 - A disabled entity takes what DDS 1.4 §2.2.2.1.1.7 lets it take, the same on every entity
   (`docs/decisions.md`). Deleting from a disabled DomainParticipant, Publisher or
   Subscriber now works: `delete_publisher`, `delete_subscriber`, `delete_topic`,

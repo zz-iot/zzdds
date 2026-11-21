@@ -440,6 +440,38 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # ── language spikes ──────────────────────────────────────────────────────
+  #
+  # The Python, Go, Rust and Haskell spikes in examples/spikes call zzdds's
+  # C ABI over each language's FFI, and nothing else builds them. This builds
+  # every one (running none), so a C-ABI change that breaks one fails here:
+  # a removed or renamed function, or for Go a changed signature.
+  spikes:
+    name: language spikes
+    needs: test-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: "0.17.1"
+
+      # Python, Go and Rust come with the runner image; GHC does not.
+      - name: Install GHC
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ghc
+
+      - name: Build zzdds with the C binding
+        run: zig build install -Dc-binding=true
+
+      - name: Build the spikes
+        run: python3 examples/spikes/build_all.py --out "$RUNNER_TEMP/spikes"
+
   # ── release bundle ───────────────────────────────────────────────────────
   #
   # Builds the install tree as release.yml's package-libs job does, packs it,
