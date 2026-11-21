@@ -36,8 +36,8 @@
 package main
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../../../zzdds/zig-out/include
-#cgo LDFLAGS: -L${SRCDIR}/../../../../zzdds/zig-out/lib -lzzdds -Wl,-rpath,${SRCDIR}/../../../../zzdds/zig-out/lib
+#cgo CFLAGS: -I${SRCDIR}/../../../../zig-out/include
+#cgo LDFLAGS: -L${SRCDIR}/../../../../zig-out/lib -lzzdds -Wl,-rpath,${SRCDIR}/../../../../zig-out/lib
 #include <stdlib.h>
 #include "dcps.h"
 #include "zzdds_c.h"
@@ -147,7 +147,7 @@ func main() {
 
 	typeName := C.CString("SpikeType")
 	defer C.free(unsafe.Pointer(typeName))
-	if rc := C.zzdds_register_type_support(dp, typeName, nil, nil); rc != 0 {
+	if rc := C.zzdds_register_type_support(dp, typeName, nil, nil, nil); rc != 0 {
 		fmt.Printf("FAIL: register_type_support rc=%d\n", rc)
 		os.Exit(1)
 	}

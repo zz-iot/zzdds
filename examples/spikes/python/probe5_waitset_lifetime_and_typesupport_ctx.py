@@ -36,7 +36,7 @@ import time
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ZZDDS_LIB = os.environ.get(
     "ZZDDS_LIB",
-    os.path.join(SCRIPT_DIR, "..", "..", "..", "zzdds", "zig-out", "lib", "libzzdds.so"),
+    os.path.join(SCRIPT_DIR, "..", "..", "..", "zig-out", "lib", "libzzdds.so"),
 )
 
 c_void_p = ctypes.c_void_p
@@ -73,7 +73,8 @@ def load_and_declare():
     KEY_HASH_CTX_FN = ctypes.CFUNCTYPE(ctypes.c_int, c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint8))
     CTX_DEINIT_FN = ctypes.CFUNCTYPE(None, c_void_p)
     zzdds.zzdds_register_type_support_ctx.restype = ctypes.c_int
-    zzdds.zzdds_register_type_support_ctx.argtypes = [c_void_p, ctypes.c_char_p, KEY_HASH_CTX_FN, c_void_p, c_void_p, CTX_DEINIT_FN]
+    # (participant, type_name, compute_key_hash, compute_key_hash_key_only, get_field, ctx, ctx_deinit)
+    zzdds.zzdds_register_type_support_ctx.argtypes = [c_void_p, ctypes.c_char_p, KEY_HASH_CTX_FN, c_void_p, c_void_p, c_void_p, CTX_DEINIT_FN]
 
     return zzdds, DDS_Duration_t, DDS_ConditionSeq, CTX_DEINIT_FN, KEY_HASH_CTX_FN
 
@@ -181,7 +182,7 @@ def run_typesupport_ctx():
         state["deinit_b_fired"] = True
         print("[ctx_deinit B] fired", flush=True)
 
-    rc = zzdds.zzdds_register_type_support_ctx(dp, b"SpikeCtxType", null_key_hash_fn, None, ctx_a, deinit_a)
+    rc = zzdds.zzdds_register_type_support_ctx(dp, b"SpikeCtxType", null_key_hash_fn, None, None, ctx_a, deinit_a)
     if rc != DDS_RETCODE_OK:
         sys.exit(f"FAIL: first register_type_support_ctx rc={rc}")
     print("[main] registered TypeSupport A", flush=True)
@@ -198,7 +199,7 @@ def run_typesupport_ctx():
 
     holder_b = Holder(magic=MAGIC_B)
     ctx_b = ctypes.cast(ctypes.pointer(holder_b), c_void_p)
-    rc = zzdds.zzdds_register_type_support_ctx(dp, b"SpikeCtxType", null_key_hash_fn, None, ctx_b, deinit_b)
+    rc = zzdds.zzdds_register_type_support_ctx(dp, b"SpikeCtxType", null_key_hash_fn, None, None, ctx_b, deinit_b)
     if rc != DDS_RETCODE_OK:
         sys.exit(f"FAIL: second register_type_support_ctx rc={rc}")
     print("[main] registered TypeSupport B (same type_name -- should supersede A)", flush=True)

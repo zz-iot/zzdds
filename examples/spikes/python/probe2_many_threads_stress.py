@@ -80,7 +80,7 @@ def run_one_iteration(zzdds, shim, domain_id, state):
     if not dp:
         sys.exit(f"FAIL: create_participant() failed on domain {domain_id}")
 
-    rc = zzdds.zzdds_register_type_support(dp, b"SpikeType", None, None)
+    rc = zzdds.zzdds_register_type_support(dp, b"SpikeType", None, None, None)
     if rc != p.DDS_RETCODE_OK:
         sys.exit(f"FAIL: register_type_support failed rc={rc}")
 

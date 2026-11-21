@@ -47,7 +47,7 @@ import time
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ZZDDS_LIB = os.environ.get(
     "ZZDDS_LIB",
-    os.path.join(SCRIPT_DIR, "..", "..", "..", "zzdds", "zig-out", "lib", "libzzdds.so"),
+    os.path.join(SCRIPT_DIR, "..", "..", "..", "zig-out", "lib", "libzzdds.so"),
 )
 
 c_void_p = ctypes.c_void_p

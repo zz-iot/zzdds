@@ -282,9 +282,9 @@ unsafe extern "C" {
     pub fn DDS_DataReader_return_loan_raw(
         self_: DDS_DataReader,
         cdr_payloads: *mut DDS_OctetSeqSeq,
+        key_hashes: *mut DDS_OctetSeq,
         sample_infos: *mut DDS_SampleInfoSeq,
     ) -> DDS_ReturnCode_t;
-    pub fn DDS_OctetSeq_free(v: *mut DDS_OctetSeq);
 
     // spike_shim.c
     pub fn spike_sizeof_writer_qos() -> usize;

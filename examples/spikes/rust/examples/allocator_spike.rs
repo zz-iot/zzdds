@@ -9,7 +9,7 @@
 //! probe, not the analysis.
 //!
 //! Deliberately small: one factory, one WaitSet, one GuardCondition, all
-//! under the same caller-supplied allocator (zzdds-examples' existing
+//! under the same caller-supplied allocator (examples/c/custom-allocator's
 //! `static_pool_allocator.c`, reused via FFI — copied into this directory,
 //! not reimplemented in Rust, since the question here is whether Rust can
 //! *consume* a ZidlAllocator across the C ABI, not whether it can implement
