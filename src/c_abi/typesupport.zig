@@ -25,6 +25,7 @@ const participant_mod = @import("../dcps/participant.zig");
 const TypeSupport = participant_mod.TypeSupport;
 const DomainParticipantImpl = participant_mod.DomainParticipantImpl;
 const filter_mod = @import("../dcps/filter.zig");
+const key_value = @import("../dcps/key_value.zig");
 const nil = @import("../dcps/nil.zig");
 const zidl_bindings = @import("zidl_bindings");
 const extensions = @import("extensions.zig");
@@ -424,4 +425,89 @@ pub export fn zzdds_register_type_support_checked_ctx(participant: ?*anyopaque, 
     const adapter = impl.alloc.create(CheckedTypeSupportAdapter) catch return -1;
     adapter.* = .{ .alloc = impl.alloc, .process_ctx_fn = process_fn, .field_ctx_fn = field_fn, .has_key = has_key != 0, .user_ctx = ctx, .user_deinit = ctx_deinit };
     return adapter.install(impl, std.mem.span(type_name));
+}
+
+/// A type's key projection, as a binding generates it: writes the key-only
+/// CDR of the complete sample `sample[0..sample_len]` (both with their
+/// encapsulation header) to `out[0..out_size]` and its size to `*out_len`.
+/// Returns DDS_RETCODE_OK; PRECONDITION_NOT_MET when the key does not fit,
+/// with `*out_len` set to the size needed; or any other code if it cannot
+/// project the sample. Pure: it must not call DDS operations.
+pub const ZzddsProjectKeyFn = *const fn (
+    ctx: ?*anyopaque,
+    sample: [*]const u8,
+    sample_len: usize,
+    out: ?[*]u8,
+    out_size: usize,
+    out_len: *usize,
+) callconv(.c) DDS.ReturnCode_t;
+
+/// `key_value.KeyProjection` over a `ZzddsProjectKeyFn`.
+const CKeyProjection = struct {
+    alloc: std.mem.Allocator,
+    func: ZzddsProjectKeyFn,
+    user_ctx: ?*anyopaque,
+    user_deinit: ?*const fn (?*anyopaque) callconv(.c) void,
+
+    fn project(ctx: *anyopaque, sample: []const u8, allocator: std.mem.Allocator) ?[]u8 {
+        const self: *CKeyProjection = @ptrCast(@alignCast(ctx));
+        // Most keys are small: a stack buffer first, then the size asked for.
+        var stack: [256]u8 = undefined;
+        var len: usize = 0;
+        var rc = self.func(self.user_ctx, sample.ptr, sample.len, &stack, stack.len, &len);
+        if (rc == DDS.RETCODE_OK) return allocator.dupe(u8, stack[0..@min(len, stack.len)]) catch null;
+        // The same sample always projects to the same key, so the second
+        // call fits; a few more are only a guard against a projection that
+        // reports sizes it then does not use.
+        var tries: usize = 0;
+        while (rc == DDS.RETCODE_PRECONDITION_NOT_MET and tries < 4) : (tries += 1) {
+            const buf = allocator.alloc(u8, len) catch return null;
+            rc = self.func(self.user_ctx, sample.ptr, sample.len, buf.ptr, buf.len, &len);
+            if (rc == DDS.RETCODE_OK and len <= buf.len) {
+                if (len == buf.len) return buf;
+                defer allocator.free(buf);
+                return allocator.dupe(u8, buf[0..len]) catch null;
+            }
+            allocator.free(buf);
+        }
+        return null;
+    }
+
+    fn deinit(ctx: *anyopaque) void {
+        const self: *CKeyProjection = @ptrCast(@alignCast(ctx));
+        if (self.user_deinit) |f| f(self.user_ctx);
+        self.alloc.destroy(self);
+    }
+};
+
+/// Gives the type `type_name`, already registered on `participant`, a key
+/// projection: an instance then keeps the key-only CDR of its first alive
+/// sample for get_key_value, not the sample. Writers and readers created
+/// afterwards use it. Returns DDS_RETCODE_OK, and `ctx` passes to the
+/// participant, which releases it with `ctx_deinit` (if not NULL) as it is
+/// deleted, or at once if the type already has a projection, which it
+/// keeps. BAD_PARAMETER for a NULL participant or `func`, or an unregistered
+/// type, and OUT_OF_RESOURCES, leave `ctx` with the caller.
+pub export fn zzdds_set_key_projection(
+    participant: ?*anyopaque,
+    type_name: [*:0]const u8,
+    func: ?ZzddsProjectKeyFn,
+    ctx: ?*anyopaque,
+    ctx_deinit: ?*const fn (?*anyopaque) callconv(.c) void,
+) callconv(.c) DDS.ReturnCode_t {
+    const handle = participant orelse return DDS.RETCODE_BAD_PARAMETER;
+    const f = func orelse return DDS.RETCODE_BAD_PARAMETER;
+    const p = zidl_bindings.unboxAsView(DDS.DomainParticipant, handle);
+    if (nil.isNil(p)) return DDS.RETCODE_BAD_PARAMETER;
+    const impl: *DomainParticipantImpl = @ptrCast(@alignCast(p.ptr));
+    const adapter = impl.alloc.create(CKeyProjection) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+    adapter.* = .{ .alloc = impl.alloc, .func = f, .user_ctx = ctx, .user_deinit = ctx_deinit };
+    _ = impl.setKeyProjection(std.mem.span(type_name), .{ .ctx = adapter, .project = CKeyProjection.project }, CKeyProjection.deinit) catch |e| {
+        impl.alloc.destroy(adapter);
+        return switch (e) {
+            error.TypeNotRegistered => DDS.RETCODE_BAD_PARAMETER,
+            error.OutOfMemory => DDS.RETCODE_OUT_OF_RESOURCES,
+        };
+    };
+    return DDS.RETCODE_OK;
 }

@@ -111,6 +111,96 @@ pub const Fixture = struct {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
+// ── zzdds_set_key_projection ─────────────────────────────────────────────────
+
+const PROJECTED = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0x2A };
+
+fn projectKey(ctx: ?*anyopaque, sample: [*]const u8, sample_len: usize, out: ?[*]u8, out_size: usize, out_len: *usize) callconv(.c) DDS.ReturnCode_t {
+    _ = ctx;
+    _ = sample;
+    if (sample_len == 0) return DDS.RETCODE_ERROR;
+    out_len.* = PROJECTED.len;
+    if (out_size < PROJECTED.len) return DDS.RETCODE_PRECONDITION_NOT_MET;
+    @memcpy(out.?[0..PROJECTED.len], &PROJECTED);
+    return DDS.RETCODE_OK;
+}
+
+var released: usize = 0;
+fn releaseCtx(ctx: ?*anyopaque) callconv(.c) void {
+    _ = ctx;
+    released += 1;
+}
+
+test "c_abi TypeSupport: zzdds_set_key_projection installs one projection per type and releases the context" {
+    released = 0;
+    // A reference as an endpoint holds one, which outlives the participant.
+    var held: ?zzdds.KeyProjection = null;
+    {
+        var fx = try Fixture.init(testing.allocator);
+        defer fx.deinit();
+        // The type must be registered first; the context stays the caller's.
+        try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, c_abi_ts.zzdds_set_key_projection(fx.dp_boxed, "KeyedType", projectKey, null, releaseCtx));
+        try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, c_abi_ts.zzdds_set_key_projection(fx.dp_boxed, "KeyedType", null, null, releaseCtx));
+        try testing.expectEqual(@as(usize, 0), released);
+
+        try testing.expectEqual(@as(c_int, 0), c_abi_ts.zzdds_register_type_support(fx.dp_boxed, "KeyedType", stubComputeKeyHashFromCdr, null, null));
+        try testing.expectEqual(DDS.RETCODE_OK, c_abi_ts.zzdds_set_key_projection(fx.dp_boxed, "KeyedType", projectKey, null, releaseCtx));
+        const kp = fx.impl().type_support_registry.get("KeyedType").?.key_projection.?;
+        const key = kp.project(kp.ctx, &[_]u8{ 0, 1, 0, 0, 7, 7, 7, 7 }, testing.allocator).?;
+        defer testing.allocator.free(key);
+        try testing.expectEqualSlices(u8, &PROJECTED, key);
+        try testing.expect(kp.project(kp.ctx, &.{}, testing.allocator) == null);
+
+        // A second one is released at once: the first is kept.
+        try testing.expectEqual(DDS.RETCODE_OK, c_abi_ts.zzdds_set_key_projection(fx.dp_boxed, "KeyedType", projectKey, null, releaseCtx));
+        try testing.expectEqual(@as(usize, 1), released);
+        try testing.expectEqual(kp.ctx, fx.impl().type_support_registry.get("KeyedType").?.key_projection.?.ctx);
+
+        // Registering the type again keeps its projection.
+        try testing.expectEqual(@as(c_int, 0), c_abi_ts.zzdds_register_type_support(fx.dp_boxed, "KeyedType", stubComputeKeyHashFromCdr, null, null));
+        try testing.expectEqual(kp.ctx, fx.impl().type_support_registry.get("KeyedType").?.key_projection.?.ctx);
+
+        kp.retain();
+        held = kp;
+    }
+    // The kept one outlives the participant while a reference is held, and
+    // is released with the last.
+    try testing.expectEqual(@as(usize, 1), released);
+    const kp = held.?;
+    const key = kp.project(kp.ctx, &[_]u8{ 0, 1, 0, 0, 7, 7, 7, 7 }, testing.allocator).?;
+    testing.allocator.free(key);
+    kp.release();
+    try testing.expectEqual(@as(usize, 2), released);
+}
+
+test "c_abi TypeSupport: a writer and a reader take a key projection reference and release it as they are freed" {
+    released = 0;
+    {
+        var fx = try Fixture.init(testing.allocator);
+        defer fx.deinit();
+        try testing.expectEqual(@as(c_int, 0), c_abi_ts.zzdds_register_type_support(fx.dp_boxed, "KeyedType", stubComputeKeyHashFromCdr, null, null));
+        try testing.expectEqual(DDS.RETCODE_OK, c_abi_ts.zzdds_set_key_projection(fx.dp_boxed, "KeyedType", projectKey, null, releaseCtx));
+        const owner = fx.impl().type_support_registry.get("KeyedType").?.key_projection.?.owner.?;
+        try testing.expectEqual(@as(usize, 1), owner.refs.load(.monotonic));
+
+        const topic = fx.dp.create_topic("KeyedTopic", "KeyedType", .{}, null, 0);
+        const desc = @as(*zzdds.dcps.TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
+        const publisher = fx.dp.create_publisher(.{}, null, 0);
+        const subscriber = fx.dp.create_subscriber(.{}, null, 0);
+        const dw = publisher.create_datawriter(topic, .{}, null, 0);
+        const dr = subscriber.create_datareader(desc, .{}, null, 0);
+        try testing.expect(dw.ptr != nil.nil_datawriter.ptr and dr.ptr != nil.nil_datareader.ptr);
+        try testing.expectEqual(@as(usize, 3), owner.refs.load(.monotonic));
+
+        try testing.expectEqual(DDS.RETCODE_OK, publisher.delete_datawriter(dw));
+        try testing.expectEqual(DDS.RETCODE_OK, subscriber.delete_datareader(dr));
+        try testing.expectEqual(@as(usize, 1), owner.refs.load(.monotonic));
+        try testing.expectEqual(@as(usize, 0), released);
+        try testing.expectEqual(DDS.RETCODE_OK, fx.dp.vtable.delete_contained_entities(fx.dp.ptr));
+    }
+    try testing.expectEqual(@as(usize, 1), released);
+}
+
 test "c_abi TypeSupport: zzdds_register_type_support wires compute_key_hash" {
     var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();

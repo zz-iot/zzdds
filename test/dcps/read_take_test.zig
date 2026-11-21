@@ -409,9 +409,9 @@ test "readNextInstanceRaw: iterates instances in handle order" {
     try testing.expect(pair.dr.readNextInstanceRaw(second_ih) == null);
 }
 
-// ── getKeyValueRaw (reader) ───────────────────────────────────────────────────
+// ── storedKey (reader) ────────────────────────────────────────────────────────
 
-test "getKeyValueRaw (reader): returns CDR payload for known alive instance" {
+test "storedKey (reader): a known alive instance keeps its first sample, without a key projection" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
@@ -421,19 +421,20 @@ test "getKeyValueRaw (reader): returns CDR payload for known alive instance" {
     fx.settle();
 
     const ih = pair.dr.lookupInstance(KEY_A).?;
-    const kv = pair.dr.getKeyValueRaw(ih);
+    const kv = pair.dr.storedKey(ih);
     try testing.expect(kv != null);
-    try testing.expectEqualSlices(u8, &PAYLOAD, kv.?);
+    try testing.expectEqualSlices(u8, &PAYLOAD, kv.?.payload);
+    try testing.expect(!kv.?.key_only);
 }
 
-test "getKeyValueRaw (reader): returns null for unknown handle" {
+test "storedKey (reader): null for an unknown handle" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
     const pair = fx.makeWriterReader(.{}, .{});
 
     const unknown_ih: DDS.InstanceHandle_t = @bitCast(@as(u32, 0x7FFF_FFFE));
-    try testing.expect(pair.dr.getKeyValueRaw(unknown_ih) == null);
+    try testing.expect(pair.dr.storedKey(unknown_ih) == null);
 }
 
 // ── lookupInstance ────────────────────────────────────────────────────────────
@@ -455,9 +456,9 @@ test "lookupInstance: the handle of an alive instance, null for an unknown key" 
     try testing.expectEqual(@as(?DDS.InstanceHandle_t, null), pair.dr.lookupInstance(KEY_B));
 }
 
-// ── getKeyValueRaw (writer) ───────────────────────────────────────────────────
+// ── storedKey (writer) ────────────────────────────────────────────────────────
 
-test "getKeyValueRaw (writer): returns CDR payload after alive write" {
+test "storedKey (writer): an alive write keeps its sample, without a key projection" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
@@ -467,20 +468,21 @@ test "getKeyValueRaw (writer): returns CDR payload after alive write" {
     fx.settle();
 
     const ih = pair.dw.lookupInstance(KEY_A);
-    const kv = pair.dw.getKeyValueRaw(ih);
+    const kv = pair.dw.storedKey(ih);
     try testing.expect(kv != null);
-    try testing.expectEqualSlices(u8, &PAYLOAD, kv.?);
+    try testing.expectEqualSlices(u8, &PAYLOAD, kv.?.payload);
+    try testing.expect(!kv.?.key_only);
 }
 
-test "getKeyValueRaw (writer): returns null for handle with no prior write" {
+test "storedKey (writer): null for an instance registered without a key and not written" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
     const pair = fx.makeWriterReader(.{}, .{});
 
-    const ih = pair.dw.registerInstance(KEY_A);
+    const ih = pair.dw.registerInstance(KEY_A, &.{});
     try testing.expect(ih != DDS.HANDLE_NIL);
-    try testing.expect(pair.dw.getKeyValueRaw(ih) == null);
+    try testing.expect(pair.dw.storedKey(ih) == null);
 }
 
 // ── takeWithReadConditionRaw / readWithReadConditionRaw ────────────────────────

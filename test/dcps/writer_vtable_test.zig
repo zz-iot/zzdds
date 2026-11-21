@@ -1094,9 +1094,9 @@ test "write_raw: an explicit instance_handle that doesn't match the key hash is 
     var payload_seq = DDS.OctetSeq{ ._buffer = &payload_buf, ._length = payload_buf.len, ._maximum = payload_buf.len, ._release = false };
     const ts = DDS.Time_t{ .sec = DDS.TIME_INVALID_SEC, .nanosec = DDS.TIME_INVALID_NSEC };
     const impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
-    const real_handle = impl.registerInstance(key_hash_bytes);
+    const real_handle = impl.registerInstance(key_hash_bytes, &.{});
     // Another instance's handle, and one never issued.
-    const other_handle = impl.registerInstance(@as([16]u8, @splat(9)));
+    const other_handle = impl.registerInstance(@as([16]u8, @splat(9)), &.{});
     for ([_]DDS.InstanceHandle_t{ other_handle, real_handle + 1 }) |wrong_handle| {
         const rc = dw.vtable.write_raw(dw.ptr, &key_hash_seq, wrong_handle, &payload_seq, .ALIVE_WRITE_KIND, &ts);
         try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, rc);
@@ -1118,7 +1118,7 @@ test "publish_loan_raw: an explicit instance_handle that doesn't match the key h
     var key_hash_bytes = @as([16]u8, @splat(7));
     const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
     const impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
-    const wrong_handle = impl.registerInstance(key_hash_bytes) + 1;
+    const wrong_handle = impl.registerInstance(key_hash_bytes, &.{}) + 1;
     const rc = dw.vtable.publish_loan_raw(dw.ptr, &cdr_payload, &key_hash, wrong_handle, .ALIVE_WRITE_KIND);
     try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, rc);
 
@@ -1176,7 +1176,7 @@ test "concurrent write_raw on one DataWriter keeps its instances and last_sn con
         fn run(c: @This()) void {
             while (!c.stop.load(.acquire)) {
                 const kh = std.mem.zeroes([16]u8);
-                _ = c.impl.getKeyValueRaw(c.impl.lookupInstance(kh));
+                _ = c.impl.storedKey(c.impl.lookupInstance(kh));
                 std.Thread.yield() catch {};
             }
         }
@@ -1200,7 +1200,7 @@ test "concurrent write_raw on one DataWriter keeps its instances and last_sn con
             var kh = std.mem.zeroes([16]u8);
             std.mem.writeInt(u32, kh[0..4], tid, .little);
             std.mem.writeInt(u32, kh[4..8], i, .little);
-            if (impl.getKeyValueRaw(impl.lookupInstance(kh)) != null) found += 1;
+            if (impl.storedKey(impl.lookupInstance(kh)) != null) found += 1;
         }
     }
     try testing.expectEqual(@as(usize, N_THREADS * PER_THREAD), found);

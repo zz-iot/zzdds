@@ -898,7 +898,7 @@ test "A disabled tree takes factory, lookup and get-status operations at every l
     offered_incompatible.policies.deinit(alloc);
     var pub_matched = DDS.PublicationMatchedStatus{};
     try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.get_publication_matched_status(dw.ptr, &pub_matched));
-    try testing.expectEqual(DDS.HANDLE_NIL, zzdds.registerInstanceRaw(dw, @splat(0)));
+    try testing.expectEqual(DDS.HANDLE_NIL, zzdds.registerInstanceRaw(dw, @splat(0), &.{}));
     try testing.expectEqual(DDS.RETCODE_OK, pub_.delete_datawriter(dw));
     _ = pub_.create_datawriter(topic, .{}, null, 0);
     try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.delete_contained_entities(pub_.ptr));

@@ -398,6 +398,31 @@ was rejected: its index cannot serve as a handle once entries are removed, and i
 slower from 100,000 entries. Study, measurements and order of work:
 [`design/handle-registries.md`](design/handle-registries.md).
 
+**An instance keeps its key for `get_key_value`, not its first sample.** DDS 1.4
+§2.2.2.4.2.9 and §2.2.2.5.3.29 fill a key holder's key fields for any instance the writer
+or reader knows, so zzdds keeps each instance's key once, the first it gets, and never
+replaces it (`src/dcps/key_value.zig`). In order of arrival:
+- the key-only CDR `register_instance` passes (`zzdds_register_instance_raw`);
+- the key-only CDR of a dispose or unregister, written or received, which zzdds already
+  treats as key-only (RTPS sends it as a serialized key; the reader hashes it with the
+  key-only hash function);
+- the first alive sample's, projected to key-only by the type's key projection
+  (`TypeSupport.key_projection`; `zzdds_set_key_projection` from C), which zidl's generated
+  typesupport provides;
+- otherwise the first alive sample whole, flagged so, for a type without a projection (a
+  hand-written typesupport such as rmw_zzdds's, or none).
+
+`get_key_value` returns the key with that flag, and a binding decodes it with its key-only
+decoder or its selective one. Keeping the key rather than the sample keeps an instance's
+memory, and the copy `get_key_value` makes, to the key's size. A projection is installed
+apart from the registration, with its own reference-counted context: the participant holds
+one reference, and each writer and reader another from its creation until it is freed. A
+registration can be replaced and its context freed, and a writer can still be projecting a
+sample as its participant is deleted, while the projection's context lives on. The first
+projection a type gets is kept. With XTypes type
+information zzdds could project keys itself, leaving the whole-sample fallback for types it
+has no description of.
+
 **What a disabled entity takes follows DDS 1.4 §2.2.2.1.1.7, the same for every entity.**
 That section lets a disabled entity take: setting and getting its QoS, default QoS and
 listener; `get_statuscondition`; factory operations; `get_status_changes` and the other

@@ -220,7 +220,7 @@ int main(int argc, char **argv) {
 
     // -- get_key_value() round-trip on instance A's handle --
     ::SensorReading key_holder;
-    if (writer.get_key_value(handle_a, key_holder) != 0) {
+    if (writer.get_key_value(key_holder, handle_a) != DDS_RETCODE_OK) {
         std::fprintf(stderr, "FAIL: get_key_value() failed for sensor_id=1\n");
         return 1;
     }

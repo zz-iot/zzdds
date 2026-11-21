@@ -195,9 +195,10 @@ public class Publisher {
         System.out.println("Publisher: wrote sensor_id=3 value=300");
 
         // -- get_key_value() round-trip on instance A's handle --
-        Registry_sample.SensorReading keyHolder = writer.get_key_value(handleA);
-        if (keyHolder == null) {
-            System.err.println("FAIL: get_key_value() failed for sensor_id=1");
+        Registry_sample.SensorReading keyHolder = new Registry_sample.SensorReading();
+        int keyRc = writer.get_key_value(keyHolder, handleA);
+        if (keyRc != 0) {
+            System.err.println("FAIL: get_key_value() failed for sensor_id=1: rc=" + keyRc);
             System.exit(1);
         }
         if (keyHolder.get_sensor_id() != 1) {
