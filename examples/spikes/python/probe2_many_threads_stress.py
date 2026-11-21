@@ -72,15 +72,15 @@ def run_one_iteration(zzdds, shim, domain_id, state):
     listener.on_sample_lost = p.ON_SAMPLE_LOST_CB(0)
     listener.release_listener_data = p.RELEASE_LISTENER_DATA_CB(0)
 
-    factory = zzdds.zzdds_create_factory()
+    factory = zzdds.zzdds_DomainParticipantFactory_create()
     if not factory:
-        sys.exit("FAIL: zzdds_create_factory() returned NULL")
+        sys.exit("FAIL: zzdds_DomainParticipantFactory_create() returned NULL")
     dds_factory = zzdds.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory)
     dp = zzdds.DDS_DomainParticipantFactory_create_participant(dds_factory, domain_id, None, None, 0)
     if not dp:
         sys.exit(f"FAIL: create_participant() failed on domain {domain_id}")
 
-    rc = zzdds.zzdds_register_type_support(dp, b"SpikeType", None, None)
+    rc = zzdds.zzdds_register_type_support(dp, b"SpikeType", None, None, None)
     if rc != p.DDS_RETCODE_OK:
         sys.exit(f"FAIL: register_type_support failed rc={rc}")
 
@@ -104,9 +104,9 @@ def run_one_iteration(zzdds, shim, domain_id, state):
         sys.exit("FAIL: create_datareader() failed")
 
     time.sleep(SETTLE_SEC)
-    zzdds.zzdds_destroy_factory(factory)
+    zzdds.zzdds_DomainParticipantFactory_release(factory)
     # cb/listener must outlive the factory (native side may still be
-    # mid-dispatch right up to destroy_factory returning) but not this
+    # mid-dispatch right up to the factory release returning) but not this
     # function -- drop them now, deliberately, and let gc.collect() below
     # prove nothing native still points at them. (Probe 3 is the dedicated,
     # adversarial version of "drop the reference *before* teardown".)

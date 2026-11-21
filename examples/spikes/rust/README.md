@@ -48,8 +48,8 @@ RELIABLE+KEEP_ALL on the writer QoS.
 
 ```sh
 cd zzdds && zig build -Dc-binding=true install
-cd ../zzdds-examples/spikes/rust
-gcc -shared -fPIC -I../../../zzdds/zig-out/include -o libspike_shim.so spike_shim.c static_pool_allocator.c
+cd examples/spikes/rust
+gcc -shared -fPIC -I../../../zig-out/include -o libspike_shim.so spike_shim.c static_pool_allocator.c
 cargo run                                  # real end-to-end loan, correct usage
 cargo build --example escape_attempt       # MUST fail to compile -- see Findings
 cargo run --example allocator_spike        # allocator-injection probe, see "Allocator injection" below
@@ -82,7 +82,7 @@ cargo run --example allocator_spike        # allocator-injection probe, see "All
 - **`examples/allocator_spike.rs`** — the allocator-injection probe (added
   later, see "Allocator injection" below): creates a factory, `WaitSet`, and
   `GuardCondition` all under the same caller-supplied `ZidlAllocator`
-  (`static_pool_allocator.c`, copied in from `zzdds-examples/c/custom-
+  (`static_pool_allocator.c`, copied in from `examples/c/custom-
   allocator/`, same self-contained-copy convention as `spike_shim.c`),
   attaches/triggers/waits for the condition, and confirms it fired.
 

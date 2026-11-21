@@ -186,8 +186,8 @@ impl DDS_SampleInfoSeq {
 }
 
 unsafe extern "C" {
-    pub fn zzdds_create_factory() -> ZzddsDomainParticipantFactory;
-    pub fn zzdds_destroy_factory(factory: ZzddsDomainParticipantFactory);
+    pub fn zzdds_DomainParticipantFactory_create() -> ZzddsDomainParticipantFactory;
+    pub fn zzdds_DomainParticipantFactory_release(factory: ZzddsDomainParticipantFactory);
     pub fn zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(
         factory: ZzddsDomainParticipantFactory,
     ) -> DDS_DomainParticipantFactory;
@@ -204,6 +204,7 @@ unsafe extern "C" {
         participant: DDS_DomainParticipant,
         type_name: *const c_char,
         compute_key_hash_fn: *const c_void,
+        compute_key_hash_key_only_fn: *const c_void,
         get_field_fn: *const c_void,
     ) -> c_int;
 
@@ -282,9 +283,9 @@ unsafe extern "C" {
     pub fn DDS_DataReader_return_loan_raw(
         self_: DDS_DataReader,
         cdr_payloads: *mut DDS_OctetSeqSeq,
+        key_hashes: *mut DDS_OctetSeq,
         sample_infos: *mut DDS_SampleInfoSeq,
     ) -> DDS_ReturnCode_t;
-    pub fn DDS_OctetSeq_free(v: *mut DDS_OctetSeq);
 
     // spike_shim.c
     pub fn spike_sizeof_writer_qos() -> usize;
@@ -295,7 +296,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     // ── Allocator-spike additions ──
 
-    pub fn zzdds_create_factory_with_allocator(
+    pub fn zzdds_DomainParticipantFactory_create_with_allocator(
         allocator: *const ZidlAllocator,
     ) -> ZzddsDomainParticipantFactory;
 

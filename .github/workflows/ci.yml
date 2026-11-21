@@ -305,7 +305,7 @@ jobs:
     needs: test-linux
     permissions:
       contents: read
-    uses: zz-iot/rmw_zzdds/.github/workflows/ci.yml@175974a80d7389be5cacb8d38303aeaa130748fa
+    uses: zz-iot/rmw_zzdds/.github/workflows/ci.yml@be8b00b8e78cdce86d79abe085477eb4aa40f0f1
     with:
       mode: zzdds-pr
       zzdds_repo: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
@@ -439,6 +439,40 @@ jobs:
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 14
+
+  # ── language spikes ──────────────────────────────────────────────────────
+  #
+  # The Python, Go, Rust and Haskell spikes in examples/spikes call zzdds's
+  # C ABI over each language's FFI, and nothing else builds them. This checks
+  # the hand-written Python, Rust and Haskell declarations against the
+  # headers, builds every spike and runs each probe expected to pass, so a
+  # C-ABI change that breaks one fails here. The probes run one at a time,
+  # over loopback.
+  spikes:
+    name: language spikes
+    needs: test-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: "0.17.1"
+
+      # Python, Go and Rust come with the runner image; GHC does not.
+      - name: Install GHC
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ghc
+
+      - name: Build zzdds with the C binding
+        run: zig build install -Dc-binding=true
+
+      - name: Build the spikes and run their probes
+        run: python3 examples/spikes/build_all.py --out "$RUNNER_TEMP/spikes" --run
 
   # ── release bundle ───────────────────────────────────────────────────────
   #

@@ -34,7 +34,7 @@ tweak? Read it yourself and mutate the resolved struct — same as any other ove
 `docs/decisions.md` §Configuration for the full rationale.
 
 Process-wide config (`resolveProcessConfig`/`resolveProcessConfigFrom`, `src/config/process.zig`)
-is a deliberate, singular exception: `zzdds_create_factory()` lazily resolves+installs it at
+is a deliberate, singular exception: creating a factory lazily resolves+installs it at
 most once per process (trying `./zzdds.toml`) unless the app already called
 `zzdds_process_configure()` itself, then seeds each new factory's default participant config
 from it.

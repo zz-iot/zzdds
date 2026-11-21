@@ -33,14 +33,14 @@ import System.Exit (exitFailure)
 import System.IO (hFlush, stdout)
 import System.Mem (performGC)
 
-foreign import ccall "zzdds_create_factory" c_zzdds_create_factory :: IO (Ptr ())
-foreign import ccall "zzdds_destroy_factory" c_zzdds_destroy_factory :: Ptr () -> IO ()
+foreign import ccall "zzdds_DomainParticipantFactory_create" c_zzdds_DomainParticipantFactory_create :: IO (Ptr ())
+foreign import ccall "zzdds_DomainParticipantFactory_release" c_zzdds_DomainParticipantFactory_release :: Ptr () -> IO ()
 foreign import ccall "zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory"
   c_factory_as_dds :: Ptr () -> IO (Ptr ())
 foreign import ccall "DDS_DomainParticipantFactory_create_participant"
   c_create_participant :: Ptr () -> Word32 -> Ptr () -> Ptr () -> Word32 -> IO (Ptr ())
 foreign import ccall "zzdds_register_type_support"
-  c_register_type_support :: Ptr () -> CString -> Ptr () -> Ptr () -> IO CInt
+  c_register_type_support :: Ptr () -> CString -> Ptr () -> Ptr () -> Ptr () -> IO CInt
 foreign import ccall "DDS_DomainParticipant_create_topic"
   c_create_topic :: Ptr () -> CString -> CString -> Ptr () -> Ptr () -> Word32 -> IO (Ptr ())
 foreign import ccall "DDS_Topic_as_DDS_TopicDescription" c_topic_as_desc :: Ptr () -> IO (Ptr ())
@@ -104,15 +104,15 @@ main = do
 
   releaseCbPtr <- mkReleaseCb $ \_ -> putStrLn "[callback] release_listener_data fired"
 
-  factory <- c_zzdds_create_factory
-  when (factory == nullPtr) $ putStrLn "FAIL: zzdds_create_factory nil" >> exitFailure
+  factory <- c_zzdds_DomainParticipantFactory_create
+  when (factory == nullPtr) $ putStrLn "FAIL: zzdds_DomainParticipantFactory_create nil" >> exitFailure
   ddsFactory <- c_factory_as_dds factory
   dp <- c_create_participant ddsFactory domainId nullPtr nullPtr 0
   when (dp == nullPtr) $ putStrLn "FAIL: create_participant" >> exitFailure
 
   withCString "SpikeType" $ \typeName ->
     withCString "SpikeTopic" $ \topicName -> do
-      rc <- c_register_type_support dp typeName nullPtr nullPtr
+      rc <- c_register_type_support dp typeName nullPtr nullPtr nullPtr
       when (rc /= 0) $ putStrLn "FAIL: register_type_support" >> exitFailure
       topic <- c_create_topic dp topicName typeName nullPtr nullPtr 0
       when (topic == nullPtr) $ putStrLn "FAIL: create_topic" >> exitFailure
@@ -138,7 +138,7 @@ main = do
       hFlush stdout
       threadDelay (fromIntegral (tickCount + 3) * 200000)
 
-      c_zzdds_destroy_factory factory
+      c_zzdds_DomainParticipantFactory_release factory
       freeStablePtr magicSP
 
       checks <- readIORef checksRef

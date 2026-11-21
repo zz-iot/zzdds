@@ -19,14 +19,14 @@ did.
 
 ```sh
 cd zzdds && zig build -Dc-binding=true install
-cd ../zzdds-examples/spikes/go
+cd examples/spikes/go
 go build -o /tmp/probe1_attach ./probe1_attach && /tmp/probe1_attach
 go build -o /tmp/probe2_ctx_handle ./probe2_ctx_handle
 SPIKE_MODE=handle /tmp/probe2_ctx_handle
 SPIKE_MODE=raw    /tmp/probe2_ctx_handle   # expected to panic -- see Findings
 ```
 
-Each probe's `#cgo CFLAGS`/`LDFLAGS` point at `../../../../zzdds/zig-out`
+Each probe's `#cgo CFLAGS`/`LDFLAGS` point at `../../../../zig-out`
 relative to its own source file (`${SRCDIR}`-based, no env vars needed) —
 only requires `zig build -Dc-binding=true install` to have been run first.
 

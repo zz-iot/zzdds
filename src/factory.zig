@@ -16,7 +16,7 @@ pub const CreateFactoryError = error{
 
 /// Single-owner factory wrapper. Must not be copied by value while active —
 /// each copy holds an independent `active` field, so both copies would call
-/// zzdds_destroy_factory on the same underlying FactoryOwner on deinit.
+/// release the same underlying FactoryOwner on deinit.
 pub const DomainParticipantFactory = struct {
     handle: ZZDDS.DomainParticipantFactory,
     active: bool = true,
@@ -25,7 +25,8 @@ pub const DomainParticipantFactory = struct {
 
     pub fn deinit(self: *Self) void {
         if (!@atomicRmw(bool, &self.active, .Xchg, false, .acq_rel)) return;
-        extensions.zzdds_destroy_factory(self.handle.vtable.get_c_abi_handle(self.handle.ptr));
+        // The release: deletes every participant left, then the factory.
+        self.handle.vtable.deinit(self.handle.ptr);
     }
 
     pub fn toZZDDSFactory(self: *const Self) ZZDDS.DomainParticipantFactory {
@@ -38,8 +39,7 @@ pub const DomainParticipantFactory = struct {
 };
 
 pub fn createFactory() CreateFactoryError!DomainParticipantFactory {
-    const boxed = extensions.zzdds_create_factory() orelse return error.FactoryCreateFailed;
-    const handle = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, boxed);
+    const handle = extensions.createFactory(null) catch return error.FactoryCreateFailed;
     return .{ .handle = handle };
 }
 
@@ -51,7 +51,7 @@ pub fn createFactory() CreateFactoryError!DomainParticipantFactory {
 /// `c_alloc` must outlive the returned `DomainParticipantFactory` (and
 /// everything created through it) -- zzdds never copies it, only ever
 /// dereferences it, same contract as the raw C-ABI
-/// `zzdds_create_factory_with_allocator` this wraps. Build `c_alloc` with
+/// `zzdds_DomainParticipantFactory_create_with_allocator`. Build `c_alloc` with
 /// `allocator_adapter.fromAllocator(&my_stable_allocator)` and store the
 /// result somewhere that outlives the factory (a module-level `var`, or a
 /// field on whatever your own top-level "participant" struct is) -- NOT a
@@ -61,8 +61,7 @@ pub fn createFactory() CreateFactoryError!DomainParticipantFactory {
 /// `c_alloc` as its own local and got exactly that crash on first
 /// `deinit()`).
 pub fn createFactoryWithAllocator(c_alloc: *const zidl_bindings.ZidlAllocator) CreateFactoryError!DomainParticipantFactory {
-    const boxed = extensions.zzdds_create_factory_with_allocator(c_alloc) orelse return error.FactoryCreateFailed;
-    const handle = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, boxed);
+    const handle = extensions.createFactory(c_alloc) catch return error.FactoryCreateFailed;
     return .{ .handle = handle };
 }
 

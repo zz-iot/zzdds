@@ -100,15 +100,15 @@ def run(mode):
     listener.on_sample_lost = p.ON_SAMPLE_LOST_CB(0)
     listener.release_listener_data = release_cb
 
-    factory = zzdds.zzdds_create_factory()
+    factory = zzdds.zzdds_DomainParticipantFactory_create()
     if not factory:
-        sys.exit("FAIL: zzdds_create_factory() returned NULL")
+        sys.exit("FAIL: zzdds_DomainParticipantFactory_create() returned NULL")
     dds_factory = zzdds.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory)
     dp = zzdds.DDS_DomainParticipantFactory_create_participant(dds_factory, DOMAIN_ID, None, None, 0)
     if not dp:
         sys.exit("FAIL: create_participant() failed")
 
-    rc = zzdds.zzdds_register_type_support(dp, b"SpikeType", None, None)
+    rc = zzdds.zzdds_register_type_support(dp, b"SpikeType", None, None, None)
     if rc != p.DDS_RETCODE_OK:
         sys.exit(f"FAIL: register_type_support failed rc={rc}")
 
@@ -148,7 +148,7 @@ def run(mode):
     time.sleep(RUN_SECONDS)
 
     print(f"[main] survived {RUN_SECONDS}s post-setup, fires={state['fires']}", flush=True)
-    zzdds.zzdds_destroy_factory(factory)
+    zzdds.zzdds_DomainParticipantFactory_release(factory)
     print("[main] teardown completed without crashing", flush=True)
     print("PASS" if mode == "safe" else "PASS (unsafe mode did not crash -- see README before trusting this)")
 

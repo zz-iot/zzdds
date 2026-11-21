@@ -468,7 +468,7 @@ real mistake than an intentional absence.
 
 Process-wide config (`src/config/process.zig`) is a deliberate, singular exception to this
 codebase's "not a singleton" stance (`factory.zig`'s own doc comment) — a process genuinely has
-exactly one ambient environment/filesystem, unlike a `DomainParticipantConfig`. `zzdds_create_factory()`
+exactly one ambient environment/filesystem, unlike a `DomainParticipantConfig`. Creating a factory
 lazily resolves and installs it at most once per process if the app never called
 `zzdds_process_configure()` itself, then seeds the new factory's default participant config from it.
 
