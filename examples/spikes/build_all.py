@@ -3,12 +3,14 @@
 each probe that is expected to pass.
 
 CI runs this with --run, so that a change to zzdds's C ABI that breaks a
-spike fails there. A build checks where each spike finds zzdds, the names of
-the C functions it links, and, for Go (cgo checks calls against the
-headers), their signatures. Only running a probe checks the Python, Rust and
-Haskell declarations, which are written by hand. The modes a spike's README
-expects to crash (Python's probe3 --unsafe and probe4 --crash, Go's
-SPIKE_MODE=raw) are not run.
+spike fails there. First it checks that the Python, Rust and Haskell
+declarations of zzdds's C functions, which are written by hand, name
+functions the headers declare and take as many parameters (and that each
+Python call passes that many). A build then checks where each spike finds
+zzdds, the names of the C functions it links, and, for Go (cgo checks calls
+against the headers), their signatures. Running a probe checks the rest.
+The modes a spike's README expects to crash (Python's probe3 --unsafe and
+probe4 --crash, Go's SPIKE_MODE=raw) are not run.
 
 Needs `zig build install -Dc-binding=true` first, plus gcc, python3, go,
 cargo and ghc. Everything it builds goes under --out (a temporary directory
@@ -25,6 +27,7 @@ from __future__ import annotations
 import argparse
 import os
 import py_compile
+import re
 import subprocess
 import sys
 import tempfile
@@ -77,6 +80,78 @@ def run(name: str, cmd: list[str], cwd: Path, env: dict[str, str] | None = None,
         failures.append(name)
         print(output, flush=True)
         print(f"FAIL: {reason}", flush=True)
+
+
+def split_top_level(text: str) -> list[str]:
+    """Splits a parameter or argument list at its top-level commas."""
+    parts, depth, current = [], 0, ""
+    for ch in text:
+        if ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += ch
+    parts.append(current)
+    return [p for p in parts if p.strip()]
+
+
+def closing_paren(text: str, start: int) -> int:
+    """The index just past the `)` matching the `(` before `start`."""
+    depth, i = 1, start
+    while depth and i < len(text):
+        depth += {"(": 1, ")": -1}.get(text[i], 0)
+        i += 1
+    return i
+
+
+def header_arities(include: Path) -> dict[str, int]:
+    """Each zzdds or DDS function the installed headers declare, with its
+    parameter count."""
+    arities: dict[str, int] = {}
+    for header in include.glob("*.h"):
+        text = re.sub(r"/\*.*?\*/|//[^\n]*", "", header.read_text(), flags=re.S)
+        for m in re.finditer(r"\b((?:DDS|zzdds)_\w+)\s*\(", text):
+            end = closing_paren(text, m.end())
+            statement = text[text.rfind(";", 0, m.start()) + 1 : m.start()]
+            if not text[end:].lstrip().startswith(";") or "typedef" in statement:
+                continue  # a call, a macro or a function-pointer typedef
+            params = text[m.end() : end - 1].strip()
+            arities[m.group(1)] = 0 if params in ("", "void") else len(split_top_level(params))
+    return arities
+
+
+def check_declarations(include: Path) -> None:
+    """Checks the hand-written FFI declarations of zzdds's C functions (and
+    the Python calls) against the headers: the function exists and takes as
+    many parameters. A wrong count can pass a run, when the parameter it
+    shifts is one the probe never exercises."""
+    print("== declarations match the headers", flush=True)
+    arities = header_arities(include)
+    found: list[tuple[str, str, int]] = []  # (where, function, parameter or argument count)
+    for m in re.finditer(r"pub fn ((?:DDS|zzdds)_\w+)\((.*?)\)", (SPIKES / "rust" / "src" / "ffi.rs").read_text(), re.S):
+        found.append(("rust/src/ffi.rs", m.group(1), len(split_top_level(m.group(2)))))
+    for hs in sorted((SPIKES / "haskell").glob("*.hs")):
+        for m in re.finditer(r'foreign import ccall\s+(?:safe\s+|unsafe\s+)?"((?:DDS|zzdds)_\w+)"\s+\w+\s*::\s*([^\n]*)', hs.read_text()):
+            found.append((f"haskell/{hs.name}", m.group(1), m.group(2).count("->")))
+    for py in sorted((SPIKES / "python").glob("*.py")):
+        text = py.read_text()
+        for m in re.finditer(r"\.((?:DDS|zzdds)_\w+)\.argtypes\s*=\s*\[(.*?)\]\s*\n", text, re.S):
+            found.append((f"python/{py.name} (argtypes)", m.group(1), len(split_top_level(m.group(2)))))
+        for m in re.finditer(r"\bzzdds\.((?:DDS|zzdds)_\w+)\(", text):
+            found.append((f"python/{py.name} (call)", m.group(1), len(split_top_level(text[m.end() : closing_paren(text, m.end()) - 1]))))
+    for where, name, count in found:
+        if name not in arities:
+            failures.append(f"{where}: {name} is not in zzdds's headers")
+        elif arities[name] != count:
+            failures.append(f"{where}: {name} has {count} parameters or arguments, the header {arities[name]}")
+    if not found:
+        failures.append("declarations: found none to check")
+    for f in failures:
+        print(f"FAIL: {f}", flush=True)
 
 
 def with_env(**extra: str) -> dict[str, str]:
@@ -160,6 +235,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="zzdds-spikes-") as tmp:
         out = (args.out or Path(tmp)).resolve()
         out.mkdir(parents=True, exist_ok=True)
+        check_declarations(include)
         build_python(out, include, lib)
         build_go(out, include, lib)
         build_rust(out, include, lib)

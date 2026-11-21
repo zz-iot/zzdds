@@ -108,7 +108,7 @@ def run(mode):
     if not dp:
         sys.exit("FAIL: create_participant() failed")
 
-    rc = zzdds.zzdds_register_type_support(dp, b"SpikeType", None, None)
+    rc = zzdds.zzdds_register_type_support(dp, b"SpikeType", None, None, None)
     if rc != p.DDS_RETCODE_OK:
         sys.exit(f"FAIL: register_type_support failed rc={rc}")
 

@@ -81,7 +81,8 @@ def declare_signatures(zzdds, shim):
     ]
 
     zzdds.zzdds_register_type_support.restype = ctypes.c_int
-    zzdds.zzdds_register_type_support.argtypes = [c_void_p, ctypes.c_char_p, c_void_p, c_void_p]
+    # (participant, type_name, compute_key_hash, compute_key_hash_key_only, get_field)
+    zzdds.zzdds_register_type_support.argtypes = [c_void_p, ctypes.c_char_p, c_void_p, c_void_p, c_void_p]
 
     zzdds.DDS_DomainParticipant_create_topic.restype = c_void_p
     zzdds.DDS_DomainParticipant_create_topic.argtypes = [
@@ -187,7 +188,7 @@ def main():
 
     # Keyless, no CDR/TypeSupport needed at all -- this probe never writes or
     # reads a sample, only exercises DEADLINE timer callback delivery.
-    rc = zzdds.zzdds_register_type_support(dp, b"SpikeType", None, None)
+    rc = zzdds.zzdds_register_type_support(dp, b"SpikeType", None, None, None)
     if rc != DDS_RETCODE_OK:
         sys.exit(f"FAIL: register_type_support failed rc={rc}")
 

@@ -204,6 +204,7 @@ unsafe extern "C" {
         participant: DDS_DomainParticipant,
         type_name: *const c_char,
         compute_key_hash_fn: *const c_void,
+        compute_key_hash_key_only_fn: *const c_void,
         get_field_fn: *const c_void,
     ) -> c_int;
 

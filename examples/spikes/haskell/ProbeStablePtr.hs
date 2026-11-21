@@ -40,7 +40,7 @@ foreign import ccall "zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFac
 foreign import ccall "DDS_DomainParticipantFactory_create_participant"
   c_create_participant :: Ptr () -> Word32 -> Ptr () -> Ptr () -> Word32 -> IO (Ptr ())
 foreign import ccall "zzdds_register_type_support"
-  c_register_type_support :: Ptr () -> CString -> Ptr () -> Ptr () -> IO CInt
+  c_register_type_support :: Ptr () -> CString -> Ptr () -> Ptr () -> Ptr () -> IO CInt
 foreign import ccall "DDS_DomainParticipant_create_topic"
   c_create_topic :: Ptr () -> CString -> CString -> Ptr () -> Ptr () -> Word32 -> IO (Ptr ())
 foreign import ccall "DDS_Topic_as_DDS_TopicDescription" c_topic_as_desc :: Ptr () -> IO (Ptr ())
@@ -112,7 +112,7 @@ main = do
 
   withCString "SpikeType" $ \typeName ->
     withCString "SpikeTopic" $ \topicName -> do
-      rc <- c_register_type_support dp typeName nullPtr nullPtr
+      rc <- c_register_type_support dp typeName nullPtr nullPtr nullPtr
       when (rc /= 0) $ putStrLn "FAIL: register_type_support" >> exitFailure
       topic <- c_create_topic dp topicName typeName nullPtr nullPtr 0
       when (topic == nullPtr) $ putStrLn "FAIL: create_topic" >> exitFailure

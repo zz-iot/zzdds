@@ -30,7 +30,7 @@ fn main() {
         assert!(!dp.is_null(), "create_participant() failed");
 
         let type_name = CString::new("SpikeLoanType").unwrap();
-        let rc = ffi::zzdds_register_type_support(dp, type_name.as_ptr(), std::ptr::null(), std::ptr::null());
+        let rc = ffi::zzdds_register_type_support(dp, type_name.as_ptr(), std::ptr::null(), std::ptr::null(), std::ptr::null());
         assert_eq!(rc, ffi::DDS_RETCODE_OK, "register_type_support failed rc={}", rc);
 
         let topic_name = CString::new("SpikeLoanTopic").unwrap();

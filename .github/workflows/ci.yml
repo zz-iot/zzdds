@@ -443,11 +443,11 @@ jobs:
   # ── language spikes ──────────────────────────────────────────────────────
   #
   # The Python, Go, Rust and Haskell spikes in examples/spikes call zzdds's
-  # C ABI over each language's FFI, and nothing else builds them. This builds
-  # every one and runs each probe expected to pass, so a C-ABI change that
-  # breaks one fails here: a removed or renamed function, or a changed
-  # signature, which only running catches for the hand-written Python, Rust
-  # and Haskell declarations. The probes run one at a time, over loopback.
+  # C ABI over each language's FFI, and nothing else builds them. This checks
+  # the hand-written Python, Rust and Haskell declarations against the
+  # headers, builds every spike and runs each probe expected to pass, so a
+  # C-ABI change that breaks one fails here. The probes run one at a time,
+  # over loopback.
   spikes:
     name: language spikes
     needs: test-linux
