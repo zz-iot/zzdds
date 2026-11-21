@@ -36,8 +36,8 @@
 package main
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../../../zzdds/zig-out/include
-#cgo LDFLAGS: -L${SRCDIR}/../../../../zzdds/zig-out/lib -lzzdds -Wl,-rpath,${SRCDIR}/../../../../zzdds/zig-out/lib
+#cgo CFLAGS: -I${SRCDIR}/../../../../zig-out/include
+#cgo LDFLAGS: -L${SRCDIR}/../../../../zig-out/lib -lzzdds -Wl,-rpath,${SRCDIR}/../../../../zig-out/lib
 #include <stdlib.h>
 #include "dcps.h"
 #include "zzdds_c.h"
@@ -133,9 +133,9 @@ func main() {
 	}
 	fmt.Printf("[main] mode=%s\n", mode)
 
-	factory := C.zzdds_create_factory()
+	factory := C.zzdds_DomainParticipantFactory_create()
 	if factory == nil {
-		fmt.Println("FAIL: zzdds_create_factory() returned nil")
+		fmt.Println("FAIL: zzdds_DomainParticipantFactory_create() returned nil")
 		os.Exit(1)
 	}
 	ddsFactory := C.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory)
@@ -147,7 +147,7 @@ func main() {
 
 	typeName := C.CString("SpikeType")
 	defer C.free(unsafe.Pointer(typeName))
-	if rc := C.zzdds_register_type_support(dp, typeName, nil, nil); rc != 0 {
+	if rc := C.zzdds_register_type_support(dp, typeName, nil, nil, nil); rc != 0 {
 		fmt.Printf("FAIL: register_type_support rc=%d\n", rc)
 		os.Exit(1)
 	}
@@ -198,7 +198,7 @@ func main() {
 	fmt.Printf("[main] reader created, waiting for %d ticks with GC+heap-churn between each...\n", tickCount)
 	time.Sleep(time.Duration(int64(tickCount+2) * deadlineNsec))
 
-	C.zzdds_destroy_factory(factory)
+	C.zzdds_DomainParticipantFactory_release(factory)
 	if mode == "handle" {
 		handle.Delete()
 	}

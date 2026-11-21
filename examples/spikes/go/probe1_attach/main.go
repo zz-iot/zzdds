@@ -21,8 +21,8 @@
 package main
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../../../zzdds/zig-out/include
-#cgo LDFLAGS: -L${SRCDIR}/../../../../zzdds/zig-out/lib -lzzdds -Wl,-rpath,${SRCDIR}/../../../../zzdds/zig-out/lib
+#cgo CFLAGS: -I${SRCDIR}/../../../../zig-out/include
+#cgo LDFLAGS: -L${SRCDIR}/../../../../zig-out/lib -lzzdds -Wl,-rpath,${SRCDIR}/../../../../zig-out/lib
 #include <stdlib.h>
 #include "dcps.h"
 #include "zzdds_c.h"
@@ -100,9 +100,9 @@ func goOnRelease(listenerData unsafe.Pointer) {
 func main() {
 	fmt.Printf("[main] pid=%d main_goroutine_id=%d GOMAXPROCS=%d\n", os.Getpid(), mainGoID, runtime.GOMAXPROCS(0))
 
-	factory := C.zzdds_create_factory()
+	factory := C.zzdds_DomainParticipantFactory_create()
 	if factory == nil {
-		fmt.Println("FAIL: zzdds_create_factory() returned nil")
+		fmt.Println("FAIL: zzdds_DomainParticipantFactory_create() returned nil")
 		os.Exit(1)
 	}
 	ddsFactory := C.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory)
@@ -114,7 +114,7 @@ func main() {
 
 	typeName := C.CString("SpikeType")
 	defer C.free(unsafe.Pointer(typeName))
-	if rc := C.zzdds_register_type_support(dp, typeName, nil, nil); rc != 0 {
+	if rc := C.zzdds_register_type_support(dp, typeName, nil, nil, nil); rc != 0 {
 		fmt.Printf("FAIL: register_type_support rc=%d\n", rc)
 		os.Exit(1)
 	}
@@ -166,7 +166,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	C.zzdds_destroy_factory(factory)
+	C.zzdds_DomainParticipantFactory_release(factory)
 	fmt.Printf("[main] teardown done; release_listener_data fired %d time(s)\n", atomic.LoadInt64(&releases))
 	fmt.Println("PASS")
 }

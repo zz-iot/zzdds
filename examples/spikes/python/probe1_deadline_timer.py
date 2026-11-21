@@ -37,7 +37,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 ZZDDS_LIB = os.environ.get(
     "ZZDDS_LIB",
-    os.path.join(SCRIPT_DIR, "..", "..", "..", "zzdds", "zig-out", "lib", "libzzdds.so"),
+    os.path.join(SCRIPT_DIR, "..", "..", "..", "zig-out", "lib", "libzzdds.so"),
 )
 SHIM_LIB = os.environ.get("SPIKE_SHIM_LIB", os.path.join(SCRIPT_DIR, "libspike_shim.so"))
 
@@ -65,12 +65,12 @@ def load_libs():
 
 
 def declare_signatures(zzdds, shim):
-    zzdds.zzdds_create_factory.restype = c_void_p
-    zzdds.zzdds_create_factory.argtypes = []
+    zzdds.zzdds_DomainParticipantFactory_create.restype = c_void_p
+    zzdds.zzdds_DomainParticipantFactory_create.argtypes = []
 
 
-    zzdds.zzdds_destroy_factory.restype = None
-    zzdds.zzdds_destroy_factory.argtypes = [c_void_p]
+    zzdds.zzdds_DomainParticipantFactory_release.restype = None
+    zzdds.zzdds_DomainParticipantFactory_release.argtypes = [c_void_p]
 
     zzdds.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory.restype = c_void_p
     zzdds.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory.argtypes = [c_void_p]
@@ -81,7 +81,8 @@ def declare_signatures(zzdds, shim):
     ]
 
     zzdds.zzdds_register_type_support.restype = ctypes.c_int
-    zzdds.zzdds_register_type_support.argtypes = [c_void_p, ctypes.c_char_p, c_void_p, c_void_p]
+    # (participant, type_name, compute_key_hash, compute_key_hash_key_only, get_field)
+    zzdds.zzdds_register_type_support.argtypes = [c_void_p, ctypes.c_char_p, c_void_p, c_void_p, c_void_p]
 
     zzdds.DDS_DomainParticipant_create_topic.restype = c_void_p
     zzdds.DDS_DomainParticipant_create_topic.argtypes = [
@@ -176,9 +177,9 @@ def main():
     listener.on_sample_lost = ON_SAMPLE_LOST_CB(0)
     listener.release_listener_data = release_listener_data
 
-    factory = zzdds.zzdds_create_factory()
+    factory = zzdds.zzdds_DomainParticipantFactory_create()
     if not factory:
-        sys.exit("FAIL: zzdds_create_factory() returned NULL")
+        sys.exit("FAIL: zzdds_DomainParticipantFactory_create() returned NULL")
 
     dds_factory = zzdds.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory)
     dp = zzdds.DDS_DomainParticipantFactory_create_participant(dds_factory, DOMAIN_ID, None, None, 0)
@@ -187,7 +188,7 @@ def main():
 
     # Keyless, no CDR/TypeSupport needed at all -- this probe never writes or
     # reads a sample, only exercises DEADLINE timer callback delivery.
-    rc = zzdds.zzdds_register_type_support(dp, b"SpikeType", None, None)
+    rc = zzdds.zzdds_register_type_support(dp, b"SpikeType", None, None, None)
     if rc != DDS_RETCODE_OK:
         sys.exit(f"FAIL: register_type_support failed rc={rc}")
 
@@ -224,7 +225,7 @@ def main():
         sys.exit("FAIL: every callback ran on the main thread's native id -- "
                   "timer thread callback delivery was not actually exercised")
 
-    zzdds.zzdds_destroy_factory(factory)
+    zzdds.zzdds_DomainParticipantFactory_release(factory)
     print(f"[main] teardown done; release_listener_data fired {state['releases']} time(s) total")
     print("PASS")
 

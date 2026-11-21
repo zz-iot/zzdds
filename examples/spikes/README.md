@@ -45,3 +45,10 @@ just trust a written conclusion indefinitely.
 
 See each subdirectory's own `README.md` for its exact questions, findings,
 and how to build/run it.
+
+`build_all.py` checks that the hand-written Python, Rust and Haskell
+declarations of zzdds's C functions match the headers' parameter counts,
+then builds every spike against zzdds's `zig-out` (after
+`zig build install -Dc-binding=true`), and with `--run` runs each probe
+expected to pass (not the modes a README expects to crash). CI runs it with
+`--run`, so a C-ABI change that breaks a spike fails there.

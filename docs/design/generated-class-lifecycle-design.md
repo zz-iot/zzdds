@@ -181,12 +181,12 @@ a hand-written one, so the reason no longer holds (decided in
 `zzdds::DomainParticipantFactory` is now `@standalone`:
 `zzdds_DomainParticipantFactory_create[_with_allocator]`, a strict `_destroy`
 (PRECONDITION_NOT_MET while participants remain) and a `_release` that deletes them, as
-`zzdds_destroy_factory` always did. C++ and Java run `release` when the owner is dropped or
+the hand-written `zzdds_destroy_factory` did. C++ and Java run `release` when the owner is dropped or
 closed. `DDS::DomainParticipantFactory` also has the spec's process-wide factory, through
 zidl's `@static`: `get_instance()` creates it on first use and `delete_instance()` deletes it
 (strict). Neither owns anything, so dropping a reference to it releases nothing. The
 hand-written `zzdds_create_factory[_with_allocator]` and `zzdds_destroy_factory` (and C++'s `zzdds::create_factory`, Java's
-`ZzddsRuntime.createFactory`) are deprecated, and go once rmw_zzdds moves over.
+`ZzddsRuntime.createFactory`) are removed, now that rmw_zzdds uses the generated functions.
 
 The other types with no parent operation are the ones above (`WaitSet`,
 `GuardCondition`).

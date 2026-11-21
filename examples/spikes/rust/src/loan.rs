@@ -78,11 +78,8 @@ impl<'a> LoanedSample<'a> {
         // (DDS_RETCODE_OK=0 even when zero samples were available) -- NOT a
         // sample count. Check payloads._length, not rc, for "did we get one".
         if rc != ffi::DDS_RETCODE_OK || payloads._length == 0 {
-            if !hashes._buffer.is_null() {
-                unsafe { ffi::DDS_OctetSeq_free(&mut hashes) };
-            }
-            if !payloads._buffer.is_null() || !infos._buffer.is_null() {
-                unsafe { ffi::DDS_DataReader_return_loan_raw(reader.0, &mut payloads, &mut infos) };
+            if !payloads._buffer.is_null() || !hashes._buffer.is_null() || !infos._buffer.is_null() {
+                unsafe { ffi::DDS_DataReader_return_loan_raw(reader.0, &mut payloads, &mut hashes, &mut infos) };
             }
             return None;
         }
@@ -111,11 +108,10 @@ impl<'a> Drop for LoanedSample<'a> {
     fn drop(&mut self) {
         println!("[LoanedSample::drop] returning loan (payloads ptr={:p})", self.payloads._buffer);
         unsafe {
-            ffi::DDS_DataReader_return_loan_raw(self.reader, &mut self.payloads, &mut self.infos);
-            // key_hashes is the one output of take_raw NOT released via
-            // return_loan_raw -- always a plain independent copy (see
-            // reader.zig's buildRawOutputFromPins), freed generically.
-            ffi::DDS_OctetSeq_free(&mut self.hashes);
+            // Releases all three of take_raw's outputs, key_hashes included:
+            // they come from the reader's own allocator (see dcps.idl's
+            // return_loan_raw).
+            ffi::DDS_DataReader_return_loan_raw(self.reader, &mut self.payloads, &mut self.hashes, &mut self.infos);
         }
     }
 }

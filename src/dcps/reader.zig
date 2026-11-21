@@ -4235,7 +4235,7 @@ pub const DataReaderImpl = struct {
         // dcps.idl doc comment) -- not through a generic, entity-context-free
         // {Type}_free. A generic free has no way to recover this specific
         // reader's own allocator, which can genuinely differ per reader
-        // (zzdds_create_factory_with_allocator); return_loan_raw always has
+        // (zzdds_DomainParticipantFactory_create_with_allocator); return_loan_raw always has
         // the reader itself in scope and so always frees correctly.
         var hashes: std.ArrayListUnmanaged(u8) = .empty;
         errdefer hashes.deinit(self.alloc);

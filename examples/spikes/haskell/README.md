@@ -25,26 +25,26 @@ Two GHC-specific questions, neither covered by any other spike:
 
 ```sh
 cd zzdds && zig build -Dc-binding=true install
-cd ../zzdds-examples/spikes/haskell
-gcc -shared -fPIC -I../../../zzdds/zig-out/include -o libspike_shim.so spike_shim.c
+cd examples/spikes/haskell
+gcc -shared -fPIC -I../../../zig-out/include -o libspike_shim.so spike_shim.c
 
 # Probe A: threaded RTS
 ghc -threaded -O0 -o ProbeAttach_threaded ProbeAttach.hs \
-  -L../../../zzdds/zig-out/lib -L. -lzzdds -lspike_shim \
-  -optl-Wl,-rpath,$(realpath ../../../zzdds/zig-out/lib) -optl-Wl,-rpath,$(realpath .)
+  -L../../../zig-out/lib -L. -lzzdds -lspike_shim \
+  -optl-Wl,-rpath,$(realpath ../../../zig-out/lib) -optl-Wl,-rpath,$(realpath .)
 ./ProbeAttach_threaded
 
 # Probe B: same source, non-threaded RTS -- see Findings before assuming
 # this is expected to fail the way the threaded build succeeds
 ghc -O0 -o ProbeAttach_unthreaded ProbeAttach.hs \
-  -L../../../zzdds/zig-out/lib -L. -lzzdds -lspike_shim \
-  -optl-Wl,-rpath,$(realpath ../../../zzdds/zig-out/lib) -optl-Wl,-rpath,$(realpath .)
+  -L../../../zig-out/lib -L. -lzzdds -lspike_shim \
+  -optl-Wl,-rpath,$(realpath ../../../zig-out/lib) -optl-Wl,-rpath,$(realpath .)
 ./ProbeAttach_unthreaded
 
 # Probe C: StablePtr keep-alive under GC pressure
 ghc -threaded -O0 -o ProbeStablePtr ProbeStablePtr.hs \
-  -L../../../zzdds/zig-out/lib -L. -lzzdds -lspike_shim \
-  -optl-Wl,-rpath,$(realpath ../../../zzdds/zig-out/lib) -optl-Wl,-rpath,$(realpath .)
+  -L../../../zig-out/lib -L. -lzzdds -lspike_shim \
+  -optl-Wl,-rpath,$(realpath ../../../zig-out/lib) -optl-Wl,-rpath,$(realpath .)
 ./ProbeStablePtr
 ```
 

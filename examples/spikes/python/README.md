@@ -49,8 +49,8 @@ script.
 
 ```sh
 cd zzdds && zig build -Dc-binding=true install
-cd ../zzdds-examples/spikes/python
-gcc -shared -fPIC -I../../../zzdds/zig-out/include -o libspike_shim.so spike_shim.c
+cd examples/spikes/python
+gcc -shared -fPIC -I../../../zig-out/include -o libspike_shim.so spike_shim.c
 python3 probe1_deadline_timer.py
 python3 probe2_many_threads_stress.py
 python3 probe3_dangling_trampoline.py --safe

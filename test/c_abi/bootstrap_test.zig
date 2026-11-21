@@ -1,6 +1,6 @@
 //! Tests for the C-ABI bootstrap shim (src/c_abi/bootstrap.zig).
 //!
-//! - Factory lifecycle test: zzdds_create_factory + generated create/delete
+//! - Factory lifecycle test: a factory of one's own + generated create/delete
 //! - key-hash/instance-handle lookup tests: use IntraProcessDelivery for
 //!   synchronous delivery so no timing sensitivity; samples are written via
 //!   the real DDS.DataWriter.write_raw IDL op (see writeRawViaOp), not the
@@ -174,20 +174,27 @@ const Fixture = struct {
 
 // ── Factory lifecycle ─────────────────────────────────────────────────────────
 
-test "support factory: destroy_factory is safe on nil handle" {
-    const alloc = testing.allocator;
-    // Must use the real ZZDDS.DomainParticipantFactory.Vtable here, not some
-    // other interface's vtable — zzdds_destroy_factory checks ptr == NIL_PTR
-    // before touching .vtable today, but boxing with a mismatched vtable type
-    // would be unsound if that guard ever moved.
-    const boxed = try zidl_bindings.boxEntity(alloc, zzdds.dcps.NIL_PTR, &extensions.factory_views);
-    defer zidl_bindings.freeEntityBox(alloc, boxed);
-    extensions.zzdds_destroy_factory(boxed); // must not crash or call deinit
+/// A factory of one's own and its C-ABI handle, as
+/// `zzdds_DomainParticipantFactory_create[_with_allocator]` makes.
+fn createBoxed(allocator: ?*const zidl_bindings.ZidlAllocator) !*anyopaque {
+    const f = try extensions.createFactory(allocator);
+    return f.vtable.get_c_abi_handle(f.ptr);
+}
+
+/// `zzdds_DomainParticipantFactory_release`: deletes every participant left,
+/// then the factory.
+fn releaseBoxed(boxed: *anyopaque) void {
+    const f = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, boxed);
+    f.vtable.release(f.ptr);
+}
+
+test "support factory: release is safe on the nil factory" {
+    extensions.factory_vtable.release(zzdds.dcps.NIL_PTR); // must not crash or call deinit
 }
 
 test "support factory: generated create_participant and delete_participant" {
-    const ext_factory_boxed = extensions.zzdds_create_factory().?;
-    defer extensions.zzdds_destroy_factory(ext_factory_boxed);
+    const ext_factory_boxed = try createBoxed(null);
+    defer releaseBoxed(ext_factory_boxed);
     const ext_factory = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
 
     const factory = ext_factory.vtable.as_DomainParticipantFactory(ext_factory.ptr);
@@ -197,8 +204,8 @@ test "support factory: generated create_participant and delete_participant" {
 }
 
 test "support factory: generated create_participant_ex uses config defaults" {
-    const ext_factory_boxed = extensions.zzdds_create_factory().?;
-    defer extensions.zzdds_destroy_factory(ext_factory_boxed);
+    const ext_factory_boxed = try createBoxed(null);
+    defer releaseBoxed(ext_factory_boxed);
     const ext_factory = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
 
     const cfg = ZZDDS.DomainParticipantConfig.default();
@@ -210,7 +217,7 @@ test "support factory: generated create_participant_ex uses config defaults" {
     try testing.expectEqual(DDS.RETCODE_OK, factory.delete_participant(dp));
 }
 
-// ── zzdds_create_factory_with_allocator ────────────────────────────────────────
+// ── zzdds_DomainParticipantFactory_create_with_allocator ──────────────────────
 //
 // Proves the C-ABI allocator injection actually reaches every downstream
 // allocation (factory bootstrap, transport, discovery, participant), not just
@@ -255,14 +262,14 @@ fn trackFree(ctx: ?*anyopaque, ptr: ?[*]u8, len: usize, alignment: usize) callco
     inner.free(inner.ctx, ptr, len, alignment);
 }
 
-test "support factory: zzdds_create_factory_with_allocator(NULL) matches zzdds_create_factory" {
-    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(null).?;
-    defer extensions.zzdds_destroy_factory(ext_factory_boxed);
+test "support factory: create_with_allocator(NULL) creates a factory on the default allocator" {
+    const ext_factory_boxed = try createBoxed(null);
+    defer releaseBoxed(ext_factory_boxed);
     const ext_factory = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
     try testing.expect(ext_factory.ptr != zzdds.dcps.NIL_PTR);
 }
 
-test "support factory: zzdds_create_factory_with_allocator routes every allocation through the caller's allocator" {
+test "support factory: create_with_allocator routes every allocation through the caller's allocator" {
     var track = TrackingCtx{ .child = testing.allocator };
     const c_alloc = zidl_bindings.ZidlAllocator{
         .ctx = &track,
@@ -271,8 +278,8 @@ test "support factory: zzdds_create_factory_with_allocator routes every allocati
         .free = trackFree,
     };
 
-    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(&c_alloc).?;
-    defer extensions.zzdds_destroy_factory(ext_factory_boxed);
+    const ext_factory_boxed = try createBoxed(&c_alloc);
+    defer releaseBoxed(ext_factory_boxed);
     const ext_factory = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
 
     // Bootstrapping the factory itself (FactoryOwner) already allocates.
@@ -302,8 +309,8 @@ test "support factory: get_default_participant_config on a custom-allocator fact
         .resize = trackResize,
         .free = trackFree,
     };
-    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(&c_alloc).?;
-    defer extensions.zzdds_destroy_factory(ext_factory_boxed);
+    const ext_factory_boxed = try createBoxed(&c_alloc);
+    defer releaseBoxed(ext_factory_boxed);
     const ext_factory = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
 
     // Simulate a caller-supplied config whose existing content came from
@@ -336,8 +343,8 @@ test "support factory: get_default_participant_qos on a custom-allocator factory
         .resize = trackResize,
         .free = trackFree,
     };
-    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(&c_alloc).?;
-    defer extensions.zzdds_destroy_factory(ext_factory_boxed);
+    const ext_factory_boxed = try createBoxed(&c_alloc);
+    defer releaseBoxed(ext_factory_boxed);
     const ext_factory = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
     const factory = ext_factory.vtable.as_DomainParticipantFactory(ext_factory.ptr);
 
@@ -359,7 +366,7 @@ test "support factory: get_default_participant_qos on a custom-allocator factory
 // `.vtable.get_allocator(...)` on anything, native or C-ABI-layer, real or
 // nil. Each of these tests exercises a *different* set of vtable literals
 // (native impl vtables via Fixture, extensions.zig's separate C-ABI-layer
-// vtables via zzdds_create_factory_with_allocator, nil singletons), since the
+// vtables via a custom-allocator factory, nil singletons), since the
 // same-looking `get_allocator = xGetAllocator` addition was made
 // independently in each place, not generated from one shared site -- a typo
 // in any one of them (wrong impl type in the cast, wrong nil constant) would
@@ -395,8 +402,8 @@ test "get_allocator: extensions-layer C-ABI vtables return the injected custom a
     // not an approximation.
     const expected = zidl_bindings.toAllocator(&c_alloc);
 
-    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(&c_alloc).?;
-    defer extensions.zzdds_destroy_factory(ext_factory_boxed);
+    const ext_factory_boxed = try createBoxed(&c_alloc);
+    defer releaseBoxed(ext_factory_boxed);
     const ext_factory = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
     try testing.expectEqual(expected, ext_factory.vtable.get_allocator(ext_factory.ptr));
 
@@ -1444,10 +1451,6 @@ test "extensions: factory DDS-view get_c_abi_handle boxes nil handle correctly" 
     try testing.expectEqual(zzdds.dcps.NIL_PTR, unboxed.ptr);
 }
 
-test "extensions: zzdds_destroy_factory of NULL does nothing" {
-    extensions.zzdds_destroy_factory(null);
-}
-
 // ── C-ABI handle coverage: real WaitSet / conditions ───────────────────────────
 
 test "waitset: get_c_abi_handle boxes real WaitSet, conditions, and their Condition views" {
@@ -2062,13 +2065,13 @@ const DestroyFromListener = struct {
         const f = ext.vtable.as_DomainParticipantFactory(ext.ptr);
         self.rc = self.dp.delete_contained_entities();
         if (self.rc == DDS.RETCODE_OK) self.rc = f.delete_participant(self.dp);
-        extensions.zzdds_destroy_factory(self.boxed);
+        releaseBoxed(self.boxed);
         self.done.set(testing.io);
     }
 };
 
 test "support factory: the last factory can be destroyed from a listener that deleted its participant" {
-    const boxed = extensions.zzdds_create_factory().?;
+    const boxed = try createBoxed(null);
     const ext = zidl_bindings.unboxAsView(ZZDDS.DomainParticipantFactory, boxed);
     const dp = ext.create_participant_ex(test_domain.get(), .{}, null, 0, ZZDDS.DomainParticipantConfig.default());
     try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);
@@ -2108,11 +2111,10 @@ test "factory: get_instance returns one process-wide factory until delete_instan
     try testing.expect(factory.ptr != zzdds.dcps.NIL_PTR);
     try testing.expectEqual(factory.ptr, Statics.get_instance().ptr);
 
-    // Nobody owns it: its zzdds view's destroy refuses, and release and the
-    // deprecated zzdds_destroy_factory leave it alone.
+    // Nobody owns it: its zzdds view's destroy refuses, and release leaves
+    // it alone.
     try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, extensions.factory_vtable.destroy(factory.ptr));
     extensions.factory_vtable.release(factory.ptr);
-    extensions.zzdds_destroy_factory(factory.vtable.get_c_abi_handle(factory.ptr));
 
     const dp = DDS_DomainParticipantFactory_create_participant_for_test(factory, test_domain.get(), null);
     try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);

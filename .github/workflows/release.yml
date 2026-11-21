@@ -274,7 +274,7 @@ jobs:
   #
   # Bundles are built ReleaseSafe: optimized, with Zig's safety checks and debug
   # info kept. A Debug libzzdds also overflowed an MSVC consumer's default 1 MiB
-  # main-thread stack inside zzdds_create_factory() (Zig's Debug-mode Windows
+  # main-thread stack inside the factory's creation (Zig's Debug-mode Windows
   # file-open frames); the zig-built tests run on 16 MiB and never saw it.
   #
   # Beyond confirming the tree is complete, this job also extracts the finished

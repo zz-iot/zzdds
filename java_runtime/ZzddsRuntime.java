@@ -7,10 +7,10 @@ package io.zzdds.runtime;
  * Unlike C/C++, Java's CDR is inlined into each generated type (no companion
  * runtime library — see zzdds/docs/language-bindings.md), so the generated
  * wrapper classes only need a small, fixed, non-generated native surface to
- * cross into zzdds: register a type, write raw bytes, take/read raw bytes,
- * and bootstrap the very first DomainParticipantFactory handle (which has no
- * IDL-level "get me the singleton" operation — see zzdds's C/C++ examples,
- * which bootstrap via `zzdds_create_factory()` the same way).
+ * cross into zzdds: register a type, write raw bytes, take/read raw bytes.
+ * Factories come from the generated
+ * {@code Zzdds.zzdds.DomainParticipantFactory.create()} or
+ * {@code Dcps.DDS.DomainParticipantFactory.get_instance()}.
  *
  * Implemented by java_runtime/zzdds_java_runtime.c, built into
  * libzzdds_jni.so alongside the zidl-generated entity JNI bridge
@@ -20,14 +20,6 @@ public final class ZzddsRuntime {
     private ZzddsRuntime() {}
 
     static { System.loadLibrary("zzdds_jni"); }
-
-    /** Deprecated: creates a new DomainParticipantFactory (a DDS_DomainParticipantFactory,
-     * boxed the same way every other entity handle is), which nothing ever deletes.
-     * Returns null on failure. Use {@code Zzdds.zzdds.DomainParticipantFactory.create()},
-     * which {@code close()} deletes, or the process-wide
-     * {@code Dcps.DDS.DomainParticipantFactory.get_instance()}. */
-    @Deprecated
-    public static native Object createFactory();
 
     /**
      * Registers `typeClass`'s TypeSupport with zzdds under `typeName`.
@@ -178,19 +170,15 @@ public final class ZzddsRuntime {
     public static native int configureFromFile(String path);
 
     /**
-     * Narrows the plain {@code io.zzdds.dcps.Dcps.DDS.DomainParticipantFactory}
-     * returned by {@code createFactory()} to zzdds's own
+     * Narrows a plain {@code io.zzdds.dcps.Dcps.DDS.DomainParticipantFactory},
+     * such as the one {@code get_instance()} returns, to zzdds's own
      * {@code io.zzdds.ext.Zzdds.zzdds.DomainParticipantFactory} extension view
      * — e.g. to reach {@code create_participant_ex}/
      * {@code set_default_participant_config}/{@code get_default_participant_config}.
      * Same underlying native factory, just a different generated interface
      * view (see {@code include/zzdds_c.h}'s
      * {@code DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory}).
-     * {@code createFactory()} itself always boxes into the base
-     * {@code io.zzdds.dcps.DomainParticipantFactoryImpl} view (see its own doc
-     * comment in {@code zzdds_java_runtime.c}) since nothing needed the
-     * extension view at bootstrap time before this; call this narrowing
-     * function to get it. Returns an {@code io.zzdds.ext.DomainParticipantFactoryImpl};
+     * Returns an {@code io.zzdds.ext.DomainParticipantFactoryImpl};
      * a factory that already is one (from
      * {@code Zzdds.zzdds.DomainParticipantFactory.create()}) is returned as is.
      */

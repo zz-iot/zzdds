@@ -52,7 +52,7 @@ either binary takes.
   `create_participant_ex` are called directly on `zzdds::DomainParticipantFactory::create()`'s
   return value — unlike `zzdds::DataWriter`/`Topic`, the factory interface
   already exposes zzdds's extension operations without any upcast, since
-  `create_factory()` returns the extension view from the start.
+  `zzdds::DomainParticipantFactory::create()` returns the extension view from the start.
 - Despite `zzdds::DomainParticipantConfig`'s fields being idiomatic C++
   (`std::string`, not `char*`), this still crosses the same
   `zzdds_DomainParticipantFactory_*` C-ABI boundary `c/participant-config`

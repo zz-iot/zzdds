@@ -68,38 +68,6 @@ typedef bool (*zzdds_get_field_from_cdr_ctx_fn)(
     uint8_t *scratch, size_t scratch_len
 );
 
-/* Deprecated factory functions: use the generated
- * zzdds_DomainParticipantFactory_create, _create_with_allocator, _destroy
- * (strict: PRECONDITION_NOT_MET while participants remain) and _release
- * (deletes them too), or DDS_DomainParticipantFactory_get_instance for the
- * process-wide factory. These stay until rmw_zzdds stops calling them.
- *
- * NULL on failure. At the C ABI, NULL is every interface's nil: a function
- * given NULL for an object or argument treats it as nil, and a function with
- * no object to return returns NULL. */
-zzdds_DomainParticipantFactory zzdds_create_factory(void);
-
-/**
- * Deprecated: zzdds_DomainParticipantFactory_create_with_allocator.
- *
- * Same as zzdds_create_factory, but every allocation the factory and
- * everything it ever creates makes (participants, topics, writers, readers,
- * history cache entries, ...) is routed through `allocator` instead of the
- * default libc malloc/free. Pass NULL for the default (equivalent to
- * zzdds_create_factory()).
- *
- * `allocator` must outlive the returned factory and everything created
- * through it — zzdds never copies it. See ZidlAllocator's contract in
- * zidl_allocator.h. NULL on failure.
- */
-zzdds_DomainParticipantFactory zzdds_create_factory_with_allocator(const ZidlAllocator *allocator);
-
-/* Deprecated: zzdds_DomainParticipantFactory_release. Deletes the factory and
- * every participant it still has. Does nothing for NULL, or for the
- * process-wide factory (only DDS_DomainParticipantFactory_delete_instance
- * deletes that). */
-void zzdds_destroy_factory(zzdds_DomainParticipantFactory factory);
-
 /**
  * Function pointer type for zzdds_waitset_attach_condition_with_release's
  * release_fn parameter — same shape as a listener struct's
@@ -151,10 +119,10 @@ DDS_ReturnCode_t zzdds_waitset_attach_condition_with_release(
  * (NULL for the default, libc malloc/free). Must be called before any
  * factory has been created in this process.
  *
- * This is the actual, C/C++-usable way to avoid zzdds_create_factory_with_allocator's
+ * This is the actual, C/C++-usable way to avoid zzdds_DomainParticipantFactory_create_with_allocator's
  * ambient lazy-default path resolving through libc malloc regardless of the
  * allocator you give it: call this first, with the SAME allocator you'll
- * pass to zzdds_create_factory_with_allocator, and the process-wide config's
+ * pass to zzdds_DomainParticipantFactory_create_with_allocator, and the process-wide config's
  * own persistent storage will live in that allocator for the rest of the
  * process's lifetime instead.
  *
@@ -178,7 +146,7 @@ DDS_ReturnCode_t zzdds_process_configure_from_file(
 DDS_DomainParticipantFactory zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(zzdds_DomainParticipantFactory factory);
 zzdds_DomainParticipantFactory DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(DDS_DomainParticipantFactory factory);
 DDS_DomainParticipant zzdds_DomainParticipant_as_DDS_DomainParticipant(zzdds_DomainParticipant participant);
-/** NOTE: only valid for handles created by a zzdds FactoryOwner (zzdds_create_factory).
+/** NOTE: only valid for handles created by a zzdds FactoryOwner (zzdds_DomainParticipantFactory_create).
  *  Passing a handle from any other DDS implementation causes memory corruption. */
 zzdds_DomainParticipant DDS_DomainParticipant_as_zzdds_DomainParticipant(DDS_DomainParticipant participant);
 /** NOTE: only valid for topics owned by a zzdds FactoryOwner participant. */
