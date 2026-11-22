@@ -49,7 +49,7 @@ fn toChangeKind(kind: WriteKind, impl: *DataWriterImpl) history_mod.ChangeKind {
         .alive => .alive,
         .dispose => .not_alive_disposed,
         .unregister => if (impl.autodispose.load(.monotonic))
-            .not_alive_disposed
+            .not_alive_disposed_unregistered
         else
             .not_alive_unregistered,
     };

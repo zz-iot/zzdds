@@ -320,7 +320,7 @@ const InstanceEntry = struct {
     fn applyChange(self: *InstanceEntry, kind: history_mod.ChangeKind) States {
         const new_state: DDS.InstanceStateKind = switch (kind) {
             .alive => DDS.ALIVE_INSTANCE_STATE,
-            .not_alive_disposed => DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE,
+            .not_alive_disposed, .not_alive_disposed_unregistered => DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE,
             .not_alive_unregistered => DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE,
         };
         var view: DDS.ViewStateKind = DDS.NEW_VIEW_STATE;

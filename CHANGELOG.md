@@ -10,6 +10,10 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-22
 
+- An unregister under WRITER_DATA_LIFECYCLE `autodispose_unregistered_instances` is sent as
+  dispose and unregister (PID_STATUS_INFO 0x3, both flags) rather than as a dispose alone
+  (0x1), so a reader learns that the writer no longer has the instance registered. A reader receiving 0x3 makes the instance NOT_ALIVE_DISPOSED, where it made it
+  NOT_ALIVE_NO_WRITERS before. `ChangeKind` has `not_alive_disposed_unregistered` for it.
 - Zig: the generated interfaces have their static operations and constructors, as every
   other binding does: `DDS.DomainParticipantFactory.get_instance()` and `delete_instance()`,
   `DDS.WaitSet.create(allocator)` and `DDS.GuardCondition.create(allocator)`. They call

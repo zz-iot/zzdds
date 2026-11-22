@@ -651,7 +651,8 @@ pub const DataWriterImpl = struct {
         );
     }
 
-    /// Send a NOT_ALIVE_UNREGISTERED change (or NOT_ALIVE_DISPOSED if autodispose is set).
+    /// Send a NOT_ALIVE_UNREGISTERED change (NOT_ALIVE_DISPOSED_UNREGISTERED
+    /// if autodispose is set).
     /// Does not update deadline/liveliness timestamps (lifecycle, not data).
     pub fn unregisterRaw(
         self: *Self,
@@ -659,7 +660,7 @@ pub const DataWriterImpl = struct {
         key_hash: [16]u8,
     ) !void {
         const kind: history_mod.ChangeKind = if (self.autodispose.load(.monotonic))
-            .not_alive_disposed
+            .not_alive_disposed_unregistered
         else
             .not_alive_unregistered;
         _ = try self.proto_writer.write(kind, source_timestamp, key_hash, key_hash, &.{});
@@ -1496,7 +1497,7 @@ pub const DataWriterImpl = struct {
             .ALIVE_WRITE_KIND => .alive,
             .DISPOSE_WRITE_KIND => .not_alive_disposed,
             .UNREGISTER_WRITE_KIND => if (self.autodispose.load(.monotonic))
-                .not_alive_disposed
+                .not_alive_disposed_unregistered
             else
                 .not_alive_unregistered,
             else => null,
