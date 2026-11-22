@@ -81,8 +81,6 @@ pub const PollBackend = struct {
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io) error{ SystemResources, OutOfMemory }!PollBackend {
         comptime std.debug.assert(supported);
-        const scratch = try alloc.create([backend_mod.service_scratch_len]u8);
-        errdefer alloc.destroy(scratch);
         var fds: [2]posix.socket_t = undefined;
         if (builtin.os.tag == .windows) {
             const fd = try openLoopbackWake();
@@ -105,7 +103,20 @@ pub const PollBackend = struct {
                 }
             }
         }
+        const scratch = alloc.create([backend_mod.service_scratch_len]u8) catch {
+            closeWake(fds[0], fds[1]);
+            return error.OutOfMemory;
+        };
         return .{ .io = io, .alloc = alloc, .wake_rd = fds[0], .wake_wr = fds[1], .scratch = scratch };
+    }
+
+    fn closeWake(rd: posix.socket_t, wr: posix.socket_t) void {
+        if (builtin.os.tag == .windows) {
+            sock.close(rd);
+        } else {
+            _ = c.close(rd);
+            if (wr != rd) _ = c.close(wr);
+        }
     }
 
     /// A nonblocking UDP socket on 127.0.0.1 connected to itself: a datagram
@@ -128,12 +139,7 @@ pub const PollBackend = struct {
     /// Once no thread waits or services, and every source is unregistered.
     pub fn deinit(self: *PollBackend) void {
         std.debug.assert(self.sources.items.len == 0);
-        if (builtin.os.tag == .windows) {
-            sock.close(self.wake_rd);
-        } else {
-            _ = c.close(self.wake_rd);
-            if (self.wake_wr != self.wake_rd) _ = c.close(self.wake_wr);
-        }
+        closeWake(self.wake_rd, self.wake_wr);
         self.sources.deinit(self.alloc);
         self.wait_fds.deinit(self.alloc);
         self.service_sources.deinit(self.alloc);
@@ -282,7 +288,7 @@ pub const PollBackend = struct {
     /// left out, since poll would still report its errors.
     fn waitEvents(s: *const Source) i16 {
         var events: i16 = 0;
-        if (s.input and !s.input_paused) events |= sock.POLL.IN;
+        if (s.service != null and !s.input_paused) events |= sock.POLL.IN;
         if (s.output_armed) events |= sock.POLL.OUT;
         return events;
     }
@@ -437,15 +443,15 @@ pub const PollBackend = struct {
                 const s = self.service_sources.items[i];
                 // Without input, an error or hangup also ends the wait for
                 // output: the next send reports it.
-                if (fds[i].revents & sock.POLL.OUT != 0 or !s.input) {
-                    fds[i].revents = if (s.input) fds[i].revents & ~sock.POLL.OUT else 0;
+                if (fds[i].revents & sock.POLL.OUT != 0 or s.service == null) {
+                    fds[i].revents = if (s.service != null) fds[i].revents & ~sock.POLL.OUT else 0;
                     if (self.disarmOutput(s)) s.writable.?(s.ctx);
                     result.serviced += 1;
                     progressed = true;
                     continue;
                 }
                 if (s.kicked.load(.seq_cst)) s.kicked.store(false, .seq_cst);
-                if (fds[i].revents & sock.POLL.NVAL != 0 or s.service(s.ctx, 1, self.scratch) == 0) {
+                if (fds[i].revents & sock.POLL.NVAL != 0 or s.service.?(s.ctx, 1, self.scratch) == 0) {
                     fds[i].revents = 0;
                     continue;
                 }

@@ -26,15 +26,12 @@ pub const Source = struct {
     handle: std.posix.socket_t,
     ctx: *anyopaque,
     /// Nonblocking: handles at most `budget` inputs that are ready now and
-    /// returns how many it handled, 0 once none is ready. Not called for a
-    /// source without `input`. `scratch` is lent for the call, which may
-    /// receive into it and keeps nothing in it: a backend lends each `service`
-    /// running at once its own.
-    service: *const fn (ctx: *anyopaque, budget: u32, scratch: *[service_scratch_len]u8) u32,
-    /// Whether the backend waits on `handle` for input. False for a socket
-    /// that is only written: the backend then waits on it only while output
-    /// is armed.
-    input: bool = true,
+    /// returns how many it handled, 0 once none is ready. `scratch` is lent
+    /// for the call, which may receive into it and keeps nothing in it: a
+    /// backend lends each `service` running at once its own. Null for a
+    /// socket that is only written: the backend then waits on it only while
+    /// output is armed.
+    service: ?*const fn (ctx: *anyopaque, budget: u32, scratch: *[service_scratch_len]u8) u32,
     /// Runs once per `armOutput`, from `service`, when `handle` can take
     /// output, or reports an error the next send will see
     /// (docs/design/concurrency/transport-adapters.md#output-submission).

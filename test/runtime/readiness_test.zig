@@ -130,6 +130,24 @@ fn awaitDelivered(tx: *Sock) !void {
 
 // ── The backend ───────────────────────────────────────────────────────────────
 
+test "a backend that cannot allocate its receive scratch fails and closes its wake descriptor" {
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    // The lowest free descriptor before, and after the failed init: equal
+    // once the init closes the wake descriptor it opened.
+    const probe = struct {
+        fn lowestFree() c_int {
+            const fd = c.eventfd(0, 0);
+            _ = c.close(fd);
+            return fd;
+        }
+    };
+    const before = if (builtin.os.tag == .linux) probe.lowestFree() else 0;
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, rt.PollBackend.init(failing.allocator(), threaded.io()));
+    if (builtin.os.tag == .linux) try std.testing.expectEqual(before, probe.lowestFree());
+}
+
 test "a wake from another thread ends the poller's and a follower's waits, however it races them" {
     if (!rt.poll_backend.supported) return error.SkipZigTest;
     var b: Backend = undefined;
@@ -316,7 +334,7 @@ const FullPair = struct {
         var fds: [2]posix.socket_t = undefined;
         if (c.socketpair(posix.AF.UNIX, posix.SOCK.DGRAM, 0, &fds) != 0) return error.SocketFailed;
         self.* = .{ .tx = fds[0], .rx = fds[1] };
-        self.source = .{ .handle = self.tx, .ctx = self, .service = noInput, .input = false, .writable = onWritable };
+        self.source = .{ .handle = self.tx, .ctx = self, .service = null, .writable = onWritable };
     }
 
     fn deinit(self: *FullPair) void {
@@ -336,10 +354,6 @@ const FullPair = struct {
     fn drain(self: *FullPair) void {
         var buf: [16]u8 = undefined;
         while (c.recv(self.rx, &buf, buf.len, DONTWAIT) >= 0) {}
-    }
-
-    fn noInput(_: *anyopaque, _: u32, _: *[rt.service_scratch_len]u8) u32 {
-        unreachable;
     }
 
     fn onWritable(ctx: *anyopaque) void {

@@ -1966,8 +1966,7 @@ pub const UdpTransport = struct {
             ss.* = .{ .transport = self, .fd = fd, .source = .{
                 .handle = fd,
                 .ctx = ss,
-                .service = SendSource.noInput,
-                .input = false,
+                .service = null,
                 .writable = SendSource.onWritable,
             } };
         }
@@ -2034,10 +2033,6 @@ const SendSource = struct {
         t.writable_mu.lock();
         defer t.writable_mu.unlock();
         t.runWritableLocked();
-    }
-
-    fn noInput(_: *anyopaque, _: u32, _: *[backend_mod.service_scratch_len]u8) u32 {
-        unreachable;
     }
 };
 
