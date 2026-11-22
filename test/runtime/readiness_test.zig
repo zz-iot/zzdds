@@ -69,7 +69,7 @@ const Sock = struct {
         if (c.sendto(self.fd, "x", 1, 0, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) != 1) return error.SendFailed;
     }
 
-    fn service(ctx: *anyopaque, budget: u32) u32 {
+    fn service(ctx: *anyopaque, budget: u32, _: *[rt.service_scratch_len]u8) u32 {
         const self: *Sock = @ptrCast(@alignCast(ctx));
         var handled: u32 = 0;
         var buf: [16]u8 = undefined;
@@ -338,7 +338,7 @@ const FullPair = struct {
         while (c.recv(self.rx, &buf, buf.len, DONTWAIT) >= 0) {}
     }
 
-    fn noInput(_: *anyopaque, _: u32) u32 {
+    fn noInput(_: *anyopaque, _: u32, _: *[rt.service_scratch_len]u8) u32 {
         unreachable;
     }
 
@@ -428,11 +428,11 @@ test "unregistering a source returns only once a running service of it has" {
         release: std.atomic.Value(bool) = .init(false),
         unregistered: std.atomic.Value(bool) = .init(false),
 
-        fn service(ctx: *anyopaque, budget: u32) u32 {
+        fn service(ctx: *anyopaque, budget: u32, scratch: *[rt.service_scratch_len]u8) u32 {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.entered.store(true, .release);
             while (!self.release.load(.acquire)) std.Thread.yield() catch {};
-            return Sock.service(&self.sock, budget);
+            return Sock.service(&self.sock, budget, scratch);
         }
 
         fn serve(bk: *Backend) void {
@@ -479,10 +479,10 @@ test "a source's own service may unregister it, and is not called on it again, a
         bk: *Backend,
         calls: u32 = 0,
 
-        fn service(ctx: *anyopaque, budget: u32) u32 {
+        fn service(ctx: *anyopaque, budget: u32, scratch: *[rt.service_scratch_len]u8) u32 {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
-            const n = Sock.service(&self.sock, @min(budget, 1));
+            const n = Sock.service(&self.sock, @min(budget, 1), scratch);
             self.bk.backend().unregister(&self.sock.source);
             // As freed: the backend must not read it again.
             self.sock.source = undefined;
@@ -533,9 +533,9 @@ test "a source whose input is paused is not serviced, and once resumed is servic
     defer s.deinit();
     const Counted = struct {
         var calls: u32 = 0;
-        fn service(ctx: *anyopaque, budget: u32) u32 {
+        fn service(ctx: *anyopaque, budget: u32, scratch: *[rt.service_scratch_len]u8) u32 {
             calls += 1;
-            return Sock.service(ctx, budget);
+            return Sock.service(ctx, budget, scratch);
         }
     };
     Counted.calls = 0;
@@ -572,7 +572,7 @@ test "resumed sources past the service's budget keep their wakeup for the next s
     const Held = struct {
         sock: Sock = undefined,
         calls: u32 = 0,
-        fn service(ctx: *anyopaque, _: u32) u32 {
+        fn service(ctx: *anyopaque, _: u32, _: *[rt.service_scratch_len]u8) u32 {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             return 1;

@@ -67,6 +67,8 @@ pub const PollBackend = struct {
     service_fds: std.ArrayListUnmanaged(sock.PollFd) = .empty,
     service_version: u64 = std.math.maxInt(u64),
     next: usize = 0,
+    /// Lent to each source's `service`, one at a time under `service_mu`.
+    scratch: *[backend_mod.service_scratch_len]u8,
 
     test_hooks: if (builtin.is_test) TestHooks else void = if (builtin.is_test) .{} else {},
 
@@ -77,8 +79,10 @@ pub const PollBackend = struct {
         before_futex_wait: ?*const fn (backend: *PollBackend) void = null,
     };
 
-    pub fn init(alloc: std.mem.Allocator, io: std.Io) error{SystemResources}!PollBackend {
+    pub fn init(alloc: std.mem.Allocator, io: std.Io) error{ SystemResources, OutOfMemory }!PollBackend {
         comptime std.debug.assert(supported);
+        const scratch = try alloc.create([backend_mod.service_scratch_len]u8);
+        errdefer alloc.destroy(scratch);
         var fds: [2]posix.socket_t = undefined;
         if (builtin.os.tag == .windows) {
             const fd = try openLoopbackWake();
@@ -101,7 +105,7 @@ pub const PollBackend = struct {
                 }
             }
         }
-        return .{ .io = io, .alloc = alloc, .wake_rd = fds[0], .wake_wr = fds[1] };
+        return .{ .io = io, .alloc = alloc, .wake_rd = fds[0], .wake_wr = fds[1], .scratch = scratch };
     }
 
     /// A nonblocking UDP socket on 127.0.0.1 connected to itself: a datagram
@@ -134,6 +138,7 @@ pub const PollBackend = struct {
         self.wait_fds.deinit(self.alloc);
         self.service_sources.deinit(self.alloc);
         self.service_fds.deinit(self.alloc);
+        self.alloc.destroy(self.scratch);
         self.mu.deinit();
         self.service_mu.deinit();
     }
@@ -440,7 +445,7 @@ pub const PollBackend = struct {
                     continue;
                 }
                 if (s.kicked.load(.seq_cst)) s.kicked.store(false, .seq_cst);
-                if (fds[i].revents & sock.POLL.NVAL != 0 or s.service(s.ctx, 1) == 0) {
+                if (fds[i].revents & sock.POLL.NVAL != 0 or s.service(s.ctx, 1, self.scratch) == 0) {
                     fds[i].revents = 0;
                     continue;
                 }

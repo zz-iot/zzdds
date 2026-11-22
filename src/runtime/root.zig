@@ -30,6 +30,7 @@ pub const ServiceResult = backend.ServiceResult;
 pub const ScriptedBackend = backend.ScriptedBackend;
 pub const IoBackend = @import("io_backend.zig").IoBackend;
 pub const Source = backend.Source;
+pub const service_scratch_len = backend.service_scratch_len;
 pub const poll_backend = @import("poll_backend.zig");
 pub const PollBackend = poll_backend.PollBackend;
 pub const Hosted = @import("hosted.zig").Hosted;

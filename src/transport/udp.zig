@@ -593,8 +593,6 @@ const PortEntry = struct {
 
 // ── Receive buffer ────────────────────────────────────────────────────────────
 
-const RECV_BUF = 65_536;
-
 // ── UdpTransport ─────────────────────────────────────────────────────────────
 
 pub const UdpTransport = struct {
@@ -668,10 +666,6 @@ pub const UdpTransport = struct {
     /// Datagrams not sent because the send buffer was full; one per
     /// interface for a multicast send.
     sends_would_block: std.atomic.Value(u64) = .init(0),
-    /// Where serviceSource receives, for every socket: they are all on
-    /// `backend`, which services one source at a time. A buffer on the stack
-    /// would be filled on each call in safe builds, once per datagram.
-    recv_buf: [RECV_BUF]u8 = undefined,
     /// The send sockets as output-only sources of `backend`, so a producer
     /// whose send would block can wait for them to drain
     /// (vtNotifyWritable). Set up with `backend`; each is registered with
@@ -2042,7 +2036,7 @@ const SendSource = struct {
         t.runWritableLocked();
     }
 
-    fn noInput(_: *anyopaque, _: u32) u32 {
+    fn noInput(_: *anyopaque, _: u32, _: *[backend_mod.service_scratch_len]u8) u32 {
         unreachable;
     }
 };
@@ -2071,12 +2065,12 @@ const udp_vtable = Transport.Vtable{
 // ── Receiving on the backend ──────────────────────────────────────────────────
 
 /// Source.service for a socket on the backend: receives what is queued now,
-/// without blocking, into the transport's buffer, and dispatches it to the
-/// socket's handler. The handlers (each participant's ingress) copy what they
-/// keep.
-fn serviceSource(ctx: *anyopaque, budget: u32) u32 {
+/// without blocking, into the backend's scratch, which holds any datagram,
+/// and dispatches it to the socket's handler. The handlers (each
+/// participant's ingress) copy what they keep.
+fn serviceSource(ctx: *anyopaque, budget: u32, scratch: *[backend_mod.service_scratch_len]u8) u32 {
     const entry: *SocketEntry = @ptrCast(@alignCast(ctx));
-    const buf = &entry.transport.recv_buf;
+    const buf: []u8 = scratch;
     var src_store: posix.sockaddr.storage = undefined;
     var handled: u32 = 0;
     while (handled < budget) {

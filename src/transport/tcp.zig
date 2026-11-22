@@ -57,9 +57,6 @@ const MAX_RECEIVE_HANDLERS = iface.MAX_RECEIVE_HANDLERS;
 const MAX_MSG_LEN: u32 = 4 * 1024 * 1024; // 4 MiB sanity cap
 /// Most pieces in one gather-list send, after the length prefix.
 const MAX_GATHER: usize = 128;
-/// What one read on a backend takes from a stream when no frame is partly
-/// read: a chunk that may hold several frames.
-const RECV_CHUNK: usize = 64 * 1024;
 
 // SHUT_RDWR: used to interrupt blocking accept()/recv() during shutdown.
 const SHUT_RDWR: c_int = 2;
@@ -561,10 +558,6 @@ pub const TcpTransport = struct {
     /// The progress backend that services the listen socket and the
     /// connections. Set (attach_backend) before the first listen or send.
     backend: ?ProgressBackend = null,
-    /// Where serviceConn reads, for every connection: they are all on
-    /// `backend`, which services one source at a time. A buffer on the stack
-    /// would be filled on each call in safe builds, once per read.
-    recv_buf: [RECV_CHUNK]u8 = undefined,
     /// The listen socket as a source of `backend`.
     listener: ?*Listener = null,
     /// Guards writable_waiters, blocked_count and each connection's
@@ -1454,7 +1447,7 @@ const tcp_vtable = Transport.Vtable{
 
 /// Source.service for the listen socket on a backend: accepts the
 /// connections pending now, each a source from then on.
-fn serviceListener(ctx: *anyopaque, budget: u32) u32 {
+fn serviceListener(ctx: *anyopaque, budget: u32, _: *[backend_mod.service_scratch_len]u8) u32 {
     if (comptime !poll_backend.supported) unreachable;
     const l: *Listener = @ptrCast(@alignCast(ctx));
     var handled: u32 = 0;
@@ -1486,7 +1479,7 @@ fn serviceListener(ctx: *anyopaque, budget: u32) u32 {
 /// one for the next read. A frame a handler has no room for is held, and
 /// reading stops until it is taken. Closes the connection at the end of its
 /// stream or on a bad frame.
-fn serviceConn(ctx: *anyopaque, budget: u32) u32 {
+fn serviceConn(ctx: *anyopaque, budget: u32, scratch: *[backend_mod.service_scratch_len]u8) u32 {
     if (comptime !poll_backend.supported) unreachable;
     const conn: *TcpConnection = @ptrCast(@alignCast(ctx));
     if (conn.held.len > 0) switch (conn.retryHeld()) {
@@ -1497,7 +1490,9 @@ fn serviceConn(ctx: *anyopaque, budget: u32) u32 {
             return 1;
         },
     };
-    const buf = &conn.owner.recv_buf;
+    // With no frame partly read, a read takes a chunk that may hold
+    // several frames into the backend's scratch.
+    const buf: []u8 = scratch;
     var handled: u32 = 0;
     while (handled < budget) {
         // A partly read frame takes the bytes in place.
