@@ -1010,21 +1010,13 @@ and progress that runs internal work only passes them over. Direct discovery sti
 matches synchronously on the caller's thread, but the listeners that follow run on the
 runtime. Deleting a reader or writer from application code waits for a listener
 running through it (as a runtime turn, or inline from `notify_datareaders`) to return;
-deleting it from any callback chain does not wait. On either runtime, `set_listener` and
+deleting it from any callback chain does not wait. `set_listener` and
 `set_listener_ex` from application code return once no callback runs through the
 registration they replaced or an earlier replaced one, and do not wait from a callback
-chain ([replacement completion](design/concurrency/listeners.md#replacement-completion)).
-The threaded runtime does not yet wait for a running listener when deleting a reader,
-writer or participant. So a participant deleted from the callback that a
-`set_listener` on it waits for, or from the release hook of the listener it replaces, can
-be freed under that setter; the shared runtime defers the teardown until the setter
-returns. The threaded runtime also runs a reader's or writer's listener on the thread
-that changed its status, so one endpoint's callbacks can run at once and arrive out of
-order: a match made inside `create_datawriter` and one made on a receive thread can
-deliver the later `current_count` first, leaving a listener that keeps the last count it
-saw one short. The shared runtime runs them one at a time, each claiming its status when
-it runs. Builtin-topic readers' listeners run
-the same way. One endpoint's listeners run one at a time, and different endpoints' may
+chain ([replacement completion](design/concurrency/listeners.md#replacement-completion)),
+and a participant deleted from the callback such a setter waits for, or from the release
+hook of the listener it replaces, is torn down once the setter returns. Builtin-topic
+readers' listeners run as other readers' do. One endpoint's listeners run one at a time, and different endpoints' may
 run at once on hosted workers, except that one listener runs one call at a time wherever
 it is installed, including as a parent's listener: the core identifies it by its
 `listener_identity`, else its `listener_data` (or the registration, when both are null), and a turn whose listener is
@@ -1058,8 +1050,7 @@ under a manual and a hosted driver: match, delivery, the acknowledgment and data
 missed deadline, and retirement begun from listeners, with the runtime's last owner
 deleted inside its own listener. Every participant runs on the runtime; tests that check delivery and listeners deterministically
 install a manual runtime they drive themselves (`test/support/manual_runtime.zig`).
-Remaining work: delete the threads components still start without a runtime, then the
-gaps above. The review-era
+Remaining work: the gaps above. The review-era
 synchronization prototype and bounded models stay on the `concurrency-broker-specs` branch
 (see the [evidence inventory](design/probes/README.md)). Advanced extension objects (explicit runtime owners/refs, listener groups, resource
 scopes) additionally depend on zidl's managed-reference/construction-only Config
