@@ -580,6 +580,69 @@ test "a timer fired again while its own turn runs runs again once the turn ends"
     try m.retire();
 }
 
+test "a timer fired again as its own turn ends runs again" {
+    var m: Manual = undefined;
+    m.init(.{ .mode = .manual });
+    var ctx = rt.Context.init(&m.runtime, 16);
+    var log: Log = .{};
+    const t0 = m.now();
+    var t = Tick.init(&ctx, 1, &log);
+    _ = m.runtime.armTimer(&t.timer, t0 + 100);
+
+    // The turn has run its callback and is done, and the timer is armed
+    // and fires again before the turn releases its context, as another
+    // thread arming it and a worker may on a hosted runtime.
+    const Refire = struct {
+        fn hook(runtime: *rt.Runtime, _: *rt.Context, req: *rt.Request) void {
+            const timer: *rt.Timer = @fieldParentPtr("request", req);
+            const now = runtime.clock.nowNs();
+            _ = runtime.armTimerNoLater(timer, now);
+            runtime.fireDueTimers(now);
+        }
+    };
+    m.runtime.test_hooks.after_run = Refire.hook;
+    m.sb.clock_state.advance(100);
+    _ = try m.runtime.drive(10, 0);
+    try testing.expectEqualSlices(u32, &.{ 1, 1 }, log.slice());
+
+    // No fire is left pending, so arming no later sets the time it asks.
+    try testing.expect(m.runtime.armTimerNoLater(&t.timer, t0 + 900));
+    try testing.expectEqual(@as(?i64, t0 + 900), m.runtime.nextDeadline());
+    m.runtime.cancelTimer(&t.timer);
+    ctx.deinit();
+    try m.retire();
+}
+
+test "a timer fired again as its turn starts calls back once" {
+    var m: Manual = undefined;
+    m.init(.{ .mode = .manual });
+    var ctx = rt.Context.init(&m.runtime, 16);
+    var log: Log = .{};
+    const t0 = m.now();
+    var t = Tick.init(&ctx, 1, &log);
+    _ = m.runtime.armTimer(&t.timer, t0 + 100);
+
+    // The fire's turn is claimed but has not started, and the timer is
+    // armed and fires again: that turn takes the new fire, and the turn
+    // queued for it finds none left.
+    const Refire = struct {
+        fn hook(runtime: *rt.Runtime, _: *rt.Context, req: *rt.Request) void {
+            const timer: *rt.Timer = @fieldParentPtr("request", req);
+            const now = runtime.clock.nowNs();
+            _ = runtime.armTimer(timer, now);
+            runtime.fireDueTimers(now);
+        }
+    };
+    m.runtime.test_hooks.before_run = Refire.hook;
+    m.sb.clock_state.advance(100);
+    const r = try m.runtime.drive(10, 0);
+    try testing.expectEqual(@as(u32, 2), r.turns);
+    try testing.expectEqualSlices(u32, &.{1}, log.slice());
+    try testing.expectEqual(@as(?i64, null), m.runtime.nextDeadline());
+    ctx.deinit();
+    try m.retire();
+}
+
 test "a fire on its way to a context holds it open past the timer's cancel and close" {
     var m: Manual = undefined;
     m.init(.{ .mode = .manual });

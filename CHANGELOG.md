@@ -8,6 +8,17 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-22
+
+- A runtime timer no longer stops for good when it fires again just as its previous turn
+  ends. The fire found the turn's request still running and left it to that turn, which had
+  already finished; the timer then stayed marked as fired, so every later `armTimerNoLater`
+  was skipped. That could stop a participant's DEADLINE and LIVELINESS checks, its SPDP
+  announcements, lease expiry and locator refresh, or a reliable writer's heartbeats and
+  resends. A fire that finds its timer's turn running now queues it again when that turn
+  ends. Seen as a rare Windows CI failure of the `set_qos` DEADLINE test, which re-arms the
+  checks on every call.
+
 ## 2026-11-20
 
 - `get_key_value` keeps each instance's key rather than its first sample, answers for every
