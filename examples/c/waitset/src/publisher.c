@@ -143,12 +143,14 @@ static uint32_t parse_domain(int argc, char **argv) {
 int main(int argc, char **argv) {
     uint32_t domain_id = parse_domain(argc, argv);
 
-    zzdds_DomainParticipantFactory factory = zzdds_DomainParticipantFactory_create();
-    if (factory == NULL) {
-        fprintf(stderr, "FAIL: createFactory() failed\n");
+    /* The process-wide factory, as every binding gets it. It is borrowed:
+     * DDS_DomainParticipantFactory_delete_instance() frees it, and refuses
+     * while any participant remains. */
+    DDS_DomainParticipantFactory dds_factory = DDS_DomainParticipantFactory_get_instance();
+    if (dds_factory == NULL) {
+        fprintf(stderr, "FAIL: DDS_DomainParticipantFactory_get_instance() failed\n");
         return 1;
     }
-    DDS_DomainParticipantFactory dds_factory = zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory);
 
     DDS_DomainParticipant dp = DDS_DomainParticipantFactory_create_participant(dds_factory, domain_id, NULL, NULL, 0);
     if (!dp) {
@@ -322,6 +324,13 @@ int main(int argc, char **argv) {
     DDS_WaitSet_destroy(ws);
 
     printf("Publisher: done.\n");
-    zzdds_DomainParticipantFactory_release(factory);
+    /* delete_participant refuses while the participant still contains
+     * entities, and delete_instance while any participant remains. */
+    if (DDS_DomainParticipant_delete_contained_entities(dp) != DDS_RETCODE_OK
+        || DDS_DomainParticipantFactory_delete_participant(dds_factory, dp) != DDS_RETCODE_OK
+        || DDS_DomainParticipantFactory_delete_instance() != DDS_RETCODE_OK) {
+        fprintf(stderr, "FAIL: deleting the participant or the factory failed\n");
+        return 1;
+    }
     return 0;
 }

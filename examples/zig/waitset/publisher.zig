@@ -111,19 +111,30 @@ pub fn main(init: std.process.Init) !void {
 
     const domain_id = parseDomain(&args);
 
-    var factory = zzdds.createFactory() catch {
-        std.debug.print("FAIL: createFactory() failed\n", .{});
+    // The process-wide factory, as every binding gets it. It is borrowed:
+    // delete_instance() frees it, and refuses while any participant remains,
+    // so it runs last (defers run in reverse).
+    const dpf = DDS.DomainParticipantFactory.get_instance();
+    if (dpf.ptr == zzdds.dcps.NIL_PTR) {
+        std.debug.print("FAIL: DomainParticipantFactory.get_instance() failed\n", .{});
+        std.process.exit(1);
+    }
+    defer if (DDS.DomainParticipantFactory.delete_instance() != DDS.RETCODE_OK) {
+        std.debug.print("FAIL: DomainParticipantFactory.delete_instance() failed\n", .{});
         std.process.exit(1);
     };
-    defer factory.deinit();
-    const dpf = factory.toDDSFactory();
 
     const dp = dpf.create_participant(domain_id, .{}, null, 0);
     if (dp.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_participant() failed on domain {d}\n", .{domain_id});
         std.process.exit(1);
     }
-    defer _ = dpf.delete_participant(dp);
+    // delete_participant() refuses while the participant still contains
+    // entities, so they go first.
+    defer if (dp.delete_contained_entities() != DDS.RETCODE_OK or dpf.delete_participant(dp) != DDS.RETCODE_OK) {
+        std.debug.print("FAIL: deleting the participant failed\n", .{});
+        std.process.exit(1);
+    };
 
     var ts_alloc = alloc;
     if (!zzdds.registerTypeSupport(dp, "WaitsetSample", .{
@@ -162,8 +173,8 @@ pub fn main(init: std.process.Init) !void {
 
     // ── WaitSet setup: StatusCondition + GuardCondition together ────────────
 
-    const ws = zzdds.createWaitSet(alloc) catch {
-        std.debug.print("FAIL: createWaitSet() failed\n", .{});
+    const ws = DDS.WaitSet.create(alloc) catch {
+        std.debug.print("FAIL: WaitSet.create() failed\n", .{});
         std.process.exit(1);
     };
 
@@ -177,8 +188,8 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
-    const gc = zzdds.createGuardCondition(alloc) catch {
-        std.debug.print("FAIL: createGuardCondition() failed\n", .{});
+    const gc = DDS.GuardCondition.create(alloc) catch {
+        std.debug.print("FAIL: GuardCondition.create() failed\n", .{});
         std.process.exit(1);
     };
     if (ws.attach_condition(guardAsCondition(gc)) != DDS.RETCODE_OK) {
@@ -272,8 +283,8 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Publisher: StatusCondition remained attached through delete_datawriter (safe).\n", .{});
     _ = publisher.delete_datawriter(dw);
 
-    gc.deinit();
-    ws.deinit();
+    _ = gc.destroy();
+    _ = ws.destroy();
 
     std.debug.print("Publisher: done.\n", .{});
 }

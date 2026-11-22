@@ -76,6 +76,12 @@ comptime {
     // than linking the separately built archive (see build.zig).
     if (@import("build_options").cdr_exports_in_library) _ = @import("zidl_cdr_exports");
 }
+/// What zidl's generated code needs from zzdds: the C exports get it from
+/// `exportCAbi`, and the generated Zig statics and constructors
+/// (`DDS.DomainParticipantFactory.get_instance()`, `DDS.WaitSet.create(...)`)
+/// from here, through the "zzdds_provider" import (see build.zig's gen_dcps).
+pub const zidl_provider = c_abi.extensions.CAbiProvider;
+
 /// Re-export the generated DDS type definitions so generated code can do
 ///   const _zzdds = @import("zzdds");
 ///   const DDS = _zzdds.DDS;

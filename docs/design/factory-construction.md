@@ -5,7 +5,9 @@
 Implemented, with five decisions (below), all made: `get_instance` comes with the rest, in
 one zidl release (3), and `release` retires a reader's or writer's handle on its last
 loan's return (5). The factory work is in #173; decision 5 is in its own PR. rmw_zzdds
-moved to the generated functions in rmw_zzdds#19, and the deprecated functions are now removed. Follows WaitSet and GuardCondition onto zidl's
+moved to the generated functions in rmw_zzdds#19, and the deprecated functions are now removed.
+Zig has `get_instance` too, through zidl's `--zig-provider-module` (see [Zig](#zig)), and the
+hello_world and waitset examples use it in every binding. Follows WaitSet and GuardCondition onto zidl's
 `@standalone` construction ([#167](https://github.com/zz-iot/zzdds/pull/167), zidl
 `docs/design/standalone-construction.md`). A throwaway prototype of the constructor half is
 was on a local branch, since deleted; its findings are recorded here.
@@ -524,8 +526,15 @@ try (Zzdds.zzdds.DomainParticipantFactory factory = Zzdds.zzdds.DomainParticipan
 
 ### Zig
 
-Zig programs use zzdds's own `zzdds.createFactory()` wrapper, not generated code, and are
-unaffected. A `zzdds.getInstance()` can follow if wanted.
+Zig programs used zzdds's own `zzdds.createFactory()` wrapper, not generated code, because
+zidl generated statics and constructors for the C exports only. zidl's
+`--zig-provider-module` (zidl#90) gives the generated interfaces them too, calling the
+same `CAbiProvider`, which `src/root.zig` exports as `zidl_provider`:
+`DDS.DomainParticipantFactory.get_instance()`, `delete_instance()`,
+`DDS.WaitSet.create(allocator)` and `DDS.GuardCondition.create(allocator)`. The generated
+module imports zzdds as `zzdds_provider`, so each zzdds module rooted at `src/root.zig`
+(the Zig module, libzzdds, the LLVM-safe and TSan variants) has generated modules of its
+own. `zzdds.createFactory()`, `createWaitSet` and `createGuardCondition` remain.
 
 ## Impact on examples and tests
 

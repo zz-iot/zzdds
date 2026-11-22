@@ -184,7 +184,8 @@ a hand-written one, so the reason no longer holds (decided in
 the hand-written `zzdds_destroy_factory` did. C++ and Java run `release` when the owner is dropped or
 closed. `DDS::DomainParticipantFactory` also has the spec's process-wide factory, through
 zidl's `@static`: `get_instance()` creates it on first use and `delete_instance()` deletes it
-(strict). Neither owns anything, so dropping a reference to it releases nothing. The
+(strict), in Zig too (`DDS.DomainParticipantFactory.get_instance()`, through zidl's
+`--zig-provider-module`). Neither owns anything, so dropping a reference to it releases nothing. The
 hand-written `zzdds_create_factory[_with_allocator]` and `zzdds_destroy_factory` (and C++'s `zzdds::create_factory`, Java's
 `ZzddsRuntime.createFactory`) are removed, now that rmw_zzdds uses the generated functions.
 

@@ -108,9 +108,12 @@ uint32_t parse_domain(int argc, char **argv) {
 int main(int argc, char **argv) {
     uint32_t domain_id = parse_domain(argc, argv);
 
-    auto factory = zzdds::DomainParticipantFactory::create();
+    // The process-wide factory, as every binding gets it. It is borrowed:
+    // DomainParticipantFactory::delete_instance() frees it, and refuses while
+    // any participant remains.
+    auto factory = ::DDS::DomainParticipantFactory::get_instance();
     if (!factory) {
-        std::fprintf(stderr, "FAIL: createFactory() failed\n");
+        std::fprintf(stderr, "FAIL: DomainParticipantFactory::get_instance() failed\n");
         return 1;
     }
 
@@ -314,5 +317,13 @@ int main(int argc, char **argv) {
     sub->delete_datareader(dr);
 
     std::printf("Subscriber: done.\n");
+    // delete_participant refuses while the participant still contains
+    // entities, and delete_instance while any participant remains.
+    if (dp->delete_contained_entities() != ::DDS::RETCODE_OK
+        || factory->delete_participant(dp) != ::DDS::RETCODE_OK
+        || ::DDS::DomainParticipantFactory::delete_instance() != ::DDS::RETCODE_OK) {
+        std::fprintf(stderr, "FAIL: deleting the participant or the factory failed\n");
+        return 1;
+    }
     return 0;
 }

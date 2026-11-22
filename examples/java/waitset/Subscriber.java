@@ -76,10 +76,12 @@ public class Subscriber {
     public static void main(String[] args) throws Exception {
         int domainId = parseDomain(args);
 
-        Dcps.DDS.DomainParticipantFactory factory =
-            io.zzdds.ext.Zzdds.zzdds.DomainParticipantFactory.create();
+        // The process-wide factory, as every binding gets it. It is borrowed:
+        // DomainParticipantFactory.delete_instance() frees it, and refuses
+        // while any participant remains.
+        Dcps.DDS.DomainParticipantFactory factory = Dcps.DDS.DomainParticipantFactory.get_instance();
         if (factory == null) {
-            System.err.println("FAIL: DomainParticipantFactory.create() failed");
+            System.err.println("FAIL: DomainParticipantFactory.get_instance() failed");
             System.exit(1);
         }
 
@@ -283,5 +285,13 @@ public class Subscriber {
         ws.close();
 
         System.out.println("Subscriber: done.");
+        // delete_participant refuses while the participant still contains
+        // entities, and delete_instance while any participant remains.
+        if (dp.delete_contained_entities() != Dcps.DDS.RETCODE_OK.value
+            || factory.delete_participant(dp) != Dcps.DDS.RETCODE_OK.value
+            || Dcps.DDS.DomainParticipantFactory.delete_instance() != Dcps.DDS.RETCODE_OK.value) {
+            System.err.println("FAIL: deleting the participant or the factory failed");
+            System.exit(1);
+        }
     }
 }

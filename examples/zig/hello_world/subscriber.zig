@@ -97,19 +97,30 @@ pub fn main(init: std.process.Init) !void {
 
     const domain_id = parseDomain(&args);
 
-    var factory = zzdds.createFactory() catch {
-        std.debug.print("FAIL: createFactory() failed\n", .{});
+    // The process-wide factory, as every binding gets it. It is borrowed:
+    // delete_instance() frees it, and refuses while any participant remains,
+    // so it runs last (defers run in reverse).
+    const dpf = DDS.DomainParticipantFactory.get_instance();
+    if (dpf.ptr == zzdds.dcps.NIL_PTR) {
+        std.debug.print("FAIL: DomainParticipantFactory.get_instance() failed\n", .{});
+        std.process.exit(1);
+    }
+    defer if (DDS.DomainParticipantFactory.delete_instance() != DDS.RETCODE_OK) {
+        std.debug.print("FAIL: DomainParticipantFactory.delete_instance() failed\n", .{});
         std.process.exit(1);
     };
-    defer factory.deinit();
-    const dpf = factory.toDDSFactory();
 
     const dp = dpf.create_participant(domain_id, .{}, null, 0);
     if (dp.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_participant() failed on domain {d}\n", .{domain_id});
         std.process.exit(1);
     }
-    defer _ = dpf.delete_participant(dp);
+    // delete_participant() refuses while the participant still contains
+    // entities, so they go first.
+    defer if (dp.delete_contained_entities() != DDS.RETCODE_OK or dpf.delete_participant(dp) != DDS.RETCODE_OK) {
+        std.debug.print("FAIL: deleting the participant failed\n", .{});
+        std.process.exit(1);
+    };
 
     // computeKeyHashFromCdr's ctx is a *const std.mem.Allocator (zidl's Zig
     // backend keeps the rest of the runtime's explicit-allocator idiom rather
