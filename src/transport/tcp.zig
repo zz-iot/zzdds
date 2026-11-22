@@ -561,6 +561,10 @@ pub const TcpTransport = struct {
     /// The progress backend that services the listen socket and the
     /// connections. Set (attach_backend) before the first listen or send.
     backend: ?ProgressBackend = null,
+    /// Where serviceConn reads, for every connection: they are all on
+    /// `backend`, which services one source at a time. A buffer on the stack
+    /// would be filled on each call in safe builds, once per read.
+    recv_buf: [RECV_CHUNK]u8 = undefined,
     /// The listen socket as a source of `backend`.
     listener: ?*Listener = null,
     /// Guards writable_waiters, blocked_count and each connection's
@@ -1493,11 +1497,11 @@ fn serviceConn(ctx: *anyopaque, budget: u32) u32 {
             return 1;
         },
     };
-    var buf: [RECV_CHUNK]u8 = undefined;
+    const buf = &conn.owner.recv_buf;
     var handled: u32 = 0;
     while (handled < budget) {
         // A partly read frame takes the bytes in place.
-        const into: []u8 = if (conn.frame.len > 0) conn.frame[conn.frame_off..] else &buf;
+        const into: []u8 = if (conn.frame.len > 0) conn.frame[conn.frame_off..] else buf;
         const n = c.recv(conn.fd, into.ptr, into.len, 0);
         if (n < 0) switch (sock.lastError()) {
             .would_block => break,

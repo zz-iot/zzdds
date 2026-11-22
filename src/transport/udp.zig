@@ -668,6 +668,10 @@ pub const UdpTransport = struct {
     /// Datagrams not sent because the send buffer was full; one per
     /// interface for a multicast send.
     sends_would_block: std.atomic.Value(u64) = .init(0),
+    /// Where serviceSource receives, for every socket: they are all on
+    /// `backend`, which services one source at a time. A buffer on the stack
+    /// would be filled on each call in safe builds, once per datagram.
+    recv_buf: [RECV_BUF]u8 = undefined,
     /// The send sockets as output-only sources of `backend`, so a producer
     /// whose send would block can wait for them to drain
     /// (vtNotifyWritable). Set up with `backend`; each is registered with
@@ -2067,12 +2071,12 @@ const udp_vtable = Transport.Vtable{
 // ── Receiving on the backend ──────────────────────────────────────────────────
 
 /// Source.service for a socket on the backend: receives what is queued now,
-/// without blocking, into this executor's buffer, and dispatches it to the
+/// without blocking, into the transport's buffer, and dispatches it to the
 /// socket's handler. The handlers (each participant's ingress) copy what they
 /// keep.
 fn serviceSource(ctx: *anyopaque, budget: u32) u32 {
     const entry: *SocketEntry = @ptrCast(@alignCast(ctx));
-    var buf: [RECV_BUF]u8 = undefined;
+    const buf = &entry.transport.recv_buf;
     var src_store: posix.sockaddr.storage = undefined;
     var handled: u32 = 0;
     while (handled < budget) {
@@ -2080,7 +2084,7 @@ fn serviceSource(ctx: *anyopaque, budget: u32) u32 {
         // A socket on a backend is nonblocking on Windows, which has no
         // MSG_DONTWAIT.
         const dontwait: u32 = if (builtin.os.tag == .windows) 0 else posix.MSG.DONTWAIT;
-        const n = socketRecvFromFlags(entry.fd, &buf, @ptrCast(&src_store), &src_len, dontwait) catch |err| switch (err) {
+        const n = socketRecvFromFlags(entry.fd, buf, @ptrCast(&src_store), &src_len, dontwait) catch |err| switch (err) {
             error.WouldBlock => break,
             error.Interrupted => continue,
             // Receiving took the socket's pending error (an ICMP report of

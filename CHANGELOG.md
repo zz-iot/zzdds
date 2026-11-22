@@ -10,6 +10,10 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-22
 
+- UDP and TCP receive into a buffer the transport keeps, not a 64 KiB stack buffer per call.
+  Safe builds fill a stack buffer declared `undefined`, and the backend reads one datagram
+  per call, so every datagram cost a 64 KiB fill: 29% of a ThreadSanitizer subscriber's
+  time receiving large fragmented data, which then fell behind and lost fragments.
 - Zig: the generated interfaces have their static operations and constructors, as every
   other binding does: `DDS.DomainParticipantFactory.get_instance()` and `delete_instance()`,
   `DDS.WaitSet.create(allocator)` and `DDS.GuardCondition.create(allocator)`. They call
