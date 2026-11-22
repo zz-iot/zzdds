@@ -142,7 +142,8 @@ change.
 - Neither forgets an instance yet, as today. Reclaiming them (a reader's instance once it
   is not alive, has no samples and is not loaned; a writer's on `unregister_instance`) is
   the follow-on that bounds memory, and the generations make it safe for handles already
-  handed out.
+  handed out. Done 2026-11-22, with a reader also waiting until no writer has the
+  instance registered ([`decisions.md`](../decisions.md)); a taken loan holds no instance.
 
 ### The participant's entity registry
 
@@ -195,7 +196,7 @@ by a handle of its own.
    their re-export from `dcps/root.zig` (`keyHashToHandle` went in step 2). Done
    2026-11-19.
 4. **Follow-ons**, each its own roadmap item: instance reclamation bounded by
-   `max_instances`; the linear `discovered_*` lists.
+   `max_instances` (done 2026-11-22); the linear `discovered_*` lists.
 
 Tests that computed a handle with `guidToHandle` (`api_test.zig`, `ignore_test.zig`,
 `matched_status_test.zig`) read it back from a built-in topic sample, or give it with the

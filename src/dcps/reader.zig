@@ -162,9 +162,9 @@ pub const PendingChange = struct {
     /// The raw 16-byte RTPS key hash this sample arrived with (`CacheChange.key_hash`,
     /// see `onDataCb`) -- distinct from `info.instance_handle`, the reader's handle for its instance
     /// (`DataReaderImpl.instances`). Needed
-    /// for `take_raw`/`read_raw`'s `key_hashes` output param (see dcps.idl); zero for
-    /// synthetic NOT_ALIVE_NO_WRITERS injections, which have no real writer/key-hash
-    /// source (see the one call site that constructs one).
+    /// for `take_raw`/`read_raw`'s `key_hashes` output param (see dcps.idl), and for
+    /// instance reclamation to see which instances cached samples hold. A synthetic
+    /// NOT_ALIVE_NO_WRITERS sample carries its instance's.
     key_hash: [16]u8 = std.mem.zeroes([16]u8),
     /// Refcounted keep-alive pin, acquired by `pinSamplesForLoan` for a
     /// non-destructive read-loan (see `docs/design/raw-loan-api.md`) --
@@ -615,8 +615,15 @@ pub const DataReaderImpl = struct {
 
     /// The reader's instances by key hash: their handles, and their state for
     /// view_state, get_key_value, TIME_BASED_FILTER and EXCLUSIVE ownership.
-    /// Not yet removed.
+    /// RESOURCE_LIMITS `max_instances` bounds how many it holds. An instance
+    /// is forgotten once it is not alive, no writer has it registered and
+    /// none of its samples is cached (DDS 1.4 §2.2.3.21): `reclaim_candidates`.
     instances: InstanceRegistry = .empty,
+    /// Key hashes of instances that may be forgotten once their cached
+    /// samples are gone: each became not alive, or lost a writer, since.
+    /// Checked as reads and takes end (`reclaimInstancesLocked`), which uses
+    /// the values to mark those a cached sample still holds.
+    reclaim_candidates: std.AutoArrayHashMapUnmanaged([16]u8, bool) = .empty,
     /// The type's projection of a sample to its key, set as the reader is
     /// created (`key_value.KeyProjection`) and released as it is freed; null
     /// keeps whole samples.
@@ -886,14 +893,18 @@ pub const DataReaderImpl = struct {
         var it = self.instances.iterator();
         while (it.next()) |e| if (e.value.key) |kv| alloc.free(kv.payload);
         self.instances.deinit(alloc);
+        self.reclaim_candidates.deinit(alloc);
     }
 
-    /// The instance with `key_hash`, registering it if it is new; null if it
-    /// cannot be registered. `entity_handle` is the handle of a built-in
-    /// reader's instance. The pointer is valid until the next registration.
-    /// Must be called with `mu` held.
-    fn instanceForKeyLocked(self: *Self, key_hash: [16]u8, entity_handle: DDS.InstanceHandle_t) ?*InstanceEntry {
-        const r = self.instances.getOrPut(self.alloc, key_hash) catch return null;
+    /// The instance with `key_hash`, registering it if it is new:
+    /// OutOfHandles for a new one beyond RESOURCE_LIMITS `max_instances`.
+    /// `entity_handle` is the handle of a built-in reader's instance. The
+    /// pointer is valid until the next registration or reclamation. Must be
+    /// called with `mu` held.
+    fn instanceForKeyLocked(self: *Self, key_hash: [16]u8, entity_handle: DDS.InstanceHandle_t) error{ OutOfMemory, OutOfHandles }!*InstanceEntry {
+        const max = self.qos.resource_limits.max_instances;
+        self.instances.limit = if (max > 0) @min(@as(u32, @intCast(max)), handle_registry.MAX_ENTRIES) else handle_registry.MAX_ENTRIES;
+        const r = try self.instances.getOrPut(self.alloc, key_hash);
         if (!r.found_existing) r.value.* = .{ .handle = r.handle };
         // An entity's handle can change: a lost entity's is freed, and the
         // entity has a new one if it is discovered again.
@@ -908,6 +919,58 @@ pub const DataReaderImpl = struct {
         var it = self.instances.iterator();
         while (it.next()) |e| if (e.value.handle == handle) return e.value;
         return null;
+    }
+
+    /// Marks the instance with `key_hash` to be forgotten once nothing holds
+    /// it (`reclaimInstancesLocked`): it became not alive, or a writer
+    /// unregistered it or was lost. Out of memory, the instance is kept.
+    /// With `mu` held.
+    fn markReclaimCandidateLocked(self: *Self, key_hash: [16]u8) void {
+        self.reclaim_candidates.put(self.alloc, key_hash, false) catch {};
+    }
+
+    fn markCandidateHeldLocked(self: *Self, key_hash: [16]u8) void {
+        if (self.reclaim_candidates.getPtr(key_hash)) |held| held.* = true;
+    }
+
+    /// Whether a matched writer has the instance `handle` names registered:
+    /// it wrote the instance alive and has neither unregistered it nor been
+    /// lost. With `mu` held.
+    fn instanceHasWriterLocked(self: *Self, handle: DDS.InstanceHandle_t) bool {
+        var it = self.writer_instances.valueIterator();
+        while (it.next()) |set| if (set.contains(handle)) return true;
+        return false;
+    }
+
+    /// Forgets each candidate instance that is not alive, that no writer has
+    /// registered and that has no cached sample, queued or in a coherent set
+    /// (DDS 1.4 §2.2.3.21). Its handle then names nothing, and a later sample
+    /// of its key starts a new instance, NEW, with generation counts of 0. A
+    /// candidate a cached sample holds stays one; one that is alive again or
+    /// still registered is dropped, and marked again when that changes. Run
+    /// with `mu` held as a read or take ends, after its samples' ranks are
+    /// set from their instances.
+    fn reclaimInstancesLocked(self: *Self) void {
+        if (self.reclaim_candidates.count() == 0) return;
+        @memset(self.reclaim_candidates.values(), false);
+        for (self.pending.items) |pc| self.markCandidateHeldLocked(pc.key_hash);
+        var wip_it = self.coherent_wip.valueIterator();
+        while (wip_it.next()) |wip| for (wip.samples.items) |pc| self.markCandidateHeldLocked(pc.key_hash);
+        for (self.coherent_committed.items) |cs| for (cs.samples.items) |pc| self.markCandidateHeldLocked(pc.key_hash);
+        // Downwards, as removing one moves the last into its place.
+        var i = self.reclaim_candidates.count();
+        while (i > 0) {
+            i -= 1;
+            if (self.reclaim_candidates.values()[i]) continue;
+            const key_hash = self.reclaim_candidates.keys()[i];
+            self.reclaim_candidates.swapRemoveAt(i);
+            const handle = self.instances.handleOfKey(key_hash) orelse continue;
+            const entry = self.instances.get(handle).?;
+            if (entry.instance_state == DDS.ALIVE_INSTANCE_STATE) continue;
+            if (self.instanceHasWriterLocked(entry.handle)) continue;
+            const removed = self.instances.remove(handle).?;
+            if (removed.key) |kv| self.alloc.free(kv.payload);
+        }
     }
 
     /// Gives the instance its key from this change if it has none yet: an
@@ -943,11 +1006,12 @@ pub const DataReaderImpl = struct {
         defer self.quiesce.release(self, reallyDeinit);
         const copy = self.alloc.dupe(u8, if (kind == .alive) cdr else &.{}) catch return;
         self.mu.lock();
-        const entry = self.instanceForKeyLocked(key_hash, entity_handle) orelse {
+        const entry = self.instanceForKeyLocked(key_hash, entity_handle) catch {
             self.mu.unlock();
             self.alloc.free(copy);
             return;
         };
+        if (kind != .alive) self.markReclaimCandidateLocked(key_hash);
         const states = entry.applyChange(kind);
         const info = DDS.SampleInfo{
             .sample_state = DDS.NOT_READ_SAMPLE_STATE,
@@ -985,12 +1049,20 @@ pub const DataReaderImpl = struct {
 
     // ── Data delivery ─────────────────────────────────────────────────────────
 
-    /// Record that `guid` has published an alive sample for instance `ih`.
-    /// Must be called with `mu` held.  Used by onWriterUnmatchingCb.
+    /// Record that `guid` has instance `ih` registered: it wrote or disposed
+    /// it. Must be called with `mu` held. Used by onWriterUnmatchingCb and
+    /// instance reclamation.
     fn trackWriterInstanceLocked(self: *Self, guid: Guid, ih: DDS.InstanceHandle_t) void {
         const gop = self.writer_instances.getOrPut(self.alloc, guid) catch return;
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         gop.value_ptr.put(self.alloc, ih, {}) catch {};
+    }
+
+    /// Record that the writer of `change`, accepted, unregistered instance
+    /// `ih`, if it is an unregister. With `mu` held.
+    fn untrackIfUnregisterLocked(self: *Self, change: *const history_mod.CacheChange, ih: DDS.InstanceHandle_t) void {
+        if (!change.kind.unregisters()) return;
+        if (self.writer_instances.getPtr(change.writer_guid)) |set| _ = set.remove(ih);
     }
 
     /// Records the handle the participant gave the writer `guid` at its
@@ -1082,6 +1154,22 @@ pub const DataReaderImpl = struct {
         }
     }
 
+    /// Counts a sample RESOURCE_LIMITS rejects for `reason`, then drops it as
+    /// `dropSampleUnlock` does and raises on_sample_rejected. `ih` is its
+    /// instance, or HANDLE_NIL for one the reader had no room to register.
+    fn rejectSampleUnlock(self: *Self, reason: DDS.SampleRejectedStatusKind, ih: DDS.InstanceHandle_t, copy: []u8, coherent_queued: bool) void {
+        self.sample_rejected_total += 1;
+        self.sample_rejected_total_change += 1;
+        self.sample_rejected_last_reason = reason;
+        self.sample_rejected_last_handle = ih;
+        self.status_changes |= DDS.SAMPLE_REJECTED_STATUS;
+        self.mu.unlock();
+        self.alloc.free(copy);
+        if (self.status_cond) |sc| sc.notifyWakeup();
+        self.deferListener(DDS.SAMPLE_REJECTED_STATUS);
+        if (coherent_queued) self.deferListener(DDS.DATA_AVAILABLE_STATUS);
+    }
+
     /// Matches the DataCallback.on_data function pointer signature.
     /// Must not block; must not call back into the ProtocolReader.
     fn onDataCb(ctx: *anyopaque, change: *const history_mod.CacheChange) void {
@@ -1102,15 +1190,24 @@ pub const DataReaderImpl = struct {
 
         // The sample's instance, registered by its first sample even if a
         // filter below drops it: ownership and writer tracking need it. A
-        // reader that cannot register it drops the sample.
-        const entry = self.instanceForKeyLocked(change.key_hash, DDS.HANDLE_NIL) orelse
-            return self.dropSampleUnlock(copy, coherent_queued);
+        // sample of a new instance beyond RESOURCE_LIMITS `max_instances` is
+        // rejected, and one the reader has no memory to register dropped.
+        const entry = self.instanceForKeyLocked(change.key_hash, DDS.HANDLE_NIL) catch |err| switch (err) {
+            error.OutOfHandles => return self.rejectSampleUnlock(.REJECTED_BY_INSTANCE_LIMIT, DDS.HANDLE_NIL, copy, coherent_queued),
+            error.OutOfMemory => return self.dropSampleUnlock(copy, coherent_queued),
+        };
         const ih = entry.handle;
 
         // Track writer→instance before any filter so that ownership-dropped writes
         // still mark the instance as covered (prevents spurious NOT_ALIVE_NO_WRITERS
         // when the owner leaves but another writer is still publishing to the instance).
-        if (change.kind == .alive) trackWriterInstanceLocked(self, change.writer_guid, ih);
+        // A writer that disposes an instance has it registered too, so a reader
+        // that hears of it first by a dispose keeps it. An unregister ends the
+        // registration once its sample is accepted (`untrackIfUnregisterLocked`),
+        // so one that is rejected leaves the instance as it was. A not-alive
+        // instance may be forgotten once nothing holds it.
+        if (!change.kind.unregisters()) trackWriterInstanceLocked(self, change.writer_guid, ih);
+        if (change.kind != .alive) self.markReclaimCandidateLocked(change.key_hash);
 
         // OWNERSHIP: per-instance exclusive ownership check.
         // A writer owns an instance if it is the highest-strength writer that has
@@ -1138,7 +1235,12 @@ pub const DataReaderImpl = struct {
                     break :blk true;
                 }
             };
-            if (!accepted) return self.dropSampleUnlock(copy, coherent_queued);
+            if (!accepted) {
+                // A writer that does not own the instance still ends its
+                // registration by unregistering; only its sample is hidden.
+                self.untrackIfUnregisterLocked(change, ih);
+                return self.dropSampleUnlock(copy, coherent_queued);
+            }
         }
 
         // TIME_BASED_FILTER: suppress alive samples whose source timestamp is within
@@ -1217,6 +1319,7 @@ pub const DataReaderImpl = struct {
                 wip.intact = false;
                 return self.dropSampleUnlock(copy, coherent_queued);
             };
+            self.untrackIfUnregisterLocked(change, ih);
             self.mu.unlock();
             self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
             if (coherent_queued) {
@@ -1248,15 +1351,12 @@ pub const DataReaderImpl = struct {
             }
         }
 
-        // RESOURCE_LIMITS: check all three limits in priority order.
+        // RESOURCE_LIMITS: the per-instance and total sample limits, in that
+        // order; max_instances was checked as the instance was registered.
         // Rejection is notified via on_sample_rejected; sample is dropped.
         //
         // Ordering invariant: KEEP_LAST eviction above must run first.  The
-        // three axes cannot produce a silent loss after that eviction:
-        //   max_instances   — only checked when ih is a NEW instance; KEEP_LAST
-        //                     only fires when ih already exists in pending, so
-        //                     post-eviction current_distinct+1 equals the
-        //                     pre-eviction count, which was already ≤ max_instances.
+        // two axes cannot produce a silent loss after that eviction:
         //   max_samples_per_instance — post-eviction per-instance count is depth-1;
         //                     the spec QoS consistency rule (depth ≤ max_samples_per_instance)
         //                     guarantees depth-1 < max_samples_per_instance.
@@ -1264,32 +1364,6 @@ pub const DataReaderImpl = struct {
         //                     the total never exceeds the pre-eviction level.
         const rl = self.qos.resource_limits;
         const reject_reason: ?DDS.SampleRejectedStatusKind = blk: {
-            if (rl.max_instances > 0) {
-                // Would this sample introduce a new instance that pushes us over the limit?
-                var is_new_instance = true;
-                for (self.pending.items) |pc| {
-                    if (pc.info.instance_handle == ih) {
-                        is_new_instance = false;
-                        break;
-                    }
-                }
-                if (is_new_instance) {
-                    // Count distinct instance handles currently in pending (O(n²), n is bounded by limits).
-                    var current_distinct: usize = 0;
-                    for (self.pending.items, 0..) |pc, i| {
-                        var seen = false;
-                        for (self.pending.items[0..i]) |prev| {
-                            if (prev.info.instance_handle == pc.info.instance_handle) {
-                                seen = true;
-                                break;
-                            }
-                        }
-                        if (!seen) current_distinct += 1;
-                    }
-                    if (current_distinct + 1 > @as(usize, @intCast(rl.max_instances)))
-                        break :blk .REJECTED_BY_INSTANCE_LIMIT;
-                }
-            }
             if (rl.max_samples_per_instance > 0) {
                 var count: usize = 0;
                 for (self.pending.items) |pc| {
@@ -1303,19 +1377,7 @@ pub const DataReaderImpl = struct {
                 break :blk .REJECTED_BY_SAMPLES_LIMIT;
             break :blk null;
         };
-        if (reject_reason) |reason| {
-            self.sample_rejected_total += 1;
-            self.sample_rejected_total_change += 1;
-            self.sample_rejected_last_reason = reason;
-            self.sample_rejected_last_handle = ih;
-            self.status_changes |= DDS.SAMPLE_REJECTED_STATUS;
-            self.mu.unlock();
-            self.alloc.free(copy);
-            if (self.status_cond) |sc| sc.notifyWakeup();
-            self.deferListener(DDS.SAMPLE_REJECTED_STATUS);
-            if (coherent_queued) self.deferListener(DDS.DATA_AVAILABLE_STATUS);
-            return;
-        }
+        if (reject_reason) |reason| return self.rejectSampleUnlock(reason, ih, copy, coherent_queued);
 
         // Build SampleInfo from the CacheChange.
         const states = entry.applyChange(change.kind);
@@ -1354,6 +1416,7 @@ pub const DataReaderImpl = struct {
             self.alloc.destroy(pc);
             return self.dropSampleUnlock(copy, coherent_queued);
         };
+        self.untrackIfUnregisterLocked(change, ih);
         // Stamp the TBF window now that the sample is committed to pending.
         if (tbf_active) entry.tbf_last_ns = tbf_src_ns;
         // Instance going non-alive: release its window and owner.
@@ -1712,6 +1775,9 @@ pub const DataReaderImpl = struct {
         defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         defer self.mu.unlock();
+        // A disposed instance only this writer had, with nothing cached, is
+        // forgotten now.
+        defer self.reclaimInstancesLocked();
         self.subscriptionMatchedLocked(self.publicationHandleLocked(guid), false);
         _ = self.writer_strengths.remove(guid);
         _ = self.writer_lifespans.remove(guid);
@@ -1759,6 +1825,10 @@ pub const DataReaderImpl = struct {
             var ih_it = inner.keyIterator();
             while (ih_it.next()) |ih_ptr| {
                 const ih = ih_ptr.*;
+                // Without this writer, the instance may be forgotten once
+                // nothing else holds it.
+                const key_hash = self.instances.keyOf(ih) orelse continue;
+                self.markReclaimCandidateLocked(key_hash);
                 // Another remaining writer covers this instance — no orphan.
                 var covered = false;
                 var wi_it = self.writer_instances.valueIterator();
@@ -1804,6 +1874,7 @@ pub const DataReaderImpl = struct {
                         .disposed_generation_count = states.disposed_generation_count,
                         .no_writers_generation_count = states.no_writers_generation_count,
                     },
+                    .key_hash = key_hash,
                 };
                 self.pending.append(self.alloc, pc) catch {
                     self.alloc.destroy(pc);
@@ -2019,6 +2090,7 @@ pub const DataReaderImpl = struct {
     pub fn takeRaw(self: *Self) ?TakenSample {
         self.mu.lock();
         defer self.mu.unlock();
+        defer self.reclaimInstancesLocked();
         self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
         while (self.pending.items.len > 0) {
@@ -2052,6 +2124,7 @@ pub const DataReaderImpl = struct {
     pub fn takeNextInstanceRaw(self: *Self, prev_instance_handle: DDS.InstanceHandle_t) ?TakenSample {
         self.mu.lock();
         defer self.mu.unlock();
+        defer self.reclaimInstancesLocked();
         self.resetDataAvailableLocked();
 
         const now_ns = time_mod.nanoTimestamp();
@@ -2102,6 +2175,7 @@ pub const DataReaderImpl = struct {
     pub fn readNextInstanceRaw(self: *Self, prev_instance_handle: DDS.InstanceHandle_t) ?TakenSample {
         self.mu.lock();
         defer self.mu.unlock();
+        defer self.reclaimInstancesLocked();
         self.resetDataAvailableLocked();
 
         const now_ns = time_mod.nanoTimestamp();
@@ -2166,6 +2240,7 @@ pub const DataReaderImpl = struct {
     ) anyerror!void {
         self.mu.lock();
         defer self.mu.unlock();
+        defer self.reclaimInstancesLocked();
         self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
 
@@ -2240,6 +2315,7 @@ pub const DataReaderImpl = struct {
     ) anyerror!void {
         self.mu.lock();
         defer self.mu.unlock();
+        defer self.reclaimInstancesLocked();
         self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
 
@@ -2331,6 +2407,7 @@ pub const DataReaderImpl = struct {
     ) anyerror!void {
         self.mu.lock();
         defer self.mu.unlock();
+        defer self.reclaimInstancesLocked();
         self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
         var ei: usize = 0;
@@ -2414,6 +2491,7 @@ pub const DataReaderImpl = struct {
     ) ![]*PendingChange {
         self.mu.lock();
         defer self.mu.unlock();
+        defer self.reclaimInstancesLocked();
         self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
         var ei: usize = 0;
@@ -2490,6 +2568,7 @@ pub const DataReaderImpl = struct {
     ) ![]*PendingChange {
         self.mu.lock();
         defer self.mu.unlock();
+        defer self.reclaimInstancesLocked();
         self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
         var ei: usize = 0;
@@ -2553,6 +2632,7 @@ pub const DataReaderImpl = struct {
     ) ![]*PendingChange {
         self.mu.lock();
         defer self.mu.unlock();
+        defer self.reclaimInstancesLocked();
         self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
         var ei: usize = 0;
@@ -2617,6 +2697,7 @@ pub const DataReaderImpl = struct {
     ) ![]*PendingChange {
         self.mu.lock();
         defer self.mu.unlock();
+        defer self.reclaimInstancesLocked();
         self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
         var ei: usize = 0;
@@ -2700,6 +2781,7 @@ pub const DataReaderImpl = struct {
     ) anyerror!void {
         self.mu.lock();
         defer self.mu.unlock();
+        defer self.reclaimInstancesLocked();
         self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
         var ei: usize = 0;
@@ -4623,7 +4705,7 @@ test "readRaw: sample_rank/generation_rank/absolute_generation_rank span a gener
     var dr = mkTestReaderForGenerationTests(alloc, &clock);
     defer deinitTestReader(&dr, alloc);
 
-    const ih = dr.instanceForKeyLocked(std.mem.zeroes([16]u8), DDS.HANDLE_NIL).?.handle;
+    const ih = (try dr.instanceForKeyLocked(std.mem.zeroes([16]u8), DDS.HANDLE_NIL)).handle;
 
     // Three samples for the same instance, spanning one dispose/resurrect cycle:
     // gen 0 (alive) -> gen 0 (dispose) -> gen 1 (alive again).
@@ -4683,7 +4765,7 @@ test "takeRaw: absolute_generation_rank reflects live generation ahead of a stal
     var dr = mkTestReaderForGenerationTests(alloc, &clock);
     defer deinitTestReader(&dr, alloc);
 
-    const ih = dr.instanceForKeyLocked(std.mem.zeroes([16]u8), DDS.HANDLE_NIL).?.handle;
+    const ih = (try dr.instanceForKeyLocked(std.mem.zeroes([16]u8), DDS.HANDLE_NIL)).handle;
     const d = try alloc.dupe(u8, &.{0xAA});
     const pc = try alloc.create(PendingChange);
     pc.* = .{

@@ -23,6 +23,16 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   `get_key_value` copies the key while it holds the writer's or reader's lock, as it can now
   be freed: the endpoints' `storedKey` and `keyValue` copy into a buffer the caller gives
   (`KeyCopy`), and `zzdds_get_key_value_writer`/`_reader` copy into theirs directly.
+- A DataReader forgets an instance once it is not alive, no matched writer has it
+  registered, and none of its samples is cached, queued or in a coherent set (DDS 1.4
+  §2.2.3.21), checked as each read or take ends, or as a writer is lost. Before, a reader
+  kept every instance a topic ever had. A later sample of its key starts a new instance:
+  NEW, under a new handle, with generation counts of 0. A disposed instance whose writer
+  still has it registered is kept, so its generation counts carry on. RESOURCE_LIMITS
+  `max_instances` now counts the instances the reader holds rather than those with samples
+  queued, found with a scan of the queue per sample: a sample of a new instance beyond it is
+  rejected (REJECTED_BY_INSTANCE_LIMIT, with HANDLE_NIL as its instance). A synthetic
+  NOT_ALIVE_NO_WRITERS sample carries its instance's key hash, which `take_raw` returns.
 - Zig: the generated interfaces have their static operations and constructors, as every
   other binding does: `DDS.DomainParticipantFactory.get_instance()` and `delete_instance()`,
   `DDS.WaitSet.create(allocator)` and `DDS.GuardCondition.create(allocator)`. They call

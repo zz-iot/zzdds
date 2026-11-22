@@ -268,14 +268,17 @@ Forward-looking only: known gaps, planned features, and open design questions.
     reflection, and every one of zzdds's own `examples/`/`stress-tests/` registrations
     passes it — see `CHANGELOG.md` 2026-09-14. Closed; not a gap anymore.
 
-- **Instances are never reclaimed.** Instance handles are allocated
-  ([`design/handle-registries.md`](design/handle-registries.md), 2026-11-19), but no
-  DataReader or DataWriter forgets an instance: memory grows with every instance a topic
-  has ever had. Reclaim a reader's instance once it is not alive, has no samples and is not
-  loaned, and a writer's on `unregister_instance`, bounded by RESOURCE_LIMITS
-  `max_instances`; the registries' generations keep handles already given out safe. The
-  reader's `max_instances` check still counts the distinct instances in `pending` with an
-  O(n²) scan, which the registry's live count can replace.
+- **READER_DATA_LIFECYCLE's autopurge delays are ignored.** A DataReader forgets an instance
+  once it is not alive, has no writers and its samples are taken
+  ([`decisions.md`](decisions.md), 2026-11-22), but `autopurge_nowriter_samples_delay` and
+  `autopurge_disposed_samples_delay` are never applied, so an application that leaves a
+  not-alive instance's samples untaken keeps the instance. Purge them on a timer once the
+  delay passes, as DDS 1.4 §2.2.3.21 describes.
+- **`autodispose_unregistered_instances` defaults to FALSE.** DDS 1.4 makes it TRUE, but
+  the generated `WriterDataLifecycleQosPolicy` zero-initializes it, and no default QoS sets
+  it, so an unregister disposes only when the application asks. Making it TRUE changes what
+  every reader sees of an unregister (NOT_ALIVE_DISPOSED rather than NOT_ALIVE_NO_WRITERS),
+  so it wants the examples and tests that expect the latter checked.
 - **The participant's `discovered_*` lists are searched linearly.**
   `discovered_participants`, `discovered_writers`, `discovered_readers` and
   `discovered_topics` are searched by GUID or name in many loops in `participant.zig`,
