@@ -40,6 +40,10 @@ pub const Request = struct {
     context: ?*Context = null,
     wait_gen: u32 = 0,
     wake_pending: bool = false,
+    /// A timer fired again while this request's turn ran: the turn queues
+    /// it again however it ends, since it may already have decided it is
+    /// done.
+    rerun: bool = false,
     /// Admitted with reserved internal credit rather than pending credit.
     internal: bool = false,
     /// Runs once the runtime is finished with a turn that ended `.done`, so
@@ -266,15 +270,16 @@ pub const Timer = struct {
     fn timerRun(req: *Request, turn: *Turn) Outcome {
         const self: *Timer = @fieldParentPtr("request", req);
         const rt = turn.runtime;
+        // A fire that found this turn claimed but not yet here is consumed
+        // now, so the turn its `Request.rerun` queues has none to run.
         rt.gate.lock();
-        const current = self.gen == self.fire_gen;
+        const current = self.fire_pending and self.gen == self.fire_gen;
         self.fire_pending = false;
         rt.gate.unlock();
         if (current) self.callback(self, turn);
-        // Fired again during this turn, finding its request busy: run again.
-        rt.gate.lock();
-        defer rt.gate.unlock();
-        return if (self.fire_pending) .yield else .done;
+        // A fire during this turn finds its request busy, and the turn ends
+        // with it queued again (`Request.rerun`).
+        return .done;
     }
 };
 
@@ -454,6 +459,12 @@ pub const Runtime = struct {
         /// before the request's `on_done`, unless that ran before the release
         /// (`done_before_release`).
         before_on_done: ?*const fn (runtime: *Runtime, ctx: *Context, req: *Request) void = null,
+        /// Runs once in `runTurn`, after a request is claimed RUNNING and
+        /// before its turn starts.
+        before_run: ?*const fn (runtime: *Runtime, ctx: *Context, req: *Request) void = null,
+        /// Runs once in `runTurn`, after a request's turn returns and before
+        /// its outcome takes effect.
+        after_run: ?*const fn (runtime: *Runtime, ctx: *Context, req: *Request) void = null,
     };
 
     /// The creator holds the first operational-owner reference.
@@ -575,6 +586,16 @@ pub const Runtime = struct {
     /// reserved internal credit: accepted while the context drains and the
     /// runtime retires. Always queued.
     pub fn submitInternal(self: *Runtime, ctx: *Context, req: *Request) error{ Busy, Closed }!void {
+        return self.admitInternal(ctx, req, false);
+    }
+
+    /// `submitInternal` for a timer's fire. A request whose turn is running
+    /// runs again once that turn ends, however it ends.
+    fn submitFire(self: *Runtime, ctx: *Context, req: *Request) error{ Busy, Closed }!void {
+        return self.admitInternal(ctx, req, true);
+    }
+
+    fn admitInternal(self: *Runtime, ctx: *Context, req: *Request, rerun_running: bool) error{ Busy, Closed }!void {
         _ = self.busy.fetchAdd(1, .seq_cst);
         defer self.endBusy();
         ctx.gate.lock();
@@ -583,6 +604,7 @@ pub const Runtime = struct {
             return error.Closed;
         }
         if (req.placement != .new and req.placement != .done) {
+            if (rerun_running and req.placement == .running) req.rerun = true;
             ctx.gate.unlock();
             return error.Busy;
         }
@@ -731,16 +753,30 @@ pub const Runtime = struct {
     /// Runs one turn of `req`, which the caller has claimed RUNNING and counted
     /// busy, then finishes the turn and releases the context.
     fn runTurn(self: *Runtime, ctx: *Context, req: *Request) void {
+        if (builtin.is_test) {
+            if (self.test_hooks.before_run) |hook| {
+                self.test_hooks.before_run = null;
+                hook(self, ctx, req);
+            }
+        }
         var turn = Turn{ .runtime = self, .context = ctx, .request = req, .now_ns = self.clock.nowNs() };
         const outer = running_context;
         running_context = ctx;
         const outcome = req.run(req, &turn);
         running_context = outer;
+        if (builtin.is_test) {
+            if (self.test_hooks.after_run) |hook| {
+                self.test_hooks.after_run = null;
+                hook(self, ctx, req);
+            }
+        }
 
         var on_done: ?*const fn (req: *Request) void = null;
         ctx.gate.lock();
+        const rerun = req.rerun;
+        req.rerun = false;
         switch (outcome) {
-            .done => {
+            .done => if (rerun) ctx.appendLocked(req) else {
                 req.placement = .done;
                 req.wake_pending = false;
                 if (!req.internal) ctx.pending -= 1;
@@ -752,7 +788,7 @@ pub const Runtime = struct {
                 }
             },
             .yield => ctx.appendLocked(req),
-            .wait => if (req.wake_pending) {
+            .wait => if (req.wake_pending or rerun) {
                 req.wake_pending = false;
                 req.wait_gen +%= 1;
                 ctx.appendLocked(req);
@@ -866,8 +902,9 @@ pub const Runtime = struct {
                     hook(self, t);
                 }
             }
-            self.submitInternal(ctx, &t.request) catch |err| switch (err) {
-                // Its request is queued, or running a turn that runs it again.
+            self.submitFire(ctx, &t.request) catch |err| switch (err) {
+                // Its request is queued, or running a turn that queues it
+                // again.
                 error.Busy => {},
                 error.Closed => {
                     self.gate.lock();
