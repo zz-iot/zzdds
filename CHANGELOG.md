@@ -10,6 +10,20 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-22
 
+- Zig: the generated interfaces have their static operations and constructors, as every
+  other binding does: `DDS.DomainParticipantFactory.get_instance()` and `delete_instance()`,
+  `DDS.WaitSet.create(allocator)` and `DDS.GuardCondition.create(allocator)`. They call
+  zzdds's C-ABI provider, which `src/root.zig` now exports as `zidl_provider`, and zidl
+  checks its signatures at compile time (zidl's `--zig-provider-module`; needs zidl
+  v0.3.40, pinned). The generated modules import zzdds as `zzdds_provider`, so each zzdds
+  module rooted at `src/root.zig` has generated modules of its own. `zzdds.createFactory()`,
+  `createWaitSet` and `createGuardCondition` remain.
+- The hello_world and waitset examples use the process-wide factory
+  (`get_instance`/`delete_instance`) in C, C++, Java and Zig, and Zig's waitset uses the
+  generated `WaitSet.create` and `GuardCondition.create`. Each now deletes its
+  participant's entities, the participant and the factory, and fails if any is refused.
+  Before, releasing a factory of their own deleted the participant for them, and Java's
+  never released its factory.
 - A runtime timer no longer stops for good when it fires again just as its previous turn
   ends. The fire found the turn's request still running and left it to that turn, which had
   already finished; the timer then stayed marked as fired, so every later `armTimerNoLater`

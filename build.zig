@@ -281,6 +281,12 @@ pub fn build(b: *std.Build) void {
     // frees route through the same registered allocator instead of a
     // hardcoded default).
     if (need_c_abi) gen_dcps.addArgs(&.{ "--zig-generate-c-api", "--zig-generate-c-api-cdr-allocator" });
+    // The generated statics and constructors (DomainParticipantFactory.get_instance,
+    // WaitSet.create, ...) call zzdds's provider, `zidl_provider` in src/root.zig.
+    // Every generated module below therefore imports the zzdds module rooted at
+    // src/root.zig that uses it as "zzdds_provider", and each such zzdds module
+    // has generated modules of its own: a file belongs to only one module.
+    gen_dcps.addArgs(&.{ "--zig-provider-module", "zzdds_provider" });
     gen_dcps.addArg("-o");
     // addOutputDirectoryArg injects the cache-managed output path as the next arg.
     const gen_output_dir = gen_dcps.addOutputDirectoryArg(gen_dir);
@@ -317,6 +323,7 @@ pub fn build(b: *std.Build) void {
     // See the matching comment on gen_dcps's --zig-generate-c-api above.
     if (config_authoring) gen_zzdds_vendor.addArg("--zig-generate-authoring");
     if (need_c_abi) gen_zzdds_vendor.addArgs(&.{ "--zig-generate-c-api", "--zig-generate-c-api-cdr-allocator" });
+    gen_zzdds_vendor.addArgs(&.{ "--zig-provider-module", "zzdds_provider" });
     gen_zzdds_vendor.addArg("-o");
     const gen_zzdds_output_dir = gen_zzdds_vendor.addOutputDirectoryArg("zzdds-generated-ext");
     gen_zzdds_vendor.addFileArg(b.path("idl/zzdds.idl"));
@@ -492,6 +499,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     zzdds_mod.addOptions("build_options", build_options);
+    generated_dcps_mod.addImport("zzdds_provider", zzdds_mod);
+    generated_zzdds_mod.addImport("zzdds_provider", zzdds_mod);
     if (typesupport_mod) |ts| {
         zzdds_mod.addImport("zidl_typesupport", ts);
         // Downstream linked providers must use this exact ABI/runtime module.
@@ -678,6 +687,29 @@ pub fn build(b: *std.Build) void {
         // (the CMake package's ZZDDS::zidl_cdr forwards to ZZDDS::zzdds), so a
         // process has one zidl-cdr and one zidl-cdr allocator.
 
+        // libzzdds's root module is a second zzdds module (it has build
+        // options of its own), so it gets generated modules of its own, whose
+        // statics and constructors call it (see gen_dcps).
+        const generated_dcps_mod_lib = b.createModule(.{
+            .root_source_file = gen_output_dir.path(b, "dcps.zig"),
+            .target = target,
+            .sanitize_thread = sanitize_thread,
+            .imports = &.{
+                .{ .name = "zidl_cdr", .module = runtime.codec },
+                .{ .name = "zidl_bindings", .module = runtime.bindings },
+            },
+        });
+        const generated_zzdds_mod_lib = b.createModule(.{
+            .root_source_file = generated_zzdds_root,
+            .target = target,
+            .sanitize_thread = sanitize_thread,
+            .imports = &.{
+                .{ .name = "zidl_cdr", .module = runtime.codec },
+                .{ .name = "zidl_bindings", .module = runtime.bindings },
+                .{ .name = "zzdds_generated", .module = generated_dcps_mod_lib },
+            },
+        });
+
         // Build libzzdds as a shared library exposing the C ABI surface.
         const zzdds_lib = b.addLibrary(.{
             .name = "zzdds",
@@ -690,8 +722,8 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "zidl_cdr", .module = runtime.codec },
                     .{ .name = "zidl_bindings", .module = runtime.bindings },
-                    .{ .name = "zzdds_generated", .module = generated_dcps_mod },
-                    .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod },
+                    .{ .name = "zzdds_generated", .module = generated_dcps_mod_lib },
+                    .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod_lib },
                     .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod },
                 },
             }),
@@ -700,6 +732,8 @@ pub fn build(b: *std.Build) void {
             .use_llvm = if (sanitize_thread) true else null,
         });
         zzdds_lib.root_module.addOptions("build_options", build_options_lib);
+        generated_dcps_mod_lib.addImport("zzdds_provider", zzdds_lib.root_module);
+        generated_zzdds_mod_lib.addImport("zzdds_provider", zzdds_lib.root_module);
         zzdds_lib.root_module.link_libc = true;
         // Without this, only Zig's own `export fn` C-ABI surface
         // (--zig-generate-c-api) ends up in zzdds.dll's export table on
@@ -2105,6 +2139,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     zzdds_mod_llvm_safe.addOptions("build_options", build_options);
+    generated_dcps_mod_llvm_safe.addImport("zzdds_provider", zzdds_mod_llvm_safe);
+    generated_zzdds_mod_llvm_safe.addImport("zzdds_provider", zzdds_mod_llvm_safe);
     if (resource_authoring_source) |source| zzdds_mod_llvm_safe.addImport("resource_authoring_generated", b.createModule(.{
         .root_source_file = source,
         .target = target_llvm_safe,
@@ -2382,6 +2418,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     zzdds_mod_tsan.addOptions("build_options", build_options);
+    generated_dcps_mod_tsan.addImport("zzdds_provider", zzdds_mod_tsan);
+    generated_zzdds_mod_tsan.addImport("zzdds_provider", zzdds_mod_tsan);
     if (resource_authoring_source) |source| zzdds_mod_tsan.addImport("resource_authoring_generated", b.createModule(.{
         .root_source_file = source,
         .target = target,
