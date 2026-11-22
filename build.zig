@@ -1963,8 +1963,14 @@ pub fn build(b: *std.Build) void {
         gen.addArgs(&.{ "-b", "c", "-o" });
         const dir = gen.addOutputDirectoryArg("checked-admission-c");
         gen.addFileArg(b.path("test/c_abi/admission.idl"));
+        // Imports typesupport_test.zig's Fixture, so it takes that file's imports.
         const m = b.createModule(.{ .root_source_file = b.path("test/c_abi/generated_admission_test.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{
-            .{ .name = "zzdds", .module = zzdds_mod }, .{ .name = "zzdds_generated", .module = generated_dcps_mod }, .{ .name = "zidl_cdr", .module = runtime.codec }, .{ .name = "zidl_bindings", .module = runtime.bindings }, .{ .name = "test_domain", .module = test_domain_mod },
+            .{ .name = "zzdds", .module = zzdds_mod },
+            .{ .name = "zzdds_generated", .module = generated_dcps_mod },
+            .{ .name = "zidl_cdr", .module = runtime.codec },
+            .{ .name = "zidl_bindings", .module = runtime.bindings },
+            .{ .name = "test_domain", .module = test_domain_mod },
+            .{ .name = "manual_runtime", .module = manual_runtime_mod },
         } });
         m.addCSourceFile(.{ .file = dir.path(b, "admission_cdr.c"), .flags = &.{ "-std=c99", "-Wall", "-Wextra", "-Werror" } });
         m.addIncludePath(dir);

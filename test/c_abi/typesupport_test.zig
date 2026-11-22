@@ -10,6 +10,7 @@ const testing = std.testing;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 const zidl_bindings = @import("zidl_bindings");
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 
 const c_abi_ts = zzdds.c_abi.typesupport;
 const DomainParticipantImpl = zzdds.dcps.DomainParticipantImpl;
@@ -175,6 +176,14 @@ test "c_abi TypeSupport: zzdds_set_key_projection installs one projection per ty
 
 test "c_abi TypeSupport: a writer and a reader take a key projection reference and release it as they are freed" {
     released = 0;
+    // A deleted writer or reader is freed, releasing its reference, once no
+    // runtime turn holds it. The local match queues listener turns for both,
+    // and on a shared runtime one could still be running when delete_* returns
+    // (seen on Windows CI). On a manual runtime, nothing runs between settle()
+    // and the deletions below.
+    var mr: ManualRuntime = undefined;
+    mr.init();
+    defer mr.deinit();
     {
         var fx = try Fixture.init(testing.allocator);
         defer fx.deinit();
@@ -190,6 +199,9 @@ test "c_abi TypeSupport: a writer and a reader take a key projection reference a
         const dw = publisher.create_datawriter(topic, .{}, null, 0);
         const dr = subscriber.create_datareader(desc, .{}, null, 0);
         try testing.expect(dw.ptr != nil.nil_datawriter.ptr and dr.ptr != nil.nil_datareader.ptr);
+        try testing.expectEqual(@as(usize, 3), owner.refs.load(.monotonic));
+        // The match and its listener turns run to completion.
+        mr.settle();
         try testing.expectEqual(@as(usize, 3), owner.refs.load(.monotonic));
 
         try testing.expectEqual(DDS.RETCODE_OK, publisher.delete_datawriter(dw));
