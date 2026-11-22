@@ -26,6 +26,23 @@ pub const KeyValue = struct {
         if (key.len == 0) return null;
         return .{ .payload = allocator.dupe(u8, key) catch return null, .key_only = true };
     }
+
+    /// Copies the payload into `buf` if it fits. An endpoint calls this under
+    /// the lock that guards its instances, which may reclaim the key once the
+    /// lock is released.
+    pub fn copyInto(self: KeyValue, buf: []u8) KeyCopy {
+        const fits = self.payload.len <= buf.len;
+        if (fits) @memcpy(buf[0..self.payload.len], self.payload);
+        return .{ .len = self.payload.len, .key_only = self.key_only, .copied = fits };
+    }
+};
+
+/// What `KeyValue.copyInto` found: the key's size and form, and whether it
+/// was copied (it fit the buffer).
+pub const KeyCopy = struct {
+    len: usize,
+    key_only: bool,
+    copied: bool,
 };
 
 /// A type's projection of a complete sample's CDR payload to its key-only

@@ -18,7 +18,7 @@ const DDS = @import("zzdds_generated").DDS;
 
 const DataWriterImpl = @import("../dcps/writer.zig").DataWriterImpl;
 const DataReaderImpl = @import("../dcps/reader.zig").DataReaderImpl;
-const KeyValue = @import("../dcps/key_value.zig").KeyValue;
+const KeyCopy = @import("../dcps/key_value.zig").KeyCopy;
 const TopicImpl = @import("../dcps/topic.zig").TopicImpl;
 const nil = @import("../dcps/nil.zig");
 const zidl_bindings = @import("zidl_bindings");
@@ -76,8 +76,8 @@ pub export fn zzdds_topic_as_description(topic: ?*anyopaque) callconv(.c) ?*anyo
 // `raw_ops` does, so a concurrent delete cannot free it part way through.
 
 /// register_instance: the handle of the key hash's instance on `writer`,
-/// registering it if it is not; 0 (HANDLE_NIL) if it cannot be.
-/// `key_cdr[0..key_cdr_len]`, the instance's key-only CDR with its
+/// registering it if it is not; 0 (HANDLE_NIL) if it cannot be, as beyond
+/// RESOURCE_LIMITS `max_instances`. `key_cdr[0..key_cdr_len]`, the instance's key-only CDR with its
 /// encapsulation header, is its key for get_key_value if it has none yet;
 /// NULL and 0 if the caller has none.
 pub export fn zzdds_register_instance_raw(
@@ -116,7 +116,7 @@ fn readerImpl(reader: *anyopaque) ?*DataReaderImpl {
 /// - BAD_PARAMETER for a NULL `writer` or `len_out`, a NULL `buf` with a
 ///   nonzero `buf_size`, or a handle that names no instance of `writer`
 ///   with a key (DDS 1.4 §2.2.2.4.2.9): one registered with its key-only
-///   CDR, written, disposed or unregistered has one;
+///   CDR, written or disposed has one, until it is unregistered;
 /// - ALREADY_DELETED for a deleted `writer`;
 /// - NOT_ENABLED until `writer` is enabled (§2.2.2.1.1.7);
 /// - PRECONDITION_NOT_MET when the payload does not fit in `buf_size`, as
@@ -135,11 +135,12 @@ pub export fn zzdds_get_key_value_writer(
     const out = keyValueOut(buf, buf_size, len_out, key_only_out) orelse return DDS.RETCODE_BAD_PARAMETER;
     if (!impl.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
     defer impl.releaseQuiesce();
-    return copyKeyValue(impl.keyValue(handle), out);
+    return copyKeyValue(impl.keyValue(handle, out.slice()), out);
 }
 
 /// lookup_instance: the handle of the key hash's instance on `writer`, or 0
-/// (HANDLE_NIL) if it was never registered or written.
+/// (HANDLE_NIL) if it is not registered: never registered or written, or
+/// unregistered since.
 pub export fn zzdds_lookup_instance_writer(
     writer: *anyopaque,
     key_hash: *const [16]u8,
@@ -165,10 +166,19 @@ pub export fn zzdds_get_key_value_reader(
     const out = keyValueOut(buf, buf_size, len_out, key_only_out) orelse return DDS.RETCODE_BAD_PARAMETER;
     if (!impl.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
     defer impl.releaseQuiesce();
-    return copyKeyValue(impl.keyValue(handle), out);
+    return copyKeyValue(impl.keyValue(handle, out.slice()), out);
 }
 
-const KeyValueOut = struct { buf: ?[*]u8, size: usize, len: *usize, key_only: ?*c_int };
+const KeyValueOut = struct {
+    buf: ?[*]u8,
+    size: usize,
+    len: *usize,
+    key_only: ?*c_int,
+
+    fn slice(self: KeyValueOut) []u8 {
+        return if (self.buf) |b| b[0..self.size] else &.{};
+    }
+};
 
 /// The caller's buffer and outputs, or null if they are unusable. A NULL
 /// buffer is only for asking the size, with `buf_size` 0.
@@ -178,18 +188,16 @@ fn keyValueOut(buf: ?[*]u8, buf_size: usize, len_out: ?*usize, key_only_out: ?*c
     return .{ .buf = buf, .size = buf_size, .len = len, .key_only = key_only_out };
 }
 
-/// Copies the key into the caller's buffer, which the caller's quiesce
-/// reference keeps the stored key alive for.
-fn copyKeyValue(result: error{ NotEnabled, BadParameter }!KeyValue, out: KeyValueOut) DDS.ReturnCode_t {
-    const kv = result catch |e| return switch (e) {
+/// Reports the key the endpoint copied into the caller's buffer, under the
+/// lock that keeps it from being reclaimed meanwhile.
+fn copyKeyValue(result: error{ NotEnabled, BadParameter }!KeyCopy, out: KeyValueOut) DDS.ReturnCode_t {
+    const copy = result catch |e| return switch (e) {
         error.NotEnabled => DDS.RETCODE_NOT_ENABLED,
         error.BadParameter => DDS.RETCODE_BAD_PARAMETER,
     };
-    out.len.* = kv.payload.len;
-    if (out.key_only) |k| k.* = @intFromBool(kv.key_only);
-    if (kv.payload.len > out.size) return DDS.RETCODE_PRECONDITION_NOT_MET;
-    if (kv.payload.len != 0) @memcpy(out.buf.?[0..kv.payload.len], kv.payload);
-    return DDS.RETCODE_OK;
+    out.len.* = copy.len;
+    if (out.key_only) |k| k.* = @intFromBool(copy.key_only);
+    return if (copy.copied) DDS.RETCODE_OK else DDS.RETCODE_PRECONDITION_NOT_MET;
 }
 
 /// lookup_instance: the handle of the key hash's instance on `reader` if it

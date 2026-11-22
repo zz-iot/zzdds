@@ -421,10 +421,11 @@ test "storedKey (reader): a known alive instance keeps its first sample, without
     fx.settle();
 
     const ih = pair.dr.lookupInstance(KEY_A).?;
-    const kv = pair.dr.storedKey(ih);
-    try testing.expect(kv != null);
-    try testing.expectEqualSlices(u8, &PAYLOAD, kv.?.payload);
-    try testing.expect(!kv.?.key_only);
+    var buf: [PAYLOAD.len]u8 = undefined;
+    const copy = pair.dr.storedKey(ih, &buf).?;
+    try testing.expect(copy.copied);
+    try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..copy.len]);
+    try testing.expect(!copy.key_only);
 }
 
 test "storedKey (reader): null for an unknown handle" {
@@ -434,7 +435,7 @@ test "storedKey (reader): null for an unknown handle" {
     const pair = fx.makeWriterReader(.{}, .{});
 
     const unknown_ih: DDS.InstanceHandle_t = @bitCast(@as(u32, 0x7FFF_FFFE));
-    try testing.expect(pair.dr.storedKey(unknown_ih) == null);
+    try testing.expect(pair.dr.storedKey(unknown_ih, &.{}) == null);
 }
 
 // ── lookupInstance ────────────────────────────────────────────────────────────
@@ -468,10 +469,11 @@ test "storedKey (writer): an alive write keeps its sample, without a key project
     fx.settle();
 
     const ih = pair.dw.lookupInstance(KEY_A);
-    const kv = pair.dw.storedKey(ih);
-    try testing.expect(kv != null);
-    try testing.expectEqualSlices(u8, &PAYLOAD, kv.?.payload);
-    try testing.expect(!kv.?.key_only);
+    var buf: [PAYLOAD.len]u8 = undefined;
+    const copy = pair.dw.storedKey(ih, &buf).?;
+    try testing.expect(copy.copied);
+    try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..copy.len]);
+    try testing.expect(!copy.key_only);
 }
 
 test "storedKey (writer): null for an instance registered without a key and not written" {
@@ -482,7 +484,7 @@ test "storedKey (writer): null for an instance registered without a key and not 
 
     const ih = pair.dw.registerInstance(KEY_A, &.{});
     try testing.expect(ih != DDS.HANDLE_NIL);
-    try testing.expect(pair.dw.storedKey(ih) == null);
+    try testing.expect(pair.dw.storedKey(ih, &.{}) == null);
 }
 
 // ── takeWithReadConditionRaw / readWithReadConditionRaw ────────────────────────

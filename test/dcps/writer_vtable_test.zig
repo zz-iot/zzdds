@@ -1176,7 +1176,7 @@ test "concurrent write_raw on one DataWriter keeps its instances and last_sn con
         fn run(c: @This()) void {
             while (!c.stop.load(.acquire)) {
                 const kh = std.mem.zeroes([16]u8);
-                _ = c.impl.storedKey(c.impl.lookupInstance(kh));
+                _ = c.impl.storedKey(c.impl.lookupInstance(kh), &.{});
                 std.Thread.yield() catch {};
             }
         }
@@ -1200,7 +1200,7 @@ test "concurrent write_raw on one DataWriter keeps its instances and last_sn con
             var kh = std.mem.zeroes([16]u8);
             std.mem.writeInt(u32, kh[0..4], tid, .little);
             std.mem.writeInt(u32, kh[4..8], i, .little);
-            if (impl.storedKey(impl.lookupInstance(kh)) != null) found += 1;
+            if (impl.storedKey(impl.lookupInstance(kh), &.{}) != null) found += 1;
         }
     }
     try testing.expectEqual(@as(usize, N_THREADS * PER_THREAD), found);

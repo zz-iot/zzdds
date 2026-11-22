@@ -14,6 +14,15 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   dispose and unregister (PID_STATUS_INFO 0x3, both flags) rather than as a dispose alone
   (0x1), so a reader learns that the writer no longer has the instance registered. A reader receiving 0x3 makes the instance NOT_ALIVE_DISPOSED, where it made it
   NOT_ALIVE_NO_WRITERS before. `ChangeKind` has `not_alive_disposed_unregistered` for it.
+- A DataWriter forgets an instance it unregisters (DDS 1.4 §2.2.2.4.2.7) rather than keeping
+  it for its lifetime: `lookup_instance` then gives HANDLE_NIL, its old handle names nothing
+  (BAD_PARAMETER from `get_key_value`, `write` and the others that take one), its key is
+  freed, and writing it again registers it under a new handle. The writer's history keeps
+  what it wrote. RESOURCE_LIMITS `max_instances` now bounds a writer's instances: writing a
+  new one beyond it gives OUT_OF_RESOURCES, and `register_instance` HANDLE_NIL.
+  `get_key_value` copies the key while it holds the writer's or reader's lock, as it can now
+  be freed: the endpoints' `storedKey` and `keyValue` copy into a buffer the caller gives
+  (`KeyCopy`), and `zzdds_get_key_value_writer`/`_reader` copy into theirs directly.
 - Zig: the generated interfaces have their static operations and constructors, as every
   other binding does: `DDS.DomainParticipantFactory.get_instance()` and `delete_instance()`,
   `DDS.WaitSet.create(allocator)` and `DDS.GuardCondition.create(allocator)`. They call

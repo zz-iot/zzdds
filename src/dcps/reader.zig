@@ -2283,23 +2283,23 @@ pub const DataReaderImpl = struct {
         self.finalizeGenerationRanksLocked(out.items[start..]);
     }
 
-    /// The key of the instance `handle` names, or null if it has none yet or
-    /// `handle` names no instance of this reader. Its payload stays valid for
-    /// the life of the reader: it is never replaced or freed before then.
-    pub fn storedKey(self: *Self, handle: DDS.InstanceHandle_t) ?KeyValue {
+    /// Copies the key of the instance `handle` names into `buf` if it fits,
+    /// under `mu`, as reclaiming the instance frees it; null if the instance
+    /// has none yet or `handle` names no instance of this reader.
+    pub fn storedKey(self: *Self, handle: DDS.InstanceHandle_t, buf: []u8) ?key_value.KeyCopy {
         self.mu.lock();
         defer self.mu.unlock();
         const entry = self.instanceOfHandleLocked(handle) orelse return null;
-        return entry.key;
+        return if (entry.key) |k| k.copyInto(buf) else null;
     }
 
     /// get_key_value's checks around `storedKey`, for a caller holding a
     /// quiesce reference: NotEnabled until enabled (DDS 1.4 §2.2.2.1.1.7),
     /// and BadParameter for a handle that names no instance of this reader
     /// with a key (§2.2.2.5.3.29).
-    pub fn keyValue(self: *Self, handle: DDS.InstanceHandle_t) error{ NotEnabled, BadParameter }!KeyValue {
+    pub fn keyValue(self: *Self, handle: DDS.InstanceHandle_t, buf: []u8) error{ NotEnabled, BadParameter }!key_value.KeyCopy {
         if (!self.enabled.load(.acquire)) return error.NotEnabled;
-        return self.storedKey(handle) orelse error.BadParameter;
+        return self.storedKey(handle, buf) orelse error.BadParameter;
     }
 
     /// lookup_instance: the handle of the key hash's instance if it is ALIVE,

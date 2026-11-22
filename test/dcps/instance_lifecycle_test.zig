@@ -344,6 +344,56 @@ test "registerInstance: a writer's instance has one handle; lookupInstance finds
     try testing.expect(written != DDS.HANDLE_NIL and written != handle);
 }
 
+test "unregister: a writer forgets the instance, which a later write registers anew" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(.{}, .{});
+
+    try writeAlive(pair.dw);
+    const first = pair.dw.lookupInstance(NIL_KEY);
+    try testing.expect(pair.dw.storedKey(first, &.{}) != null);
+
+    // With autodispose_unregistered_instances, as without it.
+    _ = try pair.dw.writeRaw(.not_alive_disposed_unregistered, RtpsTimestamp.now(), NIL_KEY, &.{});
+    try testing.expectEqual(DDS.HANDLE_NIL, pair.dw.lookupInstance(NIL_KEY));
+    try testing.expect(pair.dw.storedKey(first, &.{}) == null);
+
+    try writeAlive(pair.dw);
+    const second = pair.dw.lookupInstance(NIL_KEY);
+    try testing.expect(second != DDS.HANDLE_NIL and second != first);
+    _ = try pair.dw.writeRaw(.not_alive_unregistered, RtpsTimestamp.now(), NIL_KEY, &.{});
+    try testing.expectEqual(DDS.HANDLE_NIL, pair.dw.lookupInstance(NIL_KEY));
+
+    // A dispose alone keeps it.
+    try writeAlive(pair.dw);
+    const third = pair.dw.lookupInstance(NIL_KEY);
+    _ = try pair.dw.writeRaw(.not_alive_disposed, RtpsTimestamp.now(), NIL_KEY, &.{});
+    try testing.expectEqual(third, pair.dw.lookupInstance(NIL_KEY));
+}
+
+test "max_instances: a writer holds at most that many instances, and an unregister frees room" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.resource_limits.max_instances = 2;
+    const pair = fx.makeWriterReader(dw_qos, .{});
+
+    var keys: [3][16]u8 = .{ NIL_KEY, NIL_KEY, NIL_KEY };
+    for (&keys, 1..) |*k, i| k[15] = @intCast(i);
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), keys[0], &PAYLOAD);
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), keys[1], &PAYLOAD);
+    try testing.expectError(error.OutOfResources, pair.dw.writeRaw(.alive, RtpsTimestamp.now(), keys[2], &PAYLOAD));
+    try testing.expectEqual(DDS.HANDLE_NIL, pair.dw.registerInstance(keys[2], &.{}));
+    // An instance already registered is still written.
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), keys[1], &PAYLOAD);
+
+    _ = try pair.dw.writeRaw(.not_alive_disposed_unregistered, RtpsTimestamp.now(), keys[0], &.{});
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), keys[2], &PAYLOAD);
+    try testing.expect(pair.dw.lookupInstance(keys[2]) != DDS.HANDLE_NIL);
+}
+
 // ── Keyless topic, end-to-end via a real on_data_available listener ─────────
 //
 // Everything above this point already writes with NIL_KEY, but always with
