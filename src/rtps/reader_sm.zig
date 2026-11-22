@@ -243,11 +243,13 @@ pub const WriterProxy = struct {
         const num_bits: u32 = @intCast(@min(span, 256));
         var bitmap = std.mem.zeroes([8]u32);
 
-        // Set bits for SNs we have NOT received.
+        // Set bits for SNs we have NOT received. A partly reassembled SN is
+        // not negatively acknowledged: its missing fragments go in a
+        // NACK_FRAG instead (RTPS 2.5 §8.4.14.1.4).
         var offset: u32 = 0;
         while (offset < num_bits) : (offset += 1) {
             const sn: SequenceNumber = base + @as(i64, offset);
-            if (!self.received.contains(sn)) {
+            if (!self.received.contains(sn) and !self.reassembly.contains(sn)) {
                 const word: u32 = offset / 32;
                 const bit: u5 = @intCast(31 - (offset % 32)); // MSB-first
                 bitmap[word] |= @as(u32, 1) << bit;
@@ -768,6 +770,18 @@ pub const StatefulReader = struct {
         }
     }
 
+    /// NACK_FRAGs for the partly reassembled SNs up to `last_sn`. A HEARTBEAT
+    /// lists only SNs with every fragment available (RTPS 2.5 §8.4.14.1.4).
+    fn sendPartialNackFragsLocked(self: *Self, wp: *WriterProxy, last_sn: SequenceNumber) void {
+        const floor = wp.received.cumulativeAck();
+        var it = wp.reassembly.iterator();
+        while (it.next()) |e| {
+            const sn = e.key_ptr.*;
+            if (sn <= floor or sn > last_sn or wp.received.contains(sn)) continue;
+            self.sendNackFragLocked(wp, sn, e.value_ptr, e.value_ptr.total_frags);
+        }
+    }
+
     /// Build and send a NACK_FRAG covering all missing fragments up to last_frag_num.
     /// `entry` is null when no fragments have been received yet (request everything).
     /// Called under self.mu.
@@ -938,6 +952,19 @@ pub const StatefulReader = struct {
         }
     }
 
+    /// Frees partly reassembled samples a GAP settled: their SNs are now
+    /// accounted for, so the rest of their fragments never arrives.
+    fn dropSettledReassembly(alloc: std.mem.Allocator, wp: *WriterProxy) void {
+        while (true) {
+            var it = wp.reassembly.keyIterator();
+            const settled = while (it.next()) |k| {
+                if (wp.received.contains(k.*)) break k.*;
+            } else return;
+            var removed = wp.reassembly.fetchRemove(settled).?;
+            removed.value.deinit(alloc);
+        }
+    }
+
     fn dropReassemblyBelow(alloc: std.mem.Allocator, wp: *WriterProxy, sn: SequenceNumber) void {
         while (true) {
             var it = wp.reassembly.keyIterator();
@@ -1073,6 +1100,7 @@ pub const StatefulReader = struct {
                     if (!wp.received.contains(sn)) lost_count += 1;
                     _ = wp.received.insert(self.alloc, sn) catch {};
                 }
+                dropSettledReassembly(self.alloc, wp);
                 self.deliverPendingLocked(wp, prev_highest);
                 samples_lost += lost_count;
             }
@@ -1084,6 +1112,7 @@ pub const StatefulReader = struct {
             const has_missing = wp.received.cumulativeAck() < last_sn;
             if (!final or has_missing) {
                 self.sendAckNackLocked(wp, last_sn, !has_missing);
+                self.sendPartialNackFragsLocked(wp, last_sn);
             }
         }
 
@@ -1148,6 +1177,7 @@ pub const StatefulReader = struct {
                     _ = wp.received.insert(self.alloc, sn) catch {};
                 }
             }
+            dropSettledReassembly(self.alloc, wp);
             // Deliver any buffered pending changes that are now contiguous.
             if (self.reliable) self.deliverPendingLocked(wp, prev_highest);
             samples_lost += lost_count;
@@ -1927,6 +1957,120 @@ test "StatefulReader DATA_FRAG: a reassembly started before the match finishes a
     try reader.handleDataFrag(wguid, ZERO_TS, frag);
     try testing.expectEqual(@as(usize, 1), ctx.n);
     try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &ctx.data);
+}
+
+/// Records each message a reader sends, for tests that check its replies.
+const CaptureTransport = struct {
+    msgs: [8][512]u8 = undefined,
+    lens: [8]usize = undefined,
+    n: usize = 0,
+
+    fn send(ctx: *anyopaque, _: *const Locator, bytes: []const u8) anyerror!void {
+        const self: *CaptureTransport = @ptrCast(@alignCast(ctx));
+        if (self.n == self.msgs.len or bytes.len > 512) return error.TestCaptureFull;
+        @memcpy(self.msgs[self.n][0..bytes.len], bytes);
+        self.lens[self.n] = bytes.len;
+        self.n += 1;
+    }
+
+    const vtable = Transport.Vtable{
+        .capabilities = .{},
+        .can_reach = TestNullCtx.canReach,
+        .send = send,
+        .listen = TestNullCtx.listen,
+        .join_multicast = TestNullCtx.joinMulticast,
+        .leave_multicast = TestNullCtx.leaveMulticast,
+        .unlisten = TestNullCtx.unlisten,
+        .unicast_locators = TestNullCtx.unicastLocators,
+        .set_locator_change_handler = TestNullCtx.setLocatorChangeHandler,
+        .close = TestNullCtx.close,
+    };
+
+    fn transport(self: *CaptureTransport) Transport {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    /// The submessages sent, in order, other than INFO_DST.
+    fn submessages(self: *CaptureTransport, out: []msg.SubMessage) !usize {
+        var params: [4]msg.InlineQosParam = undefined;
+        var k: usize = 0;
+        for (self.msgs[0..self.n], self.lens[0..self.n]) |*m, len| {
+            var it = try msg.MessageIterator.init(m[0..len]);
+            while (try it.next(&params)) |sm| {
+                if (sm == .info_dst) continue;
+                out[k] = sm;
+                k += 1;
+            }
+        }
+        return k;
+    }
+};
+
+fn testFrag(sn: SequenceNumber, frag: u32, payload: []const u8) msg.submessage.DataFragSubmessage {
+    return .{
+        .flags = 0,
+        .reader_entity_id = std.mem.zeroes(EntityId),
+        .writer_entity_id = std.mem.zeroes(EntityId),
+        .writer_sn = sn,
+        .fragment_starting_num = frag,
+        .fragments_in_submessage = 1,
+        .fragment_size = 4,
+        .data_size = 12,
+        .inline_qos = null,
+        .serialized_payload = payload,
+    };
+}
+
+test "StatefulReader HEARTBEAT: a partly reassembled SN gets a NACK_FRAG, not a whole-SN NACK" {
+    // RTPS 2.5 §8.4.14.1.4: an SN is negatively acknowledged only when all its
+    // fragments are missing; a NACK_FRAG asks for the rest. Asking for the
+    // whole SN again repeats the burst whose tail was lost.
+    var cap: CaptureTransport = .{};
+    const reader = try StatefulReader.init(testing.allocator, makeGuid(40, 0xC7), cap.transport(), .keep_all, 0, true);
+    defer reader.deinit();
+
+    const wguid = makeGuid(41, 0xC2);
+    const loc = Locator{ .udp_v4 = .{ .addr = .{ 10, 0, 0, 1 }, .port = 7411 } };
+    try reader.addMatchedWriter(try WriterProxy.init(testing.allocator, wguid, &.{loc}, &.{}, true));
+    cap.n = 0;
+
+    // SN 1: fragment 1 of 3 arrives. SN 2: nothing arrives.
+    try reader.handleDataFrag(wguid, ZERO_TS, testFrag(1, 1, &.{ 1, 2, 3, 4 }));
+    reader.handleHeartbeat(wguid, reader.guid.entity_id, 1, 2, 1, false);
+
+    var sms: [8]msg.SubMessage = undefined;
+    const n = try cap.submessages(&sms);
+    try testing.expectEqual(@as(usize, 2), n);
+
+    const an = sms[0].acknack.reader_sn_state;
+    try testing.expectEqual(@as(SequenceNumber, 1), an.base);
+    try testing.expect(!an.contains(1));
+    try testing.expect(an.contains(2));
+
+    const nf = sms[1].nack_frag;
+    try testing.expectEqual(@as(SequenceNumber, 1), nf.writer_sn);
+    try testing.expect(!nf.fragment_number_state.contains(1));
+    try testing.expect(nf.fragment_number_state.contains(2));
+    try testing.expect(nf.fragment_number_state.contains(3));
+}
+
+test "StatefulReader GAP frees a partly reassembled SN" {
+    var null_ctx: TestNullCtx = .{};
+    const null_transport = Transport{ .ctx = &null_ctx, .vtable = &test_null_vtable };
+    const reader = try StatefulReader.init(testing.allocator, makeGuid(42, 0xC7), null_transport, .keep_all, 0, true);
+    defer reader.deinit();
+
+    const wguid = makeGuid(43, 0xC2);
+    try reader.addMatchedWriter(try WriterProxy.init(testing.allocator, wguid, &.{}, &.{}, true));
+    try reader.handleDataFrag(wguid, ZERO_TS, testFrag(1, 1, &.{ 1, 2, 3, 4 }));
+    try reader.handleDataFrag(wguid, ZERO_TS, testFrag(3, 1, &.{ 1, 2, 3, 4 }));
+    try testing.expectEqual(@as(u32, 2), reader.writer_proxies.items[0].reassembly.count());
+
+    // The writer no longer has SN 1; SN 3 is still coming.
+    reader.handleGap(wguid, 1, .{ .base = 2, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) });
+    const wp = &reader.writer_proxies.items[0];
+    try testing.expectEqual(@as(u32, 1), wp.reassembly.count());
+    try testing.expect(wp.reassembly.contains(3));
 }
 
 test "checked sample processing precedes sequence accounting for DATA and fragments" {

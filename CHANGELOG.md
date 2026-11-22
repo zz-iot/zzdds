@@ -10,6 +10,11 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-22
 
+- A reliable reader asks for just the missing fragments of a partly received sample when a
+  HEARTBEAT lists it, with a NACK_FRAG (RTPS 2.5 §8.4.14.1.4). Before, its ACKNACK asked
+  for the whole sample again. When a writer's burst overflowed the socket, every resend lost
+  the same fragments at its end, so the sample never completed and a KEEP_ALL writer
+  blocked. A GAP now also frees the fragments held for an SN it settles.
 - Zig: the generated interfaces have their static operations and constructors, as every
   other binding does: `DDS.DomainParticipantFactory.get_instance()` and `delete_instance()`,
   `DDS.WaitSet.create(allocator)` and `DDS.GuardCondition.create(allocator)`. They call
