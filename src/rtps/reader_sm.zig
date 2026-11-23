@@ -40,6 +40,7 @@ pub const RtpsTimestamp = time_mod.RtpsTimestamp;
 pub const Transport = iface.Transport;
 pub const Locator = iface.Locator;
 pub const ReassemblyEntry = reassembly_mod.ReassemblyEntry;
+pub const ReassemblyLimits = reassembly_mod.Limits;
 pub const UnmatchedCache = unmatched_mod.UnmatchedCache;
 pub const Prematch = unmatched_mod.Prematch;
 pub const MatchCommit = writer_sm.MatchCommit;
@@ -281,6 +282,8 @@ pub const StatefulReader = struct {
     writer_proxies: std.ArrayListUnmanaged(WriterProxy),
     callback: ?DataCallback,
     sample_processor: ?SampleProcessor = null,
+    /// Per matched writer (see setReassemblyLimits).
+    reassembly_limits: ReassemblyLimits = .{},
     mu: mutex_mod.Mutex,
     tracer: trace.Tracer,
     /// When true, out-of-order changes are buffered per WriterProxy and
@@ -334,6 +337,11 @@ pub const StatefulReader = struct {
 
     pub fn setTracer(self: *Self, t: trace.Tracer) void {
         self.tracer = t;
+    }
+
+    /// Set before the reader is published.
+    pub fn setReassemblyLimits(self: *Self, limits: ReassemblyLimits) void {
+        self.reassembly_limits = limits;
     }
 
     /// Install before the protocol reader is published. Its independent pin
@@ -482,7 +490,7 @@ pub const StatefulReader = struct {
         // Take what the writer sent before the match, as if it had arrived
         // just after it.  Under self.mu, so it all comes ahead of anything the
         // writer sends next.
-        if (prematch) |pm| self.takePrematchLocked(new_wp, pm);
+        const prematch_lost = if (prematch) |pm| self.takePrematchLocked(new_wp, pm) else 0;
         // A pre-emptive ACKNACK on discovering the writer, which RTPS 2.5
         // §8.4.2.3 allows "as an optimization".  RELIABLE only: "A best-effort
         // Reader is completely passive as it only receives data and does not
@@ -501,12 +509,14 @@ pub const StatefulReader = struct {
         const ready_ctx = self.protocol_ready_ctx;
         // Replaying buffered changes above may have delivered data.
         const flush = self.takeFlushLocked();
+        const lost_cb = if (prematch_lost > 0) self.callback else null;
         self.mu.unlock();
 
         if (newly_ready_guid) |guid| {
             if (ready_fn) |f| f(ready_ctx.?, guid, true);
         }
         runFlush(flush);
+        if (lost_cb) |cb| if (cb.on_sample_lost) |f| f(cb.ctx, prematch_lost);
         return .added;
     }
 
@@ -661,10 +671,14 @@ pub const StatefulReader = struct {
     /// Fragments from a writer not yet matched are ignored, as in handleData.
     pub fn handleDataFrag(self: *Self, writer_guid: Guid, source_timestamp: time_mod.RtpsTimestamp, df: msg.submessage.DataFragSubmessage) !void {
         self.mu.lock();
+        // As in handleGap.
+        var samples_lost: i32 = 0;
         defer {
+            const lost_cb = if (samples_lost > 0) self.callback else null;
             const flush = self.takeFlushLocked();
             self.mu.unlock();
             runFlush(flush);
+            if (lost_cb) |cb| if (cb.on_sample_lost) |f| f(cb.ctx, samples_lost);
         }
 
         var wp: ?*WriterProxy = null;
@@ -689,6 +703,14 @@ pub const StatefulReader = struct {
         const total_frags: u32 = (df.data_size + df.fragment_size - 1) / df.fragment_size;
 
         if (wp.?.reassembly.getPtr(sn) == null) {
+            switch (self.admitReassemblyLocked(wp.?, sn, df.data_size)) {
+                .start => {},
+                .skip => return,
+                .never => {
+                    samples_lost = self.settleTooLargeLocked(wp.?, sn, df.data_size);
+                    return;
+                },
+            }
             const data = try self.alloc.alloc(u8, df.data_size);
             errdefer self.alloc.free(data);
             var received = try std.DynamicBitSet.initEmpty(self.alloc, total_frags);
@@ -767,6 +789,51 @@ pub const StatefulReader = struct {
             self.sendNackFragLocked(wp, writer_sn, entry_ptr, last_frag_num);
             return;
         }
+    }
+
+    const Admission = enum { start, skip, never };
+
+    /// Whether `wp` may start reassembling `sn`, which declares `size` bytes,
+    /// within `reassembly_limits`. Past a limit, the held sample furthest
+    /// from delivery goes, or `sn` is skipped when it is furthest. Reliable
+    /// delivery waits on the lowest SN, so the highest is furthest from it;
+    /// best effort keeps the newest, so there the lowest is.
+    fn admitReassemblyLocked(self: *Self, wp: *WriterProxy, sn: SequenceNumber, size: u32) Admission {
+        const lim = self.reassembly_limits;
+        if (lim.max_bytes != 0 and size > lim.max_bytes) return .never;
+        const map = &wp.reassembly;
+        while (true) {
+            var bytes: u64 = size;
+            for (map.values()) |e| bytes += e.data_size;
+            const full = (lim.max_samples != 0 and map.count() >= lim.max_samples) or
+                (lim.max_bytes != 0 and bytes > lim.max_bytes);
+            if (!full) return .start;
+            var far: ?usize = null;
+            var far_sn = sn;
+            for (map.keys(), 0..) |k, i| {
+                if (if (self.reliable) k > far_sn else k < far_sn) {
+                    far = i;
+                    far_sn = k;
+                }
+            }
+            const i = far orelse return .skip;
+            map.values()[i].deinit(self.alloc);
+            map.swapRemoveAt(i);
+        }
+    }
+
+    /// Settles `sn`, which declares more bytes than reassembly allows, as a
+    /// GAP would: asking for it again cannot help. Returns the samples lost:
+    /// 1, or 0 for a best-effort reader, which never asks again anyway.
+    fn settleTooLargeLocked(self: *Self, wp: *WriterProxy, sn: SequenceNumber, size: u32) i32 {
+        if (!self.reliable) return 0;
+        log.rtps.warn("StatefulReader({x}): sample {d} declares {d} bytes, past the reassembly limit of {d}; counted lost", .{
+            self.guid.entity_id.entity_key, sn, size, self.reassembly_limits.max_bytes,
+        });
+        const prev_highest = wp.received.cumulativeAck();
+        if (!(wp.received.insert(self.alloc, sn) catch return 0)) return 0;
+        self.deliverPendingLocked(wp, prev_highest);
+        return 1;
     }
 
     /// NACK_FRAGs for the partly reassembled SNs up to `last_sn`. A HEARTBEAT
@@ -931,10 +998,12 @@ pub const StatefulReader = struct {
     /// drops none of them as out of order (see deliverChangeLocked), and
     /// partly reassembled ones carry on in `wp`.  Out of memory, it takes
     /// nothing: a RELIABLE reader then gets it all by repair.
-    fn takePrematchLocked(self: *Self, wp: *WriterProxy, pm: *const Prematch) void {
+    /// Returns the samples it counted lost.
+    fn takePrematchLocked(self: *Self, wp: *WriterProxy, pm: *const Prematch) i32 {
         var held: unmatched_mod.Collected = .{};
         defer held.deinit(self.alloc);
-        pm.collect(self.alloc, wp.guid, self.guid.entity_id, &held) catch return;
+        pm.collect(self.alloc, wp.guid, self.guid.entity_id, &held) catch return 0;
+        var lost: i32 = 0;
         for (held.samples.items) |ch| {
             if (wp.received.contains(ch.sequence_number)) continue;
             self.deliverChangeLocked(wp, ch) catch {};
@@ -945,10 +1014,19 @@ pub const StatefulReader = struct {
             const p = &held.partials.items[i];
             if (wp.received.contains(p.sn) or wp.reassembly.contains(p.sn)) continue;
             if (!self.reliable and p.sn <= wp.received.max()) continue;
+            switch (self.admitReassemblyLocked(wp, p.sn, p.entry.data_size)) {
+                .start => {},
+                .skip => continue,
+                .never => {
+                    lost += self.settleTooLargeLocked(wp, p.sn, p.entry.data_size);
+                    continue;
+                },
+            }
             wp.reassembly.put(self.alloc, p.sn, p.entry) catch continue;
             // Now wp's.
             _ = held.partials.swapRemove(i);
         }
+        return lost;
     }
 
     /// Frees partly reassembled samples a GAP settled: their SNs are now
@@ -2088,6 +2166,7 @@ test "StatefulReader GAP frees every partly reassembled SN it settles, among man
     const null_transport = Transport{ .ctx = &null_ctx, .vtable = &test_null_vtable };
     const reader = try StatefulReader.init(testing.allocator, makeGuid(44, 0xC7), null_transport, .keep_all, 0, true);
     defer reader.deinit();
+    reader.setReassemblyLimits(.{ .max_samples = 0, .max_bytes = 0 });
 
     const wguid = makeGuid(45, 0xC2);
     try reader.addMatchedWriter(try WriterProxy.init(testing.allocator, wguid, &.{}, &.{}, true));
@@ -2099,6 +2178,170 @@ test "StatefulReader GAP frees every partly reassembled SN it settles, among man
     const wp = &reader.writer_proxies.items[0];
     try testing.expectEqual(@as(usize, 1), wp.reassembly.count());
     try testing.expect(wp.reassembly.contains(200));
+}
+
+/// A reader matched with one writer, for the reassembly limit tests.
+fn limitedReader(id: u8, reliable: bool, limits: ReassemblyLimits) !*StatefulReader {
+    const null_transport = Transport{ .ctx = undefined, .vtable = &test_null_vtable };
+    const reader = try StatefulReader.init(testing.allocator, makeGuid(id, 0xC7), null_transport, .keep_all, 0, reliable);
+    errdefer reader.deinit();
+    reader.setReassemblyLimits(limits);
+    try reader.addMatchedWriter(try WriterProxy.init(testing.allocator, makeGuid(id, 0xC2), &.{}, &.{}, reliable));
+    return reader;
+}
+
+fn expectReassembling(reader: *StatefulReader, sns: []const SequenceNumber) !void {
+    const wp = &reader.writer_proxies.items[0];
+    try testing.expectEqual(sns.len, wp.reassembly.count());
+    for (sns) |sn| try testing.expect(wp.reassembly.contains(sn));
+}
+
+test "StatefulReader reassembly limit: a reliable reader keeps the lowest SNs" {
+    const reader = try limitedReader(46, true, .{ .max_samples = 2, .max_bytes = 0 });
+    defer reader.deinit();
+    const wguid = makeGuid(46, 0xC2);
+    const bytes = [_]u8{ 1, 2, 3, 4 };
+
+    try reader.handleDataFrag(wguid, ZERO_TS, testFrag(2, 1, &bytes));
+    try reader.handleDataFrag(wguid, ZERO_TS, testFrag(3, 1, &bytes));
+    // SN 4 is furthest from delivery, so it waits.
+    try reader.handleDataFrag(wguid, ZERO_TS, testFrag(4, 1, &bytes));
+    try expectReassembling(reader, &.{ 2, 3 });
+    // SN 1 is nearer than SN 3, which makes room.
+    try reader.handleDataFrag(wguid, ZERO_TS, testFrag(1, 1, &bytes));
+    try expectReassembling(reader, &.{ 1, 2 });
+}
+
+test "StatefulReader reassembly limit: a best-effort reader keeps the newest SNs" {
+    const reader = try limitedReader(47, false, .{ .max_samples = 2, .max_bytes = 0 });
+    defer reader.deinit();
+    const wguid = makeGuid(47, 0xC2);
+    const bytes = [_]u8{ 1, 2, 3, 4 };
+
+    try reader.handleDataFrag(wguid, ZERO_TS, testFrag(2, 1, &bytes));
+    try reader.handleDataFrag(wguid, ZERO_TS, testFrag(3, 1, &bytes));
+    try reader.handleDataFrag(wguid, ZERO_TS, testFrag(1, 1, &bytes));
+    try expectReassembling(reader, &.{ 2, 3 });
+    try reader.handleDataFrag(wguid, ZERO_TS, testFrag(4, 1, &bytes));
+    try expectReassembling(reader, &.{ 3, 4 });
+}
+
+test "StatefulReader reassembly limit: the declared bytes are bounded" {
+    // testFrag declares 12 bytes per sample: two fit.
+    const reader = try limitedReader(48, true, .{ .max_samples = 0, .max_bytes = 24 });
+    defer reader.deinit();
+    const wguid = makeGuid(48, 0xC2);
+    const bytes = [_]u8{ 1, 2, 3, 4 };
+
+    try reader.handleDataFrag(wguid, ZERO_TS, testFrag(1, 1, &bytes));
+    try reader.handleDataFrag(wguid, ZERO_TS, testFrag(2, 1, &bytes));
+    try reader.handleDataFrag(wguid, ZERO_TS, testFrag(3, 1, &bytes));
+    try expectReassembling(reader, &.{ 1, 2 });
+}
+
+test "StatefulReader reassembly limit: a reliable sample too large for it is counted lost" {
+    const reader = try limitedReader(49, true, .{ .max_bytes = 12 });
+    defer reader.deinit();
+    const Ctx = struct {
+        delivered: usize = 0,
+        lost: i32 = 0,
+        fn onData(ctx: *anyopaque, _: *const CacheChange) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.delivered += 1;
+        }
+        fn onLost(ctx: *anyopaque, count: i32) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.lost += count;
+        }
+    };
+    var ctx: Ctx = .{};
+    reader.setCallback(.{ .ctx = &ctx, .on_data = Ctx.onData, .on_sample_lost = Ctx.onLost });
+    const wguid = makeGuid(49, 0xC2);
+
+    // SN 2 completes, but waits on SN 1.
+    try reader.handleDataFrag(wguid, ZERO_TS, testFrag(2, 1, &.{ 1, 2, 3, 4 }));
+    try reader.handleDataFrag(wguid, ZERO_TS, testFrag(2, 2, &.{ 5, 6, 7, 8 }));
+    try reader.handleDataFrag(wguid, ZERO_TS, testFrag(2, 3, &.{ 9, 10, 11, 12 }));
+    try testing.expectEqual(@as(usize, 0), ctx.delivered);
+
+    var big = testFrag(1, 1, &.{ 1, 2, 3, 4 });
+    big.data_size = 16;
+    try reader.handleDataFrag(wguid, ZERO_TS, big);
+    try testing.expectEqual(@as(i32, 1), ctx.lost);
+    try testing.expectEqual(@as(usize, 1), ctx.delivered);
+    try expectReassembling(reader, &.{});
+    try testing.expectEqual(@as(SequenceNumber, 2), reader.writer_proxies.items[0].received.cumulativeAck());
+
+    // Settled: its other fragments change nothing.
+    try reader.handleDataFrag(wguid, ZERO_TS, big);
+    try testing.expectEqual(@as(i32, 1), ctx.lost);
+}
+
+test "StatefulReader reassembly limit: a best-effort sample too large for it is dropped" {
+    const reader = try limitedReader(50, false, .{ .max_bytes = 8 });
+    defer reader.deinit();
+    try reader.handleDataFrag(makeGuid(50, 0xC2), ZERO_TS, testFrag(1, 1, &.{ 1, 2, 3, 4 }));
+    try expectReassembling(reader, &.{});
+    try testing.expectEqual(@as(SequenceNumber, 0), reader.writer_proxies.items[0].received.max());
+}
+
+test "StatefulReader reassembly limit: a reassembly held from before the match counts toward it" {
+    const reader = try limitedReader(51, true, .{ .max_samples = 1, .max_bytes = 0 });
+    defer reader.deinit();
+    const wguid = makeGuid(52, 0xC2);
+    var held = UnmatchedCache.init(testing.allocator, test_unmatched_limits);
+    defer held.deinit();
+    // The match takes the later-held first: SN 1, then SN 2, which waits.
+    held.putFrag(wguid, guid_mod.EntityIds.unknown, testFrag(2, 1, &.{ 1, 2, 3, 4 }), ZERO_TS, 0, std.time.ns_per_s);
+    held.putFrag(wguid, guid_mod.EntityIds.unknown, testFrag(1, 1, &.{ 1, 2, 3, 4 }), ZERO_TS, 0, std.time.ns_per_s);
+
+    const proxy = try WriterProxy.init(testing.allocator, wguid, &.{}, &.{}, true);
+    _ = try reader.addOrRefreshMatchedWriterWith(proxy, &.{ .cache = &held }, null);
+    const wp = for (reader.writer_proxies.items) |*w| {
+        if (w.guid.eql(wguid)) break w;
+    } else unreachable;
+    try testing.expectEqual(@as(usize, 1), wp.reassembly.count());
+    try testing.expect(wp.reassembly.contains(1));
+}
+
+test "StatefulReader reassembly limit: a reliable sample held from before the match, too large for it, is counted lost" {
+    const reader = try limitedReader(53, true, .{ .max_bytes = 12 });
+    defer reader.deinit();
+    const Ctx = struct {
+        delivered: usize = 0,
+        lost: i32 = 0,
+        fn onData(ctx: *anyopaque, _: *const CacheChange) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.delivered += 1;
+        }
+        fn onLost(ctx: *anyopaque, count: i32) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.lost += count;
+        }
+    };
+    var ctx: Ctx = .{};
+    reader.setCallback(.{ .ctx = &ctx, .on_data = Ctx.onData, .on_sample_lost = Ctx.onLost });
+
+    const wguid = makeGuid(54, 0xC2);
+    var held = UnmatchedCache.init(testing.allocator, test_unmatched_limits);
+    defer held.deinit();
+    // SN 2 completes while held; SN 1 is held part-received and too large.
+    held.putFrag(wguid, guid_mod.EntityIds.unknown, testFrag(2, 1, &.{ 1, 2, 3, 4 }), ZERO_TS, 0, std.time.ns_per_s);
+    held.putFrag(wguid, guid_mod.EntityIds.unknown, testFrag(2, 2, &.{ 5, 6, 7, 8 }), ZERO_TS, 0, std.time.ns_per_s);
+    held.putFrag(wguid, guid_mod.EntityIds.unknown, testFrag(2, 3, &.{ 9, 10, 11, 12 }), ZERO_TS, 0, std.time.ns_per_s);
+    var big = testFrag(1, 1, &.{ 1, 2, 3, 4 });
+    big.data_size = 16;
+    held.putFrag(wguid, guid_mod.EntityIds.unknown, big, ZERO_TS, 0, std.time.ns_per_s);
+
+    const proxy = try WriterProxy.init(testing.allocator, wguid, &.{}, &.{}, true);
+    _ = try reader.addOrRefreshMatchedWriterWith(proxy, &.{ .cache = &held }, null);
+    try testing.expectEqual(@as(i32, 1), ctx.lost);
+    try testing.expectEqual(@as(usize, 1), ctx.delivered);
+    const wp = for (reader.writer_proxies.items) |*w| {
+        if (w.guid.eql(wguid)) break w;
+    } else unreachable;
+    try testing.expectEqual(@as(usize, 0), wp.reassembly.count());
+    try testing.expectEqual(@as(SequenceNumber, 2), wp.received.cumulativeAck());
 }
 
 test "checked sample processing precedes sequence accounting for DATA and fragments" {

@@ -38,7 +38,14 @@ copying, and is sent as described above.
 
 The reader's `StatefulReader` accumulates DATA_FRAG payloads into a reassembly buffer
 (indexed by writerSN + received-fragment bitmap). Only when all fragments arrive is a
-complete `CacheChange` stored in the reader history cache.
+complete `CacheChange` stored in the reader history cache. Per matched writer, the samples
+in reassembly and the bytes they declare are bounded (`rtps.reassembly_max_samples`,
+`rtps.reassembly_max_bytes`). When a new sample would pass either bound, the sample furthest
+from delivery is set aside: the highest SN for a reliable reader, which delivers in order,
+and the lowest for a best-effort one, which keeps the newest. A reliable reader asks for a
+set-aside sample again once there is room. A sample larger than the byte bound cannot fit,
+so asking again cannot help, and a reliable reader settles it as lost, whether it arrives
+after the match or was held from before it.
 
 ## Security scratch buffer
 

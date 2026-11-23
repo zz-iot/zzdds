@@ -2467,6 +2467,10 @@ pub const DomainParticipantImpl = struct {
         );
         errdefer adapter.deinit();
         adapter.setTracer(self.tracer);
+        adapter.reader.setReassemblyLimits(.{
+            .max_samples = self.config.rtps.reassembly_max_samples,
+            .max_bytes = self.config.rtps.reassembly_max_bytes,
+        });
 
         const pr = adapter.toProtocolReader();
 

@@ -19,6 +19,15 @@ pub fn keyHashFromInlineQos(inline_qos: ?msg.submessage.InlineQos) [16]u8 {
     return std.mem.zeroes([16]u8);
 }
 
+/// Bounds on the fragmented samples a reader reassembles at once for one
+/// matched writer. 0 is no bound.
+pub const Limits = struct {
+    /// Samples in reassembly.
+    max_samples: u32 = 16,
+    /// Bytes they declare together; a larger sample is never reassembled.
+    max_bytes: u32 = 256 * 1024 * 1024,
+};
+
 // ── ReassemblyEntry ───────────────────────────────────────────────────────────
 
 /// In-progress fragment reassembly for one (writer, sequence_number) pair.
