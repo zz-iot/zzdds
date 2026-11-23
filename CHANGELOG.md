@@ -28,6 +28,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   read or not, and it is forgotten unless a writer still has it registered. The reader's
   timer check does this, as it does DEADLINE. A zero delay, the policy's zero-initialized
   value, means never, as DURATION_INFINITE does.
+- The participant keeps its discovered participants, DataWriters and DataReaders by GUID,
+  and its discovered topics by name and type, rather than in lists it searched for each
+  announcement, lookup and handle release.
 
 ## 2026-11-22
 

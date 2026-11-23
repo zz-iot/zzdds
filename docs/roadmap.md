@@ -274,11 +274,6 @@ Forward-looking only: known gaps, planned features, and open design questions.
   writer goes: a reader sees the writer lost, and its instances NOT_ALIVE_NO_WRITERS,
   whatever the policy. As it is deleted, the writer should write an unregister for each
   instance it has registered, before discovery withdraws it.
-- **The participant's `discovered_*` lists are searched linearly.**
-  `discovered_participants`, `discovered_writers`, `discovered_readers` and
-  `discovered_topics` are searched by GUID or name in many loops in `participant.zig`,
-  and freeing an entity's handle scans them too (`releaseGuidHandleIfGoneLocked`). Fine at
-  realistic counts; index them by GUID and name when it is not.
 
 ### Selective CDR parse (`deserialize_selected`) — deferred follow-ups
 
