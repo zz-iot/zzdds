@@ -611,6 +611,10 @@ pub const StatefulWriter = struct {
     /// `closeAckWaits`.
     ack_waits: std.ArrayListUnmanaged(*ack_wait.Capture) = .empty,
     ack_waits_closed: bool = false,
+    /// The last sequence number `write` or `writeReserved` committed: what
+    /// an acknowledgment wait covers. Not `cache.next_sn - 1`, which a
+    /// write that failed may have taken. Guarded by `mu`.
+    last_committed_sn: SequenceNumber = 0,
     /// When true, write() defers DATA sends and accumulates SNs in
     /// coherent_pending_sns.  Cleared by endCoherentSet().
     coherent_active: bool,
@@ -1081,7 +1085,7 @@ pub const StatefulWriter = struct {
         self.mu.lock();
         defer self.mu.unlock();
         if (self.ack_waits_closed) return cap.waiter.settle(.writer_closed);
-        const target = self.cache.next_sn - 1;
+        const target = self.last_committed_sn;
         var n: usize = 0;
         for (self.reader_proxies.items) |*rp| {
             if (owesAck(rp, target)) n += 1;
@@ -1125,7 +1129,7 @@ pub const StatefulWriter = struct {
         self.ack_waits_closed = true;
         for (self.ack_waits.items) |cap| {
             cap.registered = false;
-            cap.waiter.settle(.writer_closed);
+            cap.waiter.settleClose(.writer_closed);
         }
         self.ack_waits.clearRetainingCapacity();
     }
@@ -1152,8 +1156,20 @@ pub const StatefulWriter = struct {
         }
     }
 
+    /// Drops `rp`'s match from every acknowledgment wait, then settles
+    /// those it was the last to owe. Caller must hold `mu`.
+    fn retireFromAckWaitsLocked(self: *Self, rp: *const ReaderProxy) void {
+        for (self.ack_waits.items) |cap| {
+            for (cap.readers) |*r| {
+                if (r.guid.eql(rp.guid) and r.match_id == rp.match_id) r.retired = true;
+            }
+        }
+        self.settleAckWaitsLocked();
+    }
+
     fn capturedAckedLocked(self: *Self, cap: *const ack_wait.Capture) bool {
         for (cap.readers) |r| {
+            if (r.retired) continue;
             for (self.reader_proxies.items) |*rp| {
                 if (!rp.guid.eql(r.guid)) continue;
                 if (rp.match_id == r.match_id and owesAck(rp, cap.target_sn)) return false;
@@ -1210,8 +1226,9 @@ pub const StatefulWriter = struct {
                 rp.multicast_locators = proxy.multicast_locators;
                 rp.selected_locators = proxy.selected_locators;
                 rp.reliable = proxy.reliable;
-                // A reader no longer reliable owes no acknowledgment.
-                if (!rp.reliable) self.settleAckWaitsLocked();
+                // A reader no longer reliable owes no acknowledgment, even
+                // made reliable again.
+                if (!rp.reliable) self.retireFromAckWaitsLocked(rp);
                 rp.expects_inline_qos = proxy.expects_inline_qos;
                 rp.wants_replay = proxy.wants_replay;
                 rp.is_local = proxy.is_local;
@@ -2012,6 +2029,7 @@ pub const StatefulWriter = struct {
             // With no reliable reader to wait for, it is already acknowledged.
             self.trimAckedLocked();
         }
+        self.last_committed_sn = sn;
         return sn;
     }
 
@@ -2047,6 +2065,7 @@ pub const StatefulWriter = struct {
         defer self.mu.unlock();
         std.debug.assert(!self.coherent_active);
         const sn = self.cache.addReservedWriterChange(kind, self.guid, source_timestamp, instance_handle, key_hash, data, uses_reservation);
+        self.last_committed_sn = sn;
         if (self.cache.getChange(sn)) |ch| {
             self.sendChangeToAllLocked(ch, true);
             self.trimAckedLocked();

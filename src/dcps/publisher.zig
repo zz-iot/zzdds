@@ -295,7 +295,7 @@ pub const PublisherImpl = struct {
             self.mu.lock();
             defer self.mu.unlock();
             self.ack_waits_closed = true;
-            for (self.ack_waiters.items) |waiter| waiter.settle(.closed);
+            for (self.ack_waiters.items) |waiter| waiter.settleClose(.closed);
         }
         for (self.writers.items) |w| self.destroyWriter(w);
         self.writers.clearRetainingCapacity();

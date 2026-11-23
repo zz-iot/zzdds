@@ -2691,3 +2691,50 @@ test "a caller blocked on an acknowledgment wait wakes when another thread ackno
     t.join();
     try testing.expectEqual(ack_wait.Outcome.acknowledged, got);
 }
+
+test "a writer closing after the deadline leaves its wait timed out" {
+    const a = makeGuid(0x02, READER_EID);
+    var rec: Recording = .{};
+    const w = try replayingWriterWithReader(&rec, a);
+    defer w.deinit();
+
+    // A zero timeout: the deadline has passed by the close.
+    var wait: AckWait = undefined;
+    try wait.begin(w, 0);
+    defer wait.end(w);
+    w.closeAckWaits();
+    try testing.expectEqual(@as(?ack_wait.Outcome, .timed_out), wait.outcome());
+}
+
+test "a reader that became best effort owes nothing, even made reliable again" {
+    const a = makeGuid(0x02, READER_EID);
+    const b = makeGuid(0x03, READER_EID);
+    var rec: Recording = .{};
+    const w = try replayingWriterWithReader(&rec, a);
+    defer w.deinit();
+    try w.addMatchedReader(try reliableProxy(b, 7206));
+
+    var wait: AckWait = undefined;
+    try wait.begin(w, null);
+    defer wait.end(w);
+    const loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7200);
+    try testing.expect(!try w.addOrRefreshMatchedReader(try ReaderProxy.init(testing.allocator, a, &.{loc}, &.{}, false, false)));
+    try testing.expect(!try w.addOrRefreshMatchedReader(try ReaderProxy.init(testing.allocator, a, &.{loc}, &.{}, false, true)));
+    ackThrough(w, b, 3, 1);
+    try testing.expectEqual(@as(?ack_wait.Outcome, .acknowledged), wait.outcome());
+}
+
+test "an acknowledgment wait covers the last change written, not a sequence number taken without one" {
+    const a = makeGuid(0x02, READER_EID);
+    var rec: Recording = .{};
+    const w = try replayingWriterWithReader(&rec, a);
+    defer w.deinit();
+    // As a failed write, or a wire-only marker, takes a number.
+    _ = w.cache.allocSn();
+
+    var wait: AckWait = undefined;
+    try wait.begin(w, null);
+    defer wait.end(w);
+    ackThrough(w, a, 3, 1);
+    try testing.expectEqual(@as(?ack_wait.Outcome, .acknowledged), wait.outcome());
+}

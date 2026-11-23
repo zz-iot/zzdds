@@ -81,6 +81,13 @@ pub const Waiter = struct {
         self.wake();
     }
 
+    /// Settles the wait `outcome` as what it waits on closes, unless it is
+    /// settled already, or timed out if the deadline has passed: a caller
+    /// running late still sees its timeout.
+    pub fn settleClose(self: *Waiter, outcome: Outcome) void {
+        self.settle(if (self.expired()) .timed_out else outcome);
+    }
+
     /// Whether a capture acknowledged now is late: at the deadline or past
     /// it, the wait times out.
     pub fn expired(self: *const Waiter) bool {
@@ -161,6 +168,8 @@ pub const Capture = struct {
         guid: Guid,
         /// Which of the reader's matches it owes for.
         match_id: u64,
+        /// Owes nothing more: it became best effort.
+        retired: bool = false,
     };
 };
 
