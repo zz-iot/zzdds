@@ -714,6 +714,8 @@ pub const UdpTransport = struct {
         // vtSend() works even before vtListen() has been called.
         const sv4: posix.socket_t = socketCreate(posix.AF.INET, posix.SOCK.DGRAM) catch INVALID_SOCKET;
         const sv6: posix.socket_t = socketCreate(posix.AF.INET6, posix.SOCK.DGRAM) catch INVALID_SOCKET;
+        if (sv4 != INVALID_SOCKET) sock.requestBufferSize(sv4, .send, config.send_buffer_size, "udp: IPv4 send socket");
+        if (sv6 != INVALID_SOCKET) sock.requestBufferSize(sv6, .send, config.send_buffer_size, "udp: IPv6 send socket");
         errdefer {
             if (sv4 != INVALID_SOCKET) socketClose(sv4);
             if (sv6 != INVALID_SOCKET) socketClose(sv6);
@@ -1241,21 +1243,21 @@ pub const UdpTransport = struct {
 
     // ── Reservation helpers ───────────────────────────────────────────────────
 
-    /// Consume a pre-bound reservation fd for `port`, if one exists.
+    /// Consume a pre-bound reservation fd for `port`, if one exists, with
+    /// the receive buffer size createUnicastSocket would have requested.
     fn takeReservedFd(self: *Self, port: u32) ?posix.socket_t {
         const meta_port: u32 = schema.metatrafficUnicastPort(&self.config, self.domain_id, self.participant_id);
         const data_port: u32 = schema.defaultUnicastPort(&self.config, self.domain_id, self.participant_id);
-        if (port == meta_port) {
-            const fd = self.reserved_meta_fd orelse return null;
-            self.reserved_meta_fd = null;
-            return fd;
-        }
-        if (port == data_port) {
-            const fd = self.reserved_data_fd orelse return null;
-            self.reserved_data_fd = null;
-            return fd;
-        }
-        return null;
+        const slot = if (port == meta_port)
+            &self.reserved_meta_fd
+        else if (port == data_port)
+            &self.reserved_data_fd
+        else
+            return null;
+        const fd = slot.* orelse return null;
+        slot.* = null;
+        requestReceiveBuffer(fd, @intCast(port), self.config.recv_buffer_size);
+        return fd;
     }
 
     /// Returns true if there is already a wildcard (0.0.0.0) unicast socket for port.
@@ -2124,12 +2126,18 @@ fn sockaddrToLocator(addr: *const posix.sockaddr) Locator {
 
 // ── Socket creation helpers ───────────────────────────────────────────────────
 
+fn requestReceiveBuffer(fd: posix.socket_t, port: u16, size: u32) void {
+    var buf: [32]u8 = undefined;
+    const what = std.fmt.bufPrint(&buf, "udp: port {d}", .{port}) catch "udp";
+    sock.requestBufferSize(fd, .receive, size, what);
+}
+
 fn createUnicastSocket(addr_kind: i32, ip: [16]u8, port: u16, recv_buf: u32) !posix.socket_t {
     const family: u32 = if (addr_kind == LocatorKind.udp_v4) posix.AF.INET else posix.AF.INET6;
     const fd = try socketCreate(family, posix.SOCK.DGRAM);
     errdefer socketClose(fd);
     try allowAddrReuse(fd);
-    if (recv_buf > 0) sockOptInt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, @intCast(recv_buf)) catch {};
+    requestReceiveBuffer(fd, port, recv_buf);
 
     if (addr_kind == LocatorKind.udp_v4) {
         const addr = posix.sockaddr.in{
@@ -2163,7 +2171,7 @@ fn createMulticastSocket(addr_kind: i32, port: u16, recv_buf: u32) !posix.socket
     // every datagram, each sender's SPDP included: see allowAddrReuse for why
     // that is SO_REUSEADDR on Linux and SO_REUSEPORT too on Darwin.
     try allowAddrReuse(fd);
-    if (recv_buf > 0) sockOptInt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, @intCast(recv_buf)) catch {};
+    requestReceiveBuffer(fd, port, recv_buf);
 
     if (addr_kind == LocatorKind.udp_v4) {
         const addr = posix.sockaddr.in{
@@ -2534,6 +2542,44 @@ test "init auto-assigns participant_id and reserves meta+data fds" {
 }
 
 // ── vtListen reserved-fd promotion path ──────────────────────────────────────
+
+/// A size every OS accepts; Linux reports it doubled.
+fn expectBufferSize(fd: posix.socket_t, buffer: sock.Buffer, size: u32) !void {
+    const got = sock.bufferSize(fd, buffer).?;
+    if (got != size and got != 2 * size) {
+        std.debug.print("{t} buffer: expected {d}, got {d}\n", .{ buffer, size, got });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "the configured buffer sizes reach the send sockets and a promoted reserved receive socket" {
+    const alloc = std.testing.allocator;
+    var hp_udp: rt_testing.HostedPoll = undefined;
+    try hp_udp.init(std.testing.allocator);
+    defer hp_udp.deinit();
+    const udp = try UdpTransport.init(alloc, .{ .ipv6_enabled = false, .recv_buffer_size = 40960, .send_buffer_size = 24576 }, 0, null);
+    defer udp.deinit();
+    try udp.transport().attachBackend(hp_udp.backend());
+    try expectBufferSize(udp.owned_send_fd_v4, .send, 24576);
+
+    const meta_port = schema.metatrafficUnicastPort(&udp.config, udp.domain_id, udp.participant_id);
+    const loc = Locator.udp4(.{ 0, 0, 0, 0 }, meta_port);
+    var sentinel: u8 = 0;
+    const h = ReceiveHandler{
+        .ctx = &sentinel,
+        .on_receive = struct {
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
+        }.f,
+    };
+    try udp.transport().listen(&loc, h);
+    defer udp.transport().unlisten(&loc, h);
+    var found = false;
+    for (udp.sockets.items) |s| if (s.port == meta_port) {
+        try expectBufferSize(s.fd, .receive, 40960);
+        found = true;
+    };
+    try std.testing.expect(found);
+}
 
 test "vtListen promotes reserved meta fd on first listen" {
     const alloc = std.testing.allocator;

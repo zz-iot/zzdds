@@ -26,6 +26,8 @@ pub fn toRuntimeConfig(allocator: std.mem.Allocator, cfg: *const ext.DomainParti
     runtime.transport.tcp.enabled = cfg.transport.tcp.enabled;
     runtime.transport.tcp.bind_address = try dupeString(allocator, cfg.transport.tcp.bind_address);
     runtime.transport.tcp.reuse_connection_by_host = cfg.transport.tcp.reuse_connection_by_host;
+    runtime.transport.tcp.recv_buffer_size = cfg.transport.tcp.recv_buffer_size;
+    runtime.transport.tcp.send_buffer_size = cfg.transport.tcp.send_buffer_size;
     runtime.rtps.fragment_size = cfg.rtps.fragment_size;
     runtime.rtps.reassembly_max_samples = cfg.rtps.reassembly_max_samples;
     runtime.rtps.reassembly_max_bytes = cfg.rtps.reassembly_max_bytes;
@@ -158,6 +160,7 @@ fn toUdpConfig(allocator: std.mem.Allocator, udp: *const ext.UdpConfig) !schema.
         .data_multicast_port = udp.data_multicast_port,
         .bind_wildcard = udp.bind_wildcard,
         .recv_buffer_size = udp.recv_buffer_size,
+        .send_buffer_size = udp.send_buffer_size,
         .interface_poll_interval_ms = udp.interface_poll_interval_ms,
         .interfaces = &.{},
         .multicast_group_v4 = "",

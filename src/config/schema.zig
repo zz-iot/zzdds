@@ -84,6 +84,12 @@ pub const TcpConfig = struct {
     /// the locator port differs from the currently connected port. This is unsafe
     /// when multiple participants share one host, so it is opt-in.
     reuse_connection_by_host: bool = false,
+
+    /// Socket buffer sizes to request (bytes), for every connection. 0 = OS
+    /// default, which most OSes grow with the connection's needs; a set
+    /// size turns that off on Linux.
+    recv_buffer_size: u32 = 0,
+    send_buffer_size: u32 = 0,
 };
 
 pub const UdpConfig = struct {
@@ -178,8 +184,11 @@ pub const UdpConfig = struct {
 
     // ── Misc ──────────────────────────────────────────────────────────────────
 
-    /// Receive buffer size hint (bytes). 0 = OS default.
+    /// Socket buffer sizes to request (bytes), for the receive sockets and
+    /// the send sockets. 0 = OS default. An OS that refuses a size is asked
+    /// for less; one that grants less logs it, at debug.
     recv_buffer_size: u32 = 0,
+    send_buffer_size: u32 = 0,
 
     /// How often the polling InterfaceMonitor re-enumerates interfaces (ms).
     /// 0 disables periodic re-polling entirely (interfaces are still

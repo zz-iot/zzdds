@@ -834,7 +834,7 @@ pub const TcpTransport = struct {
         }
 
         // Slow path: dial without holding conn_mu.
-        const new_conn = try dialConnection(self.alloc, key);
+        const new_conn = try dialConnection(self.alloc, key, self.config);
         new_conn.owner = self;
         new_conn.channel = self.channels.insert(self.alloc, new_conn) catch |err| {
             socketClose(new_conn.fd);
@@ -1315,7 +1315,7 @@ pub const TcpTransport = struct {
             return err;
         };
 
-        const fd = bindListenTcp(self.config.bind_address, port, family) catch |err| {
+        const fd = bindListenTcp(self.config, port, family) catch |err| {
             self.rollbackHandler(handler);
             self.conn_mu.unlock();
             return err;
@@ -1577,7 +1577,18 @@ fn resolveAdvertiseAddress(bind_address: []const u8, locator: *const Locator, fa
     return out;
 }
 
-fn bindListenTcp(bind_address: []const u8, port: u16, family: AddrFamily) !posix.socket_t {
+/// Requests `config`'s buffer sizes on `fd`, before it listens or connects:
+/// TCP fixes its window scale then, and an accepted connection takes its
+/// listener's sizes.
+fn requestBuffers(fd: posix.socket_t, config: schema.TcpConfig, kind: []const u8, port: u16) void {
+    var buf: [40]u8 = undefined;
+    const what = std.fmt.bufPrint(&buf, "tcp: {s} port {d}", .{ kind, port }) catch "tcp";
+    sock.requestBufferSize(fd, .receive, config.recv_buffer_size, what);
+    sock.requestBufferSize(fd, .send, config.send_buffer_size, what);
+}
+
+fn bindListenTcp(config: schema.TcpConfig, port: u16, family: AddrFamily) !posix.socket_t {
+    const bind_address = config.bind_address;
     const af: u32 = if (family == .v4) posix.AF.INET else posix.AF.INET6;
     const fd = try socketCreate(af, posix.SOCK.STREAM);
     errdefer socketClose(fd);
@@ -1585,6 +1596,7 @@ fn bindListenTcp(bind_address: []const u8, port: u16, family: AddrFamily) !posix
     var opt: i32 = 1;
     _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &opt, @sizeOf(i32));
     setSockNoSigPipe(fd);
+    requestBuffers(fd, config, "listener", port);
 
     switch (family) {
         .v4 => {
@@ -1623,12 +1635,13 @@ fn bindListenTcp(bind_address: []const u8, port: u16, family: AddrFamily) !posix
 
 /// Dials `key`. A `nonblocking` dial may return a connection whose dial is
 /// still in progress (`connecting`).
-fn dialConnection(alloc: std.mem.Allocator, key: RemoteKey) !*TcpConnection {
+fn dialConnection(alloc: std.mem.Allocator, key: RemoteKey, config: schema.TcpConfig) !*TcpConnection {
     const af: u32 = if (key.family == .v4) posix.AF.INET else posix.AF.INET6;
     const fd = try socketCreate(af, posix.SOCK.STREAM);
     errdefer socketClose(fd);
 
     setSockNoSigPipe(fd);
+    requestBuffers(fd, config, "dial to", key.port);
     try setNonblocking(fd);
 
     const rc = switch (key.family) {
@@ -1672,6 +1685,43 @@ fn dialConnection(alloc: std.mem.Allocator, key: RemoteKey) !*TcpConnection {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// A size every OS accepts; Linux reports it doubled.
+fn expectBufferSize(fd: posix.socket_t, buffer: sock.Buffer, size: u32) !void {
+    const got = sock.bufferSize(fd, buffer).?;
+    if (got != size and got != 2 * size) {
+        std.debug.print("{t} buffer: expected {d}, got {d}\n", .{ buffer, size, got });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "the configured buffer sizes reach the listener, a dialed connection and an accepted one" {
+    const config: schema.TcpConfig = .{ .recv_buffer_size = 40960, .send_buffer_size = 24576 };
+    const listener = try bindListenTcp(config, 0, .v4);
+    defer socketClose(listener);
+    try expectBufferSize(listener, .receive, 40960);
+    try expectBufferSize(listener, .send, 24576);
+
+    var addr: posix.sockaddr.in = undefined;
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    try std.testing.expectEqual(@as(c_int, 0), c.getsockname(listener, @ptrCast(&addr), &len));
+    var key: RemoteKey = .{ .addr = std.mem.zeroes([16]u8), .port = std.mem.bigToNative(u16, addr.port), .family = .v4 };
+    key.addr[0..4].* = .{ 127, 0, 0, 1 };
+    const conn = try dialConnection(std.testing.allocator, key, config);
+    defer {
+        socketClose(conn.fd);
+        std.testing.allocator.destroy(conn);
+    }
+    try expectBufferSize(conn.fd, .receive, 40960);
+    try expectBufferSize(conn.fd, .send, 24576);
+
+    const accepted = c.accept(listener, null, null);
+    try std.testing.expect(accepted >= 0);
+    const accepted_fd = sock.handle(accepted);
+    defer socketClose(accepted_fd);
+    try expectBufferSize(accepted_fd, .receive, 40960);
+    try expectBufferSize(accepted_fd, .send, 24576);
+}
 
 test "locatorToRemoteKey round-trip" {
     const loc = Locator.tcp4(.{ 192, 168, 1, 1 }, 9001);

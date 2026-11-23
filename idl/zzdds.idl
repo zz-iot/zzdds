@@ -60,7 +60,10 @@ module zzdds {
         @optional       unsigned short data_multicast_port;
         @default(FALSE) boolean        bind_wildcard;
                         StringSeq      initial_peers;
+        // Socket buffer sizes to request, in bytes; 0 is the OS default.
+        // An OS that refuses a size is asked for less.
                         unsigned long  recv_buffer_size;
+                        unsigned long  send_buffer_size;
         @default(5000)  unsigned long  interface_poll_interval_ms;
     };
 
@@ -68,6 +71,11 @@ module zzdds {
         @default(FALSE) boolean enabled;
         @default("")    string  bind_address;
         @default(FALSE) boolean reuse_connection_by_host;
+        // As for UdpConfig, for every connection. Most OSes grow a TCP
+        // buffer left at its default as the connection needs; a set size
+        // turns that off on Linux.
+                        unsigned long recv_buffer_size;
+                        unsigned long send_buffer_size;
     };
 
     struct TransportConfig {
