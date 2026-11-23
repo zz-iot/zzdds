@@ -77,6 +77,13 @@ module zzdds {
 
     struct RtpsConfig {
         @default(16384) unsigned short fragment_size;
+        // Per matched writer, at each reader: the fragmented samples it
+        // reassembles at once, and the bytes they declare together. Past
+        // either, the sample furthest from delivery waits (reliable) or is
+        // dropped (best effort). A sample larger than reassembly_max_bytes
+        // is never received; a reliable reader counts it lost. 0 is no bound.
+        @default(16)        unsigned long reassembly_max_samples;
+        @default(268435456) unsigned long reassembly_max_bytes;
     };
 
     struct DiscoveryConfig {

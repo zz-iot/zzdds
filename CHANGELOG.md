@@ -8,6 +8,15 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-23
+
+- A reader bounds the fragmented samples it reassembles at once for each matched writer:
+  `rtps.reassembly_max_samples` (16) and the bytes they declare, `rtps.reassembly_max_bytes`
+  (256 MiB); 0 is no bound. Past either, a reliable reader sets aside the highest SN and a
+  best-effort one the lowest. A sample declaring more than the byte limit is never
+  reassembled, and a reliable reader counts it lost, as a GAP would. Before, a reader
+  allocated whatever size a DATA_FRAG declared, up to 4 GiB, for any number of samples.
+
 ## 2026-11-22
 
 - An unregister under WRITER_DATA_LIFECYCLE `autodispose_unregistered_instances` is sent as

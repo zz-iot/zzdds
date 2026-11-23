@@ -228,6 +228,8 @@ guid_strategy = "GUID_SPEC_RANDOM"  # "GUID_SPEC_RANDOM" | "GUID_HOST_BASED" | "
 
 [rtps]
 fragment_size = 16384       # max RTPS message size before DATA_FRAG splitting (bytes)
+reassembly_max_samples = 16         # per matched writer: fragmented samples reassembled at once
+reassembly_max_bytes = 268435456    # per matched writer: bytes they declare; 0 = no bound
 
 [transport.udp]
 enabled = true

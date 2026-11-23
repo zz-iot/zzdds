@@ -27,6 +27,8 @@ pub fn toRuntimeConfig(allocator: std.mem.Allocator, cfg: *const ext.DomainParti
     runtime.transport.tcp.bind_address = try dupeString(allocator, cfg.transport.tcp.bind_address);
     runtime.transport.tcp.reuse_connection_by_host = cfg.transport.tcp.reuse_connection_by_host;
     runtime.rtps.fragment_size = cfg.rtps.fragment_size;
+    runtime.rtps.reassembly_max_samples = cfg.rtps.reassembly_max_samples;
+    runtime.rtps.reassembly_max_bytes = cfg.rtps.reassembly_max_bytes;
     runtime.discovery.kind = toDiscoveryKind(cfg.discovery.kind);
     runtime.discovery.initial_peers = try stringSeqSlice(allocator, &cfg.discovery.initial_peers);
     runtime.discovery.static_config_file = try dupeString(allocator, cfg.discovery.static_config_file);

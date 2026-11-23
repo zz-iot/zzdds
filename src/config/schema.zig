@@ -56,6 +56,11 @@ pub const RtpsConfig = struct {
     /// to avoid IP-level fragmentation; MTU-aware auto-calculation is a future
     /// feature.  Valid range: 1..65535 (fragment_size field is u16 in the spec).
     fragment_size: u16 = 16384,
+    /// Per matched writer, at each reader: the fragmented samples it
+    /// reassembles at once, and the bytes they declare together (see
+    /// rtps/reassembly.zig's Limits). 0 is no bound.
+    reassembly_max_samples: u32 = 16,
+    reassembly_max_bytes: u32 = 256 * 1024 * 1024,
 };
 
 pub const TransportConfig = struct {
