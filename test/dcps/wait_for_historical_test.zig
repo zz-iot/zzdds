@@ -29,6 +29,8 @@ const MockNetwork = mock_tr.MockNetwork;
 const MockTransport = mock_tr.MockTransport;
 
 const testing = std.testing;
+const rt = zzdds.runtime;
+const ManualRuntime = @import("manual_runtime").ManualRuntime;
 
 const DURATION_ZERO: DDS.Duration_t = .{ .sec = 0, .nanosec = 0 };
 const DURATION_INFINITE: DDS.Duration_t = .{
@@ -183,6 +185,51 @@ test "wait_for_historical_data: VOLATILE returns OK immediately" {
     try testing.expectEqual(DDS.RETCODE_OK, rc);
 }
 
+test "wait_for_historical_data: a reader on the built-in Subscriber, which nothing owes, returns OK at once" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
+    const tp_impl: *dcps.TopicImpl = @ptrCast(@alignCast(topic.ptr));
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+    const builtin = dp.get_builtin_subscriber();
+    const dr_raw = builtin.create_datareader(tp_impl.toTopicDescription(), dr_qos, null, 0);
+    defer _ = builtin.delete_datareader(dr_raw);
+
+    const max_wait = DDS.Duration_t{ .sec = 10, .nanosec = 0 };
+    try testing.expectEqual(DDS.RETCODE_OK, dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &max_wait));
+}
+
+test "wait_for_historical_data: a reader whose deletion has begun returns ALREADY_DELETED" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
+    const tp_impl: *dcps.TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const sub = dp.create_subscriber(.{}, null, 0);
+    defer _ = dp.vtable.delete_subscriber(dp.ptr, sub);
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+    const dr_raw = sub.create_datareader(tp_impl.toTopicDescription(), dr_qos, null, 0);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr_raw.ptr));
+    // As the Subscriber does first when it deletes the reader.
+    dr_impl.closeProto();
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO));
+}
+
 test "wait_for_historical_data: TRANSIENT_LOCAL with no matched writers returns OK immediately" {
     var h = try Harness.init();
     defer h.deinit();
@@ -208,19 +255,10 @@ test "wait_for_historical_data: TRANSIENT_LOCAL with no matched writers returns 
     try testing.expectEqual(DDS.RETCODE_OK, rc);
 }
 
-test "wait_for_historical_data: non-zero max_wait with no matched writer times out, doesn't return OK instantly" {
-    // Regression test: historicalDelivered() alone can't tell "genuinely
-    // nothing to wait for" apart from "no writer has matched *yet*" -- both
-    // look like an empty writer_proxies list. Previously this made a
-    // *non-zero* max_wait return RETCODE_OK on the very first poll purely
-    // because discovery hadn't matched a writer yet, defeating the whole
-    // point of a bounded wait. Found building zzdds-examples' `catchup`
-    // example: a real subscriber calling this immediately after creating
-    // its reader (the single most common real call pattern) got an instant
-    // false "OK" with zero historical samples actually delivered. Unlike
-    // the DURATION_ZERO test above (a deliberate "check current state,
-    // don't block" query, unaffected by this fix), a real max_wait must
-    // still time out here since no writer ever matches in this test.
+test "wait_for_historical_data: with no matched writer, any max_wait returns OK at once" {
+    // Nothing is owed (docs/design/concurrency/operations.md#historical-wait-compatibility):
+    // an application that needs a writer to match first waits for that
+    // match, not for historical data.
     var h = try Harness.init();
     defer h.deinit();
 
@@ -240,21 +278,10 @@ test "wait_for_historical_data: non-zero max_wait with no matched writer times o
     dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     const dr_raw = sub.create_datareader(td, dr_qos, null, 0);
 
-    // No writer is ever matched in this test -- a real (short, but non-zero)
-    // max_wait must time out, not return OK on the first poll.
-    const short_wait: DDS.Duration_t = .{ .sec = 0, .nanosec = 50 * std.time.ns_per_ms };
-    const rc = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &short_wait);
-    try testing.expectEqual(DDS.RETCODE_TIMEOUT, rc);
+    try testing.expectEqual(DDS.RETCODE_OK, dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_INFINITE));
 }
 
-test "wait_for_historical_data: matches and delivers *during* the wait, not before it starts" {
-    // The positive-path counterpart to the test above: a writer that
-    // matches (and finishes delivering history) *while* wait_for_historical_data
-    // is already blocked must still be observed as a real success, not
-    // just "doesn't false-positive on nothing". Mirrors `catchup`'s actual
-    // runtime shape (reader created, wait_for_historical_data called
-    // immediately, writer discovered moments later) using a real background
-    // thread rather than pre-arranging the match before the call.
+test "wait_for_historical_data: a BEST_EFFORT reader returns OK at once" {
     var h = try Harness.init();
     defer h.deinit();
 
@@ -271,44 +298,124 @@ test "wait_for_historical_data: matches and delivers *during* the wait, not befo
     defer _ = dp.vtable.delete_subscriber(dp.ptr, sub);
 
     var dr_qos = DDS.DataReaderQos{};
-    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
     dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     const dr_raw = sub.create_datareader(td, dr_qos, null, 0);
-    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr_raw.ptr));
+    _ = h.fireWriter(dp_impl, makePrefix(0x51), "TestTopic", 1, 1);
 
-    // Real thread-to-thread synchronization, not a guessed sleep duration:
-    // about_to_wait is set right before this thread calls
-    // wait_for_historical_data() below; the background thread spins on it
-    // (std.Thread.Mutex/Condition/ResetEvent don't exist in this Zig
-    // version -- removed in 0.16 when threads moved to the async std.Io
-    // model, see src/util/mutex.zig's own comment) before firing the
-    // match. A tight spin, not a sleep-based backoff, is fine here: this is
-    // a single one-shot wait for one flag, not a contested loop (contrast
-    // waitset_lifecycle_test.zig's audited real backoff, needed there
-    // specifically to avoid hammering a shared mutex under Valgrind).
-    // Guarantees the ordering this test is actually about ("during the
-    // wait", not "before it starts") without any flakiness risk from a
-    // fixed-duration sleep being too short under load.
-    var about_to_wait: std.atomic.Value(bool) = .init(false);
+    // Twice: it warns only once.
+    try testing.expectEqual(DDS.RETCODE_OK, dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_INFINITE));
+    try testing.expectEqual(DDS.RETCODE_OK, dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_INFINITE));
+}
 
-    const MatchLater = struct {
-        fn run(event: *std.atomic.Value(bool), harness: *Harness, participant_impl: *DomainParticipantImpl, reader_impl: *DataReaderImpl) void {
-            while (!event.load(.acquire)) std.atomic.spinLoopHint();
-            const prefix = makePrefix(0x50);
-            const writer_guid = harness.fireWriter(participant_impl, prefix, "TestTopic", 1, 1);
-            // Empty history (first_sn=1, last_sn=0): floor=0, immediately satisfied
-            // once history_established flips true -- see the "empty history"
-            // test above for the same HEARTBEAT shape.
-            reader_impl.proto_reader.handleHeartbeat(writer_guid, EntityIds.unknown, 1, 0, 1, true, false);
+test "wait_for_historical_data: a negative or unnormalized max_wait is BAD_PARAMETER" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
+    const tp_impl: *dcps.TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const td = tp_impl.toTopicDescription();
+
+    const sub = dp.create_subscriber(.{}, null, 0);
+    defer _ = dp.vtable.delete_subscriber(dp.ptr, sub);
+    const dr_raw = sub.create_datareader(td, .{}, null, 0);
+    for ([_]DDS.Duration_t{ .{ .sec = -1, .nanosec = 0 }, .{ .sec = 0, .nanosec = 1_000_000_000 } }) |d| {
+        try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &d));
+    }
+}
+
+/// A participant on a manual runtime, with a transient-local reliable
+/// reader matched to a writer that owes it history, and a runtime timer due
+/// at once that changes something: the wait's help runs it, so it happens
+/// during the wait.
+const DuringWait = struct {
+    mr: ManualRuntime,
+    h: Harness,
+    dp: DDS.DomainParticipant,
+    dp_impl: *DomainParticipantImpl,
+    sub: DDS.Subscriber,
+    dr: DDS.DataReader,
+    dr_impl: *DataReaderImpl,
+    writer: Guid,
+    context: rt.Context,
+    timer: rt.Timer,
+    action: enum { lose_writer, match_another, delete_reader },
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+
+    /// Must not move afterwards.
+    fn init(self: *DuringWait) !void {
+        self.mr.init();
+        self.h = try Harness.init();
+        const dpf = self.h.factory.toDDSFactory();
+        self.dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
+        self.dp_impl = @ptrCast(@alignCast(self.dp.ptr));
+        const topic = self.dp.create_topic("TestTopic", "TestType", .{}, null, 0);
+        const tp_impl: *dcps.TopicImpl = @ptrCast(@alignCast(topic.ptr));
+        self.sub = self.dp.create_subscriber(.{}, null, 0);
+        var dr_qos = DDS.DataReaderQos{};
+        dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+        dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+        self.dr = self.sub.create_datareader(tp_impl.toTopicDescription(), dr_qos, null, 0);
+        self.dr_impl = @ptrCast(@alignCast(self.dr.ptr));
+        self.writer = self.h.fireWriter(self.dp_impl, makePrefix(0x70), "TestTopic", 1, 1);
+        self.context = rt.Context.init(&self.mr.runtime, 4);
+        self.timer = rt.Timer.init(&self.context, fire);
+    }
+
+    /// Runs `action` when the timer fires, due now.
+    fn arm(self: *DuringWait, action: @TypeOf(self.action)) void {
+        self.action = action;
+        _ = self.mr.runtime.armTimer(&self.timer, self.mr.runtime.clock.nowNs());
+    }
+
+    fn fire(t: *rt.Timer, _: *rt.Turn) void {
+        const self: *DuringWait = @fieldParentPtr("timer", t);
+        switch (self.action) {
+            .lose_writer => self.dp_impl.disc_callbacks.on_writer_lost(self.dp_impl.disc_callbacks.ctx, self.writer),
+            .match_another => {
+                _ = self.h.fireWriter(self.dp_impl, makePrefix(0x71), "TestTopic", 1, 1);
+                self.dr_impl.proto_reader.handleHeartbeat(self.writer, EntityIds.unknown, 1, 0, 1, true, false);
+            },
+            .delete_reader => self.rc = self.sub.delete_datareader(self.dr),
         }
-    };
-    const t = try std.Thread.spawn(.{}, MatchLater.run, .{ &about_to_wait, &h, dp_impl, dr_impl });
-    defer t.join();
+    }
 
-    const generous_wait: DDS.Duration_t = .{ .sec = 2, .nanosec = 0 };
-    about_to_wait.store(true, .release);
-    const rc = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &generous_wait);
-    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    fn deinit(self: *DuringWait) void {
+        self.context.deinit();
+        _ = self.dp.delete_contained_entities();
+        _ = self.h.factory.toDDSFactory().delete_participant(self.dp);
+        self.h.deinit();
+        self.mr.deinit();
+    }
+};
+
+test "wait_for_historical_data: a writer matched after the wait began does not join it" {
+    var d: DuringWait = undefined;
+    try d.init();
+    defer d.deinit();
+    d.arm(.match_another);
+    try testing.expectEqual(DDS.RETCODE_OK, d.dr.wait_for_historical_data(.{ .sec = 1, .nanosec = 0 }));
+}
+
+test "wait_for_historical_data: a writer lost before delivering its history fails the wait with ERROR" {
+    var d: DuringWait = undefined;
+    try d.init();
+    defer d.deinit();
+    d.arm(.lose_writer);
+    try testing.expectEqual(DDS.RETCODE_ERROR, d.dr.wait_for_historical_data(.{ .sec = 1, .nanosec = 0 }));
+}
+
+test "wait_for_historical_data: deleting the reader ends its wait with ALREADY_DELETED" {
+    var d: DuringWait = undefined;
+    try d.init();
+    defer d.deinit();
+    d.arm(.delete_reader);
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, d.dr.wait_for_historical_data(.{ .sec = 1, .nanosec = 0 }));
+    try testing.expectEqual(DDS.RETCODE_OK, d.rc);
 }
 
 test "wait_for_historical_data: times out before first HEARTBEAT from transient-local writer" {
@@ -472,6 +579,50 @@ test "wait_for_historical_data: returns OK once pending data fills history floor
     const rc3 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_OK, rc3);
     try testing.expectEqual(@as(usize, 2), available(dr_impl));
+}
+
+test "wait_for_historical_data: history the reader rejects for RESOURCE_LIMITS fails the wait with ERROR" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+
+    const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
+    const tp_impl: *dcps.TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const td = tp_impl.toTopicDescription();
+
+    const sub = dp.create_subscriber(.{}, null, 0);
+    defer _ = dp.vtable.delete_subscriber(dp.ptr, sub);
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    dr_qos.resource_limits.max_samples = 1;
+    dr_qos.resource_limits.max_samples_per_instance = 1;
+    const dr_raw = sub.create_datareader(td, dr_qos, null, 0);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr_raw.ptr));
+
+    const prefix = makePrefix(0x41);
+    const writer_guid = h.fireWriter(dp_impl, prefix, "TestTopic", 1, 1);
+
+    const ts = zzdds.util.time.RtpsTimestamp.zero;
+    const kh = std.mem.zeroes([16]u8);
+    var payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0xEF, 0x01 };
+
+    // The writer's history is two samples; the reader has room for one.
+    dr_impl.proto_reader.handleHeartbeat(writer_guid, EntityIds.unknown, 1, 2, 1, false, false);
+    dr_impl.proto_reader.handleIncomingChange(writer_guid, 1, ts, kh, &payload, .alive, null, null, null, null);
+    dr_impl.proto_reader.handleIncomingChange(writer_guid, 2, ts, kh, &payload, .alive, null, null, null, null);
+    try testing.expectEqual(@as(usize, 1), available(dr_impl));
+
+    // The second sample was rejected: that history cannot arrive complete.
+    const rc = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO);
+    try testing.expectEqual(DDS.RETCODE_ERROR, rc);
 }
 
 test "wait_for_historical_data: history the writer no longer has is reported lost, not waited for" {

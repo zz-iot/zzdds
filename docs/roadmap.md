@@ -508,10 +508,9 @@ or an optimisation on an already-improved path):
   `examples/docs/design/`): `run.py`-style cross-binding pass/fail harnesses (discovery,
   participant-config); `assert_liveliness()` + AUTOMATIC/MANUAL_BY_PARTICIPANT +
   `on_liveliness_lost` (presence); `*_w_timestamp` symmetry + batch instance ops (registry);
-  Java's `instance_state` on the batch-take family. The `wait_for_historical_data`-should-
-  time-out negative case left out of `catchup` itself is no longer on this list — it's
-  covered by the `wait-for-historical-data` Integration-tier scenario instead (see
-  `docs/design/dcps-api-coverage-audit.md`).
+  Java's `instance_state` on the batch-take family. `wait_for_historical_data` beyond
+  `catchup`'s success path is covered by the `wait-for-historical-data` Integration-tier
+  scenario instead (see `docs/design/dcps-api-coverage-audit.md`).
 - **Cross-binding "never matched" failures — resolved: listeners installed after entity
   creation.** Root-caused 2026-10-02 from CI captures (`scripts/ci_net_diagnostics.py`,
   PR #96): in `liveliness-lost` (cpp subscriber ← c publisher) and `source-timestamp`
@@ -1042,8 +1041,8 @@ unretained pointer, which the application keeps valid while it is installed and 
 waits run (the `ExecutionRuntime` binding API is designed in
 [factory construction](design/factory-construction.md), not built). Operations map the
 contracts' effect states (commit and cancellation) and waits onto endpoint locks as
-[operation effects](design/concurrency/operation-effects.md) describes: the DataWriter
-and Publisher acknowledgment waits do so, and it lists what does not yet.
+[operation effects](design/concurrency/operation-effects.md) describes: the
+acknowledgment and historical-data waits do so, and it lists what does not yet.
 The first vertical slice runs one reliable reader/writer pair through the same trace
 under a manual and a hosted driver: match, delivery, the acknowledgment and data waits, a
 missed deadline, and retirement begun from listeners, with the runtime's last owner

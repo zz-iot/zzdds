@@ -147,10 +147,11 @@ const Collector = struct {
         return .{ .ctx = self, .on_data = onData };
     }
 
-    fn onData(ctx: *anyopaque, ch: *const CacheChange) void {
+    fn onData(ctx: *anyopaque, ch: *const CacheChange) rtps.history.Delivery {
         const self: *Collector = @ptrCast(@alignCast(ctx));
-        const copy = self.alloc.dupe(u8, ch.data) catch return;
+        const copy = self.alloc.dupe(u8, ch.data) catch return .kept;
         self.samples.append(self.alloc, copy) catch self.alloc.free(copy);
+        return .kept;
     }
 };
 
@@ -1015,12 +1016,13 @@ test "dispose_survives_nack_replay: not_alive_disposed replayed with correct STA
             for (self.items.items) |it| self.alloc.free(it.data);
             self.items.deinit(self.alloc);
         }
-        fn onData(ctx: *anyopaque, ch: *const CacheChange) void {
+        fn onData(ctx: *anyopaque, ch: *const CacheChange) rtps.history.Delivery {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            const copy = self.alloc.dupe(u8, ch.data) catch return;
+            const copy = self.alloc.dupe(u8, ch.data) catch return .kept;
             self.items.append(self.alloc, .{ .kind = ch.kind, .data = copy }) catch {
                 self.alloc.free(copy);
             };
+            return .kept;
         }
         fn callback(self: *@This()) rtps.DataCallback {
             return .{ .ctx = self, .on_data = onData };

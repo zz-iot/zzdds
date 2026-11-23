@@ -10,34 +10,27 @@
 //! below always joins late and the batch can only reach it by
 //! TRANSIENT_LOCAL replay.
 //!
-//! 1. Negative case first: a TRANSIENT_LOCAL reader on UNPUBLISHED_TOPIC,
+//! 1. Unmatched case first: a TRANSIENT_LOCAL reader on UNPUBLISHED_TOPIC,
 //!    which no process ever writes, calls wait_for_historical_data() with a
-//!    short, non-zero max_wait and requires RETCODE_TIMEOUT. This is
-//!    deterministic, not a timing race: with no writer for that topic
-//!    anywhere, the call cannot return OK no matter how long it's given, so
-//!    the exact duration only bounds how long the check takes, not whether
-//!    it's correct. The publisher's writer on the other topic is already
-//!    live by then, so this also shows an unrelated writer doesn't satisfy
-//!    the wait. This is what proves the call is a real bounded wait and not
-//!    something that always reports success (regression covered natively in
-//!    test/dcps/wait_for_historical_test.zig's "non-zero max_wait with no
-//!    matched writer times out" test, itself written after this same
-//!    false-OK bug was found building the catchup example -- see that
-//!    test's comment).
-//! 2. Then the reader under test, on HistoryEvent, makes a generous-timeout
-//!    wait_for_historical_data() call and confirms the full historical batch
-//!    actually landed by the time it returns -- the positive counterpart,
-//!    unblocking only once discovery has matched the writer and durable
-//!    replay has actually happened, rather than on its own timer. It takes
-//!    from the reader itself to confirm that, before any listener is
-//!    attached: see c/wait-for-historical-data/src/subscriber.c.
+//!    short, non-zero max_wait and requires RETCODE_OK. With no writer matched,
+//!    nothing owes the reader history, so the call returns OK at once
+//!    (docs/design/concurrency/operations.md#historical-wait-compatibility). An
+//!    earlier version waited for a first writer to match instead, and returned
+//!    TIMEOUT here.
+//! 2. Then the reader under test, on HistoryEvent, waits for the publisher's
+//!    writer to match, then makes a generous-timeout wait_for_historical_data()
+//!    call and confirms the full historical batch actually landed by the time it
+//!    returns -- unblocking only once durable replay has actually happened,
+//!    rather than on its own timer. It takes from the reader itself to
+//!    confirm that, before any listener is attached: see
+//!    c/wait-for-historical-data/src/subscriber.c.
 //!
-//! Required stdout markers: "Create topic:", "Subscriber: negative check (no
-//! writer on its topic) correctly returned TIMEOUT.", "Create reader for
-//! topic:", "Subscriber: wait_for_historical_data() returned", "HISTORICAL
-//! BATCH COMPLETE (8 samples)", "LIVE SAMPLE seq_num=", "Subscriber:
-//! observed historical batch then live batch correctly." Any failure path
-//! prints a line starting "FAIL:" and exits nonzero.
+//! Required stdout markers: "Create topic:", "Subscriber: unmatched check (no
+//! writer on its topic) returned OK at once.", "Create reader for topic:",
+//! "Subscriber: wait_for_historical_data() returned", "HISTORICAL BATCH
+//! COMPLETE (8 samples)", "LIVE SAMPLE seq_num=", "Subscriber: observed
+//! historical batch then live batch correctly." Any failure path prints a
+//! line starting "FAIL:" and exits nonzero.
 
 const std = @import("std");
 const zzdds = @import("zzdds");
@@ -46,11 +39,11 @@ const history_event_gen = @import("history_event_gen");
 
 const HISTORICAL_COUNT: i32 = 8;
 const LIVE_COUNT: i32 = 4;
-const NEGATIVE_WAIT_NS: u32 = 300 * std.time.ns_per_ms;
+const UNMATCHED_WAIT_NS: u32 = 300 * std.time.ns_per_ms;
 const HISTORICAL_WAIT_TIMEOUT_S: i32 = 15;
 const RECEIVE_TIMEOUT_NS: i64 = 30 * std.time.ns_per_s;
 const POLL_PERIOD_NS: u64 = 20 * std.time.ns_per_ms;
-/// A topic of the same type that no process ever writes, for the negative case.
+/// A topic of the same type that no process ever writes, for the unmatched case.
 const UNPUBLISHED_TOPIC = "HistoryEventUnpublished";
 
 fn monoNs(io: std.Io) i64 {
@@ -131,6 +124,16 @@ fn parseDomain(process_args: std.process.Args, arena: std.mem.Allocator) u32 {
 }
 
 /// A reader's current matched count, for saying which endpoint a timeout is about.
+/// Polls until a writer matches `dr`, for up to HISTORICAL_WAIT_TIMEOUT_S.
+fn waitForMatch(dr: DDS.DataReader, io: std.Io) bool {
+    var waited: u64 = 0;
+    while (waited < @as(u64, HISTORICAL_WAIT_TIMEOUT_S) * std.time.ns_per_s) : (waited += POLL_PERIOD_NS) {
+        if (readerMatched(dr) > 0) return true;
+        sleepNs(io, POLL_PERIOD_NS);
+    }
+    return false;
+}
+
 fn readerMatched(dr: anytype) i32 {
     var status: DDS.SubscriptionMatchedStatus = undefined;
     return if (dr.get_subscription_matched_status(&status) == DDS.RETCODE_OK) status.current_count else -1;
@@ -192,27 +195,27 @@ pub fn main(init: std.process.Init) !void {
         .on_data_available = onDataAvailable,
     });
 
-    // Negative case -- see this file's header comment. No process writes
-    // UNPUBLISHED_TOPIC, so a short, non-zero max_wait here is guaranteed to
-    // time out.
+    // Unmatched case -- see this file's header comment. No process writes
+    // UNPUBLISHED_TOPIC, so nothing owes this reader history: a non-zero
+    // max_wait returns OK at once.
     const unpublished = dp.create_topic(UNPUBLISHED_TOPIC, "HistoryEvent", .{}, null, 0);
     if (unpublished.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_topic(" ++ UNPUBLISHED_TOPIC ++ ") failed\n", .{});
         std.process.exit(1);
     }
-    const neg_dr = subscriber.create_datareader(dp.lookup_topicdescription(UNPUBLISHED_TOPIC), dr_qos, null, 0);
-    if (neg_dr.ptr == zzdds.dcps.NIL_PTR) {
+    const unmatched_dr = subscriber.create_datareader(dp.lookup_topicdescription(UNPUBLISHED_TOPIC), dr_qos, null, 0);
+    if (unmatched_dr.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_datareader(" ++ UNPUBLISHED_TOPIC ++ ") failed\n", .{});
         std.process.exit(1);
     }
-    const negative_wait = DDS.Duration_t{ .sec = 0, .nanosec = NEGATIVE_WAIT_NS };
-    const neg_rc = neg_dr.wait_for_historical_data(negative_wait);
-    if (neg_rc != DDS.RETCODE_TIMEOUT) {
-        std.debug.print("FAIL: wait_for_historical_data() with no writer matched returned {d}, expected RETCODE_TIMEOUT ({d})\n", .{ neg_rc, DDS.RETCODE_TIMEOUT });
+    const unmatched_wait = DDS.Duration_t{ .sec = 0, .nanosec = UNMATCHED_WAIT_NS };
+    const unmatched_rc = unmatched_dr.wait_for_historical_data(unmatched_wait);
+    if (unmatched_rc != DDS.RETCODE_OK) {
+        std.debug.print("FAIL: wait_for_historical_data() with no writer matched returned {d}, expected RETCODE_OK\n", .{unmatched_rc});
         std.process.exit(1);
     }
-    _ = subscriber.delete_datareader(neg_dr);
-    std.debug.print("Subscriber: negative check (no writer on its topic) correctly returned TIMEOUT.\n", .{});
+    _ = subscriber.delete_datareader(unmatched_dr);
+    std.debug.print("Subscriber: unmatched check (no writer on its topic) returned OK at once.\n", .{});
 
     // Create with no listener attached yet -- see this file's header
     // comment and c/wait-for-historical-data/src/subscriber.c's matching
@@ -226,9 +229,14 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Create reader for topic: HistoryEvent\n", .{});
     state.reader = history_event_gen.HistoryEventDataReader.init(dr, alloc);
 
-    // The positive case: block until discovery has matched the publisher's
-    // writer and its TRANSIENT_LOCAL historical replay has actually landed,
-    // before taking anything.
+    // The positive case: wait for the publisher's writer to match, then
+    // block until its TRANSIENT_LOCAL historical replay has actually landed,
+    // before taking anything. wait_for_historical_data() waits for the
+    // writers matched when it is called, so the match comes first.
+    if (!waitForMatch(dr, io)) {
+        std.debug.print("FAIL: no writer matched within {d} s\n", .{HISTORICAL_WAIT_TIMEOUT_S});
+        std.process.exit(1);
+    }
     const max_wait = DDS.Duration_t{ .sec = HISTORICAL_WAIT_TIMEOUT_S, .nanosec = 0 };
     const rc = dr.wait_for_historical_data(max_wait);
     if (rc != DDS.RETCODE_OK) {

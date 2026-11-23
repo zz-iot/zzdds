@@ -261,13 +261,14 @@ const FlushProbe = struct {
     flush_calls: usize = 0,
     flush_unlocked: bool = true,
 
-    fn onData(ctx: *anyopaque, _: *const rtps.history.CacheChange) void {
+    fn onData(ctx: *anyopaque, _: *const rtps.history.CacheChange) rtps.history.Delivery {
         const p: *FlushProbe = @ptrCast(@alignCast(ctx));
         p.data_calls += 1;
         if (p.reader.mu.tryLock()) {
             p.reader.mu.unlock();
             p.data_under_lock = false;
         }
+        return .kept;
     }
 
     fn onFlush(ctx: *anyopaque) void {
@@ -640,9 +641,10 @@ test "handleData: duplicate SN is discarded without re-delivery" {
     var delivered: usize = 0;
     const Ctx = struct {
         count: *usize,
-        fn onData(ctx: *anyopaque, _: *const CacheChange) void {
+        fn onData(ctx: *anyopaque, _: *const CacheChange) rtps.history.Delivery {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.count.* += 1;
+            return .kept;
         }
     };
     var ctx = Ctx{ .count = &delivered };
@@ -756,13 +758,14 @@ const Recorder = struct {
         self.sns.deinit(self.alloc);
         self.data.deinit(self.alloc);
     }
-    fn onData(ctx: *anyopaque, ch: *const CacheChange) void {
+    fn onData(ctx: *anyopaque, ch: *const CacheChange) rtps.history.Delivery {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
-        self.sns.append(self.alloc, ch.sequence_number) catch return;
-        const copy = self.alloc.dupe(u8, ch.data) catch return;
+        self.sns.append(self.alloc, ch.sequence_number) catch return .kept;
+        const copy = self.alloc.dupe(u8, ch.data) catch return .kept;
         self.data.append(self.alloc, copy) catch {
             self.alloc.free(copy);
         };
+        return .kept;
     }
 };
 
@@ -1240,4 +1243,271 @@ test "addMatchedWriter: proxy-list append OOM releases self.mu instead of leakin
     try testing.expect(lock_acquired);
 
     try testing.expect(!r.isWriterMatched(writer_guid));
+}
+
+// ── Historical-data waits ─────────────────────────────────────────────────────
+//
+// docs/design/concurrency/operations.md#historical-data-wait-contract
+
+const history_wait = zzdds.protocol.history_wait;
+
+/// Matches a writer that owes history: its first HEARTBEAT will say how much.
+fn matchHistoryWriter(r: *StatefulReader, guid: Guid, port: u16) !void {
+    var wp = try WriterProxy.init(testing.allocator, guid, &.{Locator.udp4(.{ 127, 0, 0, 1 }, port)}, &.{}, true);
+    wp.history_established = false;
+    try r.addMatchedWriter(wp);
+}
+
+/// A first HEARTBEAT announcing no history: the writer then owes none.
+fn emptyHistory(r: *StatefulReader, guid: Guid) void {
+    r.handleHeartbeat(guid, READER_EID, 1, 0, 1, true);
+}
+
+const HistoryWait = struct {
+    waiter: history_wait.Waiter,
+    cap: history_wait.Capture,
+
+    /// Must not move afterwards.
+    fn begin(self: *HistoryWait, r: *StatefulReader, timeout_ns: ?i64) !void {
+        self.waiter = history_wait.Waiter.init(null, timeout_ns);
+        self.cap = .{ .waiter = &self.waiter };
+        self.waiter.expect();
+        try r.beginHistoryWait(&self.cap);
+    }
+
+    fn end(self: *HistoryWait, r: *StatefulReader) void {
+        r.endHistoryWait(&self.cap);
+        self.waiter.deinit();
+    }
+
+    fn outcome(self: *HistoryWait) ?history_wait.Outcome {
+        self.waiter.mu.lock();
+        defer self.waiter.mu.unlock();
+        return self.waiter.outcome;
+    }
+};
+
+fn historyReader(rec: *Recording) !*StatefulReader {
+    return StatefulReader.init(testing.allocator, makeGuid(0x01, READER_EID), rec.makeTransport(), .keep_all, 0, true);
+}
+
+test "a historical-data wait covers the writers that owed history when it began" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    const a = makeGuid(0x02, WRITER_EID);
+    const b = makeGuid(0x03, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+    // A writer with no history to deliver owes none.
+    try r.addMatchedWriter(try WriterProxy.init(testing.allocator, makeGuid(0x04, WRITER_EID), &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7302)}, &.{}, true));
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, null);
+    defer wait.end(r);
+    // A writer matched now does not join.
+    try matchHistoryWriter(r, b, 7301);
+    try testing.expectEqual(@as(?history_wait.Outcome, null), wait.outcome());
+    emptyHistory(r, a);
+    try testing.expectEqual(@as(?history_wait.Outcome, .satisfied), wait.outcome());
+}
+
+test "a historical-data wait is satisfied at once when no writer owes history" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, 0);
+    defer wait.end(r);
+    try testing.expectEqual(@as(?history_wait.Outcome, .satisfied), wait.outcome());
+}
+
+test "a writer that unmatches before delivering its history fails the wait" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    const a = makeGuid(0x02, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, null);
+    defer wait.end(r);
+    r.removeMatchedWriter(a);
+    try testing.expectEqual(@as(?history_wait.Outcome, .part_failed), wait.outcome());
+}
+
+test "a writer that has delivered its history stays done when it unmatches" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    const a = makeGuid(0x02, WRITER_EID);
+    const b = makeGuid(0x03, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+    try matchHistoryWriter(r, b, 7301);
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, null);
+    defer wait.end(r);
+    emptyHistory(r, a);
+    r.removeMatchedWriter(a);
+    try testing.expectEqual(@as(?history_wait.Outcome, null), wait.outcome());
+    emptyHistory(r, b);
+    try testing.expectEqual(@as(?history_wait.Outcome, .satisfied), wait.outcome());
+}
+
+test "history delivered at the deadline or later times the wait out" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    const a = makeGuid(0x02, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, 0);
+    defer wait.end(r);
+    emptyHistory(r, a);
+    try testing.expectEqual(@as(?history_wait.Outcome, .timed_out), wait.outcome());
+}
+
+/// A reader's DCPS side that drops (or filters) the samples with the given
+/// sequence numbers and keeps the rest.
+const Disposer = struct {
+    drop: []const i64 = &.{},
+    filter: []const i64 = &.{},
+
+    fn onData(ctx: *anyopaque, ch: *const CacheChange) rtps.history.Delivery {
+        const self: *Disposer = @ptrCast(@alignCast(ctx));
+        if (std.mem.indexOfScalar(i64, self.drop, ch.sequence_number) != null) return .dropped;
+        if (std.mem.indexOfScalar(i64, self.filter, ch.sequence_number) != null) return .filtered;
+        return .kept;
+    }
+};
+
+/// Delivers writer `guid`'s samples `first`..`last` in order.
+fn deliverSamples(r: *StatefulReader, guid: Guid, first: i64, last: i64) !void {
+    var sn = first;
+    while (sn <= last) : (sn += 1) {
+        try r.handleData(guid, .{
+            .kind = .alive,
+            .writer_guid = guid,
+            .sequence_number = sn,
+            .source_timestamp = ZERO_TS,
+            .instance_handle = NIL_IH,
+            .key_hash = NIL_KH,
+            .data = "payload",
+        });
+    }
+}
+
+test "history the reader drops fails the wait; history it filters does not" {
+    for ([_]bool{ true, false }) |dropped| {
+        var rec: Recording = .{};
+        const r = try historyReader(&rec);
+        defer r.deinit();
+        var disposer: Disposer = if (dropped) .{ .drop = &.{1} } else .{ .filter = &.{1} };
+        r.setCallback(.{ .ctx = &disposer, .on_data = Disposer.onData });
+        const a = makeGuid(0x02, WRITER_EID);
+        try matchHistoryWriter(r, a, 7300);
+
+        var wait: HistoryWait = undefined;
+        try wait.begin(r, null);
+        defer wait.end(r);
+        // The writer's history is samples 1 and 2.
+        r.handleHeartbeat(a, READER_EID, 1, 2, 1, false);
+        try deliverSamples(r, a, 1, 2);
+        const expected: history_wait.Outcome = if (dropped) .part_failed else .satisfied;
+        try testing.expectEqual(@as(?history_wait.Outcome, expected), wait.outcome());
+    }
+}
+
+test "history the protocol reader's cache has no room for fails the wait" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    const a = makeGuid(0x02, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, null);
+    defer wait.end(r);
+    r.handleHeartbeat(a, READER_EID, 1, 1, 1, false);
+    const cache_alloc = r.cache.alloc;
+    var failing = std.testing.FailingAllocator.init(cache_alloc, .{ .fail_index = 0 });
+    r.cache.alloc = failing.allocator();
+    defer r.cache.alloc = cache_alloc;
+    try testing.expectError(error.OutOfMemory, deliverSamples(r, a, 1, 1));
+    try testing.expectEqual(@as(?history_wait.Outcome, .part_failed), wait.outcome());
+}
+
+test "a dropped live sample does not fail a historical-data wait" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    var disposer: Disposer = .{ .drop = &.{3} };
+    r.setCallback(.{ .ctx = &disposer, .on_data = Disposer.onData });
+    const a = makeGuid(0x02, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+    r.handleHeartbeat(a, READER_EID, 1, 2, 1, false);
+    try deliverSamples(r, a, 1, 3);
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, null);
+    defer wait.end(r);
+    try testing.expectEqual(@as(?history_wait.Outcome, .satisfied), wait.outcome());
+}
+
+test "a historical-data wait begun after history was dropped fails at once" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    var disposer: Disposer = .{ .drop = &.{2} };
+    r.setCallback(.{ .ctx = &disposer, .on_data = Disposer.onData });
+    const a = makeGuid(0x02, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+    r.handleHeartbeat(a, READER_EID, 1, 2, 1, false);
+    try deliverSamples(r, a, 1, 2);
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, null);
+    defer wait.end(r);
+    try testing.expectEqual(@as(?history_wait.Outcome, .part_failed), wait.outcome());
+}
+
+test "a writer that unmatches at the deadline or later times the wait out" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    const a = makeGuid(0x02, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, 0);
+    defer wait.end(r);
+    r.removeMatchedWriter(a);
+    try testing.expectEqual(@as(?history_wait.Outcome, .timed_out), wait.outcome());
+}
+
+test "closing a reader settles its historical-data waits, and any begun after" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    const a = makeGuid(0x02, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, null);
+    defer wait.end(r);
+    var late_wait: HistoryWait = undefined;
+    try late_wait.begin(r, 0);
+    defer late_wait.end(r);
+    r.closeHistoryWaits();
+    // Removing the writer afterwards does not turn the close into a failure.
+    r.removeMatchedWriter(a);
+    try testing.expectEqual(@as(?history_wait.Outcome, .closed), wait.outcome());
+    // Past its deadline, a wait the close settles has timed out.
+    try testing.expectEqual(@as(?history_wait.Outcome, .timed_out), late_wait.outcome());
+
+    var after: HistoryWait = undefined;
+    try after.begin(r, null);
+    defer after.end(r);
+    try testing.expectEqual(@as(?history_wait.Outcome, .closed), after.outcome());
 }

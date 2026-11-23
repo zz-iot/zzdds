@@ -60,9 +60,9 @@ pub fn waitTimeoutNs(d: DDS.Duration_t) error{BadParameter}!?i64 {
 /// waited on closed first.
 pub fn ackWaitResult(outcome: proto.ack_wait.Outcome, closed_rc: DDS.ReturnCode_t) DDS.ReturnCode_t {
     return switch (outcome) {
-        .acknowledged => DDS.RETCODE_OK,
+        .satisfied => DDS.RETCODE_OK,
         .timed_out => DDS.RETCODE_TIMEOUT,
-        .writer_closed => closed_rc,
+        .part_failed => closed_rc,
         .closed => DDS.RETCODE_ALREADY_DELETED,
     };
 }
@@ -448,9 +448,9 @@ pub const DataWriterImpl = struct {
 
     /// Begins this writer's part of `cap.waiter`'s acknowledgment wait,
     /// which must expect it, pinning the writer until `endAckWait`. Settles
-    /// it `writer_closed` once the writer's deletion has begun.
+    /// it `part_failed` once the writer's deletion has begun.
     pub fn beginAckWait(self: *Self, cap: *proto.ack_wait.Capture) error{OutOfMemory}!void {
-        if (!self.acquireProto()) return cap.waiter.settle(.writer_closed);
+        if (!self.acquireProto()) return cap.waiter.settle(.part_failed);
         errdefer self.releaseProto();
         try self.proto_writer.beginAckWait(cap);
         cap.pinned = true;

@@ -140,20 +140,14 @@ const noop_pr_vtable = proto.ProtocolReader.Vtable{
     .handle_gap = struct {
         fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.SequenceNumberSet) void {}
     }.f,
-    .historical_delivered = struct {
-        fn f(_: *anyopaque) bool {
-            return true;
+    // No real reader backs this stub: no writer owes it history.
+    .begin_history_wait = struct {
+        fn f(_: *anyopaque, cap: *proto.history_wait.Capture) error{OutOfMemory}!void {
+            cap.waiter.satisfied();
         }
     }.f,
-    // No real reader backs this stub, so there's nothing to ever match --
-    // `true` here (not `false`) is what lets vtWaitForHistorical's
-    // `is_zero_wait or hasMatchedWriters()` check still short-circuit to OK
-    // immediately for a stub/null reader, matching historical_delivered's
-    // own unconditional `true` above rather than blocking until max_wait.
-    .has_matched_writers = struct {
-        fn f(_: *anyopaque) bool {
-            return true;
-        }
+    .end_history_wait = struct {
+        fn f(_: *anyopaque, _: *proto.history_wait.Capture) void {}
     }.f,
     .deinit = struct {
         fn f(_: *anyopaque) void {}

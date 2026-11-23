@@ -153,11 +153,10 @@ concurrency/lifecycle-under-load, `OpenDDS EntityLifecycleStress`-shaped).
 - ~~**`wait_for_historical_data`**~~ — **Done**, as the `wait-for-historical-data`
   Integration-tier scenario (`integration-tests/{c,cpp,java,zig}/wait-for-historical-data`).
   Modeled on `examples/*/catchup`'s late-joining-reader mechanism but held to a harder bar:
-  a deterministic negative case (a short, non-zero `max_wait` called while no writer exists
-  anywhere on the domain yet must return `RETCODE_TIMEOUT`, not `RETCODE_OK` — closing the
-  negative case `docs/roadmap.md` recorded as deliberately out of scope for `catchup`
-  itself) followed by a positive case (a generous `max_wait` must return `RETCODE_OK` only
-  once every historical sample has actually been delivered). See `integration-tests/README.md`
+  an unmatched case (a short, non-zero `max_wait` on a reader no writer matches must
+  return `RETCODE_OK` at once, since nothing owes it history) followed by a positive case
+  (once the writer has matched, a generous `max_wait` must return `RETCODE_OK` only once
+  every historical sample has actually been delivered). See `integration-tests/README.md`
   for the full scenario writeup.
 - ~~**`ignore_participant`/`ignore_topic`/`ignore_publication`/`ignore_subscription`**~~ —
   **Done**, as the `ignore-entities` Integration-tier scenario

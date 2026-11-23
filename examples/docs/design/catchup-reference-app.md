@@ -80,11 +80,16 @@ live batch`, `Publisher: wrote live seq_num=`, `Publisher: done.`
    the harness, the app pattern itself is simple.
 2. Create participant → TypeSupport → topic → subscriber → DataReader with
    the same TRANSIENT_LOCAL/KEEP_ALL QoS and no listener yet.
-3. **Immediately after creating the reader, call
-   `wait_for_historical_data(max_wait)` — before taking anything.** This is
-   the API this whole example exists to exercise. Blocks until the cached
-   historical batch has actually been delivered (or `max_wait` elapses).
-4. Once `wait_for_historical_data` returns successfully, take everything
+3. Wait for the publisher's writer to match the reader, polling
+   `get_subscription_matched_status` for up to `max_wait`.
+   `wait_for_historical_data` waits only for the writers matched when it is
+   called, and with none returns OK at once (zzdds
+   `docs/design/concurrency/operations.md#historical-wait-compatibility`).
+4. **Then call `wait_for_historical_data(max_wait)` — before taking
+   anything.** This is the API this whole example exists to exercise. It
+   blocks until the cached historical batch has actually been delivered (or
+   `max_wait` elapses).
+5. Once `wait_for_historical_data` returns successfully, take everything
    currently available and confirm it's exactly the historical batch
    (`seq_num` 0–9, in order) — printing a `HISTORICAL BATCH COMPLETE`
    marker only after confirming the count and order, not just that the call
@@ -93,11 +98,11 @@ live batch`, `Publisher: wrote live seq_num=`, `Publisher: done.`
    waits for the samples to reach the reader, not for a listener to have
    taken them, so counting what a listener took right after the call
    returns races the listener's last take.
-5. Attach the `on_data_available` listener (`set_listener` delivers
+6. Attach the `on_data_available` listener (`set_listener` delivers
    anything that arrived since the take) and continue taking as live data
    arrives (`seq_num` 10–14), printing a distinct `LIVE SAMPLE` marker per
    item, until all 15 total samples have been seen.
-6. Exit successfully once both the historical batch and the live batch have
+7. Exit successfully once both the historical batch and the live batch have
    been fully and correctly observed, *in that order* (the one thing this
    example actually asserts programmatically: a sample never counted as
    "historical" after the `wait_for_historical_data` boundary, and never
@@ -108,51 +113,24 @@ Required stdout markers: `Create topic:`, `Create reader for topic:`,
 COMPLETE (10 samples)`, `LIVE SAMPLE seq_num=`, `Subscriber: observed
 historical batch then live batch correctly.`
 
-## Real, live bug found building this example
+## A bug found building this example, and what replaced its fix
 
-`wait_for_historical_data()` had **zero coverage anywhere in this project**
-before this example (confirmed by `zzdds/docs/design/dcps-api-coverage-audit.md`),
-and it turned out to have a real, previously-undiscovered bug affecting
-exactly the most common real call pattern: calling it immediately after
-creating the reader, before discovery has had any chance to run.
+`wait_for_historical_data()` had no coverage anywhere in this project before
+this example (`zzdds/docs/design/dcps-api-coverage-audit.md`), and building
+it found a bug in the most common call pattern: called right after creating
+the reader, before discovery had matched the publisher's writer, a real
+10-second wait returned `RETCODE_OK` on its first check with no historical
+sample delivered. The first fix made a nonzero wait on a reader that had
+never matched a writer wait for one to match.
 
-Traced to `StatefulReader.historicalDelivered()` (`src/rtps/reader_sm.zig`):
-it walks `writer_proxies` and returns `true` if every entry has delivered
-its full history -- which is vacuously `true` when the list is *empty*, and
-it's empty both when genuinely no writer will ever match *and* when a
-writer simply hasn't matched yet. `DataReader.wait_for_historical_data`'s
-poll loop (`vtWaitForHistorical`, `src/dcps/reader.zig`) trusted that return
-value unconditionally, so a real 10-second `max_wait` call returned
-`RETCODE_OK` on its very first poll -- before discovery had even had a
-chance to run -- with zero historical samples actually delivered. Confirmed
-live: the subscriber logged `wait_for_historical_data() returned` followed
-immediately by `only 0/10 historical samples were actually received`.
-
-This wasn't an accidental oversight: an existing unit test explicitly
-asserted the old behavior for a *zero*-duration wait
-(`"wait_for_historical_data: TRANSIENT_LOCAL with no matched writers returns
-OK immediately"`) -- a reasonable "just check current state, don't block"
-degenerate case that the fix deliberately preserves unchanged. The bug was
-specifically that the *same* vacuous-empty-list shortcut also applied to
-real, non-zero waits, where it's never correct: an app passing a real
-`max_wait` is explicitly asking to give a not-yet-discovered writer a
-chance to appear.
-
-Fixed with a new `hasMatchedWriters()` (sticky -- true once any writer has
-*ever* matched, not "currently matched", so a writer that delivers
-everything and later disappears still counts as done): a non-zero wait no
-longer trusts `historicalDelivered()`'s vacuous `true` until at least one
-writer has actually matched, keeping the same zero-duration semantics
-otherwise. Two new unit tests lock this in
-(`test/dcps/wait_for_historical_test.zig`): a negative case (non-zero
-`max_wait`, no writer ever matches → `RETCODE_TIMEOUT`, not an instant
-false `RETCODE_OK`) and a positive case using a real background thread that
-matches a writer *while* the call is already blocked (mirroring `catchup`'s
-actual runtime shape) → `RETCODE_OK` once history genuinely lands. Both
-verified to fail without the fix. Verified end-to-end across all four
-bindings and all 16 cross-binding pairs in
-`interop/catchup_cross_binding_smoke_test.py`, each clean on the first
-attempt once the fix landed.
+That fix is superseded. `wait_for_historical_data` now waits for the writers
+that owe the reader history when it is called, and with none returns OK at
+once (zzdds
+`docs/design/concurrency/operations.md#historical-wait-compatibility`):
+discovery readiness is its own predicate, not something this call waits
+for. So the subscriber waits for the publisher's writer to match first
+(step 3 above), and the `wait-for-historical-data` integration scenario
+asserts that a reader no writer matches returns OK at once.
 
 ## Deliberately out of scope
 

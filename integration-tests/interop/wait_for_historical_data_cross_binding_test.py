@@ -7,11 +7,12 @@ raw_loan_cross_binding_smoke_test.py uses.
 
 Unlike a demonstration example (examples/*/catchup, which this scenario's
 apps are directly modeled on), each pair here must clear a harder
-correctness bar on wait_for_historical_data(): a negative case (a short,
+correctness bar on wait_for_historical_data(): an unmatched case (a short,
 non-zero max_wait on a reader whose topic no process writes must return
-RETCODE_TIMEOUT, not RETCODE_OK) followed by a positive case (a generous
-max_wait must return RETCODE_OK only once the full TRANSIENT_LOCAL
-historical batch has actually been delivered). See
+RETCODE_OK at once: nothing owes that reader history) followed by a positive
+case (once the publisher's writer has matched, a generous max_wait must
+return RETCODE_OK only once the full TRANSIENT_LOCAL historical batch has
+actually been delivered). See
 docs/design/integration-test-tier.md for the full scenario spec and
 c/wait-for-historical-data/src/subscriber.c for the assertions themselves --
 this script's own checks below are a belt-and-suspenders check on the log
@@ -61,11 +62,11 @@ READY_MARKER = "Publisher: historical batch written."
 # Generous margin over publisher setup (including JVM start) and its eight
 # writes -- this should trip within a second or two in practice.
 READY_MARKER_TIMEOUT_S = 15
-# Subscriber's own internal deadline chain: negative wait (0.3s) + positive
-# wait_for_historical_data() (15s) + live-batch receive (30s). Publisher's,
-# after the marker: match wait (20s) + drain wait (15s). 60s gives
-# comfortable margin over the worst case on either side.
-PROC_TIMEOUT_S = 60
+# Subscriber's own internal deadline chain: unmatched wait (at once) + match
+# wait (15s) + positive wait_for_historical_data() (15s) + live-batch
+# receive (30s). Publisher's, after the marker: match wait (20s) + drain
+# wait (15s). 75s gives margin over the worst case on either side.
+PROC_TIMEOUT_S = 75
 
 ZIG_DIR = SUITE_ROOT / "zig" / "wait-for-historical-data"
 C_DIR = SUITE_ROOT / "c" / "wait-for-historical-data"
@@ -187,7 +188,7 @@ def run_pair(subscriber_lang: str, publisher_lang: str, zig_out: Path) -> bool:
 
     ok = pub_rc == 0 and sub_rc == 0
     ok = ok and "Publisher: done." in pub.log_text()
-    ok = ok and "Subscriber: negative check (no writer on its topic) correctly returned TIMEOUT." in sub.log_text()
+    ok = ok and "Subscriber: unmatched check (no writer on its topic) returned OK at once." in sub.log_text()
     ok = ok and "Subscriber: wait_for_historical_data() returned" in sub.log_text()
     ok = ok and "HISTORICAL BATCH COMPLETE (8 samples)" in sub.log_text()
     ok = ok and "Subscriber: observed historical batch then live batch correctly." in sub.log_text()

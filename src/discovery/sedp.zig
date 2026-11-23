@@ -1084,14 +1084,16 @@ pub const SedpEndpoints = struct {
         data: []u8,
     };
 
-    fn onPubData(ctx: *anyopaque, ch: *const CacheChange) void {
+    fn onPubData(ctx: *anyopaque, ch: *const CacheChange) history_mod.Delivery {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.deferChange(ch, true);
+        return .kept;
     }
 
-    fn onSubData(ctx: *anyopaque, ch: *const CacheChange) void {
+    fn onSubData(ctx: *anyopaque, ch: *const CacheChange) history_mod.Delivery {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.deferChange(ch, false);
+        return .kept;
     }
 
     /// Under the built-in reader's lock: keep a copy for onFlush.

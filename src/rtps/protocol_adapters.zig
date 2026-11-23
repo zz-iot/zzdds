@@ -488,6 +488,9 @@ pub const RtpsProtocolReader = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Before anything removes its writers, which would fail a wait on
+        // them rather than end it as the reader's close.
+        self.reader.closeHistoryWaits();
         self.quiesce.beginTeardown(self, reallyDeinit);
     }
 
@@ -530,8 +533,8 @@ pub const RtpsProtocolReader = struct {
         .handle_data_frag = vtHandleDataFrag,
         .handle_heartbeat_frag = vtHandleHeartbeatFrag,
         .handle_gap = vtHandleGap,
-        .historical_delivered = vtHistoricalDelivered,
-        .has_matched_writers = vtHasMatchedWriters,
+        .begin_history_wait = vtBeginHistoryWait,
+        .end_history_wait = vtEndHistoryWait,
         .deinit = vtDeinit,
         .quiesce_acquire = vtQuiesceAcquire,
         .quiesce_release = vtQuiesceRelease,
@@ -803,14 +806,14 @@ pub const RtpsProtocolReader = struct {
         self.reader.handleGap(writer_guid, gap_start, gap_list);
     }
 
-    fn vtHistoricalDelivered(ctx: *anyopaque) bool {
+    fn vtBeginHistoryWait(ctx: *anyopaque, cap: *protocol.history_wait.Capture) error{OutOfMemory}!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.reader.historicalDelivered();
+        return self.reader.beginHistoryWait(cap);
     }
 
-    fn vtHasMatchedWriters(ctx: *anyopaque) bool {
+    fn vtEndHistoryWait(ctx: *anyopaque, cap: *protocol.history_wait.Capture) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.reader.hasMatchedWriters();
+        self.reader.endHistoryWait(cap);
     }
 
     fn vtDeinit(ctx: *anyopaque) void {

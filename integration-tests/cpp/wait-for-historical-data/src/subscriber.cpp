@@ -2,15 +2,15 @@
  * integration-tests/cpp/wait-for-historical-data -- subscriber (the late
  * joiner). Direct C++ port of c/wait-for-historical-data/src/subscriber.c --
  * see that file's header comment for the full scenario rationale
- * (negative-then-positive wait_for_historical_data() bar) and
+ * (unmatched-then-positive wait_for_historical_data() bar) and
  * docs/design/integration-test-tier.md for the scenario spec.
  *
- * Required stdout markers: "Create topic:", "Subscriber: negative check (no
- * writer on its topic) correctly returned TIMEOUT.", "Create reader for
- * topic:", "Subscriber: wait_for_historical_data() returned", "HISTORICAL
- * BATCH COMPLETE (8 samples)", "LIVE SAMPLE seq_num=", "Subscriber: observed
- * historical batch then live batch correctly." Any failure path prints a
- * line starting "FAIL:" and exits nonzero.
+ * Required stdout markers: "Create topic:", "Subscriber: unmatched check (no
+ * writer on its topic) returned OK at once.", "Create reader for topic:",
+ * "Subscriber: wait_for_historical_data() returned", "HISTORICAL BATCH
+ * COMPLETE (8 samples)", "LIVE SAMPLE seq_num=", "Subscriber: observed
+ * historical batch then live batch correctly." Any failure path prints a line
+ * starting "FAIL:" and exits nonzero.
  */
 #include "history_event.hpp"
 #include "zzdds_cpp.hpp"
@@ -40,11 +40,11 @@ namespace {
 
 constexpr int HISTORICAL_COUNT = 8;
 constexpr int LIVE_COUNT = 4;
-constexpr int NEGATIVE_WAIT_NSEC = 300 * 1000 * 1000;
+constexpr int UNMATCHED_WAIT_NSEC = 300 * 1000 * 1000;
 constexpr int HISTORICAL_WAIT_TIMEOUT_S = 15;
 constexpr int RECEIVE_TIMEOUT_MS = 30000;
 constexpr int POLL_PERIOD_MS = 20;
-// A topic of the same type that no process ever writes, for the negative case.
+// A topic of the same type that no process ever writes, for the unmatched case.
 constexpr const char *UNPUBLISHED_TOPIC = "HistoryEventUnpublished";
 
 struct SubState {
@@ -135,6 +135,16 @@ static int reader_matched(const Reader &dr) {
     return dr->get_subscription_matched_status(status) == ::DDS::RETCODE_OK ? status.current_count : -1;
 }
 
+// Polls until a writer matches `dr`, for up to HISTORICAL_WAIT_TIMEOUT_S.
+template <typename Reader>
+static bool wait_for_match(const Reader &dr) {
+    for (int waited_ms = 0; waited_ms < HISTORICAL_WAIT_TIMEOUT_S * 1000; waited_ms += POLL_PERIOD_MS) {
+        if (reader_matched(dr) > 0) return true;
+        usleep(POLL_PERIOD_MS * 1000);
+    }
+    return false;
+}
+
 int main(int argc, char **argv) {
     uint32_t domain_id = parse_domain(argc, argv);
 
@@ -177,31 +187,31 @@ int main(int argc, char **argv) {
     SubState state;
     auto listener = std::make_shared<SubListener>(&state);
 
-    // Negative case -- see c/wait-for-historical-data/src/subscriber.c's
-    // header comment. No process writes UNPUBLISHED_TOPIC, so a short,
-    // non-zero max_wait here is guaranteed to time out.
+    // Unmatched case -- see c/wait-for-historical-data/src/subscriber.c's
+    // header comment. No process writes UNPUBLISHED_TOPIC, so nothing owes
+    // this reader history: a non-zero max_wait returns OK at once.
     auto unpublished = dp->create_topic(UNPUBLISHED_TOPIC, "HistoryEvent", ::DDS::TopicQos::default_value(), nullptr, 0);
     if (!unpublished) {
         std::fprintf(stderr, "FAIL: create_topic(%s) failed\n", UNPUBLISHED_TOPIC);
         return 1;
     }
-    auto neg_dr = sub->create_datareader(
+    auto unmatched_dr = sub->create_datareader(
         std::static_pointer_cast<::zzdds::TopicImpl>(unpublished)->as_topic_description(), dr_qos, nullptr, 0);
-    if (!neg_dr) {
+    if (!unmatched_dr) {
         std::fprintf(stderr, "FAIL: create_datareader(%s) failed\n", UNPUBLISHED_TOPIC);
         return 1;
     }
-    ::DDS::Duration_t negative_wait;
-    negative_wait.sec = 0;
-    negative_wait.nanosec = NEGATIVE_WAIT_NSEC;
-    ::DDS::ReturnCode_t neg_rc = neg_dr->wait_for_historical_data(negative_wait);
-    if (neg_rc != ::DDS::RETCODE_TIMEOUT) {
-        std::fprintf(stderr, "FAIL: wait_for_historical_data() with no writer matched returned %d, expected RETCODE_TIMEOUT (%d)\n",
-                      static_cast<int>(neg_rc), static_cast<int>(::DDS::RETCODE_TIMEOUT));
+    ::DDS::Duration_t unmatched_wait;
+    unmatched_wait.sec = 0;
+    unmatched_wait.nanosec = UNMATCHED_WAIT_NSEC;
+    ::DDS::ReturnCode_t unmatched_rc = unmatched_dr->wait_for_historical_data(unmatched_wait);
+    if (unmatched_rc != ::DDS::RETCODE_OK) {
+        std::fprintf(stderr, "FAIL: wait_for_historical_data() with no writer matched returned %d, expected RETCODE_OK\n",
+                     static_cast<int>(unmatched_rc));
         return 1;
     }
-    sub->delete_datareader(neg_dr);
-    std::printf("Subscriber: negative check (no writer on its topic) correctly returned TIMEOUT.\n");
+    sub->delete_datareader(unmatched_dr);
+    std::printf("Subscriber: unmatched check (no writer on its topic) returned OK at once.\n");
 
     // Create with no listener attached yet -- see this file's header
     // comment and c/wait-for-historical-data/src/subscriber.c's matching
@@ -219,9 +229,14 @@ int main(int argc, char **argv) {
     HistoryEventDataReader reader(dr_handle);
     state.reader = &reader;
 
-    // The positive case: block until discovery has matched the publisher's
-    // writer and its TRANSIENT_LOCAL historical replay has actually landed,
-    // before taking anything.
+    // The positive case: wait for the publisher's writer to match, then
+    // block until its TRANSIENT_LOCAL historical replay has actually landed,
+    // before taking anything. wait_for_historical_data() waits for the
+    // writers matched when it is called, so the match comes first.
+    if (!wait_for_match(dr)) {
+        std::fprintf(stderr, "FAIL: no writer matched within %d s\n", HISTORICAL_WAIT_TIMEOUT_S);
+        return 1;
+    }
     ::DDS::Duration_t max_wait;
     max_wait.sec = HISTORICAL_WAIT_TIMEOUT_S;
     max_wait.nanosec = 0;

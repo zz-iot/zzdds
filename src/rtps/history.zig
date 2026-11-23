@@ -48,6 +48,18 @@ pub const ChangeKind = enum(u8) {
     }
 };
 
+/// What a reader's DCPS layer did with a change the protocol reader handed it.
+pub const Delivery = enum {
+    /// Kept in the reader's cache, or staged in a coherent set.
+    kept,
+    /// Left out by the reader's own choice: a content or time filter, or
+    /// exclusive ownership. Owed history may legitimately leave it out.
+    filtered,
+    /// Lost: RESOURCE_LIMITS rejected it, or there was no memory to keep it.
+    /// History owed with it cannot complete.
+    dropped,
+};
+
 /// One change stored in the history cache.
 ///
 /// `data` contains the full serialized payload: 4-byte CDR encapsulation header

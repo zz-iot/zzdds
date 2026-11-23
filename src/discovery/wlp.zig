@@ -259,17 +259,18 @@ pub const WlpEndpoints = struct {
     const Alive = struct { prefix: GuidPrefix, kind: u8 };
 
     /// Under the built-in reader's lock: decode and queue for onFlush.
-    fn onPmData(ctx: *anyopaque, change: *const history_mod.CacheChange) void {
+    fn onPmData(ctx: *anyopaque, change: *const history_mod.CacheChange) history_mod.Delivery {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        const decoded = decodeParticipantMessageData(change.data) orelse return;
+        const decoded = decodeParticipantMessageData(change.data) orelse return .kept;
         const kind: u8 = if (std.mem.eql(u8, &decoded.kind, &KIND_AUTOMATIC))
             LIVELINESS_AUTOMATIC
         else if (std.mem.eql(u8, &decoded.kind, &KIND_MANUAL))
             LIVELINESS_MANUAL_BY_PARTICIPANT
         else
-            return;
+            return .kept;
         self.deferred.push(self.alloc, .{ .prefix = decoded.prefix, .kind = kind }) catch
             log.wlp.warn("wlp: out of memory queueing a liveliness assertion; dropped", .{});
+        return .kept;
     }
 
     /// The built-in reader's on_flush: reports the queued assertions, in
@@ -379,9 +380,9 @@ test "liveliness assertions are reported from on_flush, in arrival order, not fr
     defer alloc.free(pb);
     var ch = std.mem.zeroes(history_mod.CacheChange);
     ch.data = pa;
-    WlpEndpoints.onPmData(self, &ch);
+    _ = WlpEndpoints.onPmData(self, &ch);
     ch.data = pb;
-    WlpEndpoints.onPmData(self, &ch);
+    _ = WlpEndpoints.onPmData(self, &ch);
     try testing.expectEqual(@as(usize, 0), probe.seen.items.len);
 
     WlpEndpoints.onFlush(self);

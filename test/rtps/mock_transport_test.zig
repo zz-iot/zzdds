@@ -151,12 +151,13 @@ const Collector = struct {
         return .{ .ctx = self, .on_data = onData };
     }
 
-    fn onData(ctx: *anyopaque, ch: *const CacheChange) void {
+    fn onData(ctx: *anyopaque, ch: *const CacheChange) rtps.history.Delivery {
         const self: *Collector = @ptrCast(@alignCast(ctx));
-        const copy = self.alloc.dupe(u8, ch.data) catch return;
+        const copy = self.alloc.dupe(u8, ch.data) catch return .kept;
         self.samples.append(self.alloc, copy) catch {
             self.alloc.free(copy);
         };
+        return .kept;
     }
 };
 

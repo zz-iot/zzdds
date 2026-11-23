@@ -75,6 +75,17 @@ public class Subscriber {
         return n;
     }
 
+    // Polls until a writer matches rawReader, for up to
+    // HISTORICAL_WAIT_TIMEOUT_S.
+    static boolean waitForMatch(Dcps.DDS.DataReader rawReader) throws InterruptedException {
+        for (int waitedMs = 0; waitedMs < HISTORICAL_WAIT_TIMEOUT_S * 1000; waitedMs += POLL_PERIOD_MS) {
+            Dcps.DDS.SubscriptionMatchedStatus matched = new Dcps.DDS.SubscriptionMatchedStatus();
+            if (rawReader.get_subscription_matched_status(matched) == 0 && matched.get_current_count() > 0) return true;
+            Thread.sleep(POLL_PERIOD_MS);
+        }
+        return false;
+    }
+
     // After a historical shortfall: prints what the reader reports, then
     // keeps taking for SHORTFALL_RECHECK_MS. Samples that turn up late mean
     // the wait returned too early; lost ones mean the writer never sent them.
@@ -204,6 +215,14 @@ public class Subscriber {
         System.out.println("Create reader for topic: HistoryEvent");
         HistoryEventDataReader reader = new HistoryEventDataReader(rawReader);
         readerBox[0] = reader;
+
+        // wait_for_historical_data() waits for the writers matched when it
+        // is called, and with none returns OK at once: wait for the
+        // publisher's writer to match first.
+        if (!waitForMatch(rawReader)) {
+            System.err.println("FAIL: no writer matched within " + HISTORICAL_WAIT_TIMEOUT_S + " s");
+            System.exit(1);
+        }
 
         // The API this whole example exists to exercise: block until the
         // TRANSIENT_LOCAL historical replay has actually landed, before

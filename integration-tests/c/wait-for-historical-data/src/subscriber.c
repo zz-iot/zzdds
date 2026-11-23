@@ -9,35 +9,28 @@
  * so the reader below always joins late and the batch can only reach it by
  * TRANSIENT_LOCAL replay.
  *
- * 1. Negative case first: a TRANSIENT_LOCAL reader on UNPUBLISHED_TOPIC,
+ * 1. Unmatched case first: a TRANSIENT_LOCAL reader on UNPUBLISHED_TOPIC,
  *    which no process ever writes, calls wait_for_historical_data() with a
- *    short, non-zero max_wait and requires RETCODE_TIMEOUT. This is
- *    deterministic, not a timing race: with no writer for that topic
- *    anywhere, the call cannot return OK no matter how long it's given, so
- *    the exact duration only bounds how long the check takes, not whether
- *    it's correct. The publisher's writer on the other topic is already live
- *    by then, so this also shows an unrelated writer doesn't satisfy the
- *    wait. This is what proves the call is a real bounded wait and not
- *    something that always reports success (regression covered natively in
- *    test/dcps/wait_for_historical_test.zig's "non-zero max_wait with no
- *    matched writer times out" test, itself written after this same false-OK
- *    bug was found building the catchup example -- see that test's comment).
- * 2. Then the reader under test, on HistoryEvent, makes a generous-timeout
- *    wait_for_historical_data() call and confirms the full historical batch
- *    actually landed by the time it returns -- the positive counterpart,
- *    unblocking only once discovery has matched the writer and durable
- *    replay has actually happened, rather than on its own timer. It confirms
- *    that by taking from the reader itself, before any listener is attached:
- *    the call promises the samples are in the reader, not that a listener
- *    has run (on the shared runtime, on_data_available runs later, as a
- *    runtime turn).
+ *    short, non-zero max_wait and requires RETCODE_OK. With no writer matched,
+ *    nothing owes the reader history, so the call returns OK at once
+ *    (docs/design/concurrency/operations.md#historical-wait-compatibility). An
+ *    earlier version waited for a first writer to match instead, and returned
+ *    TIMEOUT here.
+ * 2. Then the reader under test, on HistoryEvent, waits for the publisher's
+ *    writer to match, then makes a generous-timeout wait_for_historical_data()
+ *    call and confirms the full historical batch actually landed by the time it
+ *    returns -- unblocking only once durable replay has actually happened,
+ *    rather than on its own timer. It confirms that by taking from the
+ *    reader itself, before any listener is attached: the call promises the
+ *    samples are in the reader, not that a listener has run (on the shared
+ *    runtime, on_data_available runs later, as a runtime turn).
  *
- * Required stdout markers: "Create topic:", "Subscriber: negative check (no
- * writer on its topic) correctly returned TIMEOUT.", "Create reader for
- * topic:", "Subscriber: wait_for_historical_data() returned", "HISTORICAL
- * BATCH COMPLETE (8 samples)", "LIVE SAMPLE seq_num=", "Subscriber: observed
- * historical batch then live batch correctly." Any failure path prints a
- * line starting "FAIL:" and exits nonzero.
+ * Required stdout markers: "Create topic:", "Subscriber: unmatched check (no
+ * writer on its topic) returned OK at once.", "Create reader for topic:",
+ * "Subscriber: wait_for_historical_data() returned", "HISTORICAL BATCH
+ * COMPLETE (8 samples)", "LIVE SAMPLE seq_num=", "Subscriber: observed
+ * historical batch then live batch correctly." Any failure path prints a line
+ * starting "FAIL:" and exits nonzero.
  */
 #include "history_event.h"
 #include "zzdds_c.h"
@@ -63,11 +56,11 @@ static inline void sleep(unsigned s) { Sleep((DWORD)s * 1000); }
 
 #define HISTORICAL_COUNT 8
 #define LIVE_COUNT 4
-#define NEGATIVE_WAIT_NSEC (300 * 1000 * 1000)
+#define UNMATCHED_WAIT_NSEC (300 * 1000 * 1000)
 #define HISTORICAL_WAIT_TIMEOUT_S 15
 #define RECEIVE_TIMEOUT_MS 30000
 #define POLL_PERIOD_MS 20
-/* A topic of the same type that no process ever writes, for the negative case. */
+/* A topic of the same type that no process ever writes, for the unmatched case. */
 #define UNPUBLISHED_TOPIC "HistoryEventUnpublished"
 
 typedef struct {
@@ -151,6 +144,16 @@ static int reader_matched(DDS_DataReader dr) {
     return DDS_DataReader_get_subscription_matched_status(dr, &status) == DDS_RETCODE_OK ? status.current_count : -1;
 }
 
+/* Polls until a writer matches `dr`, for up to HISTORICAL_WAIT_TIMEOUT_S.
+ * Returns 1 once one has, 0 if none did. */
+static int wait_for_match(DDS_DataReader dr) {
+    for (int waited_ms = 0; waited_ms < HISTORICAL_WAIT_TIMEOUT_S * 1000; waited_ms += POLL_PERIOD_MS) {
+        if (reader_matched(dr) > 0) return 1;
+        usleep(POLL_PERIOD_MS * 1000);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     uint32_t domain_id = parse_domain(argc, argv);
 
@@ -203,29 +206,29 @@ int main(int argc, char **argv) {
     listener.listener_data = &state;
     listener.on_data_available = on_data_available;
 
-    /* Negative case -- see this file's header comment. No process writes
-     * UNPUBLISHED_TOPIC, so a short, non-zero max_wait here is guaranteed to
-     * time out. */
+    /* Unmatched case -- see this file's header comment. No process writes
+     * UNPUBLISHED_TOPIC, so nothing owes this reader history: a non-zero
+     * max_wait returns OK at once. */
     DDS_Topic unpublished = DDS_DomainParticipant_create_topic(dp, UNPUBLISHED_TOPIC, "HistoryEvent", NULL, NULL, 0);
     if (!unpublished) {
         fprintf(stderr, "FAIL: create_topic(" UNPUBLISHED_TOPIC ") failed\n");
         return 1;
     }
-    DDS_DataReader neg_dr = DDS_Subscriber_create_datareader(sub, zzdds_topic_as_description(unpublished), &dr_qos, NULL, 0);
-    if (!neg_dr) {
+    DDS_DataReader unmatched_dr = DDS_Subscriber_create_datareader(sub, zzdds_topic_as_description(unpublished), &dr_qos, NULL, 0);
+    if (!unmatched_dr) {
         fprintf(stderr, "FAIL: create_datareader(" UNPUBLISHED_TOPIC ") failed\n");
         return 1;
     }
-    DDS_Duration_t negative_wait;
-    negative_wait.sec = 0;
-    negative_wait.nanosec = NEGATIVE_WAIT_NSEC;
-    DDS_ReturnCode_t neg_rc = DDS_DataReader_wait_for_historical_data(neg_dr, &negative_wait);
-    if (neg_rc != DDS_RETCODE_TIMEOUT) {
-        fprintf(stderr, "FAIL: wait_for_historical_data() with no writer matched returned %d, expected RETCODE_TIMEOUT (%d)\n", neg_rc, DDS_RETCODE_TIMEOUT);
+    DDS_Duration_t unmatched_wait;
+    unmatched_wait.sec = 0;
+    unmatched_wait.nanosec = UNMATCHED_WAIT_NSEC;
+    DDS_ReturnCode_t unmatched_rc = DDS_DataReader_wait_for_historical_data(unmatched_dr, &unmatched_wait);
+    if (unmatched_rc != DDS_RETCODE_OK) {
+        fprintf(stderr, "FAIL: wait_for_historical_data() with no writer matched returned %d, expected RETCODE_OK\n", unmatched_rc);
         return 1;
     }
-    DDS_Subscriber_delete_datareader(sub, neg_dr);
-    printf("Subscriber: negative check (no writer on its topic) correctly returned TIMEOUT.\n");
+    DDS_Subscriber_delete_datareader(sub, unmatched_dr);
+    printf("Subscriber: unmatched check (no writer on its topic) returned OK at once.\n");
 
     /* Create with no listener attached yet: it is attached only once the
      * historical batch has been taken and checked below, so until then
@@ -242,9 +245,14 @@ int main(int argc, char **argv) {
     HistoryEventDataReader_init(&reader, dr);
     state.reader = &reader;
 
-    /* The positive case: block until discovery has matched the publisher's
-     * writer and its TRANSIENT_LOCAL historical replay has actually landed,
-     * before taking anything. */
+    /* The positive case: wait for the publisher's writer to match, then
+     * block until its TRANSIENT_LOCAL historical replay has actually landed,
+     * before taking anything. wait_for_historical_data() waits for the
+     * writers matched when it is called, so the match comes first. */
+    if (!wait_for_match(dr)) {
+        fprintf(stderr, "FAIL: no writer matched within %d s\n", HISTORICAL_WAIT_TIMEOUT_S);
+        return 1;
+    }
     DDS_Duration_t max_wait;
     max_wait.sec = HISTORICAL_WAIT_TIMEOUT_S;
     max_wait.nanosec = 0;

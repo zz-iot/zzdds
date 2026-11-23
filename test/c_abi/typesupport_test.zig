@@ -612,10 +612,11 @@ test "checked C registration rejects before DATA, fragment and prematch admissio
         reader.setSampleProcessor(ts.sample_processor);
         const Delivered = struct {
             count: usize = 0,
-            fn onData(ctx: *anyopaque, change: *const rtps.CacheChange) void {
+            fn onData(ctx: *anyopaque, change: *const rtps.CacheChange) rtps.history.Delivery {
                 const self: *@This() = @ptrCast(@alignCast(ctx));
                 std.debug.assert(std.mem.allEqual(u8, &change.key_hash, 0));
                 self.count += 1;
+                return .kept;
             }
         };
         var delivered = Delivered{};

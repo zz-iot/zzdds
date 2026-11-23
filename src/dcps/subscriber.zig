@@ -291,10 +291,7 @@ pub const SubscriberImpl = struct {
         // matching comment): each r.deinit() drops the lifetime ref it holds
         // on us, so by beginTeardown only our "alive" ref and any in-flight
         // fallback dispatch remain.
-        for (self.readers.items) |r| {
-            self.cbs.destroy_proto_reader(self.cbs.ctx, r.instance_handle);
-            r.deinit();
-        }
+        for (self.readers.items) |r| self.destroyReader(r);
         self.readers.clearRetainingCapacity();
         self.retireHandles();
         self.quiesce.beginTeardown(self, reallyDeinit);
@@ -715,9 +712,16 @@ pub const SubscriberImpl = struct {
         };
         // Torn down without `mu`: deinit waits for a running listener,
         // which may call back into this Subscriber.
+        self.destroyReader(r);
+        return DDS.RETCODE_OK;
+    }
+
+    /// Deletes a reader already taken out of `readers`: its protocol reader,
+    /// then the reader.
+    fn destroyReader(self: *Self, r: *reader_mod.DataReaderImpl) void {
+        r.closeProto();
         self.cbs.destroy_proto_reader(self.cbs.ctx, r.instance_handle);
         r.deinit();
-        return DDS.RETCODE_OK;
     }
 
     /// Checks every reader's delete precondition without tearing anything
@@ -748,10 +752,7 @@ pub const SubscriberImpl = struct {
             self.readers = .empty;
         }
         // Torn down without `mu`, as in delete_datareader.
-        for (taken.items) |r| {
-            self.cbs.destroy_proto_reader(self.cbs.ctx, r.instance_handle);
-            r.deinit();
-        }
+        for (taken.items) |r| self.destroyReader(r);
         taken.deinit(self.alloc);
         return DDS.RETCODE_OK;
     }

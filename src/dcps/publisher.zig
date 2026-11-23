@@ -760,7 +760,7 @@ pub const PublisherImpl = struct {
         self.mu.lock();
         defer self.mu.unlock();
         self.ack_waits_closed = true;
-        for (self.ack_waiters.items) |waiter| waiter.settleClose(.closed);
+        for (self.ack_waiters.items) |waiter| waiter.settleFailure(.closed);
     }
 
     /// Deletes every writer, each as `delete_datawriter` does: for a deletion

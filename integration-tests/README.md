@@ -163,19 +163,15 @@ intermittently failed when discovery matched the reader mid-batch.
 
 Two assertions, in order:
 
-1. **Negative case**: the subscriber calls `wait_for_historical_data()` with a short,
+1. **Unmatched case**: the subscriber calls `wait_for_historical_data()` with a short,
    non-zero `max_wait` on a TRANSIENT_LOCAL reader of `HistoryEventUnpublished`, a topic no
-   process writes -- deterministic, not a timing race, since a call with no writer to wait
-   for cannot return `RETCODE_OK` no matter how long it's given. The publisher's writer on
-   `HistoryEvent` is already live, so this also shows an unrelated writer doesn't satisfy
-   the wait. Requires `RETCODE_TIMEOUT`. This closes the
-   `wait_for_historical_data()`-should-time-out negative case `docs/roadmap.md` recorded as
-   deliberately out of scope for the `catchup` example itself, and is the same shape as the
-   regression `test/dcps/wait_for_historical_test.zig`'s "non-zero max_wait with no matched
-   writer times out" test covers at the Zig-unit level (both exist because an earlier,
-   real bug made this case return `RETCODE_OK` immediately purely because discovery hadn't
-   matched a writer *yet*, not because there was truly nothing to wait for).
-2. **Positive case**: the subscriber then creates its reader on `HistoryEvent`, makes a
+   process writes. Requires `RETCODE_OK`, at once: the call waits for the writers that owe
+   the reader history when it is called, and with none matched nothing does
+   (`docs/design/concurrency/operations.md#historical-wait-compatibility`). An earlier
+   version waited for a first writer to match instead, and required `RETCODE_TIMEOUT`
+   here.
+2. **Positive case**: the subscriber then creates its reader on `HistoryEvent`, waits for
+   the publisher's writer to match (polling `get_subscription_matched_status`), makes a
    generous-timeout call and confirms every one of the 8 historical samples actually
    arrived by the time that call returns `RETCODE_OK`, not just that the return code itself
    was `RETCODE_OK`. It takes them from the reader itself, with no listener attached yet:
