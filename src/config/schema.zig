@@ -185,8 +185,8 @@ pub const UdpConfig = struct {
 
     // ── Misc ──────────────────────────────────────────────────────────────────
 
-    /// Socket buffer sizes to request (bytes), for the receive sockets and
-    /// the send sockets. 0 = OS default. An OS that refuses a size is asked
+    /// Socket buffer sizes to request (bytes), for every socket the
+    /// transport opens. 0 = OS default. An OS that refuses a size is asked
     /// for less; one that grants less logs it, at debug.
     recv_buffer_size: u32 = 0,
     send_buffer_size: u32 = 0,

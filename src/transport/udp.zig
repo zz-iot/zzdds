@@ -714,8 +714,8 @@ pub const UdpTransport = struct {
         // vtSend() works even before vtListen() has been called.
         const sv4: posix.socket_t = socketCreate(posix.AF.INET, posix.SOCK.DGRAM) catch INVALID_SOCKET;
         const sv6: posix.socket_t = socketCreate(posix.AF.INET6, posix.SOCK.DGRAM) catch INVALID_SOCKET;
-        if (sv4 != INVALID_SOCKET) sock.requestBufferSize(sv4, .send, config.send_buffer_size, "udp: IPv4 send socket");
-        if (sv6 != INVALID_SOCKET) sock.requestBufferSize(sv6, .send, config.send_buffer_size, "udp: IPv6 send socket");
+        if (sv4 != INVALID_SOCKET) BufferSizes.of(&config).request(sv4, 0);
+        if (sv6 != INVALID_SOCKET) BufferSizes.of(&config).request(sv6, 0);
         errdefer {
             if (sv4 != INVALID_SOCKET) socketClose(sv4);
             if (sv6 != INVALID_SOCKET) socketClose(sv6);
@@ -940,7 +940,7 @@ pub const UdpTransport = struct {
     // ── Socket lifecycle ──────────────────────────────────────────────────────
 
     fn addUnicastSocket(self: *Self, if_addr: IfAddr, port: u32, handler: ReceiveHandler) !void {
-        const fd = try createUnicastSocket(if_addr.kind, if_addr.ip, @intCast(port), self.config.recv_buffer_size);
+        const fd = try createUnicastSocket(if_addr.kind, if_addr.ip, @intCast(port), .of(&self.config));
         try self.addUnicastSocketFromFd(fd, if_addr.kind, if_addr.ip, port, handler);
     }
 
@@ -1043,7 +1043,7 @@ pub const UdpTransport = struct {
         for (self.sockets.items) |s| {
             if (s.kind == .multicast and s.port == port and s.addr_kind == addr_kind) return s;
         }
-        const fd = try createMulticastSocket(addr_kind, @intCast(port), self.config.recv_buffer_size);
+        const fd = try createMulticastSocket(addr_kind, @intCast(port), .of(&self.config));
         errdefer socketClose(fd);
         const entry = try self.alloc.create(SocketEntry);
         errdefer self.alloc.destroy(entry);
@@ -1244,7 +1244,7 @@ pub const UdpTransport = struct {
     // ── Reservation helpers ───────────────────────────────────────────────────
 
     /// Consume a pre-bound reservation fd for `port`, if one exists, with
-    /// the receive buffer size createUnicastSocket would have requested.
+    /// the buffer sizes createUnicastSocket would have requested.
     fn takeReservedFd(self: *Self, port: u32) ?posix.socket_t {
         const meta_port: u32 = schema.metatrafficUnicastPort(&self.config, self.domain_id, self.participant_id);
         const data_port: u32 = schema.defaultUnicastPort(&self.config, self.domain_id, self.participant_id);
@@ -1256,7 +1256,7 @@ pub const UdpTransport = struct {
             return null;
         const fd = slot.* orelse return null;
         slot.* = null;
-        requestReceiveBuffer(fd, @intCast(port), self.config.recv_buffer_size);
+        BufferSizes.of(&self.config).request(fd, @intCast(port));
         return fd;
     }
 
@@ -1470,6 +1470,7 @@ pub const UdpTransport = struct {
     fn temporarySendSocket(self: *Self, family: u32) !posix.socket_t {
         const fd = try socketCreate(family, posix.SOCK.DGRAM);
         errdefer socketClose(fd);
+        BufferSizes.of(&self.config).request(fd, 0);
         if (builtin.os.tag == .windows and self.send_nonblocking.load(.acquire)) try sock.setNonblocking(fd);
         return fd;
     }
@@ -2126,18 +2127,30 @@ fn sockaddrToLocator(addr: *const posix.sockaddr) Locator {
 
 // ── Socket creation helpers ───────────────────────────────────────────────────
 
-fn requestReceiveBuffer(fd: posix.socket_t, port: u16, size: u32) void {
-    var buf: [32]u8 = undefined;
-    const what = std.fmt.bufPrint(&buf, "udp: port {d}", .{port}) catch "udp";
-    sock.requestBufferSize(fd, .receive, size, what);
-}
+/// The buffer sizes every socket the transport opens requests: each can
+/// receive, and each can send (sendOnChannel sends from a bound one).
+const BufferSizes = struct {
+    recv: u32 = 0,
+    send: u32 = 0,
 
-fn createUnicastSocket(addr_kind: i32, ip: [16]u8, port: u16, recv_buf: u32) !posix.socket_t {
+    fn of(config: *const schema.UdpConfig) BufferSizes {
+        return .{ .recv = config.recv_buffer_size, .send = config.send_buffer_size };
+    }
+
+    fn request(self: BufferSizes, fd: posix.socket_t, port: u16) void {
+        var buf: [32]u8 = undefined;
+        const what = if (port == 0) "udp: send socket" else std.fmt.bufPrint(&buf, "udp: port {d}", .{port}) catch "udp";
+        sock.requestBufferSize(fd, .receive, self.recv, what);
+        sock.requestBufferSize(fd, .send, self.send, what);
+    }
+};
+
+fn createUnicastSocket(addr_kind: i32, ip: [16]u8, port: u16, buffers: BufferSizes) !posix.socket_t {
     const family: u32 = if (addr_kind == LocatorKind.udp_v4) posix.AF.INET else posix.AF.INET6;
     const fd = try socketCreate(family, posix.SOCK.DGRAM);
     errdefer socketClose(fd);
     try allowAddrReuse(fd);
-    requestReceiveBuffer(fd, port, recv_buf);
+    buffers.request(fd, port);
 
     if (addr_kind == LocatorKind.udp_v4) {
         const addr = posix.sockaddr.in{
@@ -2163,7 +2176,7 @@ fn createUnicastSocket(addr_kind: i32, ip: [16]u8, port: u16, recv_buf: u32) !po
     return fd;
 }
 
-fn createMulticastSocket(addr_kind: i32, port: u16, recv_buf: u32) !posix.socket_t {
+fn createMulticastSocket(addr_kind: i32, port: u16, buffers: BufferSizes) !posix.socket_t {
     const family: u32 = if (addr_kind == LocatorKind.udp_v4) posix.AF.INET else posix.AF.INET6;
     const fd = try socketCreate(family, posix.SOCK.DGRAM);
     errdefer socketClose(fd);
@@ -2171,7 +2184,7 @@ fn createMulticastSocket(addr_kind: i32, port: u16, recv_buf: u32) !posix.socket
     // every datagram, each sender's SPDP included: see allowAddrReuse for why
     // that is SO_REUSEADDR on Linux and SO_REUSEPORT too on Darwin.
     try allowAddrReuse(fd);
-    requestReceiveBuffer(fd, port, recv_buf);
+    buffers.request(fd, port);
 
     if (addr_kind == LocatorKind.udp_v4) {
         const addr = posix.sockaddr.in{
@@ -2552,7 +2565,7 @@ fn expectBufferSize(fd: posix.socket_t, buffer: sock.Buffer, size: u32) !void {
     }
 }
 
-test "the configured buffer sizes reach the send sockets and a promoted reserved receive socket" {
+test "the configured buffer sizes reach the send sockets, a promoted reserved receive socket and a temporary one" {
     const alloc = std.testing.allocator;
     var hp_udp: rt_testing.HostedPoll = undefined;
     try hp_udp.init(std.testing.allocator);
@@ -2576,9 +2589,14 @@ test "the configured buffer sizes reach the send sockets and a promoted reserved
     var found = false;
     for (udp.sockets.items) |s| if (s.port == meta_port) {
         try expectBufferSize(s.fd, .receive, 40960);
+        try expectBufferSize(s.fd, .send, 24576);
         found = true;
     };
     try std.testing.expect(found);
+
+    const temporary = try udp.temporarySendSocket(posix.AF.INET);
+    defer socketClose(temporary);
+    try expectBufferSize(temporary, .send, 24576);
 }
 
 test "vtListen promotes reserved meta fd on first listen" {
@@ -2612,7 +2630,7 @@ test "vtListen reserved meta fd also serves advertised IPv6 locators" {
     const alloc = std.testing.allocator;
 
     const zero_ip = std.mem.zeroes([16]u8);
-    const probe = createUnicastSocket(LocatorKind.udp_v6, zero_ip, 0, 0) catch return;
+    const probe = createUnicastSocket(LocatorKind.udp_v6, zero_ip, 0, .{}) catch return;
     socketClose(probe);
 
     var mon_sentinel: u8 = 0;
@@ -3294,7 +3312,7 @@ test "sendOnChannel replies from the exact socket a datagram arrived on (IPv6)" 
     // meta fd also serves advertised IPv6 locators" above.
     const alloc = std.testing.allocator;
     {
-        const probe = createUnicastSocket(LocatorKind.udp_v6, std.mem.zeroes([16]u8), 0, 0) catch return;
+        const probe = createUnicastSocket(LocatorKind.udp_v6, std.mem.zeroes([16]u8), 0, .{}) catch return;
         socketClose(probe);
     }
 
@@ -3653,7 +3671,7 @@ test "removeUnicastSockets: on_channel_closed reaches real recipients, not a Por
     // depend on actually bringing down a real interface.
     const loopback_ip: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1 };
     const fake_ip: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 203, 0, 113, 77 };
-    const fd = try createUnicastSocket(LocatorKind.udp_v4, loopback_ip, 0, 0);
+    const fd = try createUnicastSocket(LocatorKind.udp_v4, loopback_ip, 0, .{});
     udp.mu.lock();
     try udp.addUnicastSocketFromFd(fd, LocatorKind.udp_v4, fake_ip, port, pe.asHandler());
     udp.mu.unlock();
