@@ -193,6 +193,7 @@ fn commonSetup(
     if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
         .ctx = @ptrCast(ts_alloc),
         .compute_key_hash = gen.Message.computeKeyHashFromCdr,
+        .key_projection = .{ .ctx = undefined, .project = gen.Message.projectKeyFromCdr },
         .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
         .has_key = gen.Message.has_key,
     })) {

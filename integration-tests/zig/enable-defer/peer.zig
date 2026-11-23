@@ -69,6 +69,7 @@ pub fn main(init: std.process.Init) !void {
     if (!zzdds.registerTypeSupport(dp, "ConfigEvent", .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = config_event_gen.ConfigEvent.computeKeyHashFromCdr,
+        .key_projection = .{ .ctx = undefined, .project = config_event_gen.ConfigEvent.projectKeyFromCdr },
         .compute_key_hash_key_only = config_event_gen.ConfigEvent.computeKeyHashFromCdrKeyOnly,
     })) {
         std.debug.print("FAIL: registerTypeSupport(ConfigEvent) failed\n", .{});

@@ -130,6 +130,7 @@ pub fn main(init: std.process.Init) !void {
     if (!zzdds.registerTypeSupport(dp, "SessionEvent", .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = session_event_gen.SessionEvent.computeKeyHashFromCdr,
+        .key_projection = .{ .ctx = undefined, .project = session_event_gen.SessionEvent.projectKeyFromCdr },
         .compute_key_hash_key_only = session_event_gen.SessionEvent.computeKeyHashFromCdrKeyOnly,
     })) {
         std.debug.print("FAIL: registerTypeSupport(SessionEvent) failed\n", .{});

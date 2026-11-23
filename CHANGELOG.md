@@ -10,6 +10,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-23
 
+- The Zig examples, integration tests and stress tests register their types' key
+  projection (`projectKeyFromCdr`), as zidl's C, C++ and Java registrations do: their
+  writers and readers keep each instance's key-only CDR rather than its first sample.
 - zzdds pins zidl `v0.3.41-zig.0.17.1`, whose typed readers take a sample without valid data
   or a serialized key, as a dispose or unregister may carry its key hash alone, rather than
   failing on it: the value is left as it was, or given its default in a batch.

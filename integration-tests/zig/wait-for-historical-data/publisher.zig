@@ -90,6 +90,7 @@ pub fn main(init: std.process.Init) !void {
     if (!zzdds.registerTypeSupport(dp, "HistoryEvent", .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = history_event_gen.HistoryEvent.computeKeyHashFromCdr,
+        .key_projection = .{ .ctx = undefined, .project = history_event_gen.HistoryEvent.projectKeyFromCdr },
         .compute_key_hash_key_only = history_event_gen.HistoryEvent.computeKeyHashFromCdrKeyOnly,
     })) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});

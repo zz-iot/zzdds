@@ -94,6 +94,7 @@ pub fn main(init: std.process.Init) !void {
     if (!zzdds.registerTypeSupport(dp, "LivelinessEvent", .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = liveliness_event_gen.LivelinessEvent.computeKeyHashFromCdr,
+        .key_projection = .{ .ctx = undefined, .project = liveliness_event_gen.LivelinessEvent.projectKeyFromCdr },
         .compute_key_hash_key_only = liveliness_event_gen.LivelinessEvent.computeKeyHashFromCdrKeyOnly,
     })) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});

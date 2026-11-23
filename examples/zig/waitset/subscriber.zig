@@ -144,6 +144,7 @@ pub fn main(init: std.process.Init) !void {
     if (!zzdds.registerTypeSupport(dp, "WaitsetSample", .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = sample_gen.WaitsetSample.computeKeyHashFromCdr,
+        .key_projection = .{ .ctx = undefined, .project = sample_gen.WaitsetSample.projectKeyFromCdr },
         .has_key = sample_gen.WaitsetSample.has_key,
         .compute_key_hash_key_only = sample_gen.WaitsetSample.computeKeyHashFromCdrKeyOnly,
         .get_field = sample_gen.WaitsetSample.getFieldFromCdr,
