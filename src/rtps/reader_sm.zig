@@ -962,8 +962,13 @@ pub const StatefulReader = struct {
             const prev_highest = wp.received.cumulativeAck();
             if (sn == prev_highest + 1) {
                 _ = wp.received.insert(self.alloc, sn) catch {};
+                // A change the cache has no room for is received all the
+                // same, and noted dropped: what follows it is still
+                // delivered, and the history waits settled, before the
+                // error returns.
+                var delivered: error{OutOfMemory}!void = {};
                 if (!is_eoc) {
-                    try self.deliverLocked(wp, &change);
+                    delivered = self.deliverLocked(wp, &change);
                 } else {
                     // EOC marker: not cached, but notify the DCPS layer so it can
                     // flush the coherent WIP without adding a data sample to pending.
@@ -973,6 +978,7 @@ pub const StatefulReader = struct {
                     };
                 }
                 self.deliverPendingLocked(wp, sn);
+                try delivered;
             } else {
                 // Out-of-order: check if already buffered.
                 for (wp.pending_changes.items) |pc| {
@@ -1075,12 +1081,10 @@ pub const StatefulReader = struct {
         }
     }
 
-    /// Deliver all buffered pending changes with SNs in (prev_delivered, cumulativeAck()].
-    /// Called under self.mu. Only meaningful when self.reliable = true.
     /// Hands `change`, received from `wp`, to the cache and the callback,
     /// and notes a change that was lost on the way: history owed with it
     /// cannot complete. Caller must hold `mu`.
-    fn deliverLocked(self: *Self, wp: *WriterProxy, change: *const CacheChange) !void {
+    fn deliverLocked(self: *Self, wp: *WriterProxy, change: *const CacheChange) error{OutOfMemory}!void {
         errdefer wp.noteDropped(change.sequence_number);
         try self.cache.addReaderChange(change.*);
         const cb = self.callback orelse return;
@@ -1089,6 +1093,8 @@ pub const StatefulReader = struct {
         if (cb.on_data(cb.ctx, cached) == .dropped) wp.noteDropped(change.sequence_number);
     }
 
+    /// Deliver all buffered pending changes with SNs in (prev_delivered, cumulativeAck()].
+    /// Called under self.mu. Only meaningful when self.reliable = true.
     fn deliverPendingLocked(self: *Self, wp: *WriterProxy, prev_delivered: SequenceNumber) void {
         var next_sn = prev_delivered + 1;
         while (next_sn <= wp.received.cumulativeAck()) : (next_sn += 1) {

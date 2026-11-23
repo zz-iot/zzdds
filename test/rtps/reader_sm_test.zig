@@ -1419,6 +1419,25 @@ test "history the reader drops fails the wait; history it filters does not" {
     }
 }
 
+test "history the protocol reader's cache has no room for fails the wait" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    const a = makeGuid(0x02, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, null);
+    defer wait.end(r);
+    r.handleHeartbeat(a, READER_EID, 1, 1, 1, false);
+    const cache_alloc = r.cache.alloc;
+    var failing = std.testing.FailingAllocator.init(cache_alloc, .{ .fail_index = 0 });
+    r.cache.alloc = failing.allocator();
+    defer r.cache.alloc = cache_alloc;
+    try testing.expectError(error.OutOfMemory, deliverSamples(r, a, 1, 1));
+    try testing.expectEqual(@as(?history_wait.Outcome, .part_failed), wait.outcome());
+}
+
 test "a dropped live sample does not fail a historical-data wait" {
     var rec: Recording = .{};
     const r = try historyReader(&rec);
