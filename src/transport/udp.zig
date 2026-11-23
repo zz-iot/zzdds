@@ -593,8 +593,6 @@ const PortEntry = struct {
 
 // ── Receive buffer ────────────────────────────────────────────────────────────
 
-const RECV_BUF = 65_536;
-
 // ── UdpTransport ─────────────────────────────────────────────────────────────
 
 pub const UdpTransport = struct {
@@ -1968,8 +1966,7 @@ pub const UdpTransport = struct {
             ss.* = .{ .transport = self, .fd = fd, .source = .{
                 .handle = fd,
                 .ctx = ss,
-                .service = SendSource.noInput,
-                .input = false,
+                .service = null,
                 .writable = SendSource.onWritable,
             } };
         }
@@ -2037,10 +2034,6 @@ const SendSource = struct {
         defer t.writable_mu.unlock();
         t.runWritableLocked();
     }
-
-    fn noInput(_: *anyopaque, _: u32) u32 {
-        unreachable;
-    }
 };
 
 // ── Vtable singleton ──────────────────────────────────────────────────────────
@@ -2067,12 +2060,12 @@ const udp_vtable = Transport.Vtable{
 // ── Receiving on the backend ──────────────────────────────────────────────────
 
 /// Source.service for a socket on the backend: receives what is queued now,
-/// without blocking, into this executor's buffer, and dispatches it to the
-/// socket's handler. The handlers (each participant's ingress) copy what they
-/// keep.
-fn serviceSource(ctx: *anyopaque, budget: u32) u32 {
+/// without blocking, into the backend's scratch, which holds any datagram,
+/// and dispatches it to the socket's handler. The handlers (each
+/// participant's ingress) copy what they keep.
+fn serviceSource(ctx: *anyopaque, budget: u32, scratch: *[backend_mod.service_scratch_len]u8) u32 {
     const entry: *SocketEntry = @ptrCast(@alignCast(ctx));
-    var buf: [RECV_BUF]u8 = undefined;
+    const buf: []u8 = scratch;
     var src_store: posix.sockaddr.storage = undefined;
     var handled: u32 = 0;
     while (handled < budget) {
@@ -2080,7 +2073,7 @@ fn serviceSource(ctx: *anyopaque, budget: u32) u32 {
         // A socket on a backend is nonblocking on Windows, which has no
         // MSG_DONTWAIT.
         const dontwait: u32 = if (builtin.os.tag == .windows) 0 else posix.MSG.DONTWAIT;
-        const n = socketRecvFromFlags(entry.fd, &buf, @ptrCast(&src_store), &src_len, dontwait) catch |err| switch (err) {
+        const n = socketRecvFromFlags(entry.fd, buf, @ptrCast(&src_store), &src_len, dontwait) catch |err| switch (err) {
             error.WouldBlock => break,
             error.Interrupted => continue,
             // Receiving took the socket's pending error (an ICMP report of

@@ -69,7 +69,7 @@ const Sock = struct {
         if (c.sendto(self.fd, "x", 1, 0, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) != 1) return error.SendFailed;
     }
 
-    fn service(ctx: *anyopaque, budget: u32) u32 {
+    fn service(ctx: *anyopaque, budget: u32, _: *[rt.service_scratch_len]u8) u32 {
         const self: *Sock = @ptrCast(@alignCast(ctx));
         var handled: u32 = 0;
         var buf: [16]u8 = undefined;
@@ -129,6 +129,24 @@ fn awaitDelivered(tx: *Sock) !void {
 }
 
 // ── The backend ───────────────────────────────────────────────────────────────
+
+test "a backend that cannot allocate its receive scratch fails and closes its wake descriptor" {
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    // The lowest free descriptor before, and after the failed init: equal
+    // once the init closes the wake descriptor it opened.
+    const probe = struct {
+        fn lowestFree() c_int {
+            const fd = c.eventfd(0, 0);
+            _ = c.close(fd);
+            return fd;
+        }
+    };
+    const before = if (builtin.os.tag == .linux) probe.lowestFree() else 0;
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, rt.PollBackend.init(failing.allocator(), threaded.io()));
+    if (builtin.os.tag == .linux) try std.testing.expectEqual(before, probe.lowestFree());
+}
 
 test "a wake from another thread ends the poller's and a follower's waits, however it races them" {
     if (!rt.poll_backend.supported) return error.SkipZigTest;
@@ -316,7 +334,7 @@ const FullPair = struct {
         var fds: [2]posix.socket_t = undefined;
         if (c.socketpair(posix.AF.UNIX, posix.SOCK.DGRAM, 0, &fds) != 0) return error.SocketFailed;
         self.* = .{ .tx = fds[0], .rx = fds[1] };
-        self.source = .{ .handle = self.tx, .ctx = self, .service = noInput, .input = false, .writable = onWritable };
+        self.source = .{ .handle = self.tx, .ctx = self, .service = null, .writable = onWritable };
     }
 
     fn deinit(self: *FullPair) void {
@@ -336,10 +354,6 @@ const FullPair = struct {
     fn drain(self: *FullPair) void {
         var buf: [16]u8 = undefined;
         while (c.recv(self.rx, &buf, buf.len, DONTWAIT) >= 0) {}
-    }
-
-    fn noInput(_: *anyopaque, _: u32) u32 {
-        unreachable;
     }
 
     fn onWritable(ctx: *anyopaque) void {
@@ -428,11 +442,11 @@ test "unregistering a source returns only once a running service of it has" {
         release: std.atomic.Value(bool) = .init(false),
         unregistered: std.atomic.Value(bool) = .init(false),
 
-        fn service(ctx: *anyopaque, budget: u32) u32 {
+        fn service(ctx: *anyopaque, budget: u32, scratch: *[rt.service_scratch_len]u8) u32 {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.entered.store(true, .release);
             while (!self.release.load(.acquire)) std.Thread.yield() catch {};
-            return Sock.service(&self.sock, budget);
+            return Sock.service(&self.sock, budget, scratch);
         }
 
         fn serve(bk: *Backend) void {
@@ -479,10 +493,10 @@ test "a source's own service may unregister it, and is not called on it again, a
         bk: *Backend,
         calls: u32 = 0,
 
-        fn service(ctx: *anyopaque, budget: u32) u32 {
+        fn service(ctx: *anyopaque, budget: u32, scratch: *[rt.service_scratch_len]u8) u32 {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
-            const n = Sock.service(&self.sock, @min(budget, 1));
+            const n = Sock.service(&self.sock, @min(budget, 1), scratch);
             self.bk.backend().unregister(&self.sock.source);
             // As freed: the backend must not read it again.
             self.sock.source = undefined;
@@ -533,9 +547,9 @@ test "a source whose input is paused is not serviced, and once resumed is servic
     defer s.deinit();
     const Counted = struct {
         var calls: u32 = 0;
-        fn service(ctx: *anyopaque, budget: u32) u32 {
+        fn service(ctx: *anyopaque, budget: u32, scratch: *[rt.service_scratch_len]u8) u32 {
             calls += 1;
-            return Sock.service(ctx, budget);
+            return Sock.service(ctx, budget, scratch);
         }
     };
     Counted.calls = 0;
@@ -572,7 +586,7 @@ test "resumed sources past the service's budget keep their wakeup for the next s
     const Held = struct {
         sock: Sock = undefined,
         calls: u32 = 0,
-        fn service(ctx: *anyopaque, _: u32) u32 {
+        fn service(ctx: *anyopaque, _: u32, _: *[rt.service_scratch_len]u8) u32 {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             return 1;

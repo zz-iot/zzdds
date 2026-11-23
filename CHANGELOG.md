@@ -33,6 +33,17 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   queued, found with a scan of the queue per sample: a sample of a new instance beyond it is
   rejected (REJECTED_BY_INSTANCE_LIMIT, with HANDLE_NIL as its instance). A synthetic
   NOT_ALIVE_NO_WRITERS sample carries its instance's key hash, which `take_raw` returns.
+- UDP and TCP receive into a scratch buffer the runtime's backend lends each service call,
+  not a 64 KiB stack buffer per call. Safe builds fill a stack buffer declared `undefined`,
+  and the backend reads one datagram per call, so every datagram cost a 64 KiB fill: 29% of
+  a ThreadSanitizer subscriber's time receiving large fragmented data, which then fell
+  behind and lost fragments. The backend allocates the scratch once, from the runtime's
+  allocator, so a transport's own allocations stay small.
+- A reliable reader asks for just the missing fragments of a partly received sample when a
+  HEARTBEAT lists it, with a NACK_FRAG (RTPS 2.5 §8.4.14.1.4). Before, its ACKNACK asked
+  for the whole sample again. When a writer's burst overflowed the socket, every resend lost
+  the same fragments at its end, so the sample never completed and a KEEP_ALL writer
+  blocked. A GAP now also frees the fragments held for an SN it settles.
 - Zig: the generated interfaces have their static operations and constructors, as every
   other binding does: `DDS.DomainParticipantFactory.get_instance()` and `delete_instance()`,
   `DDS.WaitSet.create(allocator)` and `DDS.GuardCondition.create(allocator)`. They call
