@@ -10,6 +10,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-23
 
+- zzdds pins zidl `v0.3.41-zig.0.17.1`, whose typed readers take a sample without valid data
+  or a serialized key, as a dispose or unregister may carry its key hash alone, rather than
+  failing on it: the value is left as it was, or given its default in a batch.
 - `wait_for_acknowledgments` keeps its writer, or its Publisher's writers, alive while it
   waits. Before, deleting the writer from another thread, or from a callback the wait
   helped run, freed it under the waiting call. Deleting the writer now ends a DataWriter's
