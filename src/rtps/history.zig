@@ -27,10 +27,25 @@ pub const RtpsTimestamp = time_mod.RtpsTimestamp;
 pub const InstanceHandle = [16]u8;
 pub const INSTANCE_HANDLE_NIL: InstanceHandle = std.mem.zeroes([16]u8);
 
+/// The values are RTPS PID_STATUS_INFO's flags (StatusInfo_t): disposed is
+/// 0x1, unregistered 0x2, and both is an unregister that also disposes, as
+/// `unregister_instance` does under WRITER_DATA_LIFECYCLE
+/// `autodispose_unregistered_instances`.
 pub const ChangeKind = enum(u8) {
     alive = 0,
     not_alive_disposed = 1,
     not_alive_unregistered = 2,
+    not_alive_disposed_unregistered = 3,
+
+    /// Whether the change disposes its instance.
+    pub fn disposes(self: ChangeKind) bool {
+        return @backingInt(self) & 0x1 != 0;
+    }
+
+    /// Whether the change unregisters its writer from its instance.
+    pub fn unregisters(self: ChangeKind) bool {
+        return @backingInt(self) & 0x2 != 0;
+    }
 };
 
 /// One change stored in the history cache.

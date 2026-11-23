@@ -344,6 +344,273 @@ test "registerInstance: a writer's instance has one handle; lookupInstance finds
     try testing.expect(written != DDS.HANDLE_NIL and written != handle);
 }
 
+test "unregister: a writer forgets the instance, which a later write registers anew" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(.{}, .{});
+
+    try writeAlive(pair.dw);
+    const first = pair.dw.lookupInstance(NIL_KEY);
+    try testing.expect(pair.dw.storedKey(first, &.{}) != null);
+
+    // With autodispose_unregistered_instances, as without it.
+    _ = try pair.dw.writeRaw(.not_alive_disposed_unregistered, RtpsTimestamp.now(), NIL_KEY, &.{});
+    try testing.expectEqual(DDS.HANDLE_NIL, pair.dw.lookupInstance(NIL_KEY));
+    try testing.expect(pair.dw.storedKey(first, &.{}) == null);
+
+    try writeAlive(pair.dw);
+    const second = pair.dw.lookupInstance(NIL_KEY);
+    try testing.expect(second != DDS.HANDLE_NIL and second != first);
+    _ = try pair.dw.writeRaw(.not_alive_unregistered, RtpsTimestamp.now(), NIL_KEY, &.{});
+    try testing.expectEqual(DDS.HANDLE_NIL, pair.dw.lookupInstance(NIL_KEY));
+
+    // A dispose alone keeps it.
+    try writeAlive(pair.dw);
+    const third = pair.dw.lookupInstance(NIL_KEY);
+    _ = try pair.dw.writeRaw(.not_alive_disposed, RtpsTimestamp.now(), NIL_KEY, &.{});
+    try testing.expectEqual(third, pair.dw.lookupInstance(NIL_KEY));
+}
+
+test "max_instances: a writer holds at most that many instances, and an unregister frees room" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.resource_limits.max_instances = 2;
+    const pair = fx.makeWriterReader(dw_qos, .{});
+
+    var keys: [3][16]u8 = .{ NIL_KEY, NIL_KEY, NIL_KEY };
+    for (&keys, 1..) |*k, i| k[15] = @intCast(i);
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), keys[0], &PAYLOAD);
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), keys[1], &PAYLOAD);
+    try testing.expectError(error.OutOfResources, pair.dw.writeRaw(.alive, RtpsTimestamp.now(), keys[2], &PAYLOAD));
+    try testing.expectEqual(DDS.HANDLE_NIL, pair.dw.registerInstance(keys[2], &.{}));
+    // An instance already registered is still written.
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), keys[1], &PAYLOAD);
+
+    _ = try pair.dw.writeRaw(.not_alive_disposed_unregistered, RtpsTimestamp.now(), keys[0], &.{});
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), keys[2], &PAYLOAD);
+    try testing.expect(pair.dw.lookupInstance(keys[2]) != DDS.HANDLE_NIL);
+}
+
+// ── Reader instance reclamation (DDS 1.4 §2.2.3.21) ──────────────────────────
+
+/// Takes every queued sample, freeing them, and returns the last.
+fn takeAll(dr: *DataReaderImpl) !DDS.SampleInfo {
+    var last: ?DDS.SampleInfo = null;
+    while (dr.takeRaw()) |s| {
+        dr.alloc.free(s.data);
+        last = s.info;
+    }
+    return last orelse error.NoSample;
+}
+
+test "reclamation: a reader forgets an unregistered instance once its samples are taken" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.writer_data_lifecycle.autodispose_unregistered_instances = false;
+    const pair = fx.makeWriterReader(dw_qos, .{});
+
+    try writeAlive(pair.dw);
+    fx.settle();
+    const first = (try takeAll(pair.dr)).instance_handle;
+    try writeAlive(pair.dw);
+    try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_KEY);
+    fx.settle();
+    try testing.expectEqual(@as(u32, 1), pair.dr.instances.count());
+
+    // Its samples still queued hold it; taking them lets it go.
+    const unreg = try takeAll(pair.dr);
+    try testing.expectEqual(DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE, unreg.instance_state);
+    try testing.expectEqual(@as(u32, 0), pair.dr.instances.count());
+    try testing.expect(pair.dr.storedKey(first, &.{}) == null);
+
+    // A later sample of its key starts a new instance.
+    try writeAlive(pair.dw);
+    fx.settle();
+    const again = try takeAll(pair.dr);
+    try testing.expect(again.instance_handle != first);
+    try testing.expectEqual(DDS.NEW_VIEW_STATE, again.view_state);
+    try testing.expectEqual(@as(i32, 0), again.no_writers_generation_count);
+}
+
+test "reclamation: a disposed instance is kept while its writer has it registered" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.writer_data_lifecycle.autodispose_unregistered_instances = true;
+    const pair = fx.makeWriterReader(dw_qos, .{});
+
+    try writeAlive(pair.dw);
+    _ = try pair.dw.writeRaw(.not_alive_disposed, RtpsTimestamp.now(), NIL_KEY, &.{});
+    fx.settle();
+    const disposed = try takeAll(pair.dr);
+    try testing.expectEqual(DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, disposed.instance_state);
+    try testing.expectEqual(@as(u32, 1), pair.dr.instances.count());
+
+    // Written again, it counts on from its disposal.
+    try writeAlive(pair.dw);
+    fx.settle();
+    const alive = try takeAll(pair.dr);
+    try testing.expectEqual(disposed.instance_handle, alive.instance_handle);
+    try testing.expectEqual(@as(i32, 1), alive.disposed_generation_count);
+
+    // An unregister under autodispose arrives as dispose and unregister:
+    // disposed, and no longer registered, so forgotten once taken.
+    try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_KEY);
+    fx.settle();
+    const unreg = try takeAll(pair.dr);
+    try testing.expectEqual(DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, unreg.instance_state);
+    try testing.expectEqual(@as(u32, 0), pair.dr.instances.count());
+}
+
+test "reclamation: a reader that first hears of an instance by a dispose keeps it while its writer has it" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    // Written alive before the (VOLATILE) reader exists, so the reader's
+    // first change of it is the dispose.
+    const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));
+    try writeAlive(dw);
+    fx.settle();
+    const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(fx.topic_r.ptr))).toTopicDescription();
+    const dr_raw = fx.sub_r.create_datareader(topic_desc_r, .{}, null, 0);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_raw.ptr));
+    fx.settle();
+
+    _ = try dw.writeRaw(.not_alive_disposed, RtpsTimestamp.now(), NIL_KEY, &.{});
+    fx.settle();
+    const disposed = try takeAll(dr);
+    try testing.expectEqual(DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, disposed.instance_state);
+    try testing.expectEqual(@as(u32, 1), dr.instances.count());
+
+    try writeAlive(dw);
+    fx.settle();
+    const alive = try takeAll(dr);
+    try testing.expectEqual(disposed.instance_handle, alive.instance_handle);
+    try testing.expectEqual(@as(i32, 1), alive.disposed_generation_count);
+}
+
+test "reclamation: an unregister the reader rejects leaves the writer's registration" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    dr_qos.resource_limits.max_samples_per_instance = 1;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
+
+    // The unregister finds the instance's one sample slot taken.
+    try writeAlive(pair.dw);
+    try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_KEY);
+    fx.settle();
+    const alive = try takeAll(pair.dr);
+    try testing.expectEqual(DDS.ALIVE_INSTANCE_STATE, alive.instance_state);
+    try testing.expectEqual(@as(?DDS.InstanceHandle_t, alive.instance_handle), pair.dr.lookupInstance(NIL_KEY));
+
+    // So losing the writer still ends the instance, and then it goes.
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, pair.dw.toDDSDataWriter()));
+    fx.settle();
+    const no_writers = try takeAll(pair.dr);
+    try testing.expectEqual(DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE, no_writers.instance_state);
+    try testing.expectEqual(@as(u32, 0), pair.dr.instances.count());
+}
+
+test "reclamation: under exclusive ownership, a weaker writer's dropped unregister ends its registration" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.ownership.kind = .EXCLUSIVE_OWNERSHIP_QOS;
+    var strong_qos = DDS.DataWriterQos{};
+    strong_qos.ownership.kind = .EXCLUSIVE_OWNERSHIP_QOS;
+    strong_qos.ownership_strength.value = 10;
+    const pair = fx.makeWriterReader(strong_qos, dr_qos);
+    var weak_qos = strong_qos;
+    weak_qos.ownership_strength.value = 1;
+    const weak_raw = fx.pub_w.create_datawriter(fx.topic_w, weak_qos, null, 0);
+    const weak: *DataWriterImpl = @ptrCast(@alignCast(weak_raw.ptr));
+    fx.settle();
+
+    // The strong writer owns the instance, so the weak one's write and
+    // unregister are dropped.
+    try writeAlive(pair.dw);
+    try writeAlive(weak);
+    try weak.unregisterRaw(RtpsTimestamp.now(), NIL_KEY);
+    try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_KEY);
+    fx.settle();
+    const last = try takeAll(pair.dr);
+    try testing.expectEqual(DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE, last.instance_state);
+    try testing.expectEqual(@as(u32, 0), pair.dr.instances.count());
+}
+
+test "reclamation: a reader forgets the instances of a writer it loses" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(.{}, .{});
+
+    var key_b = NIL_KEY;
+    key_b[15] = 1;
+    // A disposed instance and an alive one.
+    try writeAlive(pair.dw);
+    _ = try pair.dw.writeRaw(.not_alive_disposed, RtpsTimestamp.now(), NIL_KEY, &.{});
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), key_b, &PAYLOAD);
+    fx.settle();
+    _ = try takeAll(pair.dr);
+    try testing.expectEqual(@as(u32, 2), pair.dr.instances.count());
+
+    // The disposed one goes with the writer; the alive one gets a
+    // NOT_ALIVE_NO_WRITERS sample, and goes once that is taken.
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, pair.dw.toDDSDataWriter()));
+    fx.settle();
+    try testing.expectEqual(@as(u32, 1), pair.dr.instances.count());
+    const no_writers = try takeAll(pair.dr);
+    try testing.expectEqual(DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE, no_writers.instance_state);
+    try testing.expectEqual(@as(u32, 0), pair.dr.instances.count());
+}
+
+test "max_instances: a reader rejects a new instance beyond it, until one is forgotten" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.resource_limits.max_instances = 1;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
+
+    var key_b = NIL_KEY;
+    key_b[15] = 1;
+    try writeAlive(pair.dw);
+    fx.settle();
+    _ = try takeAll(pair.dr);
+
+    // The first instance is alive and registered, so taking its sample
+    // leaves it held.
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), key_b, &PAYLOAD);
+    fx.settle();
+    try testing.expectError(error.NoSample, takeAll(pair.dr));
+    var rejected = DDS.SampleRejectedStatus{};
+    _ = pair.dr.toDDSDataReader().vtable.get_sample_rejected_status(pair.dr.toDDSDataReader().ptr, &rejected);
+    try testing.expectEqual(@as(i32, 1), rejected.total_count);
+    try testing.expectEqual(DDS.SampleRejectedStatusKind.REJECTED_BY_INSTANCE_LIMIT, rejected.last_reason);
+    try testing.expectEqual(DDS.HANDLE_NIL, rejected.last_instance_handle);
+
+    // Unregistered and taken, it is forgotten, which makes room.
+    try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_KEY);
+    fx.settle();
+    _ = try takeAll(pair.dr);
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), key_b, &PAYLOAD);
+    fx.settle();
+    const b = try takeAll(pair.dr);
+    try testing.expect(b.valid_data);
+}
+
 // ── Keyless topic, end-to-end via a real on_data_available listener ─────────
 //
 // Everything above this point already writes with NIL_KEY, but always with

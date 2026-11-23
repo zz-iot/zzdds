@@ -249,8 +249,10 @@ pub const DataWriterImpl = struct {
     /// Each holds its key for get_key_value, or null until it has one: the
     /// key-only CDR register_instance, a dispose or an unregister passed, or
     /// its first alive write's, projected by `key_projection` or else whole.
-    /// The first one is kept and never replaced, and instances are not yet
-    /// removed.
+    /// The first one is kept and never replaced. `unregister_instance`
+    /// removes an instance and frees its key; writing or registering it again
+    /// gives it a new handle. RESOURCE_LIMITS `max_instances` bounds how many
+    /// it holds (`instanceLimit`).
     instances: InstanceRegistry = .empty,
     /// The type's projection of a sample to its key, set as the writer is
     /// created (`key_value.KeyProjection`) and released as it is freed; null
@@ -264,9 +266,17 @@ pub const DataWriterImpl = struct {
     /// TSan: a `HashMapUnmanaged` grow racing a concurrent insert). A
     /// dedicated leaf mutex, not `mu` -- `mu`'s contract is "plain counter
     /// reads/writes, never held across a callback", and `writeRaw` takes no
-    /// other lock. Entries are inserted once and never replaced, so a `[]u8`
-    /// value handed out by `getKeyValueRaw` stays valid after unlock.
+    /// other lock. An unregister removes an entry and frees its key, so a key
+    /// is copied while this is held (`storedKey`).
     instances_mu: Mutex = .{},
+    /// Orders what changes an instance's registration with what publishes
+    /// it: an alive write's registration and publication, an unregister's
+    /// publication and forgetting, and `register_instance`. So of an alive
+    /// write and an unregister of one instance on two threads, whichever is
+    /// published last decides whether it stays registered. Taken before
+    /// `instances_mu` and the protocol writer's lock; never held across the
+    /// key projection, which is the binding's code.
+    publish_mu: Mutex = .{},
 
     /// One box for the whole object, shared across every interface view
     /// (DataWriter, Entity, and ZZDDS.DataWriter — see src/c_abi/extensions.zig)
@@ -455,15 +465,26 @@ pub const DataWriterImpl = struct {
             }
         }
 
-        // An alive write registers its instance, if not already registered.
-        // A dispose or unregister carries the key-only CDR, which a
-        // registered instance without a key yet keeps.
-        if (kind == .alive) {
-            self.registerWrittenInstance(key_hash, data) catch return error.OutOfResources;
-        } else {
-            self.keepKey(key_hash, KeyValue.ofKey(self.alloc, data));
-        }
-        const sn = try self.proto_writer.write(kind, source_timestamp, key_hash, key_hash, data);
+        // An alive write registers its instance, if not already registered:
+        // OutOfResources beyond RESOURCE_LIMITS `max_instances`. An unregister
+        // ends this writer's interest in the instance, so it forgets it
+        // (DDS 1.4 §2.2.2.4.2.7); the history keeps what it wrote.
+        // `publish_mu` keeps both in publication order. A dispose carries the
+        // key-only CDR, which a registered instance without a key yet keeps.
+        var needs_key = false;
+        const sn = blk: {
+            self.publish_mu.lock();
+            defer self.publish_mu.unlock();
+            if (kind == .alive) needs_key = self.registerForWrite(key_hash) catch return error.OutOfResources;
+            const sn = try self.proto_writer.write(kind, source_timestamp, key_hash, key_hash, data);
+            if (kind.unregisters()) self.forgetInstance(key_hash);
+            break :blk sn;
+        };
+        // Projected without the locks: the projection is the binding's code.
+        // A write whose key cannot be kept still succeeds, and the next one
+        // tries again.
+        if (needs_key) self.keepKey(key_hash, KeyValue.ofSample(self.key_projection, self.alloc, data));
+        if (kind == .not_alive_disposed) self.keepKey(key_hash, KeyValue.ofKey(self.alloc, data));
         self.last_sn.store(sn, .monotonic);
         const now_ns = self.timer_clock.nowNs();
         self.last_write_ns.store(now_ns, .monotonic);
@@ -549,18 +570,41 @@ pub const DataWriterImpl = struct {
         return self.proto_writer.matchedReaderCount();
     }
 
-    fn registerWrittenInstance(self: *Self, key_hash: [16]u8, data: []const u8) error{ OutOfMemory, OutOfHandles }!void {
-        const has_key = blk: {
+    /// How many instances the registry may hold: RESOURCE_LIMITS
+    /// `max_instances`, an immutable policy, or as many as it can name when
+    /// unlimited.
+    fn instanceLimit(self: *const Self) u32 {
+        const max = self.qos.resource_limits.max_instances;
+        return if (max > 0) @min(@as(u32, @intCast(max)), handle_registry.MAX_ENTRIES) else handle_registry.MAX_ENTRIES;
+    }
+
+    /// The registry's `getOrPut`, under `instances_mu`, bounded by
+    /// `instanceLimit`.
+    fn getOrPutInstanceLocked(self: *Self, key_hash: [16]u8) error{ OutOfMemory, OutOfHandles }!InstanceRegistry.GetOrPutResult {
+        self.instances.limit = self.instanceLimit();
+        return self.instances.getOrPut(self.alloc, key_hash);
+    }
+
+    /// Removes the instance with `key_hash`, if it is registered, and frees
+    /// its key: its handle then names nothing.
+    fn forgetInstance(self: *Self, key_hash: [16]u8) void {
+        const removed = blk: {
             self.instances_mu.lock();
             defer self.instances_mu.unlock();
-            const e = try self.instances.getOrPut(self.alloc, key_hash);
-            if (!e.found_existing) e.value.* = null;
-            break :blk e.value.* != null;
+            const handle = self.instances.handleOfKey(key_hash) orelse return;
+            break :blk self.instances.remove(handle).?;
         };
-        // Projected without the lock: the projection is the binding's code.
-        // A write whose key cannot be kept still succeeds, and the next one
-        // tries again.
-        if (!has_key) self.keepKey(key_hash, KeyValue.ofSample(self.key_projection, self.alloc, data));
+        if (removed) |kv| self.alloc.free(kv.payload);
+    }
+
+    /// Registers the instance an alive write writes, if it is not, and
+    /// returns whether it still needs its key. With `publish_mu` held.
+    fn registerForWrite(self: *Self, key_hash: [16]u8) error{ OutOfMemory, OutOfHandles }!bool {
+        self.instances_mu.lock();
+        defer self.instances_mu.unlock();
+        const e = try self.getOrPutInstanceLocked(key_hash);
+        if (!e.found_existing) e.value.* = null;
+        return e.value.* == null;
     }
 
     /// Gives a registered instance `maybe_kv` if it has no key yet, and
@@ -579,17 +623,20 @@ pub const DataWriterImpl = struct {
     }
 
     /// register_instance: the handle of the key hash's instance, registering
-    /// it if it is not; HANDLE_NIL if it cannot be, or if the writer is not
-    /// enabled (its NOT_ENABLED, as it returns no code). For a keyless topic
+    /// it if it is not; HANDLE_NIL if it cannot be (as beyond RESOURCE_LIMITS
+    /// `max_instances`), or if the writer is not enabled (its NOT_ENABLED, as
+    /// it returns no code). For a keyless topic
     /// the key hash is all zeros, so there is one instance. `key_cdr`, the
     /// instance's key-only CDR, becomes its key for get_key_value if it has
     /// none yet; empty if the caller has none.
     pub fn registerInstance(self: *Self, key_hash: [16]u8, key_cdr: []const u8) DDS.InstanceHandle_t {
         if (!self.enabled.load(.acquire)) return DDS.HANDLE_NIL;
         const handle = blk: {
+            self.publish_mu.lock();
+            defer self.publish_mu.unlock();
             self.instances_mu.lock();
             defer self.instances_mu.unlock();
-            const e = self.instances.getOrPut(self.alloc, key_hash) catch return DDS.HANDLE_NIL;
+            const e = self.getOrPutInstanceLocked(key_hash) catch return DDS.HANDLE_NIL;
             if (!e.found_existing) e.value.* = null;
             if (e.value.* != null) return e.handle;
             break :blk e.handle;
@@ -599,7 +646,8 @@ pub const DataWriterImpl = struct {
     }
 
     /// lookup_instance: the handle of the key hash's instance, or HANDLE_NIL
-    /// if it was never registered or written.
+    /// if it is not registered: never registered or written, or unregistered
+    /// since.
     pub fn lookupInstance(self: *Self, key_hash: [16]u8) DDS.InstanceHandle_t {
         self.instances_mu.lock();
         defer self.instances_mu.unlock();
@@ -615,24 +663,23 @@ pub const DataWriterImpl = struct {
         return std.mem.eql(u8, &key, &key_hash);
     }
 
-    /// The key of the instance `handle` names, or null if it has none yet or
-    /// `handle` names no instance of this writer. Its payload stays valid for
-    /// the life of the writer: it is never replaced or freed before then. The
-    /// lock only guards the registry while a concurrent `writeRaw` may grow it.
-    pub fn storedKey(self: *Self, handle: DDS.InstanceHandle_t) ?KeyValue {
+    /// Copies the key of the instance `handle` names into `buf` if it fits,
+    /// under `instances_mu`, as an unregister frees it; null if the instance
+    /// has none yet or `handle` names no instance of this writer.
+    pub fn storedKey(self: *Self, handle: DDS.InstanceHandle_t, buf: []u8) ?key_value.KeyCopy {
         self.instances_mu.lock();
         defer self.instances_mu.unlock();
         const kv = self.instances.get(handle) orelse return null;
-        return kv.*;
+        return if (kv.*) |k| k.copyInto(buf) else null;
     }
 
     /// get_key_value's checks around `storedKey`, for a caller holding a
     /// quiesce reference: NotEnabled until enabled (DDS 1.4 §2.2.2.1.1.7),
     /// and BadParameter for a handle that names no instance of this writer
     /// with a key (§2.2.2.4.2.9).
-    pub fn keyValue(self: *Self, handle: DDS.InstanceHandle_t) error{ NotEnabled, BadParameter }!KeyValue {
+    pub fn keyValue(self: *Self, handle: DDS.InstanceHandle_t, buf: []u8) error{ NotEnabled, BadParameter }!key_value.KeyCopy {
         if (!self.enabled.load(.acquire)) return error.NotEnabled;
-        return self.storedKey(handle) orelse error.BadParameter;
+        return self.storedKey(handle, buf) orelse error.BadParameter;
     }
 
     /// Send a NOT_ALIVE_DISPOSED change for the given instance.
@@ -651,7 +698,8 @@ pub const DataWriterImpl = struct {
         );
     }
 
-    /// Send a NOT_ALIVE_UNREGISTERED change (or NOT_ALIVE_DISPOSED if autodispose is set).
+    /// Send a NOT_ALIVE_UNREGISTERED change (NOT_ALIVE_DISPOSED_UNREGISTERED
+    /// if autodispose is set), and forget the instance as `writeRaw` does.
     /// Does not update deadline/liveliness timestamps (lifecycle, not data).
     pub fn unregisterRaw(
         self: *Self,
@@ -659,10 +707,13 @@ pub const DataWriterImpl = struct {
         key_hash: [16]u8,
     ) !void {
         const kind: history_mod.ChangeKind = if (self.autodispose.load(.monotonic))
-            .not_alive_disposed
+            .not_alive_disposed_unregistered
         else
             .not_alive_unregistered;
+        self.publish_mu.lock();
+        defer self.publish_mu.unlock();
         _ = try self.proto_writer.write(kind, source_timestamp, key_hash, key_hash, &.{});
+        self.forgetInstance(key_hash);
     }
 
     pub fn toDDSDataWriter(self: *Self) DDS.DataWriter {
@@ -1496,7 +1547,7 @@ pub const DataWriterImpl = struct {
             .ALIVE_WRITE_KIND => .alive,
             .DISPOSE_WRITE_KIND => .not_alive_disposed,
             .UNREGISTER_WRITE_KIND => if (self.autodispose.load(.monotonic))
-                .not_alive_disposed
+                .not_alive_disposed_unregistered
             else
                 .not_alive_unregistered,
             else => null,

@@ -994,10 +994,12 @@ test "suppress_live_data: KEEP_LAST eviction past floor clears flag, no malforme
 test "dispose_survives_nack_replay: not_alive_disposed replayed with correct STATUS_INFO" {
     // Verifies that non-alive ChangeKind values are stored in the cache, flow
     // through the NACK-driven replay path, and arrive at the reader with the
-    // correct STATUS_INFO inline QoS (bit 0 set = DISPOSE).
+    // correct STATUS_INFO inline QoS (bit 0 set = DISPOSE, both bits = an
+    // unregister that also disposes).
     //
-    // Writer: "data"(alive), ""(disposed), "more"(alive).
-    // Reader joins late; receives all three via NACK-driven replay.
+    // Writer: "data"(alive), ""(disposed), "more"(alive), ""(disposed and
+    // unregistered). Reader joins late; receives all four via NACK-driven
+    // replay.
     const alloc = testing.allocator;
 
     // Kind-aware collector: records (kind, data) for each received change.
@@ -1046,8 +1048,7 @@ test "dispose_survives_nack_replay: not_alive_disposed replayed with correct STA
                                 // StatusInfo_t is {unused,unused,unused,status} (RTPS §9.4.5.11):
                                 // an octet array, always big-endian regardless of message endianness.
                                 const v = std.mem.readInt(u32, si[0..4], .big);
-                                if (v & 0x1 != 0) break :blk ChangeKind.not_alive_disposed;
-                                if (v & 0x2 != 0) break :blk ChangeKind.not_alive_unregistered;
+                                break :blk @as(ChangeKind, @fromBackingInt(@intCast(v & 0x3)));
                             }
                             break :blk ChangeKind.alive;
                         } else ChangeKind.alive
@@ -1109,34 +1110,36 @@ test "dispose_survives_nack_replay: not_alive_disposed replayed with correct STA
     try mt_w.transport().listen(&W1_LOC, wd.makeHandler());
     try mt_r.transport().listen(&R1_LOC, krd.makeHandler());
 
-    // Write three changes: alive, disposed, alive.
+    // Write four changes: alive, disposed, alive, disposed and unregistered.
     _ = try writer.write(.alive, NIL_TS, NIL_IH, NIL_KH, "data");
     _ = try writer.write(.not_alive_disposed, NIL_TS, NIL_IH, NIL_KH, "");
     _ = try writer.write(.alive, NIL_TS, NIL_IH, NIL_KH, "more");
+    _ = try writer.write(.not_alive_disposed_unregistered, NIL_TS, NIL_IH, NIL_KH, "");
 
-    // Reader joins late; suppress=true, floor=3. Initial HB dropped.
+    // Reader joins late; suppress=true, floor=4. Initial HB dropped.
     const rp = try ReaderProxy.init(alloc, R1_GUID, &.{R1_LOC}, &.{}, false, true);
     try writer.addMatchedReader(rp);
     const wp = try WriterProxy.init(alloc, W1_GUID, &.{W1_LOC}, &.{}, true);
     try reader.addMatchedWriter(wp);
 
-    // Round 1: NACK-1(empty bitmap) → capped HB(1,3).
+    // Round 1: NACK-1(empty bitmap) → capped HB(1,4).
     net.deliverAll();
     try testing.expectEqual(@as(usize, 0), col.items.items.len);
 
-    // Round 2: reader NACKs SNs 1-3 → writer sends DATA(1,2,3).
+    // Round 2: reader NACKs SNs 1-4 → writer sends DATA(1,2,3,4).
     net.deliverAll();
     try testing.expectEqual(@as(usize, 0), col.items.items.len);
 
-    // Round 3: all three arrive and are delivered.
+    // Round 3: all four arrive and are delivered.
     net.deliverAll();
-    try testing.expectEqual(@as(usize, 3), col.items.items.len);
+    try testing.expectEqual(@as(usize, 4), col.items.items.len);
     try testing.expect(col.items.items[0].kind == .alive);
     try testing.expectEqualSlices(u8, "data", col.items.items[0].data);
     try testing.expect(col.items.items[1].kind == .not_alive_disposed);
     try testing.expectEqualSlices(u8, "", col.items.items[1].data);
     try testing.expect(col.items.items[2].kind == .alive);
     try testing.expectEqualSlices(u8, "more", col.items.items[2].data);
+    try testing.expect(col.items.items[3].kind == .not_alive_disposed_unregistered);
 }
 
 test "acknack_dedup: same count after retransmit is suppressed; new count is processed" {

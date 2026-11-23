@@ -49,7 +49,7 @@ fn toChangeKind(kind: WriteKind, impl: *DataWriterImpl) history_mod.ChangeKind {
         .alive => .alive,
         .dispose => .not_alive_disposed,
         .unregister => if (impl.autodispose.load(.monotonic))
-            .not_alive_disposed
+            .not_alive_disposed_unregistered
         else
             .not_alive_unregistered,
     };
@@ -232,12 +232,26 @@ pub fn getKeyValueWriter(writer: DDS.DataWriter, handle: DDS.InstanceHandle_t, a
     const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
     if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
     defer impl.releaseQuiesce();
-    const kv = try impl.keyValue(handle);
-    return .{ .payload = try allocator.dupe(u8, kv.payload), .key_only = kv.key_only };
+    return copyKeyValue(impl, handle, allocator);
+}
+
+/// The key `impl` (a writer or reader) keeps for the instance `handle`
+/// names, copied into memory from `allocator`: sized first, then copied
+/// under the endpoint's lock, as the instance may be reclaimed. A key is
+/// never replaced, so it is the same size both times; BadParameter if the
+/// instance is reclaimed in between.
+fn copyKeyValue(impl: anytype, handle: DDS.InstanceHandle_t, allocator: std.mem.Allocator) GetKeyValueError!KeyValue {
+    const size = try impl.keyValue(handle, &.{});
+    const payload = try allocator.alloc(u8, size.len);
+    errdefer allocator.free(payload);
+    const copy = try impl.keyValue(handle, payload);
+    if (!copy.copied or copy.len != payload.len) return error.BadParameter;
+    return .{ .payload = payload, .key_only = copy.key_only };
 }
 
 /// lookup_instance: the handle of the key hash's instance on this writer, or
-/// HANDLE_NIL if it was never registered or written.
+/// HANDLE_NIL if it is not registered: never registered or written, or
+/// unregistered since.
 pub fn lookupInstanceWriter(writer: DDS.DataWriter, key_hash: [16]u8) DDS.InstanceHandle_t {
     const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
     if (!impl.acquireQuiesce()) return DDS.HANDLE_NIL;
@@ -575,8 +589,7 @@ pub fn getKeyValueReader(reader: DDS.DataReader, handle: DDS.InstanceHandle_t, a
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
     defer impl.releaseQuiesce();
-    const kv = try impl.keyValue(handle);
-    return .{ .payload = try allocator.dupe(u8, kv.payload), .key_only = kv.key_only };
+    return copyKeyValue(impl, handle, allocator);
 }
 
 /// lookup_instance: the handle of the key hash's instance on this reader if

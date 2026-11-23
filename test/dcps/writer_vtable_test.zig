@@ -1061,7 +1061,7 @@ test "changeKindFromWriteKind: UNREGISTER_WRITE_KIND maps through autodispose_un
     // was never exercised by any write_raw test -- every existing one used
     // ALIVE_WRITE_KIND or DISPOSE_WRITE_KIND. autodispose_unregistered_
     // instances defaults to true, so a default-QoS writer's unregister maps
-    // to .not_alive_disposed (the branch this test hits); the `else`
+    // to .not_alive_disposed_unregistered (the branch this test hits); the `else`
     // (.not_alive_unregistered, when the QoS is false) is a one-line mirror
     // of the same ternary, not separately worth a second test.
     var fx = try SingleFixture.init(alloc);
@@ -1176,7 +1176,7 @@ test "concurrent write_raw on one DataWriter keeps its instances and last_sn con
         fn run(c: @This()) void {
             while (!c.stop.load(.acquire)) {
                 const kh = std.mem.zeroes([16]u8);
-                _ = c.impl.storedKey(c.impl.lookupInstance(kh));
+                _ = c.impl.storedKey(c.impl.lookupInstance(kh), &.{});
                 std.Thread.yield() catch {};
             }
         }
@@ -1200,7 +1200,7 @@ test "concurrent write_raw on one DataWriter keeps its instances and last_sn con
             var kh = std.mem.zeroes([16]u8);
             std.mem.writeInt(u32, kh[0..4], tid, .little);
             std.mem.writeInt(u32, kh[4..8], i, .little);
-            if (impl.storedKey(impl.lookupInstance(kh)) != null) found += 1;
+            if (impl.storedKey(impl.lookupInstance(kh), &.{}) != null) found += 1;
         }
     }
     try testing.expectEqual(@as(usize, N_THREADS * PER_THREAD), found);

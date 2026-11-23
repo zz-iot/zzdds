@@ -49,6 +49,7 @@ fn statusInfoFromKind(kind: ChangeKind) ?u32 {
         .alive => null,
         .not_alive_disposed => 0x00000001,
         .not_alive_unregistered => 0x00000002,
+        .not_alive_disposed_unregistered => 0x00000003,
     };
 }
 

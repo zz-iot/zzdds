@@ -268,14 +268,17 @@ Forward-looking only: known gaps, planned features, and open design questions.
     reflection, and every one of zzdds's own `examples/`/`stress-tests/` registrations
     passes it — see `CHANGELOG.md` 2026-09-14. Closed; not a gap anymore.
 
-- **Instances are never reclaimed.** Instance handles are allocated
-  ([`design/handle-registries.md`](design/handle-registries.md), 2026-11-19), but no
-  DataReader or DataWriter forgets an instance: memory grows with every instance a topic
-  has ever had. Reclaim a reader's instance once it is not alive, has no samples and is not
-  loaned, and a writer's on `unregister_instance`, bounded by RESOURCE_LIMITS
-  `max_instances`; the registries' generations keep handles already given out safe. The
-  reader's `max_instances` check still counts the distinct instances in `pending` with an
-  O(n²) scan, which the registry's live count can replace.
+- **READER_DATA_LIFECYCLE's autopurge delays are ignored.** A DataReader forgets an instance
+  once it is not alive, has no writers and its samples are taken
+  ([`decisions.md`](decisions.md), 2026-11-22), but `autopurge_nowriter_samples_delay` and
+  `autopurge_disposed_samples_delay` are never applied, so an application that leaves a
+  not-alive instance's samples untaken keeps the instance. Purge them on a timer once the
+  delay passes, as DDS 1.4 §2.2.3.21 describes.
+- **`autodispose_unregistered_instances` defaults to FALSE.** DDS 1.4 makes it TRUE, but
+  the generated `WriterDataLifecycleQosPolicy` zero-initializes it, and no default QoS sets
+  it, so an unregister disposes only when the application asks. Making it TRUE changes what
+  every reader sees of an unregister (NOT_ALIVE_DISPOSED rather than NOT_ALIVE_NO_WRITERS),
+  so it wants the examples and tests that expect the latter checked.
 - **The participant's `discovered_*` lists are searched linearly.**
   `discovered_participants`, `discovered_writers`, `discovered_readers` and
   `discovered_topics` are searched by GUID or name in many loops in `participant.zig`,
@@ -1007,21 +1010,13 @@ and progress that runs internal work only passes them over. Direct discovery sti
 matches synchronously on the caller's thread, but the listeners that follow run on the
 runtime. Deleting a reader or writer from application code waits for a listener
 running through it (as a runtime turn, or inline from `notify_datareaders`) to return;
-deleting it from any callback chain does not wait. On either runtime, `set_listener` and
+deleting it from any callback chain does not wait. `set_listener` and
 `set_listener_ex` from application code return once no callback runs through the
 registration they replaced or an earlier replaced one, and do not wait from a callback
-chain ([replacement completion](design/concurrency/listeners.md#replacement-completion)).
-The threaded runtime does not yet wait for a running listener when deleting a reader,
-writer or participant. So a participant deleted from the callback that a
-`set_listener` on it waits for, or from the release hook of the listener it replaces, can
-be freed under that setter; the shared runtime defers the teardown until the setter
-returns. The threaded runtime also runs a reader's or writer's listener on the thread
-that changed its status, so one endpoint's callbacks can run at once and arrive out of
-order: a match made inside `create_datawriter` and one made on a receive thread can
-deliver the later `current_count` first, leaving a listener that keeps the last count it
-saw one short. The shared runtime runs them one at a time, each claiming its status when
-it runs. Builtin-topic readers' listeners run
-the same way. One endpoint's listeners run one at a time, and different endpoints' may
+chain ([replacement completion](design/concurrency/listeners.md#replacement-completion)),
+and a participant deleted from the callback such a setter waits for, or from the release
+hook of the listener it replaces, is torn down once the setter returns. Builtin-topic
+readers' listeners run as other readers' do. One endpoint's listeners run one at a time, and different endpoints' may
 run at once on hosted workers, except that one listener runs one call at a time wherever
 it is installed, including as a parent's listener: the core identifies it by its
 `listener_identity`, else its `listener_data` (or the registration, when both are null), and a turn whose listener is
@@ -1055,8 +1050,7 @@ under a manual and a hosted driver: match, delivery, the acknowledgment and data
 missed deadline, and retirement begun from listeners, with the runtime's last owner
 deleted inside its own listener. Every participant runs on the runtime; tests that check delivery and listeners deterministically
 install a manual runtime they drive themselves (`test/support/manual_runtime.zig`).
-Remaining work: delete the threads components still start without a runtime, then the
-gaps above. The review-era
+Remaining work: the gaps above. The review-era
 synchronization prototype and bounded models stay on the `concurrency-broker-specs` branch
 (see the [evidence inventory](design/probes/README.md)). Advanced extension objects (explicit runtime owners/refs, listener groups, resource
 scopes) additionally depend on zidl's managed-reference/construction-only Config

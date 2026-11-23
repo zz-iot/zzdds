@@ -421,7 +421,25 @@ registration can be replaced and its context freed, and a writer can still be pr
 sample as its participant is deleted, while the projection's context lives on. The first
 projection a type gets is kept. With XTypes type
 information zzdds could project keys itself, leaving the whole-sample fallback for types it
-has no description of.
+has no description of. An instance keeps its key until it is forgotten (below).
+
+**Writers and readers forget instances as DDS 1.4 lets them (2026-11-22).** A DataWriter
+forgets an instance it unregisters (§2.2.2.4.2.7); its history keeps what it wrote. A
+DataReader forgets one once it is not alive, no matched writer has it registered, and none of
+its samples is cached, queued or in a coherent set (READER_DATA_LIFECYCLE, §2.2.3.21: a
+reader may reclaim an instance with no writers whose samples are all taken). A disposed
+instance whose writer still has it registered is kept, because that writer may write it
+again and its `disposed_generation_count` must carry on. Telling these apart needs the
+unregister on the wire, so an unregister under `autodispose_unregistered_instances` is sent
+as dispose and unregister together (PID_STATUS_INFO 0x3) rather than as a dispose, and a
+reader receiving 0x3 makes the instance NOT_ALIVE_DISPOSED and stops counting the writer.
+The registries' generations keep a forgotten instance's handle from naming whatever later
+takes its slot. RESOURCE_LIMITS `max_instances` bounds each registry, so on a reader it
+counts the instances held, not those with samples queued. A reader checks its candidates
+(instances that became not alive or lost a writer) as each read or take ends, after the
+samples' ranks are set, rather than at every place a sample leaves its cache.
+READER_DATA_LIFECYCLE's autopurge delays, which would forget an instance whose samples are
+not taken, are a roadmap item.
 
 **What a disabled entity takes follows DDS 1.4 §2.2.2.1.1.7, the same for every entity.**
 That section lets a disabled entity take: setting and getting its QoS, default QoS and
