@@ -16,6 +16,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   best-effort one the lowest. A sample declaring more than the byte limit is never
   reassembled, and a reliable reader counts it lost, as a GAP would. Before, a reader
   allocated whatever size a DATA_FRAG declared, up to 4 GiB, for any number of samples.
+- WRITER_DATA_LIFECYCLE `autodispose_unregistered_instances` defaults to TRUE, as DDS 1.4
+  §2.2.3.21 says (`@default(TRUE)` in `idl/dcps.idl`): a DataWriter's unregister now also
+  disposes the instance unless the application turns this off, so readers see
+  NOT_ALIVE_DISPOSED where they saw NOT_ALIVE_NO_WRITERS. The shape and registry examples
+  turn it off where they unregister to show NOT_ALIVE_NO_WRITERS, as the OMG interoperability
+  suite's `shape_main` does.
 
 ## 2026-11-22
 

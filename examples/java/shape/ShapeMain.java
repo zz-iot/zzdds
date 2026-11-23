@@ -154,6 +154,11 @@ public class ShapeMain {
             qos.get_ownership().set_kind(Dcps.DDS.OwnershipQosPolicyKind.EXCLUSIVE_OWNERSHIP_QOS);
             qos.get_ownership_strength().set_value(opts.ownershipStrength);
         }
+        // As the OMG shape_main does: an unregister then leaves the instance
+        // NOT_ALIVE_NO_WRITERS rather than disposing it.
+        if (opts.finalInstanceState == 'u') {
+            qos.get_writer_data_lifecycle().set_autodispose_unregistered_instances(false);
+        }
         qos.get_durability().set_kind(durabilityKind(opts.durability));
         setRepresentation(qos.get_data_representation(), opts.dataRepresentation);
         return qos;

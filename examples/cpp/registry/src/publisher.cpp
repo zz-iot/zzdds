@@ -113,6 +113,8 @@ int main(int argc, char **argv) {
     auto dw_qos = ::DDS::DataWriterQos::default_value();
     dw_qos.reliability.kind = ::DDS::ReliabilityQosPolicyKind::RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = ::DDS::HistoryQosPolicyKind::KEEP_ALL_HISTORY_QOS;
+    // So unregistering instance B leaves it NOT_ALIVE_NO_WRITERS, not disposed.
+    dw_qos.writer_data_lifecycle.autodispose_unregistered_instances = false;
 
     PubState state;
     auto listener = std::make_shared<PubListener>(&state);

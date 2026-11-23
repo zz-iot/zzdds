@@ -441,6 +441,13 @@ samples' ranks are set, rather than at every place a sample leaves its cache.
 READER_DATA_LIFECYCLE's autopurge delays, which would forget an instance whose samples are
 not taken, are a roadmap item.
 
+**`autodispose_unregistered_instances` defaults to TRUE (2026-11-23),** as DDS 1.4
+§2.2.3.21 says, through `@default(TRUE)` in `idl/dcps.idl`, so every binding's
+zero-initialized or default-constructed `DataWriterQos` has it, not only the Publisher's
+default. An unregister then disposes the instance too, and readers see NOT_ALIVE_DISPOSED.
+Examples that unregister to show NOT_ALIVE_NO_WRITERS turn it off, as the OMG
+interoperability suite's `shape_main` does.
+
 **What a disabled entity takes follows DDS 1.4 §2.2.2.1.1.7, the same for every entity.**
 That section lets a disabled entity take: setting and getting its QoS, default QoS and
 listener; `get_statuscondition`; factory operations; `get_status_changes` and the other

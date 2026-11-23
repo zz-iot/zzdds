@@ -239,6 +239,9 @@ void set_representation(::DDS::DataRepresentationQosPolicy &repr, uint16_t data_
         qos.ownership.kind = ::DDS::OwnershipQosPolicyKind::EXCLUSIVE_OWNERSHIP_QOS;
         qos.ownership_strength.value = opts.ownership_strength;
     }
+    // As the OMG shape_main does: an unregister then leaves the instance
+    // NOT_ALIVE_NO_WRITERS rather than disposing it.
+    if (opts.final_instance_state == 'u') qos.writer_data_lifecycle.autodispose_unregistered_instances = false;
     set_representation(qos.data_representation, opts.data_representation);
     return qos;
 }

@@ -276,6 +276,9 @@ static int build_writer_qos(DDS_Publisher pub, DDS_DataWriterQos *qos, const Opt
         qos->ownership.kind = DDS_OwnershipQosPolicyKind_EXCLUSIVE_OWNERSHIP_QOS;
         qos->ownership_strength.value = opts->ownership_strength;
     }
+    /* As the OMG shape_main does: an unregister then leaves the instance
+     * NOT_ALIVE_NO_WRITERS rather than disposing it. */
+    if (opts->final_instance_state == 'u') qos->writer_data_lifecycle.autodispose_unregistered_instances = false;
     set_representation(&qos->data_representation, opts->data_representation);
     return 0;
 }

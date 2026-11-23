@@ -531,6 +531,7 @@ test "reclamation: under exclusive ownership, a weaker writer's dropped unregist
     var strong_qos = DDS.DataWriterQos{};
     strong_qos.ownership.kind = .EXCLUSIVE_OWNERSHIP_QOS;
     strong_qos.ownership_strength.value = 10;
+    strong_qos.writer_data_lifecycle.autodispose_unregistered_instances = false;
     const pair = fx.makeWriterReader(strong_qos, dr_qos);
     var weak_qos = strong_qos;
     weak_qos.ownership_strength.value = 1;

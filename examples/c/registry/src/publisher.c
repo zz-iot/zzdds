@@ -148,6 +148,8 @@ int main(int argc, char **argv) {
     DDS_Publisher_get_default_datawriter_qos(pub, &dw_qos);
     dw_qos.reliability.kind = DDS_ReliabilityQosPolicyKind_RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = DDS_HistoryQosPolicyKind_KEEP_ALL_HISTORY_QOS;
+    /* So unregistering instance B leaves it NOT_ALIVE_NO_WRITERS, not disposed. */
+    dw_qos.writer_data_lifecycle.autodispose_unregistered_instances = false;
 
     PubState state;
     state.reader_ready = false;
