@@ -135,8 +135,13 @@ def java_cmd(zig_out: Path, classpath: Path, main_class: str, *args: str) -> lis
     ]
 
 
+# How long a build step may take. A Zig app builds its own zzdds dependency
+# from scratch, which on a GitHub Windows runner has taken more than 300s.
+BUILD_TIMEOUT_S = 900 if os.name == "nt" else 300
+
+
 def run_build(
-    cmd: list[str], *, cwd: Path, log_path: Path, timeout: int = 300, env: dict | None = None
+    cmd: list[str], *, cwd: Path, log_path: Path, timeout: int = BUILD_TIMEOUT_S, env: dict | None = None
 ) -> bool:
     """Run a build step, capturing combined stdout+stderr to log_path.
 
