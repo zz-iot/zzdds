@@ -44,7 +44,8 @@ in reassembly and the bytes they declare are bounded (`rtps.reassembly_max_sampl
 from delivery is set aside: the highest SN for a reliable reader, which delivers in order,
 and the lowest for a best-effort one, which keeps the newest. A reliable reader asks for a
 set-aside sample again once there is room. A sample larger than the byte bound cannot fit,
-so asking again cannot help, and a reliable reader settles it as lost.
+so asking again cannot help, and a reliable reader settles it as lost, whether it arrives
+after the match or was held from before it.
 
 ## Security scratch buffer
 
