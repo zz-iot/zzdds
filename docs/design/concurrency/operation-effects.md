@@ -66,11 +66,15 @@ does.
 
 A write first asks its `StatefulWriter` for room (`admitWrite`), without holding the
 DataWriter's `publish_mu`. The writer keeps its admissions in one list, oldest first:
-each waits for room or holds it. Room counts the history and every held admission
-against `max_samples` and the instance's `max_samples_per_instance`. Under KEEP_LAST, a
-change that replaces its instance's oldest takes none. A waiter takes room only when no
-waiter ahead of it also has room, so a newcomer cannot take what an older write is owed.
-Close and the deadline are checked under the same lock, at that decision.
+each waits for room or holds it. Room counts the history and the held admissions against
+`max_samples` and the instance's `max_samples_per_instance`. Under KEEP_LAST, a change
+that replaces its instance's oldest takes none, held or new: an instance grows by no more
+than its room below the depth. With neither limit set there is nothing to count. A waiter
+takes room only when no waiter ahead of it also has room and is still within its
+deadline, so a newcomer cannot take what an older write is owed, and an older write past
+its deadline holds nobody up. Close and the deadline are checked under the same lock, at
+that decision: a write that has waited to its deadline times out, even if room is freed
+then. A zero timeout only checks.
 
 Admitted, the write registers its instance under `publish_mu` and commits
 (`writeAdmitted`), which uses the held room. A writer closed in between refuses the

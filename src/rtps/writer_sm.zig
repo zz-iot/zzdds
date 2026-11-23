@@ -1047,31 +1047,37 @@ pub const StatefulWriter = struct {
     /// `timeout_ns` (null: no limit) while readers acknowledge, the oldest
     /// waiter that has room going first; one that may not returns
     /// OutOfResources at once, as a RELIABLE one does when it cannot queue.
-    /// Closed once `closeWrites` has run, before or during the wait. On a
-    /// manual runtime the wait runs its internal work, on its clock.
+    /// Closed once `closeWrites` has run, before or during the wait. A write
+    /// that has waited past its deadline times out rather than take room
+    /// freed since; a zero timeout only checks. On a manual runtime the wait
+    /// runs its internal work, on its clock.
     pub fn admitWrite(self: *Self, adm: *WriteAdmission, may_block: bool, timeout_ns: ?i64) error{ Timeout, OutOfResources, Closed }!void {
-        const clock = if (self.runtime) |rt| rt.clock else time_mod.monotonicClock();
+        const clock = self.admissionClock();
         const deadline_ns: ?i64 = if (timeout_ns) |t| clock.nowNs() +| t else null;
         self.mu.lock();
         defer self.mu.unlock();
         if (self.writes_closed) return error.Closed;
         self.admissions.ensureUnusedCapacity(self.alloc, 1) catch return error.OutOfResources;
         adm.held = false;
+        adm.deadline_ns = if (may_block) deadline_ns else null;
         self.admissions.appendAssumeCapacity(adm);
+        var waited = false;
         while (true) {
             if (self.writes_closed) {
                 self.leaveLocked(adm);
                 return error.Closed;
             }
-            if (self.mayHoldLocked(adm)) {
+            const now = clock.nowNs();
+            const expired = if (deadline_ns) |dl| now >= dl else false;
+            if ((!waited or !expired) and self.mayHoldLocked(adm, now)) {
                 adm.held = true;
                 return;
             }
-            const now = clock.nowNs();
-            if (!may_block or (if (deadline_ns) |dl| now >= dl else false)) {
+            if (!may_block or expired) {
                 self.leaveLocked(adm);
                 return if (may_block) error.Timeout else error.OutOfResources;
             }
+            waited = true;
             if (self.runtime) |rt| if (rt.canHelp()) {
                 const Wait = struct {
                     writer: *Self,
@@ -1079,7 +1085,7 @@ pub const StatefulWriter = struct {
                     fn done(w: *const @This()) bool {
                         w.writer.mu.lock();
                         defer w.writer.mu.unlock();
-                        return w.writer.writes_closed or w.writer.mayHoldLocked(w.adm);
+                        return w.writer.writes_closed or w.writer.mayHoldLocked(w.adm, w.writer.admissionClock().nowNs());
                     }
                 };
                 self.mu.unlock();
@@ -1122,37 +1128,78 @@ pub const StatefulWriter = struct {
         if (self.runtime) |rt| rt.wakeHelpers();
     }
 
-    /// Whether `adm`, still waiting, may take room now: there is room for
-    /// it, and no waiter ahead of it has room too.
-    fn mayHoldLocked(self: *Self, adm: *const WriteAdmission) bool {
+    /// The clock admission deadlines are on: the runtime's, else monotonic.
+    fn admissionClock(self: *const Self) time_mod.Clock {
+        return if (self.runtime) |rt| rt.clock else time_mod.monotonicClock();
+    }
+
+    /// Whether `adm`, still waiting, may take room now (`now` on the
+    /// writer's clock): there is room for it, and no waiter ahead of it
+    /// both has room and is still within its deadline.
+    fn mayHoldLocked(self: *Self, adm: *const WriteAdmission, now: i64) bool {
         for (self.admissions.items) |other| {
             if (other == adm) return self.hasRoomLocked(adm.instance);
-            if (!other.held and self.hasRoomLocked(other.instance)) return false;
+            if (other.held) continue;
+            if (other.deadline_ns) |dl| if (now >= dl) continue;
+            if (self.hasRoomLocked(other.instance)) return false;
         }
         unreachable;
     }
 
     /// Whether a change of `instance` fits the RESOURCE_LIMITS, counting
-    /// the room held for admitted writes. Under KEEP_LAST, one that replaces
-    /// its instance's oldest change takes no room.
+    /// the room held for admitted writes. Under KEEP_LAST, a change that
+    /// replaces its instance's oldest takes no room, whether it is this one
+    /// or one held already.
     fn hasRoomLocked(self: *Self, instance: InstanceHandle) bool {
-        var in_instance: usize = 0;
-        var held: usize = 0;
-        var held_in_instance: usize = 0;
-        for (self.cache.changes.items) |*ch| {
-            if (std.mem.eql(u8, &ch.instance_handle, &instance)) in_instance += 1;
-        }
-        for (self.admissions.items) |a| {
-            if (!a.held) continue;
-            held += 1;
-            if (std.mem.eql(u8, &a.instance, &instance)) held_in_instance += 1;
-        }
-        const per_instance = in_instance + held_in_instance;
-        if (self.cache.kind == .keep_last and self.cache.depth > 0 and per_instance >= self.cache.depth) return true;
         const lim = self.write_limits;
+        if (lim.max_samples == 0 and lim.max_samples_per_instance == 0) return true;
+        const per_instance = self.instanceCountLocked(instance) + self.heldForLocked(instance);
+        if (self.keepLastDepth()) |depth| if (per_instance >= depth) return true;
         if (lim.max_samples_per_instance > 0 and per_instance >= lim.max_samples_per_instance) return false;
-        if (lim.max_samples > 0 and self.cache.len() + held >= lim.max_samples) return false;
+        if (lim.max_samples > 0 and self.cache.len() + self.heldGrowthLocked() >= lim.max_samples) return false;
         return true;
+    }
+
+    fn keepLastDepth(self: *const Self) ?usize {
+        return if (self.cache.kind == .keep_last and self.cache.depth > 0) self.cache.depth else null;
+    }
+
+    fn instanceCountLocked(self: *const Self, instance: InstanceHandle) usize {
+        var n: usize = 0;
+        for (self.cache.changes.items) |*ch| {
+            if (std.mem.eql(u8, &ch.instance_handle, &instance)) n += 1;
+        }
+        return n;
+    }
+
+    fn heldForLocked(self: *const Self, instance: InstanceHandle) usize {
+        var n: usize = 0;
+        for (self.admissions.items) |a| {
+            if (a.held and std.mem.eql(u8, &a.instance, &instance)) n += 1;
+        }
+        return n;
+    }
+
+    /// How much the held admissions will grow the history once they
+    /// commit: under KEEP_LAST, each instance by no more than its room
+    /// below the depth.
+    fn heldGrowthLocked(self: *const Self) usize {
+        const depth = self.keepLastDepth() orelse {
+            var n: usize = 0;
+            for (self.admissions.items) |a| n += @intFromBool(a.held);
+            return n;
+        };
+        var growth: usize = 0;
+        for (self.admissions.items, 0..) |a, i| {
+            if (!a.held) continue;
+            // Each instance once, at its first held admission.
+            const seen = for (self.admissions.items[0..i]) |b| {
+                if (b.held and std.mem.eql(u8, &b.instance, &a.instance)) break true;
+            } else false;
+            if (seen) continue;
+            growth += @min(self.heldForLocked(a.instance), depth -| self.instanceCountLocked(a.instance));
+        }
+        return growth;
     }
 
     /// With `drop_acked`, drops the changes every reliable reader has

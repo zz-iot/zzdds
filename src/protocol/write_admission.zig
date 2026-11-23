@@ -15,4 +15,7 @@ pub const WriteLimits = struct {
 pub const WriteAdmission = struct {
     instance: history_mod.InstanceHandle,
     held: bool = false,
+    /// When a waiting write gives up, on its writer's clock; null: never.
+    /// Past it, the write no longer keeps newer ones from room.
+    deadline_ns: ?i64 = null,
 };

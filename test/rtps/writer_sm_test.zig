@@ -2586,6 +2586,81 @@ test "admitWrite: a newcomer does not take room an older waiter has room for" {
     w.releaseAdmission(&newcomer);
 }
 
+test "admitWrite: under KEEP_LAST a held replacement takes no room from another instance" {
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(testing.allocator, makeGuid(0x72, WRITER_EID), rec.makeTransport(), .keep_last, 1, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    defer w.deinit();
+    w.setWriteLimits(.{ .max_samples = 2 });
+    _ = try w.write(.alive, ZERO_TS, instance(1), NIL_KH, "a");
+
+    // Instance 1's next change replaces its only one.
+    var same: WriteAdmission = .{ .instance = instance(1) };
+    try w.admitWrite(&same, false, null);
+    defer w.releaseAdmission(&same);
+    var other: WriteAdmission = .{ .instance = instance(2) };
+    try w.admitWrite(&other, false, null);
+    w.releaseAdmission(&other);
+}
+
+test "admitWrite: an older waiter past its deadline does not keep room from a newcomer" {
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(testing.allocator, makeGuid(0x73, WRITER_EID), rec.makeTransport(), .keep_all, 0, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    defer w.deinit();
+    w.setWriteLimits(.{ .max_samples = 1 });
+
+    // A waiter whose deadline has passed but which has not yet resumed to
+    // time out.
+    var older: WriteAdmission = .{ .instance = instance(1), .deadline_ns = 0 };
+    {
+        w.mu.lock();
+        defer w.mu.unlock();
+        try w.admissions.append(testing.allocator, &older);
+    }
+    defer w.releaseAdmission(&older);
+    var newcomer: WriteAdmission = .{ .instance = instance(2) };
+    try w.admitWrite(&newcomer, false, null);
+    w.releaseAdmission(&newcomer);
+}
+
+test "admitWrite: a write that waited to its deadline times out, even if room is freed then" {
+    var sb = zzdds.runtime.ScriptedBackend.init(0);
+    var runtime = zzdds.runtime.Runtime.init(sb.clock(), sb.backend(), .{ .mode = .manual });
+    const a = makeGuid(0x74, READER_EID);
+    const b = makeGuid(0x75, READER_EID);
+    var rec: Recording = .{};
+    const w = try makeDroppingWriter(&rec, a, b, true);
+    w.attachRuntime(&runtime);
+    w.setWriteLimits(.{ .max_samples = 3 });
+
+    // Acknowledgments that free room arrive exactly at the deadline.
+    const Freer = struct {
+        timer: zzdds.runtime.Timer,
+        writer: *StatefulWriter,
+        a: Guid,
+        b: Guid,
+        fn fire(t: *zzdds.runtime.Timer, _: *zzdds.runtime.Turn) void {
+            const self: *@This() = @fieldParentPtr("timer", t);
+            pureAck(self.writer, self.a, 1, 1);
+            pureAck(self.writer, self.b, 1, 1);
+        }
+    };
+    var context = zzdds.runtime.Context.init(&runtime, 4);
+    var freer: Freer = .{ .timer = zzdds.runtime.Timer.init(&context, Freer.fire), .writer = w, .a = a, .b = b };
+    const timeout_ns = 50 * std.time.ns_per_ms;
+    _ = runtime.armTimer(&freer.timer, timeout_ns);
+
+    var adm: WriteAdmission = .{ .instance = NIL_IH };
+    try testing.expectError(error.Timeout, w.admitWrite(&adm, true, timeout_ns));
+    // The room was freed, and is there for the next write.
+    try testing.expectEqual(@as(usize, 2), cacheLen(w));
+
+    context.deinit();
+    w.deinit();
+    runtime.releaseOwner();
+    while (runtime.getState() != .backend_stopped) _ = runtime.drive(64, 0) catch break;
+    runtime.deinit();
+}
+
 test "closeWrites: refuses new writes and commits of admitted ones" {
     var rec: Recording = .{};
     const w = try StatefulWriter.init(testing.allocator, makeGuid(0x70, WRITER_EID), rec.makeTransport(), .keep_all, 0, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
