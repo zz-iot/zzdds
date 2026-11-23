@@ -13,6 +13,7 @@ const IntraProcessDelivery = zzdds.intraprocess.IntraProcessDelivery;
 const DomainParticipantFactoryImpl = zzdds.dcps.DomainParticipantFactoryImpl;
 const DataWriterImpl = zzdds.dcps.DataWriterImpl;
 const DataReaderImpl = zzdds.dcps.DataReaderImpl;
+const DomainParticipantImpl = zzdds.dcps.DomainParticipantImpl;
 const TopicImpl = zzdds.dcps.TopicImpl;
 const nil = zzdds.dcps;
 const noop_security = zzdds.noop_security.noop_security_plugins;
@@ -610,6 +611,125 @@ test "max_instances: a reader rejects a new instance beyond it, until one is for
     fx.settle();
     const b = try takeAll(pair.dr);
     try testing.expect(b.valid_data);
+}
+
+// ── READER_DATA_LIFECYCLE autopurge ──────────────────────────────────────────
+//
+// The reader's timers run on the manual runtime's clock, which the tests move
+// and then check, as qos_runtime_test's DEADLINE tests do.
+
+fn checkReaderTimers(fx: *Fixture) void {
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(fx.dp_r.ptr));
+    dp_impl.checkTimers();
+    fx.settle();
+}
+
+const ONE_SECOND: DDS.Duration_t = .{ .sec = 1, .nanosec = 0 };
+
+test "autopurge: a NOT_ALIVE_NO_WRITERS instance's untaken samples go after its delay, and it is forgotten" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const mc = fx.mr.manualClock();
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.writer_data_lifecycle.autodispose_unregistered_instances = false;
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    dr_qos.reader_data_lifecycle.autopurge_nowriter_samples_delay = ONE_SECOND;
+    const pair = fx.makeWriterReader(dw_qos, dr_qos);
+
+    try writeAlive(pair.dw);
+    try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_KEY);
+    fx.settle();
+    try testing.expectEqual(@as(usize, 2), pair.dr.pending.items.len);
+
+    mc.advance(std.time.ns_per_s - 1);
+    checkReaderTimers(&fx);
+    try testing.expectEqual(@as(usize, 2), pair.dr.pending.items.len);
+
+    mc.advance(1);
+    checkReaderTimers(&fx);
+    try testing.expectEqual(@as(usize, 0), pair.dr.pending.items.len);
+    try testing.expectEqual(@as(u32, 0), pair.dr.instances.count());
+    try testing.expect(pair.dr.takeRaw() == null);
+}
+
+test "autopurge: a disposed instance's samples go after its delay, and a registered one is kept" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const mc = fx.mr.manualClock();
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    dr_qos.reader_data_lifecycle.autopurge_disposed_samples_delay = ONE_SECOND;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
+
+    try writeAlive(pair.dw);
+    _ = try pair.dw.writeRaw(.not_alive_disposed, RtpsTimestamp.now(), NIL_KEY, &.{});
+    fx.settle();
+    try testing.expectEqual(@as(usize, 2), pair.dr.pending.items.len);
+
+    mc.advance(std.time.ns_per_s);
+    checkReaderTimers(&fx);
+    try testing.expect(pair.dr.takeRaw() == null);
+    // Its writer still has it registered, so it is kept, and its generation
+    // counts carry on.
+    try testing.expectEqual(@as(u32, 1), pair.dr.instances.count());
+    try writeAlive(pair.dw);
+    fx.settle();
+    const alive = try takeAll(pair.dr);
+    try testing.expectEqual(@as(i32, 1), alive.disposed_generation_count);
+}
+
+test "autopurge: an instance alive again before its delay keeps its samples" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const mc = fx.mr.manualClock();
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    dr_qos.reader_data_lifecycle.autopurge_disposed_samples_delay = ONE_SECOND;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
+
+    _ = try pair.dw.writeRaw(.not_alive_disposed, RtpsTimestamp.now(), NIL_KEY, &.{});
+    fx.settle();
+    mc.advance(std.time.ns_per_s / 2);
+    try writeAlive(pair.dw);
+    fx.settle();
+    mc.advance(std.time.ns_per_s);
+    checkReaderTimers(&fx);
+    try testing.expectEqual(@as(usize, 2), pair.dr.pending.items.len);
+}
+
+test "autopurge: zero and infinite delays never purge, and set_qos can start one" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const mc = fx.mr.manualClock();
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reader_data_lifecycle.autopurge_disposed_samples_delay = .{
+        .sec = DDS.DURATION_INFINITE_SEC,
+        .nanosec = DDS.DURATION_INFINITE_NSEC,
+    };
+    const pair = fx.makeWriterReader(.{}, dr_qos);
+
+    _ = try pair.dw.writeRaw(.not_alive_disposed, RtpsTimestamp.now(), NIL_KEY, &.{});
+    try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_KEY);
+    fx.settle();
+    mc.advance(3600 * std.time.ns_per_s);
+    checkReaderTimers(&fx);
+    try testing.expectEqual(@as(usize, 1), pair.dr.pending.items.len);
+
+    // The delay counts from when the instance became not alive.
+    const dr = pair.dr.toDDSDataReader();
+    var qos = DDS.DataReaderQos{};
+    defer qos.deinit(alloc);
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.get_qos(dr.ptr, &qos));
+    qos.reader_data_lifecycle.autopurge_disposed_samples_delay = ONE_SECOND;
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.set_qos(dr.ptr, &qos));
+    checkReaderTimers(&fx);
+    try testing.expectEqual(@as(usize, 0), pair.dr.pending.items.len);
+    try testing.expectEqual(@as(u32, 0), pair.dr.instances.count());
 }
 
 // ── Keyless topic, end-to-end via a real on_data_available listener ─────────

@@ -348,6 +348,17 @@ const InstanceEntry = struct {
 
 const InstanceRegistry = handle_registry.HandleRegistry([16]u8, InstanceEntry);
 
+/// A not-alive instance's state, and when (on the reader's timer clock) it
+/// entered it: `DataReaderImpl.not_alive_since`.
+const NotAlive = struct {
+    state: DDS.InstanceStateKind,
+    since_ns: i64,
+    /// Purged while a coherent set held samples of it: not timed again
+    /// until those samples reach the cache, or the instance changes, when
+    /// it is purged at the next check.
+    held: bool = false,
+};
+
 fn matchesSample(
     pc: *const PendingChange,
     sample_mask: DDS.SampleStateMask,
@@ -473,6 +484,10 @@ pub const DataReaderImpl = struct {
     deadline_ns: std.atomic.Value(i64) = .init(0),
     /// TIME_BASED_FILTER's minimum separation in ns, 0 for none.
     tbf_ns: std.atomic.Value(i64) = .init(0),
+    /// READER_DATA_LIFECYCLE's autopurge delays in ns, 0 for never: zero, as
+    /// the policy is zero-initialized, means never, like DURATION_INFINITE.
+    autopurge_nowriter_ns: std.atomic.Value(i64) = .init(0),
+    autopurge_disposed_ns: std.atomic.Value(i64) = .init(0),
 
     /// Monotonic timestamp of the last sample received; used by DEADLINE checks.
     /// Initialized to creation time so the first deadline window starts at entity creation.
@@ -624,6 +639,10 @@ pub const DataReaderImpl = struct {
     /// Checked as reads and takes end (`reclaimInstancesLocked`), which uses
     /// the values to mark those a cached sample still holds.
     reclaim_candidates: std.AutoArrayHashMapUnmanaged([16]u8, bool) = .empty,
+    /// The not-alive instances by key hash, with when each became so, for
+    /// READER_DATA_LIFECYCLE's autopurge (`purgeDueLocked`). An instance
+    /// leaves it as it becomes alive, is purged or is forgotten.
+    not_alive_since: std.AutoArrayHashMapUnmanaged([16]u8, NotAlive) = .empty,
     /// The type's projection of a sample to its key, set as the reader is
     /// created (`key_value.KeyProjection`) and released as it is freed; null
     /// keeps whole samples.
@@ -894,6 +913,7 @@ pub const DataReaderImpl = struct {
         while (it.next()) |e| if (e.value.key) |kv| alloc.free(kv.payload);
         self.instances.deinit(alloc);
         self.reclaim_candidates.deinit(alloc);
+        self.not_alive_since.deinit(alloc);
     }
 
     /// The instance with `key_hash`, registering it if it is new:
@@ -970,7 +990,132 @@ pub const DataReaderImpl = struct {
             if (self.instanceHasWriterLocked(entry.handle)) continue;
             const removed = self.instances.remove(handle).?;
             if (removed.key) |kv| self.alloc.free(kv.payload);
+            _ = self.not_alive_since.swapRemove(key_hash);
         }
+    }
+
+    /// Applies a change of `kind` to `entry`, the instance with `key_hash`,
+    /// and notes when it becomes not alive, for autopurge. With `mu` held.
+    fn applyChangeLocked(self: *Self, entry: *InstanceEntry, key_hash: [16]u8, kind: history_mod.ChangeKind) InstanceEntry.States {
+        const states = entry.applyChange(kind);
+        if (states.instance_state == DDS.ALIVE_INSTANCE_STATE) {
+            _ = self.not_alive_since.swapRemove(key_hash);
+            return states;
+        }
+        // Out of memory, the instance is never purged.
+        const r = self.not_alive_since.getOrPut(self.alloc, key_hash) catch return states;
+        if (r.found_existing and r.value_ptr.state == states.instance_state) {
+            // Overdue already: this change's sample goes at the next check.
+            if (r.value_ptr.held) self.releasePurgeHoldLocked(r.value_ptr);
+            return states;
+        }
+        r.value_ptr.* = .{ .state = states.instance_state, .since_ns = self.timer_clock.nowNs() };
+        if (self.autopurgeNs(states.instance_state) > 0) self.timersChanged();
+        return states;
+    }
+
+    /// Times a held instance's purge again: it is overdue, so the next check
+    /// purges it. With `mu` held.
+    fn releasePurgeHoldLocked(self: *Self, na: *NotAlive) void {
+        na.held = false;
+        self.timersChanged();
+    }
+
+    /// Whether a coherent set, in progress or awaiting `begin_access`, holds
+    /// a sample of the instance with `key_hash`. With `mu` held.
+    fn coherentSetHoldsLocked(self: *Self, key_hash: [16]u8) bool {
+        var wip_it = self.coherent_wip.valueIterator();
+        while (wip_it.next()) |wip| for (wip.samples.items) |pc| {
+            if (std.mem.eql(u8, &pc.key_hash, &key_hash)) return true;
+        };
+        for (self.coherent_committed.items) |cs| for (cs.samples.items) |pc| {
+            if (std.mem.eql(u8, &pc.key_hash, &key_hash)) return true;
+        };
+        return false;
+    }
+
+    /// Coherent samples are dropped before reaching the cache: an instance
+    /// whose purge they held is due at the next check, and each of theirs
+    /// may now be forgotten (`reclaimInstancesLocked`, as a read or take
+    /// ends or a purge runs). Call before freeing them, with `mu` held.
+    fn coherentSamplesDroppedLocked(self: *Self, samples: []const PendingChange) void {
+        for (samples) |pc| {
+            self.markReclaimCandidateLocked(pc.key_hash);
+            if (self.not_alive_since.getPtr(pc.key_hash)) |na| if (na.held) self.releasePurgeHoldLocked(na);
+        }
+    }
+
+    /// The autopurge delay in ns for an instance in `state`, 0 for never.
+    fn autopurgeNs(self: *Self, state: DDS.InstanceStateKind) i64 {
+        return if (state == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE)
+            self.autopurge_disposed_ns.load(.monotonic)
+        else
+            self.autopurge_nowriter_ns.load(.monotonic);
+    }
+
+    /// READER_DATA_LIFECYCLE (DDS 1.4 §2.2.3.22): drops the queued samples,
+    /// read or not, of each instance that has been NOT_ALIVE_NO_WRITERS or
+    /// NOT_ALIVE_DISPOSED for its state's autopurge delay, then forgets the
+    /// instance unless a writer still has it registered or a coherent set
+    /// still holds a sample of it (`reclaimInstancesLocked`). An instance a
+    /// coherent set holds samples of stays due, `held`, and is purged again
+    /// once they reach the cache. Run from the timer check with `mu` held.
+    fn purgeDueLocked(self: *Self, now_ns: i64) void {
+        if (self.autopurge_nowriter_ns.load(.monotonic) == 0 and
+            self.autopurge_disposed_ns.load(.monotonic) == 0) return;
+        var purged = false;
+        // Downwards, as removing one moves the last into its place.
+        var i = self.not_alive_since.count();
+        while (i > 0) {
+            i -= 1;
+            const na = &self.not_alive_since.values()[i];
+            if (na.held) continue;
+            const delay = self.autopurgeNs(na.state);
+            if (delay == 0 or now_ns - na.since_ns < delay) continue;
+            const key_hash = self.not_alive_since.keys()[i];
+            if (self.coherentSetHoldsLocked(key_hash)) {
+                na.held = true;
+            } else {
+                self.not_alive_since.swapRemoveAt(i);
+            }
+            // The samples begin_access() ordered, and only those, stay before
+            // the watermark: it drops by as many as go from before it.
+            const window = self.ordered_access_watermark;
+            var purged_in_window: usize = 0;
+            var kept: usize = 0;
+            for (self.pending.items, 0..) |pc, j| {
+                if (std.mem.eql(u8, &pc.key_hash, &key_hash)) {
+                    pc.quiesce.beginTeardown(pc, PendingChange.reallyFree);
+                    if (window) |wm| if (j < wm) {
+                        purged_in_window += 1;
+                    };
+                } else {
+                    self.pending.items[kept] = pc;
+                    kept += 1;
+                }
+            }
+            self.pending.shrinkRetainingCapacity(kept);
+            if (self.ordered_access_watermark) |*wm| wm.* -= purged_in_window;
+            self.markReclaimCandidateLocked(key_hash);
+            purged = true;
+        }
+        if (purged) self.reclaimInstancesLocked();
+    }
+
+    /// When the next not-alive instance is due to be purged, or null.
+    /// With `mu` held.
+    fn nextPurgeDueLocked(self: *Self) ?i64 {
+        if (self.autopurge_nowriter_ns.load(.monotonic) == 0 and
+            self.autopurge_disposed_ns.load(.monotonic) == 0) return null;
+        var next: ?i64 = null;
+        for (self.not_alive_since.values()) |na| {
+            if (na.held) continue;
+            const delay = self.autopurgeNs(na.state);
+            if (delay == 0) continue;
+            const due = na.since_ns + delay;
+            next = if (next) |n| @min(n, due) else due;
+        }
+        return next;
     }
 
     /// Gives the instance its key from this change if it has none yet: an
@@ -1012,7 +1157,7 @@ pub const DataReaderImpl = struct {
             return;
         };
         if (kind != .alive) self.markReclaimCandidateLocked(key_hash);
-        const states = entry.applyChange(kind);
+        const states = self.applyChangeLocked(entry, key_hash, kind);
         const info = DDS.SampleInfo{
             .sample_state = DDS.NOT_READ_SAMPLE_STATE,
             .view_state = states.view,
@@ -1277,7 +1422,7 @@ pub const DataReaderImpl = struct {
             // is incomplete anyway.
             const wip = self.coherent_wip.getPtr(change.writer_guid) orelse
                 return self.dropSampleUnlock(copy, coherent_queued);
-            const states = entry.applyChange(change.kind);
+            const states = self.applyChangeLocked(entry, change.key_hash, change.kind);
             self.storeKeyIfNeeded(entry, change.kind, copy);
             const src_time = change.source_timestamp.toTime();
             const coh_expiry: ?i64 = if (change.kind == .alive)
@@ -1380,7 +1525,7 @@ pub const DataReaderImpl = struct {
         if (reject_reason) |reason| return self.rejectSampleUnlock(reason, ih, copy, coherent_queued);
 
         // Build SampleInfo from the CacheChange.
-        const states = entry.applyChange(change.kind);
+        const states = self.applyChangeLocked(entry, change.key_hash, change.kind);
         self.storeKeyIfNeeded(entry, change.kind, copy);
         const src_time = change.source_timestamp.toTime();
         const expiry: ?i64 = if (change.kind == .alive)
@@ -1532,6 +1677,7 @@ pub const DataReaderImpl = struct {
         const complete = wip.intact and ended_cleanly;
         const group_scope = self.subscriber_presentation.access_scope == .GROUP_PRESENTATION_QOS;
         if (!complete) {
+            self.coherentSamplesDroppedLocked(wip.samples.items);
             for (wip.samples.items) |pc| pc.deinit();
             wip.samples.clearRetainingCapacity();
             // Discarded (RTPS 2.5 §8.7.6).  In GROUP scope the rest of its group
@@ -1548,6 +1694,7 @@ pub const DataReaderImpl = struct {
             .group_cs = wip.group_cs,
             .complete = complete,
         }) catch {
+            self.coherentSamplesDroppedLocked(wip.samples.items);
             for (wip.samples.items) |pc| pc.deinit();
             wip.samples.deinit(self.alloc);
             return false;
@@ -1789,6 +1936,7 @@ pub const DataReaderImpl = struct {
         _ = self.coherent_writers.remove(guid);
         if (self.coherent_wip.fetchRemove(guid)) |kv| {
             var wip = kv.value;
+            self.coherentSamplesDroppedLocked(wip.samples.items);
             for (wip.samples.items) |pc| pc.deinit();
             wip.samples.deinit(self.alloc);
         }
@@ -1854,7 +2002,7 @@ pub const DataReaderImpl = struct {
                 // a synthesized NOT_ALIVE_NO_WRITERS can fire this early). XCDR1 LE, no
                 // options, matches every other binding's default representation.
                 const empty = self.alloc.dupe(u8, &.{ 0x00, 0x01, 0x00, 0x00 }) catch continue;
-                const states = si.applyChange(.not_alive_unregistered);
+                const states = self.applyChangeLocked(si, key_hash, .not_alive_unregistered);
                 const now = time_mod.Time.now();
                 const pc = self.alloc.create(PendingChange) catch {
                     self.alloc.free(empty);
@@ -1929,6 +2077,7 @@ pub const DataReaderImpl = struct {
         // Pre-allocate so the append loop is all-or-nothing.  On OOM the entire
         // set is discarded rather than partially committed.
         self.pending.ensureUnusedCapacity(self.alloc, set.samples.items.len) catch {
+            self.coherentSamplesDroppedLocked(set.samples.items);
             set.deinit(self.alloc);
             return;
         };
@@ -1955,6 +2104,7 @@ pub const DataReaderImpl = struct {
                 // for this whole function, and these entries were never
                 // reachable outside it) -- so it's a fast-path no-op here,
                 // not load-bearing, just consistent.
+                self.coherentSamplesDroppedLocked(set.samples.items);
                 for (self.pending.items[start..]) |appended| appended.quiesce.beginTeardown(appended, PendingChange.reallyFree);
                 self.pending.items.len = start;
                 for (set.samples.items[i..]) |remaining| remaining.deinit();
@@ -1966,12 +2116,17 @@ pub const DataReaderImpl = struct {
         }
         set.samples.deinit(self.alloc);
         if (self.pending.items.len > start) self.markDataAvailableLocked();
+        // Samples of an instance purged while they were held are due now.
+        for (self.pending.items[start..]) |pc| {
+            if (self.not_alive_since.getPtr(pc.key_hash)) |na| if (na.held) self.releasePurgeHoldLocked(na);
+        }
         // data_notifiers are fired by the subscriber after releasing all locks.
     }
 
     /// Drop queued set `idx` without exposing it.  Called with self.mu held.
     pub fn discardCommittedSetLocked(self: *Self, idx: usize) void {
         var set = self.coherent_committed.orderedRemove(idx);
+        self.coherentSamplesDroppedLocked(set.samples.items);
         set.deinit(self.alloc);
         self.updateCommittedReadyLocked();
     }
@@ -3050,7 +3205,8 @@ pub const DataReaderImpl = struct {
     }
 
     /// Called by participant.checkTimers() for each active reader.
-    /// Checks DEADLINE and LIVELINESS lease expiry; fires notifications when thresholds exceeded.
+    /// Checks DEADLINE and LIVELINESS lease expiry, firing notifications when
+    /// thresholds are exceeded, and purges what READER_DATA_LIFECYCLE says to.
     /// Called with participant.mu NOT held (checkTimers() collects the due
     /// callbacks under the lock, then releases it before calling any of
     /// them) -- safe for this (and the deadline and liveliness listeners
@@ -3091,6 +3247,7 @@ pub const DataReaderImpl = struct {
                 liveliness_changed = true;
             }
         }
+        self.purgeDueLocked(now_ns);
         self.mu.unlock();
         if (liveliness_changed) self.raise(DDS.LIVELINESS_CHANGED_STATUS);
     }
@@ -3109,6 +3266,7 @@ pub const DataReaderImpl = struct {
             const due = entry.last_alive_ns + entry.lease_ns;
             next = if (next) |n| @min(n, due) else due;
         }
+        if (self.nextPurgeDueLocked()) |due| next = if (next) |n| @min(n, due) else due;
         return next;
     }
 
@@ -3490,7 +3648,7 @@ pub const DataReaderImpl = struct {
             qos_change.swapReaderChangeable(&self.qos, &new_qos);
             new_qos.deinit(self.alloc);
             self.cacheChangeable();
-            // A shorter deadline may fall due sooner.
+            // A shorter deadline or autopurge delay may fall due sooner.
             self.timersChanged();
         }
         // Announced without `qos_mu`: a change made while this is announced
@@ -3499,12 +3657,18 @@ pub const DataReaderImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    /// Copies into `deadline_ns` and `tbf_ns` what they cache of `qos`.
+    /// Copies into `deadline_ns`, `tbf_ns` and the autopurge delays what they
+    /// cache of `qos`.
     fn cacheChangeable(self: *Self) void {
         const dl = self.qos.deadline.period;
         self.deadline_ns.store(if (durationIsActive(dl)) durationNs(dl) else 0, .monotonic);
         const sep = self.qos.time_based_filter.minimum_separation;
         self.tbf_ns.store(durationNs(sep), .monotonic);
+        const rdl = self.qos.reader_data_lifecycle;
+        const nowriter = rdl.autopurge_nowriter_samples_delay;
+        self.autopurge_nowriter_ns.store(if (durationIsActive(nowriter)) durationNs(nowriter) else 0, .monotonic);
+        const disposed = rdl.autopurge_disposed_samples_delay;
+        self.autopurge_disposed_ns.store(if (durationIsActive(disposed)) durationNs(disposed) else 0, .monotonic);
     }
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.DataReaderQos) DDS.ReturnCode_t {
@@ -4783,6 +4947,117 @@ test "takeRaw: absolute_generation_rank reflects live generation ahead of a stal
     try testing.expectEqual(@as(i32, 0), taken.info.sample_rank);
     try testing.expectEqual(@as(i32, 0), taken.info.generation_rank);
     try testing.expectEqual(@as(i32, 1), taken.info.absolute_generation_rank);
+}
+
+/// A queued sample of the instance with `key_hash`, for the autopurge tests.
+fn appendTestSample(dr: *DataReaderImpl, alloc: std.mem.Allocator, key_hash: [16]u8, byte: u8) !void {
+    const ih = (try dr.instanceForKeyLocked(key_hash, DDS.HANDLE_NIL)).handle;
+    const pc = try alloc.create(PendingChange);
+    pc.* = .{
+        .data = try alloc.dupe(u8, &.{byte}),
+        .alloc = alloc,
+        .info = .{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.ALIVE_INSTANCE_STATE, .instance_handle = ih, .valid_data = true },
+        .key_hash = key_hash,
+    };
+    try dr.pending.append(alloc, pc);
+}
+
+test "purgeDueLocked: purging inside begin_access's window keeps later arrivals out of it" {
+    const alloc = testing.allocator;
+    var clock = time_test.ManualClock.init(0);
+    var dr = mkTestReaderForGenerationTests(alloc, &clock);
+    defer deinitTestReader(&dr, alloc);
+    dr.autopurge_disposed_ns.store(std.time.ns_per_s, .monotonic);
+
+    var key_a = std.mem.zeroes([16]u8);
+    key_a[15] = 1;
+    const key_b = std.mem.zeroes([16]u8);
+    try appendTestSample(&dr, alloc, key_a, 0xA1);
+    try appendTestSample(&dr, alloc, key_a, 0xA2);
+    try appendTestSample(&dr, alloc, key_b, 0xB1);
+    try dr.not_alive_since.put(alloc, key_a, .{ .state = DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, .since_ns = 0 });
+    // begin_access() ordered these three; more arrive after it, one of them
+    // of the purged instance.
+    dr.ordered_access_watermark = dr.pending.items.len;
+    try appendTestSample(&dr, alloc, key_b, 0xB2);
+    try appendTestSample(&dr, alloc, key_a, 0xA3);
+
+    dr.purgeDueLocked(std.time.ns_per_s);
+    try testing.expectEqual(@as(?usize, 1), dr.ordered_access_watermark);
+    const taken = dr.takeRaw() orelse return error.TestExpectedNonNull;
+    defer alloc.free(taken.data);
+    try testing.expectEqual(@as(u8, 0xB1), taken.data[0]);
+    try testing.expect(dr.takeRaw() == null);
+}
+
+test "purgeDueLocked: an instance a coherent set holds samples of is purged again once they are given to the application" {
+    const alloc = testing.allocator;
+    var clock = time_test.ManualClock.init(0);
+    var dr = mkTestReaderForGenerationTests(alloc, &clock);
+    defer deinitTestReader(&dr, alloc);
+    dr.autopurge_disposed_ns.store(std.time.ns_per_s, .monotonic);
+
+    const key = std.mem.zeroes([16]u8);
+    try appendTestSample(&dr, alloc, key, 0x01);
+    const writer = std.mem.zeroes(Guid);
+    var set: CommittedSet = .{ .writer_guid = writer, .publisher = writer, .group_cs = null, .complete = true };
+    try set.samples.append(alloc, PendingChange{
+        .data = try alloc.dupe(u8, &.{0x02}),
+        .alloc = alloc,
+        .info = dr.pending.items[0].info,
+        .key_hash = key,
+    });
+    try dr.coherent_committed.append(alloc, set);
+    try dr.not_alive_since.put(alloc, key, .{ .state = DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, .since_ns = 0 });
+
+    // Due: its queued sample goes, but the set's is held, and so is the
+    // instance's purge, which is not timed meanwhile.
+    dr.purgeDueLocked(std.time.ns_per_s);
+    try testing.expectEqual(@as(usize, 0), dr.pending.items.len);
+    try testing.expect(dr.not_alive_since.get(key).?.held);
+    try testing.expectEqual(@as(?i64, null), dr.nextPurgeDueLocked());
+
+    // begin_access() gives the set's sample to the application: it is due.
+    dr.promoteCommittedSetLocked(0);
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
+    try testing.expectEqual(@as(?i64, std.time.ns_per_s), dr.nextPurgeDueLocked());
+    dr.purgeDueLocked(std.time.ns_per_s);
+    try testing.expectEqual(@as(usize, 0), dr.pending.items.len);
+    try testing.expect(dr.not_alive_since.get(key) == null);
+}
+
+test "purgeDueLocked: an instance held by a coherent set that is discarded is purged and forgotten" {
+    const alloc = testing.allocator;
+    var clock = time_test.ManualClock.init(0);
+    var dr = mkTestReaderForGenerationTests(alloc, &clock);
+    defer deinitTestReader(&dr, alloc);
+    dr.autopurge_disposed_ns.store(std.time.ns_per_s, .monotonic);
+
+    const key = std.mem.zeroes([16]u8);
+    const ih = (try dr.instanceForKeyLocked(key, DDS.HANDLE_NIL)).handle;
+    dr.instanceOfHandleLocked(ih).?.instance_state = DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE;
+    const writer = std.mem.zeroes(Guid);
+    var set: CommittedSet = .{ .writer_guid = writer, .publisher = writer, .group_cs = null, .complete = false };
+    try set.samples.append(alloc, PendingChange{
+        .data = try alloc.dupe(u8, &.{0x01}),
+        .alloc = alloc,
+        .info = .{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, .instance_handle = ih, .valid_data = false },
+        .key_hash = key,
+    });
+    try dr.coherent_committed.append(alloc, set);
+    try dr.not_alive_since.put(alloc, key, .{ .state = DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, .since_ns = 0 });
+
+    dr.purgeDueLocked(std.time.ns_per_s);
+    try testing.expect(dr.not_alive_since.get(key).?.held);
+    try testing.expectEqual(@as(u32, 1), dr.instances.count());
+
+    // begin_access() discards the set, as part of an incomplete group set:
+    // the instance is due again, and the purge forgets it.
+    dr.discardCommittedSetLocked(0);
+    try testing.expectEqual(@as(?i64, std.time.ns_per_s), dr.nextPurgeDueLocked());
+    dr.purgeDueLocked(std.time.ns_per_s);
+    try testing.expect(dr.not_alive_since.get(key) == null);
+    try testing.expectEqual(@as(u32, 0), dr.instances.count());
 }
 
 test "pinSamplesForLoan/releasePinnedSamples: round trip tracks outstanding_loans and frees on release" {

@@ -22,6 +22,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   NOT_ALIVE_DISPOSED where they saw NOT_ALIVE_NO_WRITERS. The shape and registry examples
   turn it off where they unregister to show NOT_ALIVE_NO_WRITERS, as the OMG interoperability
   suite's `shape_main` does.
+- A DataReader applies READER_DATA_LIFECYCLE's autopurge delays (DDS 1.4 §2.2.3.22): once
+  an instance has been NOT_ALIVE_NO_WRITERS for `autopurge_nowriter_samples_delay`, or
+  NOT_ALIVE_DISPOSED for `autopurge_disposed_samples_delay`, its queued samples are dropped,
+  read or not, and it is forgotten unless a writer still has it registered. The reader's
+  timer check does this, as it does DEADLINE. A zero delay, the policy's zero-initialized
+  value, means never, as DURATION_INFINITE does.
 
 ## 2026-11-22
 

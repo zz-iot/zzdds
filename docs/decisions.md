@@ -438,8 +438,8 @@ takes its slot. RESOURCE_LIMITS `max_instances` bounds each registry, so on a re
 counts the instances held, not those with samples queued. A reader checks its candidates
 (instances that became not alive or lost a writer) as each read or take ends, after the
 samples' ranks are set, rather than at every place a sample leaves its cache.
-READER_DATA_LIFECYCLE's autopurge delays, which would forget an instance whose samples are
-not taken, are a roadmap item.
+READER_DATA_LIFECYCLE's autopurge delays, which forget an instance whose samples are not
+taken, are below (2026-11-23).
 
 **`autodispose_unregistered_instances` defaults to TRUE (2026-11-23),** as DDS 1.4
 §2.2.3.21 says, through `@default(TRUE)` in `idl/dcps.idl`, so every binding's
@@ -447,6 +447,21 @@ zero-initialized or default-constructed `DataWriterQos` has it, not only the Pub
 default. An unregister then disposes the instance too, and readers see NOT_ALIVE_DISPOSED.
 Examples that unregister to show NOT_ALIVE_NO_WRITERS turn it off, as the OMG
 interoperability suite's `shape_main` does.
+
+**A DataReader applies READER_DATA_LIFECYCLE's autopurge delays on its timer
+(2026-11-23).** Once an instance has been NOT_ALIVE_NO_WRITERS for
+`autopurge_nowriter_samples_delay`, or NOT_ALIVE_DISPOSED for
+`autopurge_disposed_samples_delay`, the reader drops its queued samples, read or not, and
+forgets it unless a writer still has it registered or a coherent set not yet given to the
+application holds a sample of it (§2.2.3.22). The delay counts from when the instance
+entered that state; becoming alive again stops it. Samples a coherent set held at the delay
+go once `begin_access` gives them to the application; if the set is discarded instead, the
+instance is purged then. The reader's timer check does this, as
+it does DEADLINE and LIVELINESS, so an application that never reads still has the memory
+back. A zero delay means never, as DURATION_INFINITE does, which DDS 1.4 makes the default:
+the generated policy is zero-initialized, and zero meaning "at once" would drop every
+not-alive sample of a reader made from a default-constructed QoS before the application
+could see it. A reader's DEADLINE treats zero the same way.
 
 **What a disabled entity takes follows DDS 1.4 §2.2.2.1.1.7, the same for every entity.**
 That section lets a disabled entity take: setting and getting its QoS, default QoS and

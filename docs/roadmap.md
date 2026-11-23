@@ -268,12 +268,6 @@ Forward-looking only: known gaps, planned features, and open design questions.
     reflection, and every one of zzdds's own `examples/`/`stress-tests/` registrations
     passes it — see `CHANGELOG.md` 2026-09-14. Closed; not a gap anymore.
 
-- **READER_DATA_LIFECYCLE's autopurge delays are ignored.** A DataReader forgets an instance
-  once it is not alive, has no writers and its samples are taken
-  ([`decisions.md`](decisions.md), 2026-11-22), but `autopurge_nowriter_samples_delay` and
-  `autopurge_disposed_samples_delay` are never applied, so an application that leaves a
-  not-alive instance's samples untaken keeps the instance. Purge them on a timer once the
-  delay passes, as DDS 1.4 §2.2.3.21 describes.
 - **Deleting a DataWriter does not unregister its instances.** DDS 1.4 §2.2.2.4.1.6 says it
   does, so under `autodispose_unregistered_instances` (TRUE by default) its readers should
   see each instance NOT_ALIVE_DISPOSED (§2.2.3.21). zzdds sends nothing for them as the
