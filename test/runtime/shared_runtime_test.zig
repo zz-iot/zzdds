@@ -1973,6 +1973,162 @@ test "waiting for acknowledgments helps the runtime until the reader has acknowl
     m.runtime.deinit();
 }
 
+/// Deletes the pair's writer, or everything its participant contains, from
+/// a runtime timer: from a turn that a blocking call's help runs.
+const DeleteWriterTimer = struct {
+    context: rt.Context,
+    timer: rt.Timer,
+    pair: *Pair,
+    what: enum { writer, contained },
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+
+    fn init(self: *DeleteWriterTimer, runtime: *rt.Runtime, pair: *Pair) void {
+        self.* = .{ .context = rt.Context.init(runtime, 4), .timer = undefined, .pair = pair, .what = .writer };
+        self.timer = rt.Timer.init(&self.context, fire);
+    }
+
+    fn fire(t: *rt.Timer, _: *rt.Turn) void {
+        const self: *DeleteWriterTimer = @fieldParentPtr("timer", t);
+        const dw = self.pair.dw_h;
+        self.rc = switch (self.what) {
+            .writer => dw.get_publisher().delete_datawriter(dw),
+            .contained => self.pair.dp_w.delete_contained_entities(),
+        };
+    }
+};
+
+test "a zero wait for acknowledgments only checks, and runs nothing" {
+    var m: Manual = undefined;
+    m.init();
+    var pair: Pair = undefined;
+    try pair.init(&m.runtime, .RELIABLE_RELIABILITY_QOS, null);
+    m.runtime.releaseOwner();
+    try settle(&m);
+
+    // A due timer that deletes the writer: a wait that helped would run it.
+    var del: DeleteWriterTimer = undefined;
+    del.init(&m.runtime, &pair);
+    defer del.context.deinit();
+    try pair.write(0);
+    _ = m.runtime.armTimer(&del.timer, m.now());
+    try testing.expectEqual(DDS.RETCODE_TIMEOUT, pair.dw_h.wait_for_acknowledgments(seconds(0)));
+    try testing.expectEqual(DDS.RETCODE_TIMEOUT, pair.dw_h.get_publisher().wait_for_acknowledgments(seconds(0)));
+    try testing.expectEqual(DDS.RETCODE_ERROR, del.rc);
+
+    try settle(&m);
+    try testing.expectEqual(DDS.RETCODE_OK, del.rc);
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
+test "deleting one of its writers fails a Publisher's wait for acknowledgments with ERROR" {
+    var m: Manual = undefined;
+    m.init();
+    var pair: Pair = undefined;
+    try pair.init(&m.runtime, .RELIABLE_RELIABILITY_QOS, null);
+    m.runtime.releaseOwner();
+    try settle(&m);
+
+    var del: DeleteWriterTimer = undefined;
+    del.init(&m.runtime, &pair);
+    defer del.context.deinit();
+    const publisher = pair.dw_h.get_publisher();
+    try pair.write(0);
+    _ = m.runtime.armTimer(&del.timer, m.now());
+    try testing.expectEqual(DDS.RETCODE_ERROR, publisher.wait_for_acknowledgments(seconds(1)));
+    try testing.expectEqual(DDS.RETCODE_OK, del.rc);
+
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
+test "deleting a Publisher ends its wait for acknowledgments with ALREADY_DELETED" {
+    var m: Manual = undefined;
+    m.init();
+    var pair: Pair = undefined;
+    try pair.init(&m.runtime, .RELIABLE_RELIABILITY_QOS, null);
+    m.runtime.releaseOwner();
+    try settle(&m);
+
+    var del: DeleteWriterTimer = undefined;
+    del.init(&m.runtime, &pair);
+    del.what = .contained;
+    defer del.context.deinit();
+    const publisher = pair.dw_h.get_publisher();
+    try pair.write(0);
+    _ = m.runtime.armTimer(&del.timer, m.now());
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, publisher.wait_for_acknowledgments(seconds(1)));
+    try testing.expectEqual(DDS.RETCODE_OK, del.rc);
+
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
+test "a Publisher's wait for acknowledgments waits for every reliable writer, and for no later write" {
+    var m: Manual = undefined;
+    m.init();
+    var pair: Pair = undefined;
+    try pair.init(&m.runtime, .RELIABLE_RELIABILITY_QOS, null);
+    m.runtime.releaseOwner();
+    try settle(&m);
+
+    // A second reliable writer, and a best-effort one the wait leaves out.
+    const publisher = pair.dw_h.get_publisher();
+    const topic = pair.dw_h.get_topic();
+    var qos = DDS.DataWriterQos{};
+    qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const second: *DataWriterImpl = @ptrCast(@alignCast(publisher.create_datawriter(topic, qos, null, 0).ptr));
+    var be_qos = DDS.DataWriterQos{};
+    be_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    _ = publisher.create_datawriter(topic, be_qos, null, 0);
+    try settle(&m);
+
+    const payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, 7 };
+    try pair.write(0);
+    _ = try second.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &payload);
+    try testing.expectEqual(DDS.RETCODE_OK, publisher.wait_for_acknowledgments(seconds(1)));
+    try testing.expect(pair.dw.allAcked());
+    try testing.expect(second.allAcked());
+
+    // A zero wait only checks: with nothing new written, nothing is owed.
+    try testing.expectEqual(DDS.RETCODE_OK, publisher.wait_for_acknowledgments(seconds(0)));
+    // With an unacknowledged write it times out, without helping, though
+    // the first writer owes nothing.
+    _ = try second.writeRaw(.alive, RtpsTimestamp.now(), std.mem.zeroes([16]u8), &payload);
+    try testing.expectEqual(DDS.RETCODE_TIMEOUT, publisher.wait_for_acknowledgments(seconds(0)));
+
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
+test "deleting a writer ends a wait for its acknowledgments with ALREADY_DELETED" {
+    var m: Manual = undefined;
+    m.init();
+    var pair: Pair = undefined;
+    try pair.init(&m.runtime, .RELIABLE_RELIABILITY_QOS, null);
+    m.runtime.releaseOwner();
+    try settle(&m);
+
+    // The write queues delivery to the reader first, so the timer's turn,
+    // due at once, runs before the writer hears the reader's ACKNACK.
+    var del: DeleteWriterTimer = undefined;
+    del.init(&m.runtime, &pair);
+    defer del.context.deinit();
+    try pair.write(0);
+    _ = m.runtime.armTimer(&del.timer, m.now());
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, pair.dw_h.wait_for_acknowledgments(seconds(1)));
+    try testing.expectEqual(DDS.RETCODE_OK, del.rc);
+
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
 /// RELIABLE KEEP_ALL endpoints whose writer holds at most two samples and
 /// blocks up to a second for space.
 fn limitedWriter(durability: DDS.DurabilityQosPolicyKind) PairOptions {

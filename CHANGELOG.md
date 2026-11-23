@@ -10,6 +10,16 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-23
 
+- `wait_for_acknowledgments` keeps its writer, or its Publisher's writers, alive while it
+  waits. Before, deleting the writer from another thread, or from a callback the wait
+  helped run, freed it under the waiting call. Deleting the writer now ends a DataWriter's
+  wait with ALREADY_DELETED. Deleting one of its writers ends a Publisher's wait with ERROR,
+  and deleting the Publisher with ALREADY_DELETED. Either wait covers what was written and
+  the reliable readers matched when it began: a later write or match no longer extends it,
+  and a reader that unmatches owes nothing more. An acknowledgment arriving at the deadline
+  or later is a TIMEOUT; a zero `max_wait` only checks. A negative or unnormalized
+  `max_wait` is BAD_PARAMETER. A Publisher's wait on a hosted runtime now sleeps until
+  woken rather than polling every millisecond.
 - Socket buffer sizes are configurable for both transports: `transport.udp.send_buffer_size`
   joins `recv_buffer_size`, and `transport.tcp` has both, for every connection. All default
   to 0, the OS default. An OS that refuses a size, as macOS and the BSDs do past their limit,

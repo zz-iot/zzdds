@@ -2500,3 +2500,194 @@ test "waitCacheBelow: true once acknowledgments free space, false at its timeout
     pureAck(w, b, 1, 1);
     try testing.expect(w.waitCacheBelow(3, 0));
 }
+
+// ── Acknowledgment waits ──────────────────────────────────────────────────────
+//
+// docs/design/concurrency/operations.md#datawriter-acknowledgment-wait-frontier-and-completion-contract
+
+const ack_wait = zzdds.protocol.ack_wait;
+
+/// A pure ACK of every change through `through`.
+fn ackThrough(w: *StatefulWriter, guid: Guid, through: SequenceNumber, count: i32) void {
+    const set = SequenceNumberSet{ .base = through + 1, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    w.handleAckNack(guid, through, set, count, true);
+}
+
+fn reliableProxy(guid: Guid, port: u16) !ReaderProxy {
+    return ReaderProxy.init(testing.allocator, guid, &.{Locator.udp4(.{ 127, 0, 0, 1 }, port)}, &.{}, false, true);
+}
+
+/// A writer that replays its history to each reader it matches, so a
+/// reader matched late owes every change, with one reliable reader
+/// matched and three changes written.
+fn replayingWriterWithReader(rec: *Recording, reader_guid: Guid) !*StatefulWriter {
+    const w = try StatefulWriter.init(testing.allocator, makeGuid(0x01, WRITER_EID), rec.makeTransport(), .keep_all, 0, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, true);
+    errdefer w.deinit();
+    try w.addMatchedReader(try reliableProxy(reader_guid, 7200));
+    for (0..3) |_| _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "x");
+    rec.reset();
+    return w;
+}
+
+const AckWait = struct {
+    waiter: ack_wait.Waiter,
+    cap: ack_wait.Capture,
+
+    /// Begins a wait on `w`, timing out after `timeout_ns` (null: never).
+    /// Must not move afterwards.
+    fn begin(self: *AckWait, w: *StatefulWriter, timeout_ns: ?i64) !void {
+        self.waiter = ack_wait.Waiter.init(null, timeout_ns);
+        self.cap = .{ .waiter = &self.waiter };
+        self.waiter.expect();
+        try w.beginAckWait(&self.cap);
+    }
+
+    fn end(self: *AckWait, w: *StatefulWriter) void {
+        w.endAckWait(&self.cap);
+        self.waiter.deinit();
+    }
+
+    fn outcome(self: *AckWait) ?ack_wait.Outcome {
+        self.waiter.mu.lock();
+        defer self.waiter.mu.unlock();
+        return self.waiter.outcome;
+    }
+};
+
+test "an acknowledgment wait covers the readers matched and the changes written when it began" {
+    const a = makeGuid(0x02, READER_EID);
+    const b = makeGuid(0x03, READER_EID);
+    var rec: Recording = .{};
+    const w = try replayingWriterWithReader(&rec, a);
+    defer w.deinit();
+
+    var wait: AckWait = undefined;
+    try wait.begin(w, null);
+    defer wait.end(w);
+    // Neither a reader matched now, which owes the replayed history, nor a
+    // later change, joins the wait.
+    try w.addMatchedReader(try reliableProxy(b, 7201));
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "four");
+    ackThrough(w, a, 2, 1);
+    try testing.expectEqual(@as(?ack_wait.Outcome, null), wait.outcome());
+    ackThrough(w, a, 3, 2);
+    try testing.expectEqual(@as(?ack_wait.Outcome, .acknowledged), wait.outcome());
+}
+
+test "an acknowledgment wait is acknowledged at once when no reader owes one" {
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(testing.allocator, makeGuid(0x01, WRITER_EID), rec.makeTransport(), .keep_all, 0, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    defer w.deinit();
+    // Nothing written: no change to acknowledge, even with a reader.
+    try w.addMatchedReader(try reliableProxy(makeGuid(0x02, READER_EID), 7202));
+    var wait: AckWait = undefined;
+    try wait.begin(w, 0);
+    defer wait.end(w);
+    try testing.expectEqual(@as(?ack_wait.Outcome, .acknowledged), wait.outcome());
+
+    // A best-effort reader never owes one.
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "x");
+    w.removeMatchedReader(makeGuid(0x02, READER_EID));
+    try w.addMatchedReader(try ReaderProxy.init(testing.allocator, makeGuid(0x03, READER_EID), &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7203)}, &.{}, false, false));
+    var wait2: AckWait = undefined;
+    try wait2.begin(w, 0);
+    defer wait2.end(w);
+    try testing.expectEqual(ack_wait.Outcome.acknowledged, wait2.waiter.wait());
+
+    // Nor does a reader matched after the changes, which it is not sent.
+    try w.addMatchedReader(try reliableProxy(makeGuid(0x04, READER_EID), 7205));
+    var wait3: AckWait = undefined;
+    try wait3.begin(w, 0);
+    defer wait3.end(w);
+    try testing.expectEqual(ack_wait.Outcome.acknowledged, wait3.waiter.wait());
+}
+
+test "a reader that unmatches owes nothing more, even matched again" {
+    const a = makeGuid(0x02, READER_EID);
+    const b = makeGuid(0x03, READER_EID);
+    var rec: Recording = .{};
+    const w = try replayingWriterWithReader(&rec, a);
+    defer w.deinit();
+    try w.addMatchedReader(try reliableProxy(b, 7204));
+
+    var wait: AckWait = undefined;
+    try wait.begin(w, null);
+    defer wait.end(w);
+    // `a` matches again: a new match, which the wait does not wait for.
+    w.removeMatchedReader(a);
+    try w.addMatchedReader(try reliableProxy(a, 7200));
+    try testing.expectEqual(@as(?ack_wait.Outcome, null), wait.outcome());
+    // The last captured reader unmatching settles the wait.
+    w.removeMatchedReader(b);
+    try testing.expectEqual(@as(?ack_wait.Outcome, .acknowledged), wait.outcome());
+}
+
+test "a reader no longer reliable owes no acknowledgment" {
+    const a = makeGuid(0x02, READER_EID);
+    var rec: Recording = .{};
+    const w = try replayingWriterWithReader(&rec, a);
+    defer w.deinit();
+
+    var wait: AckWait = undefined;
+    try wait.begin(w, null);
+    defer wait.end(w);
+    // A refresh keeps the match, now best effort.
+    try testing.expect(!try w.addOrRefreshMatchedReader(try ReaderProxy.init(testing.allocator, a, &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7200)}, &.{}, false, false)));
+    try testing.expectEqual(@as(?ack_wait.Outcome, .acknowledged), wait.outcome());
+}
+
+test "an acknowledgment arriving at the deadline or later times the wait out" {
+    const a = makeGuid(0x02, READER_EID);
+    var rec: Recording = .{};
+    const w = try replayingWriterWithReader(&rec, a);
+    defer w.deinit();
+
+    // A zero timeout: the deadline has passed by the acknowledgment.
+    var wait: AckWait = undefined;
+    try wait.begin(w, 0);
+    defer wait.end(w);
+    ackThrough(w, a, 3, 1);
+    try testing.expectEqual(ack_wait.Outcome.timed_out, wait.waiter.wait());
+}
+
+test "closing a writer settles its acknowledgment waits, and any begun after" {
+    const a = makeGuid(0x02, READER_EID);
+    var rec: Recording = .{};
+    const w = try replayingWriterWithReader(&rec, a);
+    defer w.deinit();
+
+    var wait: AckWait = undefined;
+    try wait.begin(w, null);
+    defer wait.end(w);
+    w.closeAckWaits();
+    // Removing the reader afterwards cannot turn it into an acknowledgment.
+    w.removeMatchedReader(a);
+    try testing.expectEqual(@as(?ack_wait.Outcome, .writer_closed), wait.outcome());
+
+    var late: AckWait = undefined;
+    try late.begin(w, null);
+    defer late.end(w);
+    try testing.expectEqual(@as(?ack_wait.Outcome, .writer_closed), late.outcome());
+}
+
+test "a caller blocked on an acknowledgment wait wakes when another thread acknowledges" {
+    const a = makeGuid(0x02, READER_EID);
+    var rec: Recording = .{};
+    const w = try replayingWriterWithReader(&rec, a);
+    defer w.deinit();
+
+    var wait: AckWait = undefined;
+    try wait.begin(w, null);
+    defer wait.end(w);
+    const Blocked = struct {
+        fn run(waiter: *ack_wait.Waiter, out: *ack_wait.Outcome) void {
+            out.* = waiter.wait();
+        }
+    };
+    var got: ack_wait.Outcome = .timed_out;
+    // Whether it blocks before the ACK or not, the wait ends acknowledged.
+    const t = try std.Thread.spawn(.{}, Blocked.run, .{ &wait.waiter, &got });
+    ackThrough(w, a, 3, 1);
+    t.join();
+    try testing.expectEqual(ack_wait.Outcome.acknowledged, got);
+}

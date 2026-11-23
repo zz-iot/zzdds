@@ -20,6 +20,7 @@ const guid_mod = @import("../rtps/guid.zig");
 const history_mod = @import("../rtps/history.zig");
 const unmatched_mod = @import("../rtps/unmatched_cache.zig");
 const submsg_mod = @import("../rtps/message/submessage.zig");
+pub const ack_wait = @import("ack_wait.zig");
 
 pub const Guid = guid_mod.Guid;
 pub const GuidPrefix = guid_mod.GuidPrefix;
@@ -317,11 +318,15 @@ pub const ProtocolWriter = struct {
         /// excluded.  Returns true immediately when `target_sn` is 0.
         all_acked: *const fn (ctx: *anyopaque, target_sn: SequenceNumber) bool,
 
-        /// Block until every RELIABLE matched reader has acknowledged all changes
-        /// up to and including `target_sn`, or for `timeout_ns`, on the clock
-        /// the writer schedules by.  Null `timeout_ns` waits indefinitely.
-        /// Returns true on success, false on timeout.
-        wait_all_acked: *const fn (ctx: *anyopaque, target_sn: SequenceNumber, timeout_ns: ?i64) bool,
+        /// Begin the writer's part of an acknowledgment wait: capture the last
+        /// change committed and the reliable readers that owe an
+        /// acknowledgment of it, and settle `cap.waiter` once none does, or
+        /// the writer closes. `cap.waiter` must expect it; end_ack_wait ends
+        /// it, settled or not.
+        begin_ack_wait: *const fn (ctx: *anyopaque, cap: *ack_wait.Capture) error{OutOfMemory}!void,
+
+        /// End an acknowledgment wait begin_ack_wait began.
+        end_ack_wait: *const fn (ctx: *anyopaque, cap: *ack_wait.Capture) void,
 
         /// Return the current number of samples in the writer's history cache.
         /// Used to enforce RESOURCE_LIMITS.max_samples before writing.
@@ -481,8 +486,12 @@ pub const ProtocolWriter = struct {
         return self.vtable.all_acked(self.ctx, target_sn);
     }
 
-    pub fn waitAllAcked(self: ProtocolWriter, target_sn: SequenceNumber, timeout_ns: ?i64) bool {
-        return self.vtable.wait_all_acked(self.ctx, target_sn, timeout_ns);
+    pub fn beginAckWait(self: ProtocolWriter, cap: *ack_wait.Capture) error{OutOfMemory}!void {
+        return self.vtable.begin_ack_wait(self.ctx, cap);
+    }
+
+    pub fn endAckWait(self: ProtocolWriter, cap: *ack_wait.Capture) void {
+        self.vtable.end_ack_wait(self.ctx, cap);
     }
 
     pub fn cacheLen(self: ProtocolWriter) usize {

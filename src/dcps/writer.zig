@@ -47,6 +47,25 @@ fn durationNs(d: DDS.Duration_t) i64 {
     return @as(i64, d.sec) * std.time.ns_per_s + @as(i64, d.nanosec);
 }
 
+/// A blocking call's `max_wait` in nanoseconds, null for DURATION_INFINITE;
+/// BadParameter for a negative or unnormalized duration.
+pub fn waitTimeoutNs(d: DDS.Duration_t) error{BadParameter}!?i64 {
+    if (d.sec == DDS.DURATION_INFINITE_SEC and d.nanosec == DDS.DURATION_INFINITE_NSEC) return null;
+    if (d.sec < 0 or d.nanosec >= std.time.ns_per_s) return error.BadParameter;
+    return durationNs(d);
+}
+
+/// The DDS result of an acknowledgment wait: `closed_rc` when a writer it
+/// waited on closed first.
+pub fn ackWaitResult(outcome: proto.ack_wait.Outcome, closed_rc: DDS.ReturnCode_t) DDS.ReturnCode_t {
+    return switch (outcome) {
+        .acknowledged => DDS.RETCODE_OK,
+        .timed_out => DDS.RETCODE_TIMEOUT,
+        .writer_closed => closed_rc,
+        .closed => DDS.RETCODE_ALREADY_DELETED,
+    };
+}
+
 /// The earlier of `a` and `b`, where null is never.
 fn earlier(a: ?i64, b: i64) i64 {
     return if (a) |x| @min(x, b) else b;
@@ -135,6 +154,11 @@ pub const DataWriterImpl = struct {
     /// Automatic listener invocations, queued on the participant's listener
     /// context when it has one (see `raise`).
     listeners: listener_lane.PendingListeners = .{},
+    /// Set under `proto_mu` as deletion begins, before the publisher
+    /// destroys `proto_writer` (`closeProto`): a call that finds it clear
+    /// there can still pin `proto_writer` (`acquireProto`).
+    proto_mu: Mutex = .{},
+    proto_closed: bool = false,
     /// Count of currently-outstanding write-loans (see `loanForWrite`/
     /// `publishLoan`/`cancelLoan`). Informational only -- feeds
     /// `checkDeletePrecondition()`'s PRECONDITION_NOT_MET check, not itself
@@ -393,6 +417,44 @@ pub const DataWriterImpl = struct {
     }
     pub fn releaseQuiesce(self: *Self) void {
         self.quiesce.release(self, reallyDeinit);
+    }
+
+    /// Ends `acquireProto`: called before the publisher destroys
+    /// `proto_writer`, which may then be freed once nothing pins it.
+    pub fn closeProto(self: *Self) void {
+        self.proto_mu.lock();
+        defer self.proto_mu.unlock();
+        self.proto_closed = true;
+    }
+
+    /// Pins `proto_writer` for a call that outlives one lock of it, such as
+    /// a wait; false once the writer's deletion has begun.
+    /// `releaseProto` unpins it.
+    pub fn acquireProto(self: *Self) bool {
+        self.proto_mu.lock();
+        defer self.proto_mu.unlock();
+        return !self.proto_closed and self.proto_writer.quiesceAcquire();
+    }
+
+    pub fn releaseProto(self: *Self) void {
+        self.proto_writer.quiesceRelease();
+    }
+
+    /// Begins this writer's part of `cap.waiter`'s acknowledgment wait,
+    /// which must expect it, pinning the writer until `endAckWait`. Settles
+    /// it `writer_closed` once the writer's deletion has begun.
+    pub fn beginAckWait(self: *Self, cap: *proto.ack_wait.Capture) error{OutOfMemory}!void {
+        if (!self.acquireProto()) return cap.waiter.settle(.writer_closed);
+        errdefer self.releaseProto();
+        try self.proto_writer.beginAckWait(cap);
+        cap.pinned = true;
+    }
+
+    pub fn endAckWait(self: *Self, cap: *proto.ack_wait.Capture) void {
+        if (!cap.pinned) return;
+        self.proto_writer.endAckWait(cap);
+        self.releaseProto();
+        cap.pinned = false;
     }
 
     fn reallyDeinit(ctx: *anyopaque) void {
@@ -1366,24 +1428,26 @@ pub const DataWriterImpl = struct {
         return self.publisher;
     }
 
+    /// Waits for the reliable readers matched now to acknowledge what the
+    /// writer has written (docs/design/concurrency/operations.md#datawriter-acknowledgment-wait-frontier-and-completion-contract):
+    /// ALREADY_DELETED if the writer is deleted first.
     fn vtWaitForAck(ctx: *anyopaque, timeout: *const DDS.Duration_t) DDS.ReturnCode_t {
         {
             const rc = cast(ctx).checkEnabledPrecondition();
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);
+        const timeout_ns = waitTimeoutNs(timeout.*) catch return DDS.RETCODE_BAD_PARAMETER;
         if (self.qos.reliability.kind == .BEST_EFFORT_RELIABILITY_QOS) return DDS.RETCODE_OK;
-        const last_sn = self.last_sn.load(.monotonic);
-        if (last_sn == 0) return DDS.RETCODE_OK;
-        const timeout_ns: ?i64 = if (timeout.sec == DDS.DURATION_INFINITE_SEC and
-            timeout.nanosec == DDS.DURATION_INFINITE_NSEC)
-            null
-        else
-            @as(i64, timeout.sec) * std.time.ns_per_s + @as(i64, @intCast(timeout.nanosec));
-        return if (self.proto_writer.waitAllAcked(last_sn, timeout_ns))
-            DDS.RETCODE_OK
-        else
-            DDS.RETCODE_TIMEOUT;
+        if (!self.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
+        defer self.releaseQuiesce();
+        var waiter = proto.ack_wait.Waiter.init(self.listeners.runtimeOf(), timeout_ns);
+        defer waiter.deinit();
+        var cap: proto.ack_wait.Capture = .{ .waiter = &waiter };
+        waiter.expect();
+        self.beginAckWait(&cap) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        defer self.endAckWait(&cap);
+        return ackWaitResult(waiter.wait(), DDS.RETCODE_ALREADY_DELETED);
     }
 
     fn vtGetLivelinessLost(ctx: *anyopaque, status: *DDS.LivelinessLostStatus) DDS.ReturnCode_t {
