@@ -144,6 +144,9 @@ and every transport the runtime uses registers its sources with it. The backend 
 * Several hosted I/O threads may wait and service the same backend at once. Each ready
   source is serviced by one of them at a time, so per-source state such as TCP framing
   needs no further lock.
+* The backend lends each source's `service` call a receive scratch, its own while the
+  call runs: a source receives into it and keeps nothing there. Sources need no receive
+  buffer of their own, and a backend has one scratch per `service` it runs at once.
 
 `drive(budget, max_wait)` services runnable runtime work and `service`, and waits only
 through `wait`. A runtime without I/O sources, such as one using only the in-process
