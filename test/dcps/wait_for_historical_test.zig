@@ -185,6 +185,51 @@ test "wait_for_historical_data: VOLATILE returns OK immediately" {
     try testing.expectEqual(DDS.RETCODE_OK, rc);
 }
 
+test "wait_for_historical_data: a reader on the built-in Subscriber, which nothing owes, returns OK at once" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
+    const tp_impl: *dcps.TopicImpl = @ptrCast(@alignCast(topic.ptr));
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+    const builtin = dp.get_builtin_subscriber();
+    const dr_raw = builtin.create_datareader(tp_impl.toTopicDescription(), dr_qos, null, 0);
+    defer _ = builtin.delete_datareader(dr_raw);
+
+    const max_wait = DDS.Duration_t{ .sec = 10, .nanosec = 0 };
+    try testing.expectEqual(DDS.RETCODE_OK, dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &max_wait));
+}
+
+test "wait_for_historical_data: a reader whose deletion has begun returns ALREADY_DELETED" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
+    const tp_impl: *dcps.TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const sub = dp.create_subscriber(.{}, null, 0);
+    defer _ = dp.vtable.delete_subscriber(dp.ptr, sub);
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+    const dr_raw = sub.create_datareader(tp_impl.toTopicDescription(), dr_qos, null, 0);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr_raw.ptr));
+    // As the Subscriber does first when it deletes the reader.
+    dr_impl.closeProto();
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO));
+}
+
 test "wait_for_historical_data: TRANSIENT_LOCAL with no matched writers returns OK immediately" {
     var h = try Harness.init();
     defer h.deinit();

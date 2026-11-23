@@ -175,6 +175,23 @@ test "an unsettled waiter times out at its deadline" {
     try testing.expectEqual(Outcome.timed_out, w.wait());
 }
 
+test "a waiter with no runtime blocks until another thread settles it" {
+    var w = Waiter.init(null, null);
+    defer w.deinit();
+    w.expect();
+    const t = try std.Thread.spawn(.{}, Waiter.satisfied, .{&w});
+    defer t.join();
+    try testing.expectEqual(Outcome.satisfied, w.wait());
+}
+
+test "a waiter with no runtime blocks until its deadline" {
+    var w = Waiter.init(null, 20 * std.time.ns_per_ms);
+    defer w.deinit();
+    w.expect();
+    try testing.expectEqual(Outcome.timed_out, w.wait());
+    try testing.expect(w.expired());
+}
+
 test "a waiter without a deadline never expires" {
     var w = Waiter.init(null, null);
     defer w.deinit();
