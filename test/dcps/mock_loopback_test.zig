@@ -395,7 +395,7 @@ test "mock_loopback: incompatible QoS detected when writer discovered before rea
         fn f(dp: *DomainParticipantImpl) usize {
             dp.mu.lock();
             defer dp.mu.unlock();
-            return dp.discovered_writers.items.len;
+            return dp.discovered_writers.count();
         }
     }.f;
     while (time_mod.nanoTimestamp() < disc_deadline_ns) {

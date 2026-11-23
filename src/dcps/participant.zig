@@ -804,6 +804,30 @@ const DiscoveredTopic = struct {
     liveliness_kind: u8,
     ownership_kind: u8,
     dest_order_kind: u8,
+
+    fn key(self: DiscoveredTopic) TopicKey {
+        return .{ .topic_name = self.topic_name, .type_name = self.type_name };
+    }
+};
+
+/// A topic's name and type: `discovered_topics`' key, whose strings are its
+/// entry's.
+const TopicKey = struct {
+    topic_name: []const u8,
+    type_name: []const u8,
+
+    const Context = struct {
+        pub fn hash(_: Context, k: TopicKey) u32 {
+            var h = std.hash.Wyhash.init(0);
+            h.update(std.mem.asBytes(&k.topic_name.len));
+            h.update(k.topic_name);
+            h.update(k.type_name);
+            return @truncate(h.final());
+        }
+        pub fn eql(_: Context, a: TopicKey, b: TopicKey, _: usize) bool {
+            return std.mem.eql(u8, a.topic_name, b.topic_name) and std.mem.eql(u8, a.type_name, b.type_name);
+        }
+    };
 };
 
 /// Persistent record of a remote writer discovered via SEDP, kept independent
@@ -1057,8 +1081,8 @@ pub const DomainParticipantImpl = struct {
     active_writers: std.AutoHashMapUnmanaged(u32, ActiveWriter),
     active_readers: std.AutoHashMapUnmanaged(u32, ActiveReader),
 
-    /// Cache of discovered remote participants; keyed by GUID, guarded by mu.
-    discovered_participants: std.ArrayListUnmanaged(DiscoveredParticipant),
+    /// Cache of discovered remote participants, by GUID prefix; guarded by mu.
+    discovered_participants: std.AutoArrayHashMapUnmanaged(GuidPrefix, DiscoveredParticipant),
 
     /// GUID prefixes passed to ignore_participant(); all discovery events from
     /// these prefixes are silently dropped.  Guarded by mu.
@@ -1076,16 +1100,16 @@ pub const DomainParticipantImpl = struct {
     /// mu.
     ignored_subscriptions: std.ArrayListUnmanaged(Guid),
 
-    /// Topics discovered via SEDP writer/reader announcements, deduped by
-    /// (topic_name, type_name).  Backing strings are owned.  Guarded by mu.
-    discovered_topics: std.ArrayListUnmanaged(DiscoveredTopic),
+    /// Topics discovered via SEDP writer/reader announcements, or created
+    /// here, by name and type.  Backing strings are owned.  Guarded by mu.
+    discovered_topics: std.ArrayHashMapUnmanaged(TopicKey, DiscoveredTopic, TopicKey.Context, true),
 
     /// Remote writers/readers discovered via SEDP, kept independent of
     /// currently-active local entities so a DataReader/DataWriter created
     /// after the remote endpoint was discovered can still be matched
-    /// immediately.  Deduped/updated by GUID.  Guarded by mu.
-    discovered_writers: std.ArrayListUnmanaged(DiscoveredWriter),
-    discovered_readers: std.ArrayListUnmanaged(DiscoveredReader),
+    /// immediately.  By GUID.  Guarded by mu.
+    discovered_writers: std.AutoArrayHashMapUnmanaged(Guid, DiscoveredWriter),
+    discovered_readers: std.AutoArrayHashMapUnmanaged(Guid, DiscoveredReader),
 
     /// Data from writers that discovery has not yet announced and matched
     /// with local readers, held for each reader that then matches one (see
@@ -1939,14 +1963,14 @@ pub const DomainParticipantImpl = struct {
         self.ignored_topic_names.deinit(self.alloc);
         self.ignored_publications.deinit(self.alloc);
         self.ignored_subscriptions.deinit(self.alloc);
-        for (self.discovered_topics.items) |dt| {
+        for (self.discovered_topics.values()) |dt| {
             self.alloc.free(dt.topic_name);
             self.alloc.free(dt.type_name);
         }
         self.discovered_topics.deinit(self.alloc);
-        for (self.discovered_writers.items) |*dw| dw.deinit(self.alloc);
+        for (self.discovered_writers.values()) |*dw| dw.deinit(self.alloc);
         self.discovered_writers.deinit(self.alloc);
-        for (self.discovered_readers.items) |*dr| dr.deinit(self.alloc);
+        for (self.discovered_readers.values()) |*dr| dr.deinit(self.alloc);
         self.discovered_readers.deinit(self.alloc);
         self.unmatched.deinit();
         self.settled_writers.deinit(self.alloc);
@@ -2227,9 +2251,9 @@ pub const DomainParticipantImpl = struct {
             if (self.active_writers.get(key)) |aw| if (aw.guid.eql(guid)) return;
             if (self.active_readers.get(key)) |ar| if (ar.guid.eql(guid)) return;
         }
-        for (self.discovered_participants.items) |e| if (e.guid.eql(guid)) return;
-        for (self.discovered_writers.items) |e| if (e.guid.eql(guid)) return;
-        for (self.discovered_readers.items) |e| if (e.guid.eql(guid)) return;
+        if (self.discovered_participants.get(guid.prefix)) |e| if (e.guid.eql(guid)) return;
+        if (self.discovered_writers.contains(guid)) return;
+        if (self.discovered_readers.contains(guid)) return;
         _ = self.entities.remove(handle);
     }
 
@@ -2869,11 +2893,8 @@ pub const DomainParticipantImpl = struct {
     /// is not about to be.  Caller holds self.mu.
     fn unmatchedTtlNsLocked(self: *Self, prefix: GuidPrefix) i64 {
         var lease_ms = self.config.participant.lease_duration_ms;
-        for (self.discovered_participants.items) |e| {
-            if (e.guid.prefix.eql(prefix)) {
-                if (e.lease_ms != 0) lease_ms = e.lease_ms;
-                break;
-            }
+        if (self.discovered_participants.get(prefix)) |e| {
+            if (e.lease_ms != 0) lease_ms = e.lease_ms;
         }
         return @min(@as(i64, lease_ms) * std.time.ns_per_ms, UNMATCHED_MAX_TTL_NS);
     }
@@ -3215,19 +3236,14 @@ pub const DomainParticipantImpl = struct {
                     return;
                 }
             }
-            var is_dup = false;
-            for (self.discovered_participants.items) |*e| {
-                if (e.guid.eql(data.guid)) {
-                    e.lease_ms = data.lease_duration_ms;
-                    handle = e.handle;
-                    is_dup = true;
-                    break;
-                }
-            }
-            if (!is_dup) {
+            if (self.discovered_participants.getPtr(data.guid.prefix)) |e| {
+                e.lease_ms = data.lease_duration_ms;
+                handle = e.handle;
+            } else {
                 handle = self.guidHandleLocked(data.guid);
-                self.discovered_participants.append(
+                self.discovered_participants.put(
                     self.alloc,
+                    data.guid.prefix,
                     .{ .guid = data.guid, .handle = handle, .vendor_id = data.vendor_id, .lease_ms = data.lease_duration_ms },
                 ) catch self.releaseGuidHandleIfGoneLocked(data.guid);
             }
@@ -3272,12 +3288,7 @@ pub const DomainParticipantImpl = struct {
         var publication_dr: ?*reader_mod.DataReaderImpl = null;
         var subscription_dr: ?*reader_mod.DataReaderImpl = null;
         self.mu.lock();
-        for (self.discovered_participants.items, 0..) |e, i| {
-            if (e.guid.eql(guid)) {
-                _ = self.discovered_participants.swapRemove(i);
-                break;
-            }
-        }
+        _ = self.discovered_participants.swapRemove(guid.prefix);
         self.releaseGuidHandleIfGoneLocked(guid);
         // As in onWriterLost and onReaderLost, for each of its endpoints.
         self.withdrawDiscoveryGensOfLocked(guid.prefix);
@@ -3289,13 +3300,13 @@ pub const DomainParticipantImpl = struct {
             _ = self.settled_writers.remove(settled);
         }
         self.unmatched.dropPrefix(guid.prefix);
-        for (self.discovered_writers.items) |entry| {
+        for (self.discovered_writers.values()) |entry| {
             if (entry.guid.prefix.eql(guid.prefix)) lost_writers.append(self.alloc, .{
                 .guid = entry.guid,
                 .handle = self.entities.handleOfKey(.{ .guid = entry.guid }) orelse DDS.HANDLE_NIL,
             }) catch {};
         }
-        for (self.discovered_readers.items) |entry| {
+        for (self.discovered_readers.values()) |entry| {
             if (entry.guid.prefix.eql(guid.prefix)) lost_readers.append(self.alloc, .{
                 .guid = entry.guid,
                 .handle = self.entities.handleOfKey(.{ .guid = entry.guid }) orelse DDS.HANDLE_NIL,
@@ -3748,10 +3759,7 @@ pub const DomainParticipantImpl = struct {
         var new_topic: ?DiscoveredTopic = null;
         var push_topic_dr: ?*reader_mod.DataReaderImpl = null;
         known: {
-            for (self.discovered_topics.items) |dt| {
-                if (std.mem.eql(u8, dt.topic_name, data.topic_name) and
-                    std.mem.eql(u8, dt.type_name, data.type_name)) break :known;
-            }
+            if (self.discovered_topics.contains(.{ .topic_name = data.topic_name, .type_name = data.type_name })) break :known;
             const tn = self.alloc.dupe(u8, data.topic_name) catch break :known;
             const tt = self.alloc.dupe(u8, data.type_name) catch {
                 self.alloc.free(tn);
@@ -3767,7 +3775,7 @@ pub const DomainParticipantImpl = struct {
                 .ownership_kind = disc.discOwnershipKind(data.qos),
                 .dest_order_kind = disc.discDestOrderKind(data.qos),
             };
-            self.discovered_topics.append(self.alloc, dt) catch {
+            self.discovered_topics.put(self.alloc, dt.key(), dt) catch {
                 self.alloc.free(tn);
                 self.alloc.free(tt);
                 break :known;
@@ -3933,10 +3941,8 @@ pub const DomainParticipantImpl = struct {
     /// Looks up the VendorId of a previously-discovered participant by GUID
     /// prefix. Caller must hold self.mu (reads discovered_participants).
     fn vendorIdForPrefixLocked(self: *Self, prefix: guid_mod.GuidPrefix) ?header_mod.VendorId {
-        for (self.discovered_participants.items) |e| {
-            if (e.guid.prefix.eql(prefix)) return e.vendor_id;
-        }
-        return null;
+        const e = self.discovered_participants.get(prefix) orelse return null;
+        return e.vendor_id;
     }
 
     fn buildMatchedReaderInfo(
@@ -4056,10 +4062,7 @@ pub const DomainParticipantImpl = struct {
         var new_topic: ?DiscoveredTopic = null;
         var push_topic_dr: ?*reader_mod.DataReaderImpl = null;
         known: {
-            for (self.discovered_topics.items) |dt| {
-                if (std.mem.eql(u8, dt.topic_name, data.topic_name) and
-                    std.mem.eql(u8, dt.type_name, data.type_name)) break :known;
-            }
+            if (self.discovered_topics.contains(.{ .topic_name = data.topic_name, .type_name = data.type_name })) break :known;
             const tn = self.alloc.dupe(u8, data.topic_name) catch break :known;
             const tt = self.alloc.dupe(u8, data.type_name) catch {
                 self.alloc.free(tn);
@@ -4075,7 +4078,7 @@ pub const DomainParticipantImpl = struct {
                 .ownership_kind = disc.discOwnershipKind(data.qos),
                 .dest_order_kind = disc.discDestOrderKind(data.qos),
             };
-            self.discovered_topics.append(self.alloc, dt) catch {
+            self.discovered_topics.put(self.alloc, dt.key(), dt) catch {
                 self.alloc.free(tn);
                 self.alloc.free(tt);
                 break :known;
@@ -4232,18 +4235,14 @@ pub const DomainParticipantImpl = struct {
     /// not discovered. Points into discovered_writers, so it is valid until
     /// that changes. Must be called with self.mu held.
     fn discoveredWriterQosLocked(self: *Self, guid: Guid) ?*const disc.DiscoveredWriterData {
-        for (self.discovered_writers.items) |*dw| {
-            if (dw.guid.eql(guid)) return &dw.qos;
-        }
-        return null;
+        const dw = self.discovered_writers.getPtr(guid) orelse return null;
+        return &dw.qos;
     }
 
     /// As discoveredWriterQosLocked, for a discovered reader.
     fn discoveredReaderQosLocked(self: *Self, guid: Guid) ?*const disc.DiscoveredReaderData {
-        for (self.discovered_readers.items) |*dr| {
-            if (dr.guid.eql(guid)) return &dr.qos;
-        }
-        return null;
+        const dr = self.discovered_readers.getPtr(guid) orelse return null;
+        return &dr.qos;
     }
 
     /// Insert or refresh the persistent record for a discovered remote writer.
@@ -4251,84 +4250,60 @@ pub const DomainParticipantImpl = struct {
     /// currently-active local reader matched — a future DataReader created for
     /// this topic still needs to find it.  Must be called with self.mu held.
     fn upsertDiscoveredWriter(self: *Self, data: *const disc.WriterData) void {
-        for (self.discovered_writers.items, 0..) |*dw, i| {
-            if (dw.guid.eql(data.guid)) {
-                if (makeDiscoveredWriter(self.alloc, data)) |fresh| {
-                    dw.deinit(self.alloc);
-                    self.discovered_writers.items[i] = fresh;
-                }
-                return;
-            }
-        }
-        if (makeDiscoveredWriter(self.alloc, data)) |fresh| {
-            self.discovered_writers.append(self.alloc, fresh) catch {
-                var f = fresh;
-                f.deinit(self.alloc);
-            };
-        }
+        // Out of memory, a known writer keeps its record.
+        var fresh = makeDiscoveredWriter(self.alloc, data) orelse return;
+        const r = self.discovered_writers.getOrPut(self.alloc, data.guid) catch return fresh.deinit(self.alloc);
+        if (r.found_existing) r.value_ptr.deinit(self.alloc);
+        r.value_ptr.* = fresh;
     }
 
     fn upsertDiscoveredReader(self: *Self, data: *const disc.ReaderData) void {
-        for (self.discovered_readers.items, 0..) |*dr, i| {
-            if (dr.guid.eql(data.guid)) {
-                if (makeDiscoveredReader(self.alloc, data)) |fresh| {
-                    dr.deinit(self.alloc);
-                    self.discovered_readers.items[i] = fresh;
-                }
-                return;
-            }
-        }
-        if (makeDiscoveredReader(self.alloc, data)) |fresh| {
-            self.discovered_readers.append(self.alloc, fresh) catch {
-                var f = fresh;
-                f.deinit(self.alloc);
-            };
-        }
+        var fresh = makeDiscoveredReader(self.alloc, data) orelse return;
+        const r = self.discovered_readers.getOrPut(self.alloc, data.guid) catch return fresh.deinit(self.alloc);
+        if (r.found_existing) r.value_ptr.deinit(self.alloc);
+        r.value_ptr.* = fresh;
     }
 
     /// Must be called with self.mu held.
     fn removeDiscoveredWriter(self: *Self, guid: Guid) void {
-        for (self.discovered_writers.items, 0..) |*dw, i| {
-            if (dw.guid.eql(guid)) {
-                dw.deinit(self.alloc);
-                _ = self.discovered_writers.swapRemove(i);
-                break;
-            }
+        if (self.discovered_writers.fetchSwapRemove(guid)) |kv| {
+            var dw = kv.value;
+            dw.deinit(self.alloc);
         }
         self.releaseGuidHandleIfGoneLocked(guid);
     }
 
     /// Must be called with self.mu held.
     fn removeDiscoveredReader(self: *Self, guid: Guid) void {
-        for (self.discovered_readers.items, 0..) |*dr, i| {
-            if (dr.guid.eql(guid)) {
-                dr.deinit(self.alloc);
-                _ = self.discovered_readers.swapRemove(i);
-                break;
-            }
+        if (self.discovered_readers.fetchSwapRemove(guid)) |kv| {
+            var dr = kv.value;
+            dr.deinit(self.alloc);
         }
         self.releaseGuidHandleIfGoneLocked(guid);
     }
 
     /// Must be called with self.mu held.
     fn removeDiscoveredEndpointsForPrefix(self: *Self, prefix: GuidPrefix) void {
-        var i: usize = 0;
-        while (i < self.discovered_writers.items.len) {
-            if (self.discovered_writers.items[i].guid.prefix.eql(prefix)) {
-                const guid = self.discovered_writers.items[i].guid;
-                self.discovered_writers.items[i].deinit(self.alloc);
-                _ = self.discovered_writers.swapRemove(i);
-                self.releaseGuidHandleIfGoneLocked(guid);
-            } else i += 1;
+        // Downwards, as removing one moves the last into its place.
+        var i = self.discovered_writers.count();
+        while (i > 0) {
+            i -= 1;
+            const dw = &self.discovered_writers.values()[i];
+            if (!dw.guid.prefix.eql(prefix)) continue;
+            const guid = dw.guid;
+            dw.deinit(self.alloc);
+            self.discovered_writers.swapRemoveAt(i);
+            self.releaseGuidHandleIfGoneLocked(guid);
         }
-        i = 0;
-        while (i < self.discovered_readers.items.len) {
-            if (self.discovered_readers.items[i].guid.prefix.eql(prefix)) {
-                const guid = self.discovered_readers.items[i].guid;
-                self.discovered_readers.items[i].deinit(self.alloc);
-                _ = self.discovered_readers.swapRemove(i);
-                self.releaseGuidHandleIfGoneLocked(guid);
-            } else i += 1;
+        i = self.discovered_readers.count();
+        while (i > 0) {
+            i -= 1;
+            const dr = &self.discovered_readers.values()[i];
+            if (!dr.guid.prefix.eql(prefix)) continue;
+            const guid = dr.guid;
+            dr.deinit(self.alloc);
+            self.discovered_readers.swapRemoveAt(i);
+            self.releaseGuidHandleIfGoneLocked(guid);
         }
     }
 
@@ -4794,7 +4769,7 @@ pub const DomainParticipantImpl = struct {
             .reader => {
                 const before = disc_adapter.readerDiscoveredData(ep.qos, ep.presentation);
                 const after = disc_adapter.readerDiscoveredData(qos.*, presentation);
-                for (self.discovered_writers.items) |*dw| {
+                for (self.discovered_writers.values()) |*dw| {
                     if (!std.mem.eql(u8, dw.topic_name, ep.topic_name) or !std.mem.eql(u8, dw.type_name, ep.type_name)) continue;
                     if (self.ignoredRemoteLocked(.writer, dw.guid, dw.topic_name)) continue;
                     if (!qm_mod.checkDiscovered(&dw.qos, &before).isCompatible()) continue;
@@ -4807,7 +4782,7 @@ pub const DomainParticipantImpl = struct {
             .writer => {
                 const before = disc_adapter.writerDiscoveredData(ep.qos, ep.presentation);
                 const after = disc_adapter.writerDiscoveredData(qos.*, presentation);
-                for (self.discovered_readers.items) |*dr| {
+                for (self.discovered_readers.values()) |*dr| {
                     if (!std.mem.eql(u8, dr.topic_name, ep.topic_name) or !std.mem.eql(u8, dr.type_name, ep.type_name)) continue;
                     if (self.ignoredRemoteLocked(.reader, dr.guid, dr.topic_name)) continue;
                     if (!qm_mod.checkDiscovered(&before, &dr.qos).isCompatible()) continue;
@@ -4891,7 +4866,7 @@ pub const DomainParticipantImpl = struct {
                 // "A remote endpoint's discovery is handled best-effort
                 // when out of memory").
                 const refresh = aw.announced;
-                const can_unmatch = refresh and removed.reserve(self.alloc, self.discovered_readers.items.len);
+                const can_unmatch = refresh and removed.reserve(self.alloc, self.discovered_readers.count());
                 aw.announced = true;
                 // Retroactively match against readers discovered before this
                 // writer existed (or before it announced final partition/
@@ -4899,7 +4874,7 @@ pub const DomainParticipantImpl = struct {
                 // that already exist at the moment a reader is discovered, so
                 // without this a reader discovered first would never be matched.
                 const local_wd = disc_adapter.writerDiscoveredData(aw.qos, aw.presentation);
-                reader_scan: for (self.discovered_readers.items) |*dr| {
+                reader_scan: for (self.discovered_readers.values()) |*dr| {
                     // Mirrors onReaderDiscovered's own ignore-list guards (see that
                     // function, above) -- see subAnnounceProtoReader's matching
                     // comment (the symmetric fix on the reader side) for why this
@@ -5075,7 +5050,7 @@ pub const DomainParticipantImpl = struct {
                 guid_opt = ar.guid;
                 self.beginAnnouncingLocked(ar.guid);
                 const refresh = ar.announced;
-                const can_unmatch = refresh and removed.reserve(self.alloc, self.discovered_writers.items.len);
+                const can_unmatch = refresh and removed.reserve(self.alloc, self.discovered_writers.count());
                 ar.announced = true;
                 // Retroactively match against writers discovered before this
                 // reader existed (or before it announced final partition/
@@ -5083,7 +5058,7 @@ pub const DomainParticipantImpl = struct {
                 // that already exist at the moment a writer is discovered, so
                 // without this a writer discovered first would never be matched.
                 const local_rd = disc_adapter.readerDiscoveredData(ar.qos, ar.presentation);
-                writer_scan: for (self.discovered_writers.items) |*dw| {
+                writer_scan: for (self.discovered_writers.values()) |*dw| {
                     // Mirrors onWriterDiscovered's own ignore-list guards (see that
                     // function, above): a writer ignored (by prefix, handle, or
                     // topic name) *before* this reader existed still sits in
@@ -5903,10 +5878,10 @@ pub const DomainParticipantImpl = struct {
         // DataWriters and DataReaders discovered already with this name and
         // another type are inconsistent with it too.
         var inconsistent: i32 = 0;
-        for (self.discovered_writers.items) |dw| {
+        for (self.discovered_writers.values()) |dw| {
             if (std.mem.eql(u8, dw.topic_name, tn_s) and !std.mem.eql(u8, dw.type_name, tt_s)) inconsistent += 1;
         }
-        for (self.discovered_readers.items) |dr| {
+        for (self.discovered_readers.values()) |dr| {
             if (std.mem.eql(u8, dr.topic_name, tn_s) and !std.mem.eql(u8, dr.type_name, tt_s)) inconsistent += 1;
         }
         if (inconsistent > 0) {
@@ -5917,13 +5892,9 @@ pub const DomainParticipantImpl = struct {
         // work for locally-created topics.  The same (topic_name, type_name) dedup key used
         // by the SEDP callbacks prevents a duplicate entry when the topic later appears on wire.
         new_dt: {
-            for (self.discovered_topics.items) |dt| {
-                if (std.mem.eql(u8, dt.topic_name, tn_s) and
-                    std.mem.eql(u8, dt.type_name, tt_s))
-                {
-                    t.instance_handle = dt.handle;
-                    break :new_dt;
-                }
+            if (self.discovered_topics.get(.{ .topic_name = tn_s, .type_name = tt_s })) |dt| {
+                t.instance_handle = dt.handle;
+                break :new_dt;
             }
             const tn = self.alloc.dupe(u8, tn_s) catch break :new_dt;
             const tt = self.alloc.dupe(u8, tt_s) catch {
@@ -5941,7 +5912,7 @@ pub const DomainParticipantImpl = struct {
                 .dest_order_kind = if (qos.destination_order.kind == .BY_SOURCE_TIMESTAMP_DESTINATIONORDER_QOS) @as(u8, 1) else 0,
             };
             t.instance_handle = dt.handle;
-            self.discovered_topics.append(self.alloc, dt) catch {
+            self.discovered_topics.put(self.alloc, dt.key(), dt) catch {
                 self.alloc.free(tn);
                 self.alloc.free(tt);
                 break :new_dt;
@@ -6386,10 +6357,10 @@ pub const DomainParticipantImpl = struct {
         defer self.mu.unlock();
         // Find the participant with this handle to get its GUID prefix.
         var found_prefix: ?GuidPrefix = null;
-        for (self.discovered_participants.items, 0..) |e, i| {
+        for (self.discovered_participants.values(), 0..) |e, i| {
             if (e.handle == handle) {
                 found_prefix = e.guid.prefix;
-                _ = self.discovered_participants.swapRemove(i);
+                self.discovered_participants.swapRemoveAt(i);
                 self.releaseGuidHandleIfGoneLocked(e.guid);
                 break;
             }
@@ -6420,7 +6391,7 @@ pub const DomainParticipantImpl = struct {
             }
         }
         if (found_name == null) {
-            for (self.discovered_topics.items) |dt| {
+            for (self.discovered_topics.values()) |dt| {
                 if (dt.handle == handle) {
                     found_name = dt.topic_name;
                     break;
@@ -6552,10 +6523,10 @@ pub const DomainParticipantImpl = struct {
             if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
         }
         seq.* = .{};
-        const n = self.discovered_participants.items.len;
+        const n = self.discovered_participants.count();
         if (n == 0) return DDS.RETCODE_OK;
         const buf = self.alloc.alloc(DDS.InstanceHandle_t, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        for (self.discovered_participants.items, 0..) |e, i| buf[i] = e.handle;
+        for (self.discovered_participants.values(), 0..) |e, i| buf[i] = e.handle;
         seq._buffer = buf.ptr;
         seq._length = @intCast(n);
         seq._maximum = @intCast(n);
@@ -6575,7 +6546,7 @@ pub const DomainParticipantImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        for (self.discovered_participants.items) |e| {
+        for (self.discovered_participants.values()) |e| {
             if (e.handle == handle) {
                 data.* = .{};
                 data.key = writer_mod.guidToBuiltinKey(e.guid);
@@ -6601,10 +6572,10 @@ pub const DomainParticipantImpl = struct {
             if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
         }
         seq.* = .{};
-        const n = self.discovered_topics.items.len;
+        const n = self.discovered_topics.count();
         if (n == 0) return DDS.RETCODE_OK;
         const buf = self.alloc.alloc(DDS.InstanceHandle_t, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        for (self.discovered_topics.items, 0..) |dt, i| buf[i] = dt.handle;
+        for (self.discovered_topics.values(), 0..) |dt, i| buf[i] = dt.handle;
         seq._buffer = buf.ptr;
         seq._length = @intCast(n);
         seq._maximum = @intCast(n);
@@ -6624,7 +6595,7 @@ pub const DomainParticipantImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        for (self.discovered_topics.items) |dt| {
+        for (self.discovered_topics.values()) |dt| {
             if (dt.handle != handle) continue;
             // name/type_name must be duped into fresh, caller-owned storage here,
             // not aliased to dt.topic_name/dt.type_name directly: the C-ABI export

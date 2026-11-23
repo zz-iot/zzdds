@@ -59,7 +59,8 @@ The GUID- and prefix-keyed maps (`writer_liveliness`, `discovery_gens`, SPDP's `
 SEDP's `participant_locs`, …) are `std.AutoHashMap`s and need no change. The participant's
 `discovered_participants`, `discovered_writers`, `discovered_readers` and
 `discovered_topics` are lists searched linearly by GUID or name, in 16 loops in
-`participant.zig`; they are a follow-on, not part of this work.
+`participant.zig`; they are a follow-on, not part of this work. (Done 2026-11-23: they are
+array hash maps by GUID prefix, GUID, and topic name and type.)
 
 ## Measurements
 
@@ -196,7 +197,7 @@ by a handle of its own.
    their re-export from `dcps/root.zig` (`keyHashToHandle` went in step 2). Done
    2026-11-19.
 4. **Follow-ons**, each its own roadmap item: instance reclamation bounded by
-   `max_instances` (done 2026-11-22); the linear `discovered_*` lists.
+   `max_instances` (done 2026-11-22); the linear `discovered_*` lists (done 2026-11-23).
 
 Tests that computed a handle with `guidToHandle` (`api_test.zig`, `ignore_test.zig`,
 `matched_status_test.zig`) read it back from a built-in topic sample, or give it with the

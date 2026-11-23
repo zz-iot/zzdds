@@ -560,7 +560,7 @@ module DDS {
     };
 
     struct WriterDataLifecycleQosPolicy {
-        boolean autodispose_unregistered_instances;
+        @default(TRUE) boolean autodispose_unregistered_instances;
     };
 
     struct ReaderDataLifecycleQosPolicy {

@@ -118,6 +118,8 @@ pub fn main(init: std.process.Init) !void {
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    // So unregistering instance B leaves it NOT_ALIVE_NO_WRITERS, not disposed.
+    dw_qos.writer_data_lifecycle.autodispose_unregistered_instances = false;
 
     // The extended listener is passed at creation, through zzdds's Publisher
     // extension view: a reader discovered earlier matches inside

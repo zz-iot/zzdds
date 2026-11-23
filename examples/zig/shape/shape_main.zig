@@ -204,6 +204,10 @@ fn buildWriterQos(alloc: std.mem.Allocator, pub_: DDS.Publisher, opts: *const Op
         qos.ownership_strength.value = opts.ownership_strength;
     }
 
+    // As the OMG shape_main does: an unregister then leaves the instance
+    // NOT_ALIVE_NO_WRITERS rather than disposing it.
+    if (opts.final_instance_state == 'u') qos.writer_data_lifecycle.autodispose_unregistered_instances = false;
+
     qos.durability.kind = switch (opts.durability) {
         'v' => .VOLATILE_DURABILITY_QOS,
         'l' => .TRANSIENT_LOCAL_DURABILITY_QOS,

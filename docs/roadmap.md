@@ -279,22 +279,12 @@ Forward-looking only: known gaps, planned features, and open design questions.
     reflection, and every one of zzdds's own `examples/`/`stress-tests/` registrations
     passes it — see `CHANGELOG.md` 2026-09-14. Closed; not a gap anymore.
 
-- **READER_DATA_LIFECYCLE's autopurge delays are ignored.** A DataReader forgets an instance
-  once it is not alive, has no writers and its samples are taken
-  ([`decisions.md`](decisions.md), 2026-11-22), but `autopurge_nowriter_samples_delay` and
-  `autopurge_disposed_samples_delay` are never applied, so an application that leaves a
-  not-alive instance's samples untaken keeps the instance. Purge them on a timer once the
-  delay passes, as DDS 1.4 §2.2.3.21 describes.
-- **`autodispose_unregistered_instances` defaults to FALSE.** DDS 1.4 makes it TRUE, but
-  the generated `WriterDataLifecycleQosPolicy` zero-initializes it, and no default QoS sets
-  it, so an unregister disposes only when the application asks. Making it TRUE changes what
-  every reader sees of an unregister (NOT_ALIVE_DISPOSED rather than NOT_ALIVE_NO_WRITERS),
-  so it wants the examples and tests that expect the latter checked.
-- **The participant's `discovered_*` lists are searched linearly.**
-  `discovered_participants`, `discovered_writers`, `discovered_readers` and
-  `discovered_topics` are searched by GUID or name in many loops in `participant.zig`,
-  and freeing an entity's handle scans them too (`releaseGuidHandleIfGoneLocked`). Fine at
-  realistic counts; index them by GUID and name when it is not.
+- **Deleting a DataWriter does not unregister its instances.** DDS 1.4 §2.2.2.4.1.6 says it
+  does, so under `autodispose_unregistered_instances` (TRUE by default) its readers should
+  see each instance NOT_ALIVE_DISPOSED (§2.2.3.21). zzdds sends nothing for them as the
+  writer goes: a reader sees the writer lost, and its instances NOT_ALIVE_NO_WRITERS,
+  whatever the policy. As it is deleted, the writer should write an unregister for each
+  instance it has registered, before discovery withdraws it.
 
 ### Selective CDR parse (`deserialize_selected`) — deferred follow-ups
 

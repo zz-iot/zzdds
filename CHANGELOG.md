@@ -22,6 +22,21 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   best-effort one the lowest. A sample declaring more than the byte limit is never
   reassembled, and a reliable reader counts it lost, as a GAP would. Before, a reader
   allocated whatever size a DATA_FRAG declared, up to 4 GiB, for any number of samples.
+- WRITER_DATA_LIFECYCLE `autodispose_unregistered_instances` defaults to TRUE, as DDS 1.4
+  §2.2.3.21 says (`@default(TRUE)` in `idl/dcps.idl`): a DataWriter's unregister now also
+  disposes the instance unless the application turns this off, so readers see
+  NOT_ALIVE_DISPOSED where they saw NOT_ALIVE_NO_WRITERS. The shape and registry examples
+  turn it off where they unregister to show NOT_ALIVE_NO_WRITERS, as the OMG interoperability
+  suite's `shape_main` does.
+- A DataReader applies READER_DATA_LIFECYCLE's autopurge delays (DDS 1.4 §2.2.3.22): once
+  an instance has been NOT_ALIVE_NO_WRITERS for `autopurge_nowriter_samples_delay`, or
+  NOT_ALIVE_DISPOSED for `autopurge_disposed_samples_delay`, its queued samples are dropped,
+  read or not, and it is forgotten unless a writer still has it registered. The reader's
+  timer check does this, as it does DEADLINE. A zero delay, the policy's zero-initialized
+  value, means never, as DURATION_INFINITE does.
+- The participant keeps its discovered participants, DataWriters and DataReaders by GUID,
+  and its discovered topics by name and type, rather than in lists it searched for each
+  announcement, lookup and handle release.
 
 ## 2026-11-22
 
@@ -40,7 +55,7 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   (`KeyCopy`), and `zzdds_get_key_value_writer`/`_reader` copy into theirs directly.
 - A DataReader forgets an instance once it is not alive, no matched writer has it
   registered, and none of its samples is cached, queued or in a coherent set (DDS 1.4
-  §2.2.3.21), checked as each read or take ends, or as a writer is lost. Before, a reader
+  §2.2.3.22), checked as each read or take ends, or as a writer is lost. Before, a reader
   kept every instance a topic ever had. A later sample of its key starts a new instance:
   NEW, under a new handle, with generation counts of 0. A disposed instance whose writer
   still has it registered is kept, so its generation counts carry on. RESOURCE_LIMITS

@@ -73,6 +73,8 @@ public class Publisher {
         pub.get_default_datawriter_qos(dwQos);
         dwQos.get_reliability().set_kind(Dcps.DDS.ReliabilityQosPolicyKind.RELIABLE_RELIABILITY_QOS);
         dwQos.get_history().set_kind(Dcps.DDS.HistoryQosPolicyKind.KEEP_ALL_HISTORY_QOS);
+        // So unregistering instance B leaves it NOT_ALIVE_NO_WRITERS, not disposed.
+        dwQos.get_writer_data_lifecycle().set_autodispose_unregistered_instances(false);
 
 
         final AtomicBoolean readerReady = new AtomicBoolean(false);
