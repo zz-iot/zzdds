@@ -288,15 +288,11 @@ pub const PublisherImpl = struct {
         // drops the lifetime ref it holds on us (writer.zig init), so by
         // beginTeardown the only refs left are our own "alive" one and any
         // still-in-flight fallback dispatch -- which is exactly what should
-        // keep us alive past this call.
-        // A wait in progress is the Publisher's, not its writers': settled
-        // before the writers close, which would settle it ERROR.
-        {
-            self.mu.lock();
-            defer self.mu.unlock();
-            self.ack_waits_closed = true;
-            for (self.ack_waiters.items) |waiter| waiter.settleClose(.closed);
-        }
+        // keep us alive past this call. Writers still here go as the
+        // participant is torn down, its discovery and reception already
+        // stopped, so they unregister nothing: a deletion while it runs
+        // (`deleteWriters`) has taken them first.
+        self.closeAckWaits();
         for (self.writers.items) |w| self.destroyWriter(w);
         self.writers.clearRetainingCapacity();
         self.c_abi.retire();
@@ -732,8 +728,55 @@ pub const PublisherImpl = struct {
         };
         // Torn down without `mu`: deinit waits for a running listener,
         // which may call back into this Publisher.
-        self.destroyWriter(w);
+        self.deleteWriter(w);
         return DDS.RETCODE_OK;
+    }
+
+    /// Deletes a writer this Publisher no longer holds: it unregisters its
+    /// instances (DDS 1.4 §2.2.2.4.1.6) before its protocol writer is
+    /// destroyed and discovery withdraws it. Outside a coherent set, what it
+    /// holds a suspension held, perhaps one since resumed while a set was
+    /// open, so it first sends that as `resume_publications` does. In a
+    /// coherent set, which it can no longer complete and its readers discard,
+    /// its unregisters would be held in the set too, so it writes none.
+    /// Without `mu`.
+    fn deleteWriter(self: *Self, w: *writer_mod.DataWriterImpl) void {
+        const in_coherent_set = blk: {
+            self.mu.lock();
+            defer self.mu.unlock();
+            break :blk w.in_coherent_set;
+        };
+        if (!in_coherent_set) {
+            w.proto_writer.endCoherentSet(.none, false, null, null, false);
+            w.unregisterAllForDelete();
+        }
+        self.destroyWriter(w);
+    }
+
+    /// Ends the Publisher's acknowledgment waits as it is deleted: a wait in
+    /// progress is the Publisher's, not its writers', so it is settled before
+    /// the writers close, which would settle it ERROR.
+    fn closeAckWaits(self: *Self) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.ack_waits_closed = true;
+        for (self.ack_waiters.items) |waiter| waiter.settleClose(.closed);
+    }
+
+    /// Deletes every writer, each as `delete_datawriter` does: for a deletion
+    /// of this Publisher while its participant runs, before `deinit`. The
+    /// caller has checked `checkDeleteContainedPrecondition`.
+    pub fn deleteWriters(self: *Self) void {
+        self.closeAckWaits();
+        var taken = blk: {
+            self.mu.lock();
+            defer self.mu.unlock();
+            const taken = self.writers;
+            self.writers = .empty;
+            break :blk taken;
+        };
+        for (taken.items) |w| self.deleteWriter(w);
+        taken.deinit(self.alloc);
     }
 
     /// Deletes a writer already taken out of `writers`: its protocol writer,
@@ -785,7 +828,7 @@ pub const PublisherImpl = struct {
             self.writers = .empty;
         }
         // Torn down without `mu`, as in delete_datawriter.
-        for (taken.items) |w| self.destroyWriter(w);
+        for (taken.items) |w| self.deleteWriter(w);
         taken.deinit(self.alloc);
         return DDS.RETCODE_OK;
     }
@@ -973,7 +1016,10 @@ pub const PublisherImpl = struct {
         self.mu.lock();
         defer self.mu.unlock();
         if (self.coherent_depth == 0) {
-            for (self.writers.items) |w| w.proto_writer.beginCoherentSet(true);
+            for (self.writers.items) |w| {
+                w.proto_writer.beginCoherentSet(true);
+                w.in_coherent_set = true;
+            }
         }
         self.coherent_depth += 1;
         return DDS.RETCODE_OK;
@@ -1020,7 +1066,10 @@ pub const PublisherImpl = struct {
             // coherent sets at the same time, preventing a subscriber poll from
             // splitting a multi-topic set.
             const defer_eoc = mode == .full or mode == .coherent_only;
-            for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode, self.suspend_active, &self.group_seq_num_counter, group_set, defer_eoc);
+            for (self.writers.items) |w| {
+                w.proto_writer.endCoherentSet(mode, self.suspend_active, &self.group_seq_num_counter, group_set, defer_eoc);
+                w.in_coherent_set = false;
+            }
             // The End Coherent Set markers took group sequence number end_gsn.
             if (group_set != null) self.group_seq_num_counter += 1;
             if (defer_eoc) {

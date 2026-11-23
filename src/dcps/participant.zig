@@ -5748,6 +5748,7 @@ pub const DomainParticipantImpl = struct {
         }
         self.mu.unlock();
         // Deinit outside lock: publisher.deinit() calls destroy_proto_writer which locks mu.
+        p.deleteWriters();
         p.deinit();
         return DDS.RETCODE_OK;
     }
@@ -6209,7 +6210,10 @@ pub const DomainParticipantImpl = struct {
         self.cft_topics = .empty;
         self.mu.unlock();
         // Deinit outside lock to allow destroy_proto callbacks to re-lock mu.
-        for (pubs.items) |p| p.deinit();
+        for (pubs.items) |p| {
+            p.deleteWriters();
+            p.deinit();
+        }
         pubs.deinit(self.alloc);
         for (subs.items) |s| s.deinit();
         subs.deinit(self.alloc);

@@ -568,14 +568,237 @@ test "reclamation: a reader forgets the instances of a writer it loses" {
     _ = try takeAll(pair.dr);
     try testing.expectEqual(@as(u32, 2), pair.dr.instances.count());
 
-    // The disposed one goes with the writer; the alive one gets a
-    // NOT_ALIVE_NO_WRITERS sample, and goes once that is taken.
-    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, pair.dw.toDDSDataWriter()));
+    // The reader loses the writer, unannounced, as when its participant's
+    // lease expires (deleting it would unregister its instances): the
+    // disposed one goes with it; the alive one gets a NOT_ALIVE_NO_WRITERS
+    // sample, and goes once that is taken.
+    pair.dr.proto_reader.removeMatchedWriter(pair.dw.guid);
     fx.settle();
     try testing.expectEqual(@as(u32, 1), pair.dr.instances.count());
     const no_writers = try takeAll(pair.dr);
     try testing.expectEqual(DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE, no_writers.instance_state);
     try testing.expectEqual(@as(u32, 0), pair.dr.instances.count());
+}
+
+/// A RELIABLE writer's QoS, which waits as it is deleted for its readers to
+/// acknowledge its unregisters: in-process discovery withdraws it at once,
+/// while its data is queued.
+fn reliableWriterQos() DDS.DataWriterQos {
+    var qos = DDS.DataWriterQos{};
+    qos.reliability = .{ .kind = .RELIABLE_RELIABILITY_QOS, .max_blocking_time = ONE_SECOND };
+    return qos;
+}
+
+/// A RELIABLE reader's QoS, which acknowledges what it receives.
+fn reliableReaderQos() DDS.DataReaderQos {
+    var qos = DDS.DataReaderQos{};
+    qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    return qos;
+}
+
+test "delete: deleting a writer unregisters its instances, disposing them under autodispose" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    var dr_qos = reliableReaderQos();
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(reliableWriterQos(), dr_qos);
+
+    var key_b = NIL_KEY;
+    key_b[15] = 1;
+    try writeAlive(pair.dw);
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), key_b, &PAYLOAD);
+    fx.settle();
+    _ = try takeAll(pair.dr);
+
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, pair.dw.toDDSDataWriter()));
+    fx.settle();
+    for (0..2) |_| {
+        const s = try takeOne(pair.dr);
+        defer alloc.free(s.data);
+        try testing.expectEqual(DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, s.info.instance_state);
+        try testing.expect(!s.info.valid_data);
+    }
+    try testing.expect(pair.dr.takeRaw() == null);
+    try testing.expectEqual(@as(u32, 0), pair.dr.instances.count());
+}
+
+test "delete: without autodispose, deleting a writer leaves its instances NOT_ALIVE_NO_WRITERS" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    var dw_qos = reliableWriterQos();
+    dw_qos.writer_data_lifecycle.autodispose_unregistered_instances = false;
+    const pair = fx.makeWriterReader(dw_qos, reliableReaderQos());
+
+    try writeAlive(pair.dw);
+    fx.settle();
+    _ = try takeAll(pair.dr);
+
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, pair.dw.toDDSDataWriter()));
+    fx.settle();
+    const s = try takeAll(pair.dr);
+    try testing.expectEqual(DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE, s.instance_state);
+    try testing.expectEqual(@as(u32, 0), pair.dr.instances.count());
+}
+
+test "delete: an instance unregistered already is not unregistered again" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    var dw_qos = reliableWriterQos();
+    dw_qos.writer_data_lifecycle.autodispose_unregistered_instances = false;
+    var dr_qos = reliableReaderQos();
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(dw_qos, dr_qos);
+
+    try writeAlive(pair.dw);
+    try pair.dw.unregisterRaw(RtpsTimestamp.now(), NIL_KEY);
+    fx.settle();
+    try testing.expectEqual(@as(usize, 2), pair.dr.pending.items.len);
+
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, pair.dw.toDDSDataWriter()));
+    fx.settle();
+    try testing.expectEqual(@as(usize, 2), pair.dr.pending.items.len);
+}
+
+test "delete: the Publisher's and the participant's delete_contained_entities unregister their writers' instances" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    const by_pub = fx.makeWriterReader(reliableWriterQos(), reliableReaderQos());
+    try writeAlive(by_pub.dw);
+    fx.settle();
+    _ = try takeAll(by_pub.dr);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.delete_contained_entities());
+    fx.settle();
+    try testing.expectEqual(DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, (try takeAll(by_pub.dr)).instance_state);
+
+    const by_dp = fx.makeWriterReader(reliableWriterQos(), reliableReaderQos());
+    try writeAlive(by_dp.dw);
+    fx.settle();
+    _ = try takeAll(by_dp.dr);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp_w.delete_contained_entities());
+    fx.settle();
+    try testing.expectEqual(DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, (try takeAll(by_dp.dr)).instance_state);
+}
+
+test "delete: delete_publisher unregisters its writers' instances" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(reliableWriterQos(), reliableReaderQos());
+    try writeAlive(pair.dw);
+    fx.settle();
+    _ = try takeAll(pair.dr);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp_w.delete_publisher(fx.pub_w));
+    fx.settle();
+    try testing.expectEqual(DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, (try takeAll(pair.dr)).instance_state);
+}
+
+test "delete: a writer deleted while publications are suspended sends what they held, then unregisters" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    var dr_qos = reliableReaderQos();
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(reliableWriterQos(), dr_qos);
+
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.suspend_publications());
+    try writeAlive(pair.dw);
+    fx.settle();
+    try testing.expect(pair.dr.takeRaw() == null);
+
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, pair.dw.toDDSDataWriter()));
+    fx.settle();
+    const alive = try takeOne(pair.dr);
+    defer alloc.free(alive.data);
+    try testing.expectEqual(DDS.ALIVE_INSTANCE_STATE, alive.info.instance_state);
+    try testing.expect(alive.info.valid_data);
+    const disposed = try takeOne(pair.dr);
+    defer alloc.free(disposed.data);
+    try testing.expectEqual(DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, disposed.info.instance_state);
+}
+
+/// A RELIABLE writer's QoS whose blocking writes never time out.
+fn unboundedWriterQos() DDS.DataWriterQos {
+    var qos = reliableWriterQos();
+    qos.reliability.max_blocking_time = .{ .sec = DDS.DURATION_INFINITE_SEC, .nanosec = DDS.DURATION_INFINITE_NSEC };
+    return qos;
+}
+
+test "delete: a writer deleted in a coherent set unregisters nothing, so it does not wait" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(unboundedWriterQos(), reliableReaderQos());
+    try writeAlive(pair.dw);
+    fx.settle();
+    _ = try takeAll(pair.dr);
+
+    // Its unregisters would be held in the set, which the reader discards
+    // with the writer: it sees the writer lost.
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.begin_coherent_changes());
+    try writeAlive(pair.dw);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, pair.dw.toDDSDataWriter()));
+    fx.settle();
+    try testing.expectEqual(DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE, (try takeAll(pair.dr)).instance_state);
+}
+
+test "delete: a writer created in its Publisher's coherent set is not in it, so it unregisters" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.begin_coherent_changes());
+    const pair = fx.makeWriterReader(unboundedWriterQos(), reliableReaderQos());
+    try writeAlive(pair.dw);
+    fx.settle();
+    _ = try takeAll(pair.dr);
+
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, pair.dw.toDDSDataWriter()));
+    fx.settle();
+    try testing.expectEqual(DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, (try takeAll(pair.dr)).instance_state);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.end_coherent_changes());
+}
+
+test "delete: a writer outside a coherent set sends what a suspension resumed within the set still holds" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.begin_coherent_changes());
+    var dr_qos = reliableReaderQos();
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(unboundedWriterQos(), dr_qos);
+
+    // Resumed while the set is open, the writer still holds its write.
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.suspend_publications());
+    try writeAlive(pair.dw);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.resume_publications());
+    fx.settle();
+    try testing.expect(pair.dr.takeRaw() == null);
+
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, pair.dw.toDDSDataWriter()));
+    fx.settle();
+    const alive = try takeOne(pair.dr);
+    defer alloc.free(alive.data);
+    try testing.expectEqual(DDS.ALIVE_INSTANCE_STATE, alive.info.instance_state);
+    const disposed = try takeOne(pair.dr);
+    defer alloc.free(disposed.data);
+    try testing.expectEqual(DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, disposed.info.instance_state);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.end_coherent_changes());
+}
+
+test "delete: writers torn down with their participant, whose discovery has stopped, do not wait" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    // delete_participant refuses a participant with entities, so the
+    // factory's teardown deletes them.
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(unboundedWriterQos(), reliableReaderQos());
+    try writeAlive(pair.dw);
+    fx.settle();
+    _ = try takeAll(pair.dr);
 }
 
 test "max_instances: a reader rejects a new instance beyond it, until one is forgotten" {
@@ -679,6 +902,28 @@ test "autopurge: a disposed instance's samples go after its delay, and a registe
     fx.settle();
     const alive = try takeAll(pair.dr);
     try testing.expectEqual(@as(i32, 1), alive.disposed_generation_count);
+}
+
+test "autopurge: an instance a deleted writer disposed is purged after its delay, and forgotten" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const mc = fx.mr.manualClock();
+    var dr_qos = reliableReaderQos();
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    dr_qos.reader_data_lifecycle.autopurge_disposed_samples_delay = ONE_SECOND;
+    const pair = fx.makeWriterReader(reliableWriterQos(), dr_qos);
+
+    try writeAlive(pair.dw);
+    fx.settle();
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, pair.dw.toDDSDataWriter()));
+    fx.settle();
+    try testing.expectEqual(@as(usize, 2), pair.dr.pending.items.len);
+
+    mc.advance(std.time.ns_per_s);
+    checkReaderTimers(&fx);
+    try testing.expect(pair.dr.takeRaw() == null);
+    try testing.expectEqual(@as(u32, 0), pair.dr.instances.count());
 }
 
 test "autopurge: an instance alive again before its delay keeps its samples" {

@@ -96,6 +96,7 @@ pub fn main(init: std.process.Init) !void {
     if (!zzdds.registerTypeSupport(dp, "IgnoreEvent", .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = ignore_event_gen.IgnoreEvent.computeKeyHashFromCdr,
+        .key_projection = .{ .ctx = undefined, .project = ignore_event_gen.IgnoreEvent.projectKeyFromCdr },
         .compute_key_hash_key_only = ignore_event_gen.IgnoreEvent.computeKeyHashFromCdrKeyOnly,
     })) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});

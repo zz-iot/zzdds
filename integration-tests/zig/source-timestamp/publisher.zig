@@ -83,6 +83,7 @@ pub fn main(init: std.process.Init) !void {
     if (!zzdds.registerTypeSupport(dp, "TimestampEvent", .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = timestamp_event_gen.TimestampEvent.computeKeyHashFromCdr,
+        .key_projection = .{ .ctx = undefined, .project = timestamp_event_gen.TimestampEvent.projectKeyFromCdr },
         .compute_key_hash_key_only = timestamp_event_gen.TimestampEvent.computeKeyHashFromCdrKeyOnly,
     })) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});

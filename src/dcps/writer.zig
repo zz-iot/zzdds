@@ -30,6 +30,7 @@ const publisher_mod = @import("publisher.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const handle_registry = @import("handle_registry.zig");
 const key_value = @import("key_value.zig");
+const log = @import("../log.zig");
 pub const KeyValue = key_value.KeyValue;
 const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 const listener_lane = @import("listener_lane.zig");
@@ -301,6 +302,11 @@ pub const DataWriterImpl = struct {
     /// `instances_mu` and the protocol writer's lock; never held across the
     /// key projection, which is the binding's code.
     publish_mu: Mutex = .{},
+    /// Whether its Publisher's open coherent set holds what it writes: set
+    /// by `begin_coherent_changes` for the writers the Publisher has then,
+    /// cleared by `end_coherent_changes`. A writer created in the set is not
+    /// in it. Guarded by the Publisher's `mu`.
+    in_coherent_set: bool = false,
 
     /// One box for the whole object, shared across every interface view
     /// (DataWriter, Entity, and ZZDDS.DataWriter — see src/c_abi/extensions.zig)
@@ -776,6 +782,63 @@ pub const DataWriterImpl = struct {
         defer self.publish_mu.unlock();
         _ = try self.proto_writer.write(kind, source_timestamp, key_hash, key_hash, &.{});
         self.forgetInstance(key_hash);
+    }
+
+    /// As the writer is deleted, unregisters every instance it has
+    /// registered (DDS 1.4 §2.2.2.4.1.6), disposing it too under
+    /// autodispose_unregistered_instances, as `unregister_instance` does.
+    /// Each unregister carries the instance's key-only CDR if it has one,
+    /// else its key hash alone. Called before the protocol writer is
+    /// destroyed and discovery withdraws it, which a reader may learn of
+    /// before the unregisters arrive, dropping them: a RELIABLE writer waits
+    /// for its matched readers to acknowledge them, for up to RELIABILITY
+    /// `max_blocking_time`, as a blocking write would. Not in a hosted
+    /// runtime's turn, as a listener deleting it runs: that worker may be the
+    /// one to process the acknowledgments.
+    pub fn unregisterAllForDelete(self: *Self) void {
+        const kind: history_mod.ChangeKind = if (self.autodispose.load(.monotonic))
+            .not_alive_disposed_unregistered
+        else
+            .not_alive_unregistered;
+        const now = time_mod.RtpsTimestamp.now();
+        var last_sn: ?history_mod.SequenceNumber = null;
+        {
+            self.publish_mu.lock();
+            defer self.publish_mu.unlock();
+            var instances = blk: {
+                self.instances_mu.lock();
+                defer self.instances_mu.unlock();
+                const taken = self.instances;
+                self.instances = .empty;
+                break :blk taken;
+            };
+            defer instances.deinit(self.alloc);
+            var it = instances.iterator();
+            while (it.next()) |e| {
+                const key: []const u8 = if (e.value.*) |kv| (if (kv.key_only) kv.payload else &.{}) else &.{};
+                if (self.proto_writer.write(kind, now, e.key.*, e.key.*, key)) |sn| {
+                    last_sn = sn;
+                } else |err| {
+                    log.dcps.warn("DataWriter: unregistering an instance as the writer is deleted: {}", .{err});
+                }
+                if (e.value.*) |kv| self.alloc.free(kv.payload);
+            }
+        }
+        if (last_sn == null) return;
+        if (self.qos.reliability.kind == .BEST_EFFORT_RELIABILITY_QOS) return;
+        const runtime = self.listeners.runtimeOf();
+        if (runtime) |rt| if (rt.waitsBlockProgress()) return;
+        const mbt = self.qos.reliability.max_blocking_time;
+        const timeout_ns: ?i64 = if (mbt.sec == DDS.DURATION_INFINITE_SEC and mbt.nanosec == DDS.DURATION_INFINITE_NSEC) null else durationNs(mbt);
+        // As wait_for_acknowledgments does: its frontier, the last write,
+        // is the last unregister.
+        var waiter = proto.ack_wait.Waiter.init(runtime, timeout_ns);
+        defer waiter.deinit();
+        var cap: proto.ack_wait.Capture = .{ .waiter = &waiter };
+        waiter.expect();
+        self.beginAckWait(&cap) catch return;
+        defer self.endAckWait(&cap);
+        _ = waiter.wait();
     }
 
     pub fn toDDSDataWriter(self: *Self) DDS.DataWriter {

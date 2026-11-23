@@ -463,6 +463,32 @@ the generated policy is zero-initialized, and zero meaning "at once" would drop 
 not-alive sample of a reader made from a default-constructed QoS before the application
 could see it. A reader's DEADLINE treats zero the same way.
 
+**Deleting a DataWriter unregisters its instances, and a RELIABLE one waits up to
+`max_blocking_time` for them to be acknowledged (2026-11-23).** DDS 1.4 §2.2.2.4.1.6 says
+deleting a writer unregisters its instances, so under `autodispose_unregistered_instances`
+its readers see them disposed. `delete_datawriter`, `delete_publisher` and both
+`delete_contained_entities` write an unregister for each instance the writer has
+registered, carrying its key-only CDR where the writer has it and its key hash alone
+otherwise, before the protocol writer is
+destroyed and discovery withdraws it. A reader may learn of the withdrawal first: discovery
+traffic and user data arrive on different ports, and in-process discovery acts at once
+while data is queued. It then drops the unregisters, and sees the writer lost and its
+instances NOT_ALIVE_NO_WRITERS whatever the policy. So a RELIABLE writer waits for its
+matched readers to acknowledge them before it goes, for up to RELIABILITY
+`max_blocking_time`, the bound it already puts on a blocking write. That bound keeps an
+unresponsive reader from holding delete up longer than the application allows a write; a
+reader that has not acknowledged by then may see the writer lost instead. A BEST_EFFORT
+writer sends them once and does not wait, and so does a writer deleted in a turn of a
+hosted runtime, as from a listener: that worker may be the one to process the
+acknowledgments, and it cannot help as a manual runtime's waiter does. A writer in its
+Publisher's open coherent set writes none: they would be held in the set, which it can no
+longer complete and its readers discard with it, so they see it lost. Any other writer
+first sends what it holds, as `resume_publications` does: what a suspension held, perhaps
+one resumed while a set it was created too late to join was open, which `resume_publications`
+leaves held. Writers torn down with their participant by the factory's teardown write none
+either, as its discovery and reception have stopped by then; `delete_participant` itself
+refuses a participant that has entities.
+
 **What a disabled entity takes follows DDS 1.4 §2.2.2.1.1.7, the same for every entity.**
 That section lets a disabled entity take: setting and getting its QoS, default QoS and
 listener; `get_statuscondition`; factory operations; `get_status_changes` and the other

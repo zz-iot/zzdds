@@ -233,6 +233,7 @@ fn runEntities(io: std.Io, cfg: Config) !void {
     if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
         .ctx = @ptrCast(&g_ts_alloc),
         .compute_key_hash = gen.Message.computeKeyHashFromCdr,
+        .key_projection = .{ .ctx = undefined, .project = gen.Message.projectKeyFromCdr },
         .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
         .has_key = gen.Message.has_key,
     })) {
@@ -473,6 +474,7 @@ fn runWaitset(io: std.Io, cfg: Config) !void {
     if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
         .ctx = @ptrCast(&g_ts_alloc),
         .compute_key_hash = gen.Message.computeKeyHashFromCdr,
+        .key_projection = .{ .ctx = undefined, .project = gen.Message.projectKeyFromCdr },
         .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
         .has_key = gen.Message.has_key,
         .get_field = gen.Message.getFieldFromCdr,
@@ -664,6 +666,7 @@ fn runListener(io: std.Io, cfg: Config) !void {
     if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
         .ctx = @ptrCast(&g_ts_alloc),
         .compute_key_hash = gen.Message.computeKeyHashFromCdr,
+        .key_projection = .{ .ctx = undefined, .project = gen.Message.projectKeyFromCdr },
         .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
         .has_key = gen.Message.has_key,
     })) {
@@ -830,6 +833,7 @@ fn runCft(io: std.Io, cfg: Config) !void {
     if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
         .ctx = @ptrCast(&g_ts_alloc),
         .compute_key_hash = gen.Message.computeKeyHashFromCdr,
+        .key_projection = .{ .ctx = undefined, .project = gen.Message.projectKeyFromCdr },
         .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
         .has_key = gen.Message.has_key,
         .get_field = gen.Message.getFieldFromCdr,
@@ -1006,6 +1010,7 @@ fn participantsThread(ctx: ParticipantsCtx) void {
         if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
             .ctx = @ptrCast(&g_ts_alloc),
             .compute_key_hash = gen.Message.computeKeyHashFromCdr,
+            .key_projection = .{ .ctx = undefined, .project = gen.Message.projectKeyFromCdr },
             .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
             .has_key = gen.Message.has_key,
         })) {
@@ -1230,6 +1235,7 @@ fn runInstance(io: std.Io, cfg: Config) !void {
     if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
         .ctx = @ptrCast(&g_ts_alloc),
         .compute_key_hash = gen.Message.computeKeyHashFromCdr,
+        .key_projection = .{ .ctx = undefined, .project = gen.Message.projectKeyFromCdr },
         .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
         .has_key = gen.Message.has_key,
     })) {

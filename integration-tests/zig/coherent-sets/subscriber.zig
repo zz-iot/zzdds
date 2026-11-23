@@ -75,6 +75,7 @@ pub fn main(init: std.process.Init) !void {
     if (!zzdds.registerTypeSupport(dp, "Position", .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = pose_group_gen.Position.computeKeyHashFromCdr,
+        .key_projection = .{ .ctx = undefined, .project = pose_group_gen.Position.projectKeyFromCdr },
         .compute_key_hash_key_only = pose_group_gen.Position.computeKeyHashFromCdrKeyOnly,
     })) {
         std.debug.print("FAIL: registerTypeSupport(Position) failed\n", .{});
@@ -83,6 +84,7 @@ pub fn main(init: std.process.Init) !void {
     if (!zzdds.registerTypeSupport(dp, "Velocity", .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = pose_group_gen.Velocity.computeKeyHashFromCdr,
+        .key_projection = .{ .ctx = undefined, .project = pose_group_gen.Velocity.projectKeyFromCdr },
         .compute_key_hash_key_only = pose_group_gen.Velocity.computeKeyHashFromCdrKeyOnly,
     })) {
         std.debug.print("FAIL: registerTypeSupport(Velocity) failed\n", .{});
