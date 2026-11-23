@@ -1042,10 +1042,15 @@ such creation and retired with its last participant (the next creation starts an
 unless the application installs a runtime of its own (creation then fails once that one
 retires, until it is replaced) or disables the default. A WaitSet created without a
 runtime helps the default for each wait when it is an installed manual runtime, and never
-starts one. The default's options are fixed (no configuration yet), and installation is
-a Zig call: an installed runtime is an unretained pointer, which the application keeps
-valid while it is installed and its waits run. It does not yet carry the operation effect states (commit and
-cancellation) or resource waits.
+starts one. The default's options come from the process configuration's `default_runtime` (workers
+and inline turns; it is always hosted), and `default_runtime_policy` can disable it.
+Installing a runtime of one's own is still a Zig call: an installed runtime is an
+unretained pointer, which the application keeps valid while it is installed and its
+waits run (the `ExecutionRuntime` binding API is designed in
+[factory construction](design/factory-construction.md), not built). Operations map the
+contracts' effect states (commit and cancellation) and waits onto endpoint locks as
+[operation effects](design/concurrency/operation-effects.md) describes: the DataWriter
+and Publisher acknowledgment waits do so, and it lists what does not yet.
 The first vertical slice runs one reliable reader/writer pair through the same trace
 under a manual and a hosted driver: match, delivery, the acknowledgment and data waits, a
 missed deadline, and retirement begun from listeners, with the runtime's last owner

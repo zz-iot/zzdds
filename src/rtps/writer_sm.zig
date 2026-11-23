@@ -22,6 +22,7 @@ const iface = @import("../transport/interface.zig");
 const locator_selector = @import("../transport/locator_selector.zig");
 const runtime_mod = @import("../runtime/core.zig");
 const CloseLatch = @import("../runtime/close_latch.zig").CloseLatch;
+const ack_wait = @import("../protocol/ack_wait.zig");
 
 const MessageBuilder = msg.builder.MessageBuilder;
 const SCRATCH_SIZE = msg.builder.SCRATCH_SIZE;
@@ -605,6 +606,15 @@ pub const StatefulWriter = struct {
     writable_waiter: WritableWaiter = .{ .on_writable = onWritable },
     /// The last ReaderProxy.match_id given. Guarded by `mu`.
     last_match_id: u64 = 0,
+    /// The acknowledgment waits this writer has still to settle
+    /// (`beginAckWait`). Guarded by `mu`, as is `ack_waits_closed`, set by
+    /// `closeAckWaits`.
+    ack_waits: std.ArrayListUnmanaged(*ack_wait.Capture) = .empty,
+    ack_waits_closed: bool = false,
+    /// The last sequence number `write` or `writeReserved` committed: what
+    /// an acknowledgment wait covers. Not `cache.next_sn - 1`, which a
+    /// write that failed may have taken. Guarded by `mu`.
+    last_committed_sn: SequenceNumber = 0,
     /// When true, write() defers DATA sends and accumulates SNs in
     /// coherent_pending_sns.  Cleared by endCoherentSet().
     coherent_active: bool,
@@ -982,6 +992,8 @@ pub const StatefulWriter = struct {
         if (self.runtime != null) self.hb_ctx.deinit();
         for (self.reader_proxies.items) |*rp| rp.deinit(self.alloc);
         self.reader_proxies.deinit(self.alloc);
+        std.debug.assert(self.ack_waits.items.len == 0);
+        self.ack_waits.deinit(self.alloc);
         self.coherent_pending_sns.deinit(self.alloc);
         self.end_markers.deinit(self.alloc);
         self.cache.deinit();
@@ -1063,39 +1075,108 @@ pub const StatefulWriter = struct {
         if (self.runtime) |rt| rt.wakeHelpers();
     }
 
-    /// Block until every RELIABLE matched reader has cumulatively acked all
-    /// changes up to and including `target_sn`, or for `timeout_ns`.  Null
-    /// means wait indefinitely.  On a manual runtime the wait runs the
-    /// runtime's internal work meanwhile, on its clock.
-    /// Returns true on success, false on timeout.
-    pub fn waitAllAcked(self: *Self, target_sn: SequenceNumber, timeout_ns: ?i64) bool {
-        if (self.runtime) |rt| if (rt.canHelp()) {
-            const Wait = struct {
-                writer: *Self,
-                target_sn: SequenceNumber,
-                fn done(w: *const @This()) bool {
-                    return w.writer.allProxiesAcked(w.target_sn);
-                }
-            };
-            const deadline_ns = if (timeout_ns) |t| rt.clock.nowNs() +| t else null;
-            return rt.helpUntil(deadline_ns, &Wait{ .writer = self, .target_sn = target_sn }, Wait.done);
-        };
-        const deadline_ns = if (timeout_ns) |t| time_mod.nanoTimestamp() +| t else null;
+    /// Begins `cap`, a writer's part of an acknowledgment wait: captures
+    /// the last sequence number committed and the reliable readers that owe
+    /// an acknowledgment of it, and keeps `cap` to settle once none does
+    /// (docs/design/concurrency/operations.md#captured-acknowledgment-frontier).
+    /// Settles it at once if none owes one, or if the writer has closed.
+    /// `cap.waiter` must expect it; `endAckWait` ends it either way.
+    pub fn beginAckWait(self: *Self, cap: *ack_wait.Capture) error{OutOfMemory}!void {
         self.mu.lock();
         defer self.mu.unlock();
-        while (true) {
-            if (self.allProxiesAckedLocked(target_sn)) return true;
-            if (deadline_ns) |dl| {
-                const now = time_mod.nanoTimestamp();
-                if (now >= dl) return false;
-                const remaining: u64 = @intCast(dl - now);
-                self.ack_cond.timedWaitNs(&self.mu, remaining) catch {};
-                // Re-check after timeout: an ACK may have arrived just as the
-                // condvar re-acquired mu, satisfying the condition already.
-            } else {
-                self.ack_cond.wait(&self.mu);
+        if (self.ack_waits_closed) return cap.waiter.settle(.writer_closed);
+        const target = self.last_committed_sn;
+        var n: usize = 0;
+        for (self.reader_proxies.items) |*rp| {
+            if (owesAck(rp, target)) n += 1;
+        }
+        if (n == 0) return cap.waiter.acknowledged();
+        const readers = try self.alloc.alloc(ack_wait.Capture.Reader, n);
+        errdefer self.alloc.free(readers);
+        try self.ack_waits.append(self.alloc, cap);
+        n = 0;
+        for (self.reader_proxies.items) |*rp| {
+            if (!owesAck(rp, target)) continue;
+            readers[n] = .{ .guid = rp.guid, .match_id = rp.match_id };
+            n += 1;
+        }
+        cap.target_sn = target;
+        cap.readers = readers;
+        cap.registered = true;
+    }
+
+    /// Ends `cap`, settled or not: the writer no longer settles it.
+    pub fn endAckWait(self: *Self, cap: *ack_wait.Capture) void {
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (cap.registered) {
+                const i = std.mem.indexOfScalar(*ack_wait.Capture, self.ack_waits.items, cap).?;
+                _ = self.ack_waits.swapRemove(i);
+                cap.registered = false;
             }
         }
+        self.alloc.free(cap.readers);
+        cap.readers = &.{};
+    }
+
+    /// Settles every acknowledgment wait not yet settled as the writer
+    /// closes, before its readers go: none can then be acknowledged by
+    /// their removal. A later `beginAckWait` settles at once.
+    pub fn closeAckWaits(self: *Self) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.ack_waits_closed = true;
+        for (self.ack_waits.items) |cap| {
+            cap.registered = false;
+            cap.waiter.settleClose(.writer_closed);
+        }
+        self.ack_waits.clearRetainingCapacity();
+    }
+
+    /// Whether `rp` owes an acknowledgment of the changes through `target`:
+    /// a reliable reader that has not acknowledged them, and was matched in
+    /// time to be sent them.
+    fn owesAck(rp: *const ReaderProxy, target: SequenceNumber) bool {
+        return rp.reliable and rp.highest_acked_sn < target and rp.start_sn <= target;
+    }
+
+    /// Settles the acknowledgment waits whose captured readers have each
+    /// acknowledged, unmatched or matched again since: as acknowledged, or
+    /// timed out once past their deadline. Caller must hold `mu`.
+    fn settleAckWaitsLocked(self: *Self) void {
+        var i = self.ack_waits.items.len;
+        while (i > 0) {
+            i -= 1;
+            const cap = self.ack_waits.items[i];
+            if (!self.capturedAckedLocked(cap)) continue;
+            _ = self.ack_waits.swapRemove(i);
+            cap.registered = false;
+            if (cap.waiter.expired()) cap.waiter.settle(.timed_out) else cap.waiter.acknowledged();
+        }
+    }
+
+    /// Drops `rp`'s match from every acknowledgment wait, then settles
+    /// those it was the last to owe. Caller must hold `mu`.
+    fn retireFromAckWaitsLocked(self: *Self, rp: *const ReaderProxy) void {
+        for (self.ack_waits.items) |cap| {
+            for (cap.readers) |*r| {
+                if (r.guid.eql(rp.guid) and r.match_id == rp.match_id) r.retired = true;
+            }
+        }
+        self.settleAckWaitsLocked();
+    }
+
+    fn capturedAckedLocked(self: *Self, cap: *const ack_wait.Capture) bool {
+        for (cap.readers) |r| {
+            if (r.retired) continue;
+            for (self.reader_proxies.items) |*rp| {
+                if (!rp.guid.eql(r.guid)) continue;
+                if (rp.match_id == r.match_id and owesAck(rp, cap.target_sn)) return false;
+                break;
+            }
+        }
+        return true;
     }
 
     /// Like addOrRefreshMatchedReader, for callers that don't need to know whether the
@@ -1145,6 +1226,9 @@ pub const StatefulWriter = struct {
                 rp.multicast_locators = proxy.multicast_locators;
                 rp.selected_locators = proxy.selected_locators;
                 rp.reliable = proxy.reliable;
+                // A reader no longer reliable owes no acknowledgment, even
+                // made reliable again.
+                if (!rp.reliable) self.retireFromAckWaitsLocked(rp);
                 rp.expects_inline_qos = proxy.expects_inline_qos;
                 rp.wants_replay = proxy.wants_replay;
                 rp.is_local = proxy.is_local;
@@ -1902,8 +1986,9 @@ pub const StatefulWriter = struct {
         if (out.removed) if (unmatch) |u| u.remove(u.ctx, guid);
         // The removed reader may have been the last to acknowledge.
         if (out.removed) self.trimAckedLocked();
-        // Wake any thread blocked in waitAllAcked: removing a reliable reader
-        // may satisfy the all-acked condition even without an explicit ACKNACK.
+        // Removing a reliable reader may settle an acknowledgment wait even
+        // without an ACKNACK, and free space for a blocked write.
+        if (out.removed) self.settleAckWaitsLocked();
         // The removal may come from an application call rather than a turn.
         self.ack_cond.broadcast();
         if (self.runtime) |rt| rt.wakeHelpers();
@@ -1944,6 +2029,7 @@ pub const StatefulWriter = struct {
             // With no reliable reader to wait for, it is already acknowledged.
             self.trimAckedLocked();
         }
+        self.last_committed_sn = sn;
         return sn;
     }
 
@@ -1979,6 +2065,7 @@ pub const StatefulWriter = struct {
         defer self.mu.unlock();
         std.debug.assert(!self.coherent_active);
         const sn = self.cache.addReservedWriterChange(kind, self.guid, source_timestamp, instance_handle, key_hash, data, uses_reservation);
+        self.last_committed_sn = sn;
         if (self.cache.getChange(sn)) |ch| {
             self.sendChangeToAllLocked(ch, true);
             self.trimAckedLocked();
@@ -2155,6 +2242,7 @@ pub const StatefulWriter = struct {
             }
             rp.highest_acked_sn = @max(rp.highest_acked_sn, highest_sn);
             self.ack_cond.broadcast();
+            self.settleAckWaitsLocked();
             self.trimAckedLocked();
             self.retireEndMarkersLocked();
             // RELIABLE protocol-ready handshake: the first AckNack whose base

@@ -200,6 +200,10 @@ pub const PublisherImpl = struct {
     /// Active DataWriter instances owned by this publisher; guarded by `mu`.
     writers: std.ArrayListUnmanaged(*writer_mod.DataWriterImpl),
     mu: Mutex,
+    /// The wait_for_acknowledgments calls in progress, which `deinit`
+    /// settles ALREADY_DELETED, and whether it has. Guarded by `mu`.
+    ack_waiters: std.ArrayListUnmanaged(*proto.ack_wait.Waiter) = .empty,
+    ack_waits_closed: bool = false,
 
     /// Nesting counter for begin/end_coherent_changes.  The coherent set on the
     /// underlying writers is opened at depth 0→1 and closed at depth 1→0.
@@ -285,10 +289,15 @@ pub const PublisherImpl = struct {
         // beginTeardown the only refs left are our own "alive" one and any
         // still-in-flight fallback dispatch -- which is exactly what should
         // keep us alive past this call.
-        for (self.writers.items) |w| {
-            self.cbs.destroy_proto_writer(self.cbs.ctx, w.instance_handle);
-            w.deinit();
+        // A wait in progress is the Publisher's, not its writers': settled
+        // before the writers close, which would settle it ERROR.
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            self.ack_waits_closed = true;
+            for (self.ack_waiters.items) |waiter| waiter.settleClose(.closed);
         }
+        for (self.writers.items) |w| self.destroyWriter(w);
         self.writers.clearRetainingCapacity();
         self.c_abi.retire();
         if (self.status_cond) |sc| sc.c_abi.retire();
@@ -315,6 +324,8 @@ pub const PublisherImpl = struct {
         // Owned DataWriters were torn down synchronously in deinit(); the list
         // is empty here.
         self.writers.deinit(self.alloc);
+        std.debug.assert(self.ack_waiters.items.len == 0);
+        self.ack_waiters.deinit(self.alloc);
         self.qos.deinit(self.alloc);
         self.default_dw_qos.deinit(self.alloc);
         self.alloc.destroy(self);
@@ -721,9 +732,16 @@ pub const PublisherImpl = struct {
         };
         // Torn down without `mu`: deinit waits for a running listener,
         // which may call back into this Publisher.
+        self.destroyWriter(w);
+        return DDS.RETCODE_OK;
+    }
+
+    /// Deletes a writer already taken out of `writers`: its protocol writer,
+    /// then the writer.
+    fn destroyWriter(self: *Self, w: *writer_mod.DataWriterImpl) void {
+        w.closeProto();
         self.cbs.destroy_proto_writer(self.cbs.ctx, w.instance_handle);
         w.deinit();
-        return DDS.RETCODE_OK;
     }
 
     /// Checks every writer's delete precondition without tearing anything
@@ -767,10 +785,7 @@ pub const PublisherImpl = struct {
             self.writers = .empty;
         }
         // Torn down without `mu`, as in delete_datawriter.
-        for (taken.items) |w| {
-            self.cbs.destroy_proto_writer(self.cbs.ctx, w.instance_handle);
-            w.deinit();
-        }
+        for (taken.items) |w| self.destroyWriter(w);
         taken.deinit(self.alloc);
         return DDS.RETCODE_OK;
     }
@@ -1036,47 +1051,69 @@ pub const PublisherImpl = struct {
         return proto.groupDigest(ids);
     }
 
+    /// Waits for each reliable writer's readers matched now to acknowledge
+    /// what it has written (docs/design/concurrency/operations.md#publisher-acknowledgment-wait-aggregation-contract):
+    /// ERROR if one of those writers is deleted first, ALREADY_DELETED if
+    /// the Publisher is.
     fn vtWaitForAck(ctx: *anyopaque, timeout: *const DDS.Duration_t) DDS.ReturnCode_t {
         {
             const rc = cast(ctx).checkEnabledPrecondition();
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);
-        const POLL_NS: u64 = 1_000_000; // 1 ms
-        const timeout_ns: ?i64 = if (timeout.sec == DDS.DURATION_INFINITE_SEC and
-            timeout.nanosec == DDS.DURATION_INFINITE_NSEC)
-            null
-        else
-            @as(i64, timeout.sec) * std.time.ns_per_s + @as(i64, timeout.nanosec);
+        const timeout_ns = writer_mod.waitTimeoutNs(timeout.*) catch return DDS.RETCODE_BAD_PARAMETER;
+        if (!self.quiesce.acquire()) return DDS.RETCODE_ALREADY_DELETED;
+        defer self.quiesce.release(self, reallyDeinit);
 
-        // On a manual runtime, nothing else may be running it.
-        if (self.helpingRuntime()) |rt| {
-            const deadline_ns = if (timeout_ns) |t| rt.clock.nowNs() +| t else null;
-            return if (rt.helpUntil(deadline_ns, self, allWritersAcked)) DDS.RETCODE_OK else DDS.RETCODE_TIMEOUT;
-        }
-        const deadline_ns = if (timeout_ns) |t| time_mod.nanoTimestamp() +| t else null;
-        while (true) {
-            if (self.allWritersAcked()) return DDS.RETCODE_OK;
-            if (deadline_ns) |dl| {
-                if (time_mod.nanoTimestamp() >= dl) return DDS.RETCODE_TIMEOUT;
+        var waiter = proto.ack_wait.Waiter.init(self.runtimeOf(), timeout_ns);
+        defer waiter.deinit();
+        // The reliable writers now, each kept until the wait ends: writers
+        // created later do not join.
+        var caps: std.ArrayListUnmanaged(WriterCapture) = .empty;
+        defer caps.deinit(self.alloc);
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (self.ack_waits_closed) return DDS.RETCODE_ALREADY_DELETED;
+            var n: usize = 0;
+            for (self.writers.items) |w| {
+                if (w.qos.reliability.kind != .BEST_EFFORT_RELIABILITY_QOS) n += 1;
             }
-            time_mod.sleepNs(POLL_NS);
+            if (n == 0) return DDS.RETCODE_OK;
+            caps.ensureTotalCapacityPrecise(self.alloc, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+            self.ack_waiters.append(self.alloc, &waiter) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+            for (self.writers.items) |w| {
+                if (w.qos.reliability.kind == .BEST_EFFORT_RELIABILITY_QOS) continue;
+                if (!w.acquireQuiesce()) continue;
+                caps.appendAssumeCapacity(.{ .writer = w, .cap = .{ .waiter = &waiter } });
+                waiter.expect();
+            }
         }
+        defer {
+            self.mu.lock();
+            const i = std.mem.indexOfScalar(*proto.ack_wait.Waiter, self.ack_waiters.items, &waiter).?;
+            _ = self.ack_waiters.swapRemove(i);
+            self.mu.unlock();
+        }
+        defer for (caps.items) |*c| {
+            c.writer.endAckWait(&c.cap);
+            c.writer.releaseQuiesce();
+        };
+        if (caps.items.len == 0) return DDS.RETCODE_OK;
+        // Every writer's part begins before any is waited for.
+        for (caps.items) |*c| c.writer.beginAckWait(&c.cap) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        return writer_mod.ackWaitResult(waiter.wait(), DDS.RETCODE_ERROR);
     }
 
-    fn allWritersAcked(self: *Self) bool {
-        self.mu.lock();
-        defer self.mu.unlock();
-        for (self.writers.items) |w| {
-            if (w.qos.reliability.kind != .BEST_EFFORT_RELIABILITY_QOS and !w.allAcked()) return false;
-        }
-        return true;
-    }
+    const WriterCapture = struct {
+        writer: *writer_mod.DataWriterImpl,
+        cap: proto.ack_wait.Capture,
+    };
 
-    /// The manual runtime a blocking call helps, if the participant is on one.
-    fn helpingRuntime(self: *Self) ?*Runtime {
+    /// The runtime this Publisher's participant runs on, if it has one.
+    fn runtimeOf(self: *Self) ?*Runtime {
         const group = self.cbs.listener_group orelse return null;
-        return if (group.runtime.canHelp()) group.runtime else null;
+        return group.runtime;
     }
 
     // NOT gated on enabled state: a pure navigational getter (no side effect,

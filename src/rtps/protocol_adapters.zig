@@ -82,6 +82,9 @@ pub const RtpsProtocolWriter = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Before anything removes its readers, which would look like their
+        // acknowledgments to a wait on them.
+        self.writer.closeAckWaits();
         // Now, while the owner's runtime and transport are alive: an
         // outstanding write loan can hold this writer past its participant,
         // and the teardown below then touches neither.
@@ -141,7 +144,8 @@ pub const RtpsProtocolWriter = struct {
         .handle_ack_nack = vtHandleAckNack,
         .handle_nack_frag = vtHandleNackFrag,
         .all_acked = vtAllAcked,
-        .wait_all_acked = vtWaitAllAcked,
+        .begin_ack_wait = vtBeginAckWait,
+        .end_ack_wait = vtEndAckWait,
         .cache_len = vtCacheLen,
         .wait_cache_below = vtWaitCacheBelow,
         .begin_coherent_set = vtBeginCoherentSet,
@@ -236,9 +240,14 @@ pub const RtpsProtocolWriter = struct {
         return self.writer.allProxiesAcked(target_sn);
     }
 
-    fn vtWaitAllAcked(ctx: *anyopaque, target_sn: history_mod.SequenceNumber, timeout_ns: ?i64) bool {
+    fn vtBeginAckWait(ctx: *anyopaque, cap: *protocol.ack_wait.Capture) error{OutOfMemory}!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.writer.waitAllAcked(target_sn, timeout_ns);
+        return self.writer.beginAckWait(cap);
+    }
+
+    fn vtEndAckWait(ctx: *anyopaque, cap: *protocol.ack_wait.Capture) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writer.endAckWait(cap);
     }
 
     fn vtWaitCacheBelow(ctx: *anyopaque, limit: usize, timeout_ns: ?i64) bool {

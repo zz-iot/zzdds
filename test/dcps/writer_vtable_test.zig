@@ -399,6 +399,19 @@ test "wait_for_acknowledgments: RELIABLE with no writes returns OK immediately" 
     try testing.expectEqual(DDS.RETCODE_OK, rc);
 }
 
+test "wait_for_acknowledgments: a negative or unnormalized max_wait is BAD_PARAMETER" {
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    var qos = DDS.DataWriterQos{};
+    qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    const dw = fx.makeWriter(qos, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+    for ([_]DDS.Duration_t{ .{ .sec = -1, .nanosec = 0 }, .{ .sec = 0, .nanosec = 1_000_000_000 } }) |d| {
+        try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, dw.vtable.wait_for_acknowledgments(dw.ptr, &d));
+        try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, fx.pub_.vtable.wait_for_acknowledgments(fx.pub_.ptr, &d));
+    }
+}
+
 test "assert_liveliness: returns RETCODE_OK" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
