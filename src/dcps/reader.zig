@@ -265,6 +265,14 @@ pub const CoherentWriter = struct {
 };
 
 /// Ownership by the caller of data returned from takeRaw().
+/// Storage a read or take prepares for its output once it knows how many
+/// samples it selects: called under the reader's lock before it changes
+/// anything, so a failure leaves the reader as it was.
+pub const PrepareOutput = struct {
+    ctx: *anyopaque,
+    prepare: *const fn (ctx: *anyopaque, n: usize) error{OutOfMemory}!void,
+};
+
 pub const TakenSample = struct {
     /// Serialized CDR payload; caller must free with the reader's allocator.
     /// Empty slice for NOT_ALIVE_* changes (check info.valid_data).
@@ -535,6 +543,10 @@ pub const DataReaderImpl = struct {
     /// anything else (same precedent as `ListenerBox`'s own dedicated lock) --
     /// safe to take independently of `mu`, no ordering relationship with it.
     loan_table_mu: Mutex = .{},
+    /// `loan_table` slots raw reads and takes have reserved and not yet
+    /// used (`RawOutput`), guarded by `loan_table_mu`: the table always has
+    /// room for them.
+    loan_table_reserved: u32 = 0,
     loan_table: std.AutoHashMapUnmanaged(*anyopaque, []*PendingChange) = .empty,
     /// The coherent set each writer is in the middle of sending, keyed by
     /// writer GUID so that different writers' sets accumulate independently.
@@ -2425,59 +2437,35 @@ pub const DataReaderImpl = struct {
         max_samples: i32,
         maybe_qc: ?*const waitset.QueryConditionImpl,
     ) anyerror!void {
+        return self.takeNextInstanceFilteredPrepared(out, prev_instance_handle, sample_mask, view_mask, instance_mask, max_samples, maybe_qc, null);
+    }
+
+    fn takeNextInstanceFilteredPrepared(
+        self: *Self,
+        out: *std.ArrayListUnmanaged(TakenSample),
+        prev_instance_handle: DDS.InstanceHandle_t,
+        sample_mask: DDS.SampleStateMask,
+        view_mask: DDS.ViewStateMask,
+        instance_mask: DDS.InstanceStateMask,
+        max_samples: i32,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
+        prepare: ?PrepareOutput,
+    ) error{OutOfMemory}!void {
         self.mu.lock();
         defer self.mu.unlock();
         defer self.reclaimInstancesLocked();
+        self.purgeExpiredLocked();
+        const tgt = self.nextInstanceLocked(prev_instance_handle, sample_mask, view_mask, instance_mask, maybe_qc);
+        const n = if (tgt) |ih| self.countSelectedLocked(sample_mask, view_mask, instance_mask, max_samples, ih, maybe_qc) else 0;
+        try self.prepareLocked(TakenSample, out, n, prepare);
         self.resetDataAvailableLocked();
-        const now_ns = time_mod.nanoTimestamp();
-
-        var ei: usize = 0;
-        while (ei < self.pending.items.len) {
-            if (self.pending.items[ei].expiry_ns) |exp| {
-                if (now_ns >= exp) {
-                    const expired = self.pending.orderedRemove(ei);
-                    expired.quiesce.beginTeardown(expired, PendingChange.reallyFree);
-                    continue;
-                }
-            }
-            ei += 1;
-        }
-
-        // Smallest instance_handle > prev (or overall smallest if prev == 0)
-        // among instances with at least one sample matching the condition.
-        var target_ih: ?DDS.InstanceHandle_t = null;
-        for (self.pending.items) |pc| {
-            const ih = pc.info.instance_handle;
-            if (prev_instance_handle != 0 and ih <= prev_instance_handle) continue;
-            if (target_ih != null and ih >= target_ih.?) continue;
-            if (!matchesSample(pc, sample_mask, view_mask, instance_mask, null)) continue;
-            if (!matchesQuery(pc, maybe_qc, self.get_field_fn)) continue;
-            target_ih = ih;
-        }
-        const tgt = target_ih orelse return;
-
-        const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
-
-        var match_count: usize = 0;
-        for (self.pending.items) |pc| {
-            if (match_count >= limit) break;
-            if (pc.info.instance_handle != tgt) continue;
-            if (matchesSample(pc, sample_mask, view_mask, instance_mask, null) and
-                matchesQuery(pc, maybe_qc, self.get_field_fn)) match_count += 1;
-        }
-        try out.ensureUnusedCapacity(self.alloc, match_count);
+        const ih = tgt orelse return;
         const start = out.items.len;
-
         var write: usize = 0;
-        var taken: usize = 0;
         for (self.pending.items) |pc| {
-            if (pc.info.instance_handle == tgt and taken < limit and
-                matchesSample(pc, sample_mask, view_mask, instance_mask, null) and
-                matchesQuery(pc, maybe_qc, self.get_field_fn))
-            {
+            if (out.items.len - start < n and self.selects(pc, sample_mask, view_mask, instance_mask, ih, maybe_qc)) {
                 out.appendAssumeCapacity(.{ .data = pc.data, .info = pc.info, .key_hash = pc.key_hash });
                 self.alloc.destroy(pc);
-                taken += 1;
             } else {
                 self.pending.items[write] = pc;
                 write += 1;
@@ -2500,49 +2488,50 @@ pub const DataReaderImpl = struct {
         max_samples: i32,
         maybe_qc: ?*const waitset.QueryConditionImpl,
     ) anyerror!void {
+        return self.readNextInstanceFilteredPrepared(out, prev_instance_handle, sample_mask, view_mask, instance_mask, max_samples, maybe_qc, null);
+    }
+
+    /// Clones every sample it selects before marking any READ: running out
+    /// of memory reads nothing.
+    fn readNextInstanceFilteredPrepared(
+        self: *Self,
+        out: *std.ArrayListUnmanaged(TakenSample),
+        prev_instance_handle: DDS.InstanceHandle_t,
+        sample_mask: DDS.SampleStateMask,
+        view_mask: DDS.ViewStateMask,
+        instance_mask: DDS.InstanceStateMask,
+        max_samples: i32,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
+        prepare: ?PrepareOutput,
+    ) error{OutOfMemory}!void {
         self.mu.lock();
         defer self.mu.unlock();
         defer self.reclaimInstancesLocked();
-        self.resetDataAvailableLocked();
-        const now_ns = time_mod.nanoTimestamp();
-
-        var ei: usize = 0;
-        while (ei < self.pending.items.len) {
-            if (self.pending.items[ei].expiry_ns) |exp| {
-                if (now_ns >= exp) {
-                    const expired = self.pending.orderedRemove(ei);
-                    expired.quiesce.beginTeardown(expired, PendingChange.reallyFree);
-                    continue;
-                }
-            }
-            ei += 1;
-        }
-
-        var target_ih: ?DDS.InstanceHandle_t = null;
-        for (self.pending.items) |pc| {
-            const ih = pc.info.instance_handle;
-            if (prev_instance_handle != 0 and ih <= prev_instance_handle) continue;
-            if (target_ih != null and ih >= target_ih.?) continue;
-            if (!matchesSample(pc, sample_mask, view_mask, instance_mask, null)) continue;
-            if (!matchesQuery(pc, maybe_qc, self.get_field_fn)) continue;
-            target_ih = ih;
-        }
-        const tgt = target_ih orelse return;
-
-        const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
+        self.purgeExpiredLocked();
+        const ih_sel = self.nextInstanceLocked(prev_instance_handle, sample_mask, view_mask, instance_mask, maybe_qc);
+        const n = if (ih_sel) |_| self.countSelectedLocked(sample_mask, view_mask, instance_mask, max_samples, ih_sel.?, maybe_qc) else 0;
+        try self.prepareLocked(TakenSample, out, n, prepare);
         const start = out.items.len;
-        var count: usize = 0;
-        for (self.pending.items) |pc| {
-            if (count >= limit) break;
-            if (pc.info.instance_handle != tgt) continue;
-            if (!matchesSample(pc, sample_mask, view_mask, instance_mask, null)) continue;
-            if (!matchesQuery(pc, maybe_qc, self.get_field_fn)) continue;
-            const clone = try self.alloc.dupe(u8, pc.data);
-            errdefer self.alloc.free(clone);
-            try out.append(self.alloc, .{ .data = clone, .info = pc.info, .key_hash = pc.key_hash });
-            pc.info.sample_state = DDS.READ_SAMPLE_STATE;
-            count += 1;
+        errdefer {
+            for (out.items[start..]) |t| self.alloc.free(t.data);
+            out.items.len = start;
         }
+        var selected: usize = 0;
+        if (ih_sel != null) for (self.pending.items) |pc| {
+            if (selected >= n) break;
+            if (!self.selects(pc, sample_mask, view_mask, instance_mask, ih_sel.?, maybe_qc)) continue;
+            out.appendAssumeCapacity(.{ .data = try self.alloc.dupe(u8, pc.data), .info = pc.info, .key_hash = pc.key_hash });
+            selected += 1;
+        };
+        self.resetDataAvailableLocked();
+        // Everything is cloned: now the selection's READ state.
+        selected = 0;
+        if (ih_sel != null) for (self.pending.items) |pc| {
+            if (selected >= n) break;
+            if (!self.selects(pc, sample_mask, view_mask, instance_mask, ih_sel.?, maybe_qc)) continue;
+            pc.info.sample_state = DDS.READ_SAMPLE_STATE;
+            selected += 1;
+        };
         self.finalizeGenerationRanksLocked(out.items[start..]);
     }
 
@@ -2592,35 +2581,50 @@ pub const DataReaderImpl = struct {
         maybe_ih: ?DDS.InstanceHandle_t,
         maybe_qc: ?*const waitset.QueryConditionImpl,
     ) anyerror!void {
+        return self.readRawPrepared(out, sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc, null);
+    }
+
+    /// Clones every sample it selects before marking any READ: running out
+    /// of memory reads nothing.
+    fn readRawPrepared(
+        self: *Self,
+        out: *std.ArrayListUnmanaged(TakenSample),
+        sample_mask: DDS.SampleStateMask,
+        view_mask: DDS.ViewStateMask,
+        instance_mask: DDS.InstanceStateMask,
+        max_samples: i32,
+        maybe_ih: ?DDS.InstanceHandle_t,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
+        prepare: ?PrepareOutput,
+    ) error{OutOfMemory}!void {
         self.mu.lock();
         defer self.mu.unlock();
         defer self.reclaimInstancesLocked();
-        self.resetDataAvailableLocked();
-        const now_ns = time_mod.nanoTimestamp();
-        var ei: usize = 0;
-        while (ei < self.pending.items.len) {
-            if (self.pending.items[ei].expiry_ns) |exp| {
-                if (now_ns >= exp) {
-                    const expired = self.pending.orderedRemove(ei);
-                    expired.quiesce.beginTeardown(expired, PendingChange.reallyFree);
-                    continue;
-                }
-            }
-            ei += 1;
-        }
-        const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
+        self.purgeExpiredLocked();
+        const ih_sel: ?void = {};
+        const n = if (ih_sel) |_| self.countSelectedLocked(sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc) else 0;
+        try self.prepareLocked(TakenSample, out, n, prepare);
         const start = out.items.len;
-        var count: usize = 0;
-        for (self.pending.items) |pc| {
-            if (count >= limit) break;
-            if (!matchesSample(pc, sample_mask, view_mask, instance_mask, maybe_ih)) continue;
-            if (!matchesQuery(pc, maybe_qc, self.get_field_fn)) continue;
-            const clone = try self.alloc.dupe(u8, pc.data);
-            errdefer self.alloc.free(clone);
-            try out.append(self.alloc, .{ .data = clone, .info = pc.info, .key_hash = pc.key_hash });
-            pc.info.sample_state = DDS.READ_SAMPLE_STATE;
-            count += 1;
+        errdefer {
+            for (out.items[start..]) |t| self.alloc.free(t.data);
+            out.items.len = start;
         }
+        var selected: usize = 0;
+        if (ih_sel != null) for (self.pending.items) |pc| {
+            if (selected >= n) break;
+            if (!self.selects(pc, sample_mask, view_mask, instance_mask, maybe_ih, maybe_qc)) continue;
+            out.appendAssumeCapacity(.{ .data = try self.alloc.dupe(u8, pc.data), .info = pc.info, .key_hash = pc.key_hash });
+            selected += 1;
+        };
+        self.resetDataAvailableLocked();
+        // Everything is cloned: now the selection's READ state.
+        selected = 0;
+        if (ih_sel != null) for (self.pending.items) |pc| {
+            if (selected >= n) break;
+            if (!self.selects(pc, sample_mask, view_mask, instance_mask, maybe_ih, maybe_qc)) continue;
+            pc.info.sample_state = DDS.READ_SAMPLE_STATE;
+            selected += 1;
+        };
         self.finalizeGenerationRanksLocked(out.items[start..]);
     }
 
@@ -2663,10 +2667,8 @@ pub const DataReaderImpl = struct {
     /// The caller owns the returned slice (allocated with this reader's
     /// allocator) and must eventually pass it to `releasePinnedSamples`.
     /// `max_samples` < 0 means no limit. `maybe_ih` restricts to a single
-    /// instance. On allocation failure partway through, returns what was
-    /// successfully pinned so far rather than failing the whole call --
-    /// matches the design's decided "partial batches on pool pressure"
-    /// semantics (return what's available).
+    /// instance. Allocates everything first: out of memory, it pins and
+    /// marks nothing (docs/design/concurrency/operations.md#admission-and-conversion-capability).
     pub fn pinSamplesForLoan(
         self: *Self,
         sample_mask: DDS.SampleStateMask,
@@ -2676,47 +2678,43 @@ pub const DataReaderImpl = struct {
         maybe_ih: ?DDS.InstanceHandle_t,
         maybe_qc: ?*const waitset.QueryConditionImpl,
     ) ![]*PendingChange {
+        return self.pinSamplesForLoanPrepared(sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc, null);
+    }
+
+    fn pinSamplesForLoanPrepared(
+        self: *Self,
+        sample_mask: DDS.SampleStateMask,
+        view_mask: DDS.ViewStateMask,
+        instance_mask: DDS.InstanceStateMask,
+        max_samples: i32,
+        maybe_ih: ?DDS.InstanceHandle_t,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
+        prepare: ?PrepareOutput,
+    ) error{OutOfMemory}![]*PendingChange {
         self.mu.lock();
         defer self.mu.unlock();
         defer self.reclaimInstancesLocked();
-        self.resetDataAvailableLocked();
-        const now_ns = time_mod.nanoTimestamp();
-        var ei: usize = 0;
-        while (ei < self.pending.items.len) {
-            if (self.pending.items[ei].expiry_ns) |exp| {
-                if (now_ns >= exp) {
-                    const expired = self.pending.orderedRemove(ei);
-                    expired.quiesce.beginTeardown(expired, PendingChange.reallyFree);
-                    continue;
-                }
-            }
-            ei += 1;
-        }
-        const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
+        self.purgeExpiredLocked();
+        const ih_sel: ??DDS.InstanceHandle_t = maybe_ih;
+        const n = if (ih_sel != null) self.countSelectedLocked(sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc) else 0;
         var out: std.ArrayListUnmanaged(*PendingChange) = .empty;
         errdefer out.deinit(self.alloc);
-        var count: usize = 0;
+        try out.ensureTotalCapacityPrecise(self.alloc, n);
+        if (prepare) |p| try p.prepare(p.ctx, n);
+        self.resetDataAvailableLocked();
         for (self.pending.items) |pc| {
-            if (count >= limit) break;
-            if (!matchesSample(pc, sample_mask, view_mask, instance_mask, maybe_ih)) continue;
-            if (!matchesQuery(pc, maybe_qc, self.get_field_fn)) continue;
+            if (out.items.len >= n) break;
+            if (!self.selects(pc, sample_mask, view_mask, instance_mask, maybe_ih, maybe_qc)) continue;
             // Structurally unreachable today: acquire-vs-eviction are both
-            // serialized by `self.mu` above, and a sample only reaches this
-            // scan while still resident in `pending` (not yet evicted) --
-            // but handle it defensively, same as any other partial-result
-            // path here, rather than assuming it can never happen.
+            // serialized by `self.mu`, and a sample only reaches this scan
+            // while still resident in `pending`.
             if (!pc.quiesce.acquire()) continue;
-            out.append(self.alloc, pc) catch |err| {
-                pc.quiesce.release(pc, PendingChange.reallyFree);
-                if (out.items.len == 0) return err;
-                break;
-            };
+            out.appendAssumeCapacity(pc);
             pc.info.sample_state = DDS.READ_SAMPLE_STATE;
-            count += 1;
         }
         self.finalizeGenerationRanksLockedPinned(out.items);
         _ = self.outstanding_loans.fetchAdd(out.items.len, .monotonic);
-        return out.toOwnedSlice(self.alloc);
+        return self.ownedSlice(*PendingChange, &out);
     }
 
     /// Release read-loan pins previously acquired by `pinSamplesForLoan`.
@@ -2753,43 +2751,34 @@ pub const DataReaderImpl = struct {
         maybe_ih: ?DDS.InstanceHandle_t,
         maybe_qc: ?*const waitset.QueryConditionImpl,
     ) ![]*PendingChange {
+        return self.takeSamplesForLoanPrepared(sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc, null);
+    }
+
+    fn takeSamplesForLoanPrepared(
+        self: *Self,
+        sample_mask: DDS.SampleStateMask,
+        view_mask: DDS.ViewStateMask,
+        instance_mask: DDS.InstanceStateMask,
+        max_samples: i32,
+        maybe_ih: ?DDS.InstanceHandle_t,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
+        prepare: ?PrepareOutput,
+    ) error{OutOfMemory}![]*PendingChange {
         self.mu.lock();
         defer self.mu.unlock();
         defer self.reclaimInstancesLocked();
-        self.resetDataAvailableLocked();
-        const now_ns = time_mod.nanoTimestamp();
-        var ei: usize = 0;
-        while (ei < self.pending.items.len) {
-            if (self.pending.items[ei].expiry_ns) |exp| {
-                if (now_ns >= exp) {
-                    const expired = self.pending.orderedRemove(ei);
-                    expired.quiesce.beginTeardown(expired, PendingChange.reallyFree);
-                    continue;
-                }
-            }
-            ei += 1;
-        }
-        const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
-
-        var match_count: usize = 0;
-        for (self.pending.items) |pc| {
-            if (match_count >= limit) break;
-            if (matchesSample(pc, sample_mask, view_mask, instance_mask, maybe_ih) and
-                matchesQuery(pc, maybe_qc, self.get_field_fn)) match_count += 1;
-        }
+        self.purgeExpiredLocked();
+        const ih_sel: ??DDS.InstanceHandle_t = maybe_ih;
+        const n = if (ih_sel != null) self.countSelectedLocked(sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc) else 0;
         var out: std.ArrayListUnmanaged(*PendingChange) = .empty;
         errdefer out.deinit(self.alloc);
-        try out.ensureUnusedCapacity(self.alloc, match_count);
-
+        try out.ensureTotalCapacityPrecise(self.alloc, n);
+        if (prepare) |p| try p.prepare(p.ctx, n);
+        self.resetDataAvailableLocked();
         var write: usize = 0;
-        var taken: usize = 0;
         for (self.pending.items) |pc| {
-            if (taken < limit and
-                matchesSample(pc, sample_mask, view_mask, instance_mask, maybe_ih) and
-                matchesQuery(pc, maybe_qc, self.get_field_fn))
-            {
+            if (out.items.len < n and self.selects(pc, sample_mask, view_mask, instance_mask, maybe_ih, maybe_qc)) {
                 out.appendAssumeCapacity(pc);
-                taken += 1;
             } else {
                 self.pending.items[write] = pc;
                 write += 1;
@@ -2798,7 +2787,7 @@ pub const DataReaderImpl = struct {
         self.pending.items.len = write;
         self.finalizeGenerationRanksLockedPinned(out.items);
         _ = self.outstanding_loans.fetchAdd(out.items.len, .monotonic);
-        return out.toOwnedSlice(self.alloc);
+        return self.ownedSlice(*PendingChange, &out);
     }
 
     /// Non-destructive read-loan analog to `pinSamplesForLoan`, for
@@ -2817,55 +2806,43 @@ pub const DataReaderImpl = struct {
         max_samples: i32,
         maybe_qc: ?*const waitset.QueryConditionImpl,
     ) ![]*PendingChange {
+        return self.pinNextInstanceForLoanPrepared(prev_instance_handle, sample_mask, view_mask, instance_mask, max_samples, maybe_qc, null);
+    }
+
+    fn pinNextInstanceForLoanPrepared(
+        self: *Self,
+        prev_instance_handle: DDS.InstanceHandle_t,
+        sample_mask: DDS.SampleStateMask,
+        view_mask: DDS.ViewStateMask,
+        instance_mask: DDS.InstanceStateMask,
+        max_samples: i32,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
+        prepare: ?PrepareOutput,
+    ) error{OutOfMemory}![]*PendingChange {
         self.mu.lock();
         defer self.mu.unlock();
         defer self.reclaimInstancesLocked();
-        self.resetDataAvailableLocked();
-        const now_ns = time_mod.nanoTimestamp();
-        var ei: usize = 0;
-        while (ei < self.pending.items.len) {
-            if (self.pending.items[ei].expiry_ns) |exp| {
-                if (now_ns >= exp) {
-                    const expired = self.pending.orderedRemove(ei);
-                    expired.quiesce.beginTeardown(expired, PendingChange.reallyFree);
-                    continue;
-                }
-            }
-            ei += 1;
-        }
-
-        var target_ih: ?DDS.InstanceHandle_t = null;
-        for (self.pending.items) |pc| {
-            const ih = pc.info.instance_handle;
-            if (prev_instance_handle != 0 and ih <= prev_instance_handle) continue;
-            if (target_ih != null and ih >= target_ih.?) continue;
-            if (!matchesSample(pc, sample_mask, view_mask, instance_mask, null)) continue;
-            if (!matchesQuery(pc, maybe_qc, self.get_field_fn)) continue;
-            target_ih = ih;
-        }
-        const tgt = target_ih orelse return &.{};
-
-        const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
+        self.purgeExpiredLocked();
+        const ih_sel = self.nextInstanceLocked(prev_instance_handle, sample_mask, view_mask, instance_mask, maybe_qc);
+        const n = if (ih_sel != null) self.countSelectedLocked(sample_mask, view_mask, instance_mask, max_samples, ih_sel.?, maybe_qc) else 0;
         var out: std.ArrayListUnmanaged(*PendingChange) = .empty;
         errdefer out.deinit(self.alloc);
-        var count: usize = 0;
+        try out.ensureTotalCapacityPrecise(self.alloc, n);
+        if (prepare) |p| try p.prepare(p.ctx, n);
+        self.resetDataAvailableLocked();
         for (self.pending.items) |pc| {
-            if (count >= limit) break;
-            if (pc.info.instance_handle != tgt) continue;
-            if (!matchesSample(pc, sample_mask, view_mask, instance_mask, null)) continue;
-            if (!matchesQuery(pc, maybe_qc, self.get_field_fn)) continue;
-            if (!pc.quiesce.acquire()) continue; // see pinSamplesForLoan's identical comment
-            out.append(self.alloc, pc) catch |err| {
-                pc.quiesce.release(pc, PendingChange.reallyFree);
-                if (out.items.len == 0) return err;
-                break;
-            };
+            if (out.items.len >= n) break;
+            if (!self.selects(pc, sample_mask, view_mask, instance_mask, ih_sel.?, maybe_qc)) continue;
+            // Structurally unreachable today: acquire-vs-eviction are both
+            // serialized by `self.mu`, and a sample only reaches this scan
+            // while still resident in `pending`.
+            if (!pc.quiesce.acquire()) continue;
+            out.appendAssumeCapacity(pc);
             pc.info.sample_state = DDS.READ_SAMPLE_STATE;
-            count += 1;
         }
         self.finalizeGenerationRanksLockedPinned(out.items);
         _ = self.outstanding_loans.fetchAdd(out.items.len, .monotonic);
-        return out.toOwnedSlice(self.alloc);
+        return self.ownedSlice(*PendingChange, &out);
     }
 
     /// Destructive analog to `pinNextInstanceForLoan`, for
@@ -2882,55 +2859,34 @@ pub const DataReaderImpl = struct {
         max_samples: i32,
         maybe_qc: ?*const waitset.QueryConditionImpl,
     ) ![]*PendingChange {
+        return self.takeNextInstanceForLoanPrepared(prev_instance_handle, sample_mask, view_mask, instance_mask, max_samples, maybe_qc, null);
+    }
+
+    fn takeNextInstanceForLoanPrepared(
+        self: *Self,
+        prev_instance_handle: DDS.InstanceHandle_t,
+        sample_mask: DDS.SampleStateMask,
+        view_mask: DDS.ViewStateMask,
+        instance_mask: DDS.InstanceStateMask,
+        max_samples: i32,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
+        prepare: ?PrepareOutput,
+    ) error{OutOfMemory}![]*PendingChange {
         self.mu.lock();
         defer self.mu.unlock();
         defer self.reclaimInstancesLocked();
-        self.resetDataAvailableLocked();
-        const now_ns = time_mod.nanoTimestamp();
-        var ei: usize = 0;
-        while (ei < self.pending.items.len) {
-            if (self.pending.items[ei].expiry_ns) |exp| {
-                if (now_ns >= exp) {
-                    const expired = self.pending.orderedRemove(ei);
-                    expired.quiesce.beginTeardown(expired, PendingChange.reallyFree);
-                    continue;
-                }
-            }
-            ei += 1;
-        }
-
-        var target_ih: ?DDS.InstanceHandle_t = null;
-        for (self.pending.items) |pc| {
-            const ih = pc.info.instance_handle;
-            if (prev_instance_handle != 0 and ih <= prev_instance_handle) continue;
-            if (target_ih != null and ih >= target_ih.?) continue;
-            if (!matchesSample(pc, sample_mask, view_mask, instance_mask, null)) continue;
-            if (!matchesQuery(pc, maybe_qc, self.get_field_fn)) continue;
-            target_ih = ih;
-        }
-        const tgt = target_ih orelse return &.{};
-
-        const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
-        var match_count: usize = 0;
-        for (self.pending.items) |pc| {
-            if (match_count >= limit) break;
-            if (pc.info.instance_handle != tgt) continue;
-            if (matchesSample(pc, sample_mask, view_mask, instance_mask, null) and
-                matchesQuery(pc, maybe_qc, self.get_field_fn)) match_count += 1;
-        }
+        self.purgeExpiredLocked();
+        const ih_sel = self.nextInstanceLocked(prev_instance_handle, sample_mask, view_mask, instance_mask, maybe_qc);
+        const n = if (ih_sel != null) self.countSelectedLocked(sample_mask, view_mask, instance_mask, max_samples, ih_sel.?, maybe_qc) else 0;
         var out: std.ArrayListUnmanaged(*PendingChange) = .empty;
         errdefer out.deinit(self.alloc);
-        try out.ensureUnusedCapacity(self.alloc, match_count);
-
+        try out.ensureTotalCapacityPrecise(self.alloc, n);
+        if (prepare) |p| try p.prepare(p.ctx, n);
+        self.resetDataAvailableLocked();
         var write: usize = 0;
-        var taken: usize = 0;
         for (self.pending.items) |pc| {
-            if (pc.info.instance_handle == tgt and taken < limit and
-                matchesSample(pc, sample_mask, view_mask, instance_mask, null) and
-                matchesQuery(pc, maybe_qc, self.get_field_fn))
-            {
+            if (out.items.len < n and self.selects(pc, sample_mask, view_mask, instance_mask, ih_sel.?, maybe_qc)) {
                 out.appendAssumeCapacity(pc);
-                taken += 1;
             } else {
                 self.pending.items[write] = pc;
                 write += 1;
@@ -2939,7 +2895,7 @@ pub const DataReaderImpl = struct {
         self.pending.items.len = write;
         self.finalizeGenerationRanksLockedPinned(out.items);
         _ = self.outstanding_loans.fetchAdd(out.items.len, .monotonic);
-        return out.toOwnedSlice(self.alloc);
+        return self.ownedSlice(*PendingChange, &out);
     }
 
     /// PRECONDITION_NOT_MET if this reader has any outstanding read-loan
@@ -2966,10 +2922,44 @@ pub const DataReaderImpl = struct {
         maybe_ih: ?DDS.InstanceHandle_t,
         maybe_qc: ?*const waitset.QueryConditionImpl,
     ) anyerror!void {
+        return self.takeFilteredPrepared(out, sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc, null);
+    }
+
+    fn takeFilteredPrepared(
+        self: *Self,
+        out: *std.ArrayListUnmanaged(TakenSample),
+        sample_mask: DDS.SampleStateMask,
+        view_mask: DDS.ViewStateMask,
+        instance_mask: DDS.InstanceStateMask,
+        max_samples: i32,
+        maybe_ih: ?DDS.InstanceHandle_t,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
+        prepare: ?PrepareOutput,
+    ) error{OutOfMemory}!void {
         self.mu.lock();
         defer self.mu.unlock();
         defer self.reclaimInstancesLocked();
+        self.purgeExpiredLocked();
+        const n = self.countSelectedLocked(sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc);
+        try self.prepareLocked(TakenSample, out, n, prepare);
         self.resetDataAvailableLocked();
+        const start = out.items.len;
+        var write: usize = 0;
+        for (self.pending.items) |pc| {
+            if (out.items.len - start < n and self.selects(pc, sample_mask, view_mask, instance_mask, maybe_ih, maybe_qc)) {
+                out.appendAssumeCapacity(.{ .data = pc.data, .info = pc.info, .key_hash = pc.key_hash });
+                self.alloc.destroy(pc);
+            } else {
+                self.pending.items[write] = pc;
+                write += 1;
+            }
+        }
+        self.pending.items.len = write;
+        self.finalizeGenerationRanksLocked(out.items[start..]);
+    }
+
+    /// Purges `pending` samples whose LIFESPAN has expired. Caller holds `mu`.
+    fn purgeExpiredLocked(self: *Self) void {
         const now_ns = time_mod.nanoTimestamp();
         var ei: usize = 0;
         while (ei < self.pending.items.len) {
@@ -2982,36 +2972,81 @@ pub const DataReaderImpl = struct {
             }
             ei += 1;
         }
+    }
+
+    /// Whether a read or take with these masks, instance and condition
+    /// selects `pc`.
+    fn selects(
+        self: *const Self,
+        pc: *const PendingChange,
+        sample_mask: DDS.SampleStateMask,
+        view_mask: DDS.ViewStateMask,
+        instance_mask: DDS.InstanceStateMask,
+        maybe_ih: ?DDS.InstanceHandle_t,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
+    ) bool {
+        return matchesSample(pc, sample_mask, view_mask, instance_mask, maybe_ih) and
+            matchesQuery(pc, maybe_qc, self.get_field_fn);
+    }
+
+    /// How many samples a read or take selects: at most `max_samples` (< 0:
+    /// no limit). Caller holds `mu`.
+    fn countSelectedLocked(
+        self: *const Self,
+        sample_mask: DDS.SampleStateMask,
+        view_mask: DDS.ViewStateMask,
+        instance_mask: DDS.InstanceStateMask,
+        max_samples: i32,
+        maybe_ih: ?DDS.InstanceHandle_t,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
+    ) usize {
         const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
-
-        // Count matches first so we can reserve out capacity before mutating pending.
-        var match_count: usize = 0;
+        var n: usize = 0;
         for (self.pending.items) |pc| {
-            if (match_count >= limit) break;
-            if (matchesSample(pc, sample_mask, view_mask, instance_mask, maybe_ih) and
-                matchesQuery(pc, maybe_qc, self.get_field_fn)) match_count += 1;
+            if (n >= limit) break;
+            if (self.selects(pc, sample_mask, view_mask, instance_mask, maybe_ih, maybe_qc)) n += 1;
         }
-        try out.ensureUnusedCapacity(self.alloc, match_count);
-        const start = out.items.len;
+        return n;
+    }
 
-        // In-place compaction: matching items move to out, rest stay in pending.
-        var write: usize = 0;
-        var taken: usize = 0;
+    /// The instance a next-instance read or take selects from: the smallest
+    /// handle above `prev` (any, for HANDLE_NIL) with a sample it selects.
+    /// Caller holds `mu`.
+    fn nextInstanceLocked(
+        self: *const Self,
+        prev: DDS.InstanceHandle_t,
+        sample_mask: DDS.SampleStateMask,
+        view_mask: DDS.ViewStateMask,
+        instance_mask: DDS.InstanceStateMask,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
+    ) ?DDS.InstanceHandle_t {
+        var target: ?DDS.InstanceHandle_t = null;
         for (self.pending.items) |pc| {
-            if (taken < limit and
-                matchesSample(pc, sample_mask, view_mask, instance_mask, maybe_ih) and
-                matchesQuery(pc, maybe_qc, self.get_field_fn))
-            {
-                out.appendAssumeCapacity(.{ .data = pc.data, .info = pc.info, .key_hash = pc.key_hash });
-                self.alloc.destroy(pc);
-                taken += 1;
-            } else {
-                self.pending.items[write] = pc;
-                write += 1;
-            }
+            const ih = pc.info.instance_handle;
+            if (prev != 0 and ih <= prev) continue;
+            if (target != null and ih >= target.?) continue;
+            if (!self.selects(pc, sample_mask, view_mask, instance_mask, null, maybe_qc)) continue;
+            target = ih;
         }
-        self.pending.items.len = write;
-        self.finalizeGenerationRanksLocked(out.items[start..]);
+        return target;
+    }
+
+    /// Prepares a read's or take's output for `n` samples, and `out` too:
+    /// called under `mu` before the read or take changes anything, so its
+    /// failure leaves the reader as it was
+    /// (docs/design/concurrency/operations.md#admission-and-conversion-capability).
+    fn prepareLocked(self: *Self, comptime T: type, out: *std.ArrayListUnmanaged(T), n: usize, prepare: ?PrepareOutput) error{OutOfMemory}!void {
+        try out.ensureUnusedCapacity(self.alloc, n);
+        if (prepare) |p| try p.prepare(p.ctx, n);
+    }
+
+    /// `out`'s items as an owned slice; with `out` filled to its exact
+    /// capacity, without allocating.
+    fn ownedSlice(self: *Self, comptime T: type, out: *std.ArrayListUnmanaged(T)) error{OutOfMemory}![]T {
+        if (out.items.len != out.capacity) return out.toOwnedSlice(self.alloc);
+        const items = out.items;
+        out.* = .empty;
+        return items;
     }
 
     pub fn toDDSDataReader(self: *Self) DDS.DataReader {
@@ -4368,10 +4403,7 @@ pub const DataReaderImpl = struct {
         var release_proto_now = true;
         defer if (release_proto_now) self.proto_reader.quiesceRelease();
 
-        self.rawReadOrTakeImpl(payloads_seq, hashes_seq, infos_seq, f, max_samples, destructive, loan_mode) catch |err| return switch (err) {
-            error.OutOfMemory => DDS.RETCODE_OUT_OF_RESOURCES,
-            else => DDS.RETCODE_ERROR,
-        };
+        self.rawReadOrTakeImpl(payloads_seq, hashes_seq, infos_seq, f, max_samples, destructive, loan_mode) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         if (loan_mode and payloads_seq._buffer != null) {
             release_now = false;
             release_proto_now = false;
@@ -4389,20 +4421,23 @@ pub const DataReaderImpl = struct {
         destructive: bool,
         loan_mode: bool,
     ) !void {
+        // The output is made before the selection, so nothing fails after it.
+        var output: RawOutput = .{ .reader = self, .loan = loan_mode };
+        defer output.deinit();
         if (loan_mode) {
             const pcs: []*PendingChange = if (destructive)
-                try self.takeSamplesForLoan(f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_ih, f.maybe_qc)
+                try self.takeSamplesForLoanPrepared(f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_ih, f.maybe_qc, output.prepareOutput())
             else
-                try self.pinSamplesForLoan(f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_ih, f.maybe_qc);
-            try self.buildRawOutputFromPins(pcs, payloads_seq, hashes_seq, infos_seq);
+                try self.pinSamplesForLoanPrepared(f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_ih, f.maybe_qc, output.prepareOutput());
+            try self.buildRawOutputFromPins(&output, pcs, payloads_seq, hashes_seq, infos_seq);
         } else {
             var out: std.ArrayListUnmanaged(TakenSample) = .empty;
             defer out.deinit(self.alloc);
             if (destructive)
-                try self.takeFiltered(&out, f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_ih, f.maybe_qc)
+                try self.takeFilteredPrepared(&out, f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_ih, f.maybe_qc, output.prepareOutput())
             else
-                try self.readRaw(&out, f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_ih, f.maybe_qc);
-            try self.buildRawOutputFromTaken(out.items, payloads_seq, hashes_seq, infos_seq);
+                try self.readRawPrepared(&out, f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_ih, f.maybe_qc, output.prepareOutput());
+            try self.buildRawOutputFromTaken(&output, out.items, payloads_seq, hashes_seq, infos_seq);
         }
     }
 
@@ -4435,10 +4470,7 @@ pub const DataReaderImpl = struct {
         var release_proto_now = true;
         defer if (release_proto_now) self.proto_reader.quiesceRelease();
 
-        self.rawReadOrTakeNextInstanceImpl(payloads_seq, hashes_seq, infos_seq, previous_handle, f, max_samples, destructive, loan_mode) catch |err| return switch (err) {
-            error.OutOfMemory => DDS.RETCODE_OUT_OF_RESOURCES,
-            else => DDS.RETCODE_ERROR,
-        };
+        self.rawReadOrTakeNextInstanceImpl(payloads_seq, hashes_seq, infos_seq, previous_handle, f, max_samples, destructive, loan_mode) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         if (loan_mode and payloads_seq._buffer != null) {
             release_now = false;
             release_proto_now = false;
@@ -4457,20 +4489,22 @@ pub const DataReaderImpl = struct {
         destructive: bool,
         loan_mode: bool,
     ) !void {
+        var output: RawOutput = .{ .reader = self, .loan = loan_mode };
+        defer output.deinit();
         if (loan_mode) {
             const pcs: []*PendingChange = if (destructive)
-                try self.takeNextInstanceForLoan(previous_handle, f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_qc)
+                try self.takeNextInstanceForLoanPrepared(previous_handle, f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_qc, output.prepareOutput())
             else
-                try self.pinNextInstanceForLoan(previous_handle, f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_qc);
-            try self.buildRawOutputFromPins(pcs, payloads_seq, hashes_seq, infos_seq);
+                try self.pinNextInstanceForLoanPrepared(previous_handle, f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_qc, output.prepareOutput());
+            try self.buildRawOutputFromPins(&output, pcs, payloads_seq, hashes_seq, infos_seq);
         } else {
             var out: std.ArrayListUnmanaged(TakenSample) = .empty;
             defer out.deinit(self.alloc);
             if (destructive)
-                try self.takeNextInstanceFiltered(&out, previous_handle, f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_qc)
+                try self.takeNextInstanceFilteredPrepared(&out, previous_handle, f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_qc, output.prepareOutput())
             else
-                try self.readNextInstanceFiltered(&out, previous_handle, f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_qc);
-            try self.buildRawOutputFromTaken(out.items, payloads_seq, hashes_seq, infos_seq);
+                try self.readNextInstanceFilteredPrepared(&out, previous_handle, f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_qc, output.prepareOutput());
+            try self.buildRawOutputFromTaken(&output, out.items, payloads_seq, hashes_seq, infos_seq);
         }
     }
 
@@ -4480,7 +4514,7 @@ pub const DataReaderImpl = struct {
     /// the batch in `loan_table` (keyed by the descriptor array's pointer
     /// identity) so `return_loan_raw` can find it again. Takes ownership of
     /// `pcs` (frees the slice itself on every path, including empty/error).
-    fn buildRawOutputFromPins(self: *Self, pcs: []*PendingChange, payloads_seq: *DDS.OctetSeqSeq, hashes_seq: *DDS.OctetSeq, infos_seq: *DDS.SampleInfoSeq) !void {
+    fn buildRawOutputFromPins(self: *Self, output: *RawOutput, pcs: []*PendingChange, payloads_seq: *DDS.OctetSeqSeq, hashes_seq: *DDS.OctetSeq, infos_seq: *DDS.SampleInfoSeq) !void {
         if (pcs.len == 0) {
             self.alloc.free(pcs);
             return;
@@ -4489,41 +4523,20 @@ pub const DataReaderImpl = struct {
             self.releasePinnedSamples(pcs);
             self.alloc.free(pcs);
         }
-        var descriptors: std.ArrayListUnmanaged(DDS.OctetSeq) = .empty;
-        errdefer descriptors.deinit(self.alloc);
-        // key_hashes is allocated via self.alloc, same as descriptors/infos,
-        // and released exclusively through return_loan_raw (see that op's
-        // dcps.idl doc comment) -- not through a generic, entity-context-free
-        // {Type}_free. A generic free has no way to recover this specific
-        // reader's own allocator, which can genuinely differ per reader
-        // (zzdds_DomainParticipantFactory_create_with_allocator); return_loan_raw always has
-        // the reader itself in scope and so always frees correctly.
-        var hashes: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer hashes.deinit(self.alloc);
-        var infos: std.ArrayListUnmanaged(DDS.SampleInfo) = .empty;
-        errdefer infos.deinit(self.alloc);
-        try descriptors.ensureTotalCapacityPrecise(self.alloc, pcs.len);
-        try hashes.ensureTotalCapacityPrecise(self.alloc, pcs.len * 16);
-        try infos.ensureTotalCapacityPrecise(self.alloc, pcs.len);
-        for (pcs) |pc| {
-            descriptors.appendAssumeCapacity(.{ ._buffer = pc.data.ptr, ._length = @intCast(pc.data.len), ._maximum = @intCast(pc.data.len), ._release = false });
-            hashes.appendSliceAssumeCapacity(&pc.key_hash);
-            infos.appendAssumeCapacity(pc.info);
+        try output.fit(pcs.len);
+        for (pcs, 0..) |pc, i| {
+            output.descriptors[i] = .{ ._buffer = pc.data.ptr, ._length = @intCast(pc.data.len), ._maximum = @intCast(pc.data.len), ._release = false };
+            output.hashes[i * 16 ..][0..16].* = pc.key_hash;
+            output.infos[i] = pc.info;
         }
-        const descriptors_owned = try descriptors.toOwnedSlice(self.alloc);
-        errdefer self.alloc.free(descriptors_owned);
-        const hashes_owned = try hashes.toOwnedSlice(self.alloc);
-        errdefer self.alloc.free(hashes_owned);
-        const infos_owned = try infos.toOwnedSlice(self.alloc);
-        errdefer self.alloc.free(infos_owned);
-
-        self.loan_table_mu.lock();
-        defer self.loan_table_mu.unlock();
-        try self.loan_table.put(self.alloc, descriptors_owned.ptr, pcs);
-
-        payloads_seq.* = .{ ._buffer = descriptors_owned.ptr, ._length = @intCast(descriptors_owned.len), ._maximum = @intCast(descriptors_owned.len), ._release = false };
-        hashes_seq.* = .{ ._buffer = hashes_owned.ptr, ._length = @intCast(hashes_owned.len), ._maximum = @intCast(hashes_owned.len), ._release = false };
-        infos_seq.* = .{ ._buffer = infos_owned.ptr, ._length = @intCast(infos_owned.len), ._maximum = @intCast(infos_owned.len), ._release = true };
+        {
+            self.loan_table_mu.lock();
+            defer self.loan_table_mu.unlock();
+            self.loan_table.putAssumeCapacityNoClobber(output.descriptors.ptr, pcs);
+            self.loan_table_reserved -= 1;
+            output.loan_slot = false;
+        }
+        output.handOut(payloads_seq, hashes_seq, infos_seq);
     }
 
     /// Builds cdr_payloads/key_hashes/sample_infos (copy mode) from a
@@ -4531,35 +4544,90 @@ pub const DataReaderImpl = struct {
     /// `takeNextInstanceFiltered` result. Does not own/free `taken` itself
     /// (caller's ArrayListUnmanaged keeps handling its own deinit); each
     /// `TakenSample.data` ownership transfers into a descriptor entry.
-    fn buildRawOutputFromTaken(self: *Self, taken: []const TakenSample, payloads_seq: *DDS.OctetSeqSeq, hashes_seq: *DDS.OctetSeq, infos_seq: *DDS.SampleInfoSeq) !void {
+    fn buildRawOutputFromTaken(self: *Self, output: *RawOutput, taken: []const TakenSample, payloads_seq: *DDS.OctetSeqSeq, hashes_seq: *DDS.OctetSeq, infos_seq: *DDS.SampleInfoSeq) !void {
         if (taken.len == 0) return;
-        errdefer for (taken) |s| self.alloc.free(s.data);
-        var descriptors: std.ArrayListUnmanaged(DDS.OctetSeq) = .empty;
-        errdefer descriptors.deinit(self.alloc);
-        // See buildRawOutputFromPins's identical hashes allocator comment.
-        var hashes: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer hashes.deinit(self.alloc);
-        var infos: std.ArrayListUnmanaged(DDS.SampleInfo) = .empty;
-        errdefer infos.deinit(self.alloc);
-        try descriptors.ensureTotalCapacityPrecise(self.alloc, taken.len);
-        try hashes.ensureTotalCapacityPrecise(self.alloc, taken.len * 16);
-        try infos.ensureTotalCapacityPrecise(self.alloc, taken.len);
-        for (taken) |s| {
-            descriptors.appendAssumeCapacity(.{ ._buffer = s.data.ptr, ._length = @intCast(s.data.len), ._maximum = @intCast(s.data.len), ._release = false });
-            hashes.appendSliceAssumeCapacity(&s.key_hash);
-            infos.appendAssumeCapacity(s.info);
+        errdefer for (taken) |t| self.alloc.free(t.data);
+        try output.fit(taken.len);
+        for (taken, 0..) |t, i| {
+            output.descriptors[i] = .{ ._buffer = t.data.ptr, ._length = @intCast(t.data.len), ._maximum = @intCast(t.data.len), ._release = false };
+            output.hashes[i * 16 ..][0..16].* = t.key_hash;
+            output.infos[i] = t.info;
         }
-        const descriptors_owned = try descriptors.toOwnedSlice(self.alloc);
-        errdefer self.alloc.free(descriptors_owned);
-        const hashes_owned = try hashes.toOwnedSlice(self.alloc);
-        errdefer self.alloc.free(hashes_owned);
-        const infos_owned = try infos.toOwnedSlice(self.alloc);
-        errdefer self.alloc.free(infos_owned);
-
-        payloads_seq.* = .{ ._buffer = descriptors_owned.ptr, ._length = @intCast(descriptors_owned.len), ._maximum = @intCast(descriptors_owned.len), ._release = false };
-        hashes_seq.* = .{ ._buffer = hashes_owned.ptr, ._length = @intCast(hashes_owned.len), ._maximum = @intCast(hashes_owned.len), ._release = false };
-        infos_seq.* = .{ ._buffer = infos_owned.ptr, ._length = @intCast(infos_owned.len), ._maximum = @intCast(infos_owned.len), ._release = true };
+        output.handOut(payloads_seq, hashes_seq, infos_seq);
     }
+
+    /// The output arrays of a raw read or take, made before it selects
+    /// (`PrepareOutput`), and in loan mode a `loan_table` slot, so filling
+    /// them after cannot fail and lose what was taken.
+    const RawOutput = struct {
+        reader: *Self,
+        loan: bool,
+        descriptors: []DDS.OctetSeq = &.{},
+        hashes: []u8 = &.{},
+        infos: []DDS.SampleInfo = &.{},
+        /// Holds one of `loan_table_reserved`.
+        loan_slot: bool = false,
+
+        fn prepareOutput(self: *RawOutput) PrepareOutput {
+            return .{ .ctx = self, .prepare = prepare };
+        }
+
+        fn prepare(ctx: *anyopaque, n: usize) error{OutOfMemory}!void {
+            const self: *RawOutput = @ptrCast(@alignCast(ctx));
+            if (n == 0) return;
+            const r = self.reader;
+            const descriptors = try r.alloc.alloc(DDS.OctetSeq, n);
+            errdefer r.alloc.free(descriptors);
+            const hashes = try r.alloc.alloc(u8, n * 16);
+            errdefer r.alloc.free(hashes);
+            const infos = try r.alloc.alloc(DDS.SampleInfo, n);
+            errdefer r.alloc.free(infos);
+            if (self.loan) {
+                r.loan_table_mu.lock();
+                defer r.loan_table_mu.unlock();
+                try r.loan_table.ensureUnusedCapacity(r.alloc, r.loan_table_reserved + 1);
+                r.loan_table_reserved += 1;
+                self.loan_slot = true;
+            }
+            self.descriptors = descriptors;
+            self.hashes = hashes;
+            self.infos = infos;
+        }
+
+        /// Sizes the arrays to `n` samples. They were made for as many as
+        /// were selected, which is `n` but for a sample the selection could
+        /// not pin (see `pinSamplesForLoan`).
+        fn fit(self: *RawOutput, n: usize) error{OutOfMemory}!void {
+            if (self.descriptors.len == n) return;
+            const a = self.reader.alloc;
+            self.descriptors = try a.realloc(self.descriptors, n);
+            self.hashes = try a.realloc(self.hashes, n * 16);
+            self.infos = try a.realloc(self.infos, n);
+        }
+
+        /// Hands the arrays to the caller's sequences, which then own them.
+        fn handOut(self: *RawOutput, payloads_seq: *DDS.OctetSeqSeq, hashes_seq: *DDS.OctetSeq, infos_seq: *DDS.SampleInfoSeq) void {
+            payloads_seq.* = .{ ._buffer = self.descriptors.ptr, ._length = @intCast(self.descriptors.len), ._maximum = @intCast(self.descriptors.len), ._release = false };
+            hashes_seq.* = .{ ._buffer = self.hashes.ptr, ._length = @intCast(self.hashes.len), ._maximum = @intCast(self.hashes.len), ._release = false };
+            infos_seq.* = .{ ._buffer = self.infos.ptr, ._length = @intCast(self.infos.len), ._maximum = @intCast(self.infos.len), ._release = true };
+            self.descriptors = &.{};
+            self.hashes = &.{};
+            self.infos = &.{};
+        }
+
+        /// Frees what was made and not handed out.
+        fn deinit(self: *RawOutput) void {
+            const a = self.reader.alloc;
+            if (self.descriptors.len > 0) a.free(self.descriptors);
+            if (self.hashes.len > 0) a.free(self.hashes);
+            if (self.infos.len > 0) a.free(self.infos);
+            if (self.loan_slot) {
+                self.reader.loan_table_mu.lock();
+                defer self.reader.loan_table_mu.unlock();
+                self.reader.loan_table_reserved -= 1;
+            }
+        }
+    };
 
     /// Release the result of a prior take_raw()/read_raw() call. Works
     /// uniformly regardless of whether that call was loan-mode or copy-mode:

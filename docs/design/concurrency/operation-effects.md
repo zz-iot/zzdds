@@ -83,6 +83,15 @@ settles acknowledgment waits, so a write blocked or admitted then returns
 ALREADY_DELETED, and none commits after the delete returns. A BEST_EFFORT writer never
 waits: no room is OUT_OF_RESOURCES.
 
+## Reads and takes running out of memory
+
+A read or take counts the samples it selects, then makes everything it needs for them
+under the reader's lock before it changes anything: its output arrays (`PrepareOutput`),
+a read's copies, and in loan mode a `loan_table` slot. Only then does it take, mark READ,
+pin or reset DATA_AVAILABLE. Running out of memory at any of these returns
+OUT_OF_RESOURCES and leaves every sample where and as it was. A failure after the samples
+are handed out (a binding that cannot convert them) is the two-step take's subject.
+
 ## Status
 
 | Operation | Status |
@@ -90,6 +99,6 @@ waits: no room is OUT_OF_RESOURCES.
 | DataWriter and Publisher `wait_for_acknowledgments` | Done |
 | DataReader `wait_for_historical_data` | Done |
 | Blocking write | Done |
-| Take after an allocation failure | Next: no sample lost when building the output fails |
-| Take when a binding fails to decode | Planned: two-step take, so a binding can fail a decode and the samples return |
+| Take after an allocation failure | Done |
+| Take when a binding fails to decode | Next: two-step take, so a binding can fail a decode and the samples return |
 | WaitSet waits | To audit |

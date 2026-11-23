@@ -1391,3 +1391,69 @@ test "takeFiltered: sweeps an already-expired (LIFESPAN) sample instead of retur
     try testing.expectEqual(@as(usize, 0), out.items.len);
     try testing.expectEqual(@as(usize, 0), dr.pending.items.len);
 }
+
+// ── Out of memory: a read or take changes nothing ─────────────────────────────
+//
+// docs/design/concurrency/operations.md#admission-and-conversion-capability:
+// exhaustion before selection has no access effect.
+
+const RawCall = enum { take_copy, read_copy, take_loan, read_loan, take_next_copy, read_next_loan };
+
+fn rawCall(dr: DDS.DataReader, call: RawCall, seq: *DDS.OctetSeqSeq, kh: *DDS.OctetSeq, infos: *DDS.SampleInfoSeq) DDS.ReturnCode_t {
+    // A zero maximum asks for a loan; a nonzero one, for copies.
+    var copies_buf: [1]DDS.OctetSeq = undefined;
+    seq.* = switch (call) {
+        .take_loan, .read_loan, .read_next_loan => .{},
+        else => .{ ._buffer = &copies_buf, ._length = 0, ._maximum = 1, ._release = false },
+    };
+    const any = .{ DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE };
+    return switch (call) {
+        .take_copy, .take_loan => dr.vtable.take_raw(dr.ptr, seq, kh, infos, DDS.HANDLE_NIL, nil.nil_readcondition, any[0], any[1], any[2], -1),
+        .read_copy, .read_loan => dr.vtable.read_raw(dr.ptr, seq, kh, infos, DDS.HANDLE_NIL, nil.nil_readcondition, any[0], any[1], any[2], -1),
+        .take_next_copy => dr.vtable.take_next_instance_raw(dr.ptr, seq, kh, infos, DDS.HANDLE_NIL, nil.nil_readcondition, any[0], any[1], any[2], -1),
+        .read_next_loan => dr.vtable.read_next_instance_raw(dr.ptr, seq, kh, infos, DDS.HANDLE_NIL, nil.nil_readcondition, any[0], any[1], any[2], -1),
+    };
+}
+
+/// How many samples `dr` holds, all of them still NOT_READ.
+fn unreadSamples(dr: *DataReaderImpl) !usize {
+    dr.mu.lock();
+    defer dr.mu.unlock();
+    for (dr.pending.items) |pc| try testing.expectEqual(DDS.NOT_READ_SAMPLE_STATE, pc.info.sample_state);
+    return dr.pending.items.len;
+}
+
+test "take_raw and read_raw: out of memory at any point, they leave every sample as it was" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    for (std.enums.values(RawCall)) |call| {
+        const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+        defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+        const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+        for (0..3) |i| dr.pushCdr(&[_]u8{ 0x00, 0x01, 0x00, 0x00, @intCast(i) });
+
+        const original = dr.alloc;
+        var fail_at: usize = 0;
+        while (true) : (fail_at += 1) {
+            try testing.expect(fail_at < 64);
+            var failing = std.testing.FailingAllocator.init(original, .{ .fail_index = fail_at, .resize_fail_index = fail_at });
+            dr.alloc = failing.allocator();
+            var seq: DDS.OctetSeqSeq = undefined;
+            var kh = DDS.OctetSeq{};
+            var infos = DDS.SampleInfoSeq{};
+            const rc = rawCall(dr_dds, call, &seq, &kh, &infos);
+            dr.alloc = original;
+            if (rc == DDS.RETCODE_OUT_OF_RESOURCES) {
+                try testing.expectEqual(@as(usize, 3), try unreadSamples(dr));
+                continue;
+            }
+            try testing.expectEqual(DDS.RETCODE_OK, rc);
+            try testing.expectEqual(@as(u32, 3), seq._length);
+            try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &seq, &kh, &infos));
+            break;
+        }
+        // Each call failed at least once before it could allocate all it needs.
+        try testing.expect(fail_at > 0);
+    }
+}
