@@ -34,7 +34,7 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   (`KeyCopy`), and `zzdds_get_key_value_writer`/`_reader` copy into theirs directly.
 - A DataReader forgets an instance once it is not alive, no matched writer has it
   registered, and none of its samples is cached, queued or in a coherent set (DDS 1.4
-  §2.2.3.21), checked as each read or take ends, or as a writer is lost. Before, a reader
+  §2.2.3.22), checked as each read or take ends, or as a writer is lost. Before, a reader
   kept every instance a topic ever had. A later sample of its key starts a new instance:
   NEW, under a new handle, with generation counts of 0. A disposed instance whose writer
   still has it registered is kept, so its generation counts carry on. RESOURCE_LIMITS

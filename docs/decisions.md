@@ -426,7 +426,7 @@ has no description of. An instance keeps its key until it is forgotten (below).
 **Writers and readers forget instances as DDS 1.4 lets them (2026-11-22).** A DataWriter
 forgets an instance it unregisters (§2.2.2.4.2.7); its history keeps what it wrote. A
 DataReader forgets one once it is not alive, no matched writer has it registered, and none of
-its samples is cached, queued or in a coherent set (READER_DATA_LIFECYCLE, §2.2.3.21: a
+its samples is cached, queued or in a coherent set (READER_DATA_LIFECYCLE, §2.2.3.22: a
 reader may reclaim an instance with no writers whose samples are all taken). A disposed
 instance whose writer still has it registered is kept, because that writer may write it
 again and its `disposed_generation_count` must carry on. Telling these apart needs the

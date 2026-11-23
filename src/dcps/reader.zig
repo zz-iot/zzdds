@@ -617,7 +617,7 @@ pub const DataReaderImpl = struct {
     /// view_state, get_key_value, TIME_BASED_FILTER and EXCLUSIVE ownership.
     /// RESOURCE_LIMITS `max_instances` bounds how many it holds. An instance
     /// is forgotten once it is not alive, no writer has it registered and
-    /// none of its samples is cached (DDS 1.4 §2.2.3.21): `reclaim_candidates`.
+    /// none of its samples is cached (DDS 1.4 §2.2.3.22): `reclaim_candidates`.
     instances: InstanceRegistry = .empty,
     /// Key hashes of instances that may be forgotten once their cached
     /// samples are gone: each became not alive, or lost a writer, since.
@@ -944,7 +944,7 @@ pub const DataReaderImpl = struct {
 
     /// Forgets each candidate instance that is not alive, that no writer has
     /// registered and that has no cached sample, queued or in a coherent set
-    /// (DDS 1.4 §2.2.3.21). Its handle then names nothing, and a later sample
+    /// (DDS 1.4 §2.2.3.22). Its handle then names nothing, and a later sample
     /// of its key starts a new instance, NEW, with generation counts of 0. A
     /// candidate a cached sample holds stays one; one that is alive again or
     /// still registered is dropped, and marked again when that changes. Run

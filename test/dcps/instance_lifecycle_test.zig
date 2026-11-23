@@ -394,7 +394,7 @@ test "max_instances: a writer holds at most that many instances, and an unregist
     try testing.expect(pair.dw.lookupInstance(keys[2]) != DDS.HANDLE_NIL);
 }
 
-// ── Reader instance reclamation (DDS 1.4 §2.2.3.21) ──────────────────────────
+// ── Reader instance reclamation (DDS 1.4 §2.2.3.22) ──────────────────────────
 
 /// Takes every queued sample, freeing them, and returns the last.
 fn takeAll(dr: *DataReaderImpl) !DDS.SampleInfo {
