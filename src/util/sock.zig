@@ -1,6 +1,6 @@
 //! Socket primitives shared by the readiness backend and the UDP and TCP
 //! transports: opening and closing sockets, nonblocking mode, readiness
-//! polling and the error of the socket call that just failed. BSD sockets on
+//! polling, buffer sizes and the error of the socket call that just failed. BSD sockets on
 //! POSIX; Winsock on Windows, where `std.posix` has no poll and Winsock
 //! reports errors through `WSAGetLastError` rather than errno.
 
@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const c = std.c;
+const log = @import("../log.zig");
 
 const is_windows = builtin.os.tag == .windows;
 
@@ -188,6 +189,103 @@ pub fn poll(fds: []PollFd, timeout_ms: i32) usize {
         return if (n > 0) @intCast(n) else 0;
     }
     return posix.poll(fds, timeout_ms) catch 0;
+}
+
+pub const Buffer = enum {
+    receive,
+    send,
+
+    fn option(self: Buffer) u32 {
+        return switch (self) {
+            .receive => posix.SO.RCVBUF,
+            .send => posix.SO.SNDBUF,
+        };
+    }
+};
+
+/// The size the OS reports for `fd`'s `buffer`, null when it reports none.
+/// Linux reports twice the size it was given, counting its bookkeeping.
+pub fn bufferSize(fd: posix.socket_t, buffer: Buffer) ?u32 {
+    var v: c_int = 0;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    if (c.getsockopt(fd, posix.SOL.SOCKET, buffer.option(), @ptrCast(&v), &len) != 0) return null;
+    return if (v < 0) null else @intCast(v);
+}
+
+const BufferOption = struct {
+    fd: posix.socket_t,
+    buffer: Buffer,
+
+    fn set(self: BufferOption, size: u32) bool {
+        const v: c_int = @intCast(@min(size, std.math.maxInt(c_int)));
+        return c.setsockopt(self.fd, posix.SOL.SOCKET, self.buffer.option(), @ptrCast(&v), @sizeOf(c_int)) == 0;
+    }
+};
+
+/// Asks for a `buffer` of `requested` bytes on `fd`; 0 leaves the OS's
+/// default. Some OSes refuse a size past their limit, macOS and the BSDs
+/// among them, where Linux and Windows cap it instead: see negotiateSize.
+/// Logs, at debug, what was asked for and what the OS then reports. `what`
+/// names the socket in that log.
+pub fn requestBufferSize(fd: posix.socket_t, buffer: Buffer, requested: u32, what: []const u8) void {
+    if (requested == 0) return;
+    const opt: BufferOption = .{ .fd = fd, .buffer = buffer };
+    const accepted = negotiateSize(opt, BufferOption.set, requested, bufferSize(fd, buffer) orelse 0);
+    log.transport.debug("{s}: {t} buffer of {d} bytes requested, {?d} accepted, {?d} reported", .{
+        what, buffer, requested, accepted, bufferSize(fd, buffer),
+    });
+}
+
+/// The size `accepts` takes: `requested`, or, each time it refuses, half
+/// as much, while that still exceeds `current`. Null when it takes none.
+fn negotiateSize(ctx: anytype, comptime accepts: fn (@TypeOf(ctx), u32) bool, requested: u32, current: u32) ?u32 {
+    var size = requested;
+    while (!accepts(ctx, size)) {
+        size /= 2;
+        if (size == 0 or size <= current) return null;
+    }
+    return size;
+}
+
+test "a refused size is asked for again at half, while that exceeds the current one" {
+    const Os = struct {
+        limit: u32,
+        asked: u32 = 0,
+        fn accepts(self: *@This(), size: u32) bool {
+            self.asked += 1;
+            return size <= self.limit;
+        }
+    };
+    var os: Os = .{ .limit = 100_000 };
+    try std.testing.expectEqual(@as(?u32, 62_500), negotiateSize(&os, Os.accepts, 1_000_000, 0));
+    try std.testing.expectEqual(@as(u32, 5), os.asked);
+
+    os = .{ .limit = 100_000 };
+    try std.testing.expectEqual(@as(?u32, null), negotiateSize(&os, Os.accepts, 1_000_000, 200_000));
+    try std.testing.expectEqual(@as(u32, 3), os.asked);
+
+    os = .{ .limit = 0 };
+    try std.testing.expectEqual(@as(?u32, null), negotiateSize(&os, Os.accepts, 3, 0));
+}
+
+test "a requested buffer size is applied, and 0 keeps the default" {
+    const fd = try open(posix.AF.INET, posix.SOCK.DGRAM);
+    defer close(fd);
+    const default = bufferSize(fd, .send).?;
+    requestBufferSize(fd, .send, 0, "test");
+    try std.testing.expectEqual(default, bufferSize(fd, .send).?);
+    // Small enough for every OS to accept; Linux reports it doubled.
+    requestBufferSize(fd, .receive, 8192, "test");
+    const got = bufferSize(fd, .receive).?;
+    try std.testing.expect(got == 8192 or got == 16384);
+}
+
+test "a buffer size past the OS's limit leaves a buffer no smaller than the default" {
+    const fd = try open(posix.AF.INET, posix.SOCK.DGRAM);
+    defer close(fd);
+    const default = bufferSize(fd, .receive).?;
+    requestBufferSize(fd, .receive, std.math.maxInt(u32), "test");
+    try std.testing.expect(bufferSize(fd, .receive).? >= default);
 }
 
 test "a nonblocking UDP socket with nothing queued reports would_block" {

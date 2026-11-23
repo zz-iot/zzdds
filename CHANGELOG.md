@@ -10,6 +10,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-23
 
+- Socket buffer sizes are configurable for both transports: `transport.udp.send_buffer_size`
+  joins `recv_buffer_size`, and `transport.tcp` has both, for every connection. All default
+  to 0, the OS default. An OS that refuses a size, as macOS and the BSDs do past their limit,
+  is asked for half as much until it accepts; what was asked for and what the OS then
+  reports is logged at debug. The participant's two unicast receive sockets, bound early to
+  reserve their ports, now get `recv_buffer_size` too; before, it reached only the others.
 - A reader bounds the fragmented samples it reassembles at once for each matched writer:
   `rtps.reassembly_max_samples` (16) and the bytes they declare, `rtps.reassembly_max_bytes`
   (256 MiB); 0 is no bound. Past either, a reliable reader sets aside the highest SN and a

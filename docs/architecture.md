@@ -259,8 +259,16 @@ multicast_ttl = 1
 # false = bind to interface IP (Cyclone style); true = bind to 0.0.0.0 / ::
 bind_wildcard = false
 
-recv_buffer_size = 0          # 0 = OS default
+recv_buffer_size = 0          # bytes; 0 = OS default. A refused size is asked for at half.
+send_buffer_size = 0          # bytes; 0 = OS default
 interface_poll_interval_ms = 5000
+
+[transport.tcp]
+enabled = false               # user data over TCP; discovery stays on UDP
+bind_address = ""             # needs a concrete, reachable address when enabled
+reuse_connection_by_host = false
+recv_buffer_size = 0          # bytes, per connection; 0 = OS default, which grows as needed
+send_buffer_size = 0
 
 [discovery]
 kind = "DISCOVERY_SPDP"  # "DISCOVERY_SPDP" (implemented) | "DISCOVERY_STATIC" | "DISCOVERY_BROKER" (planned) | custom

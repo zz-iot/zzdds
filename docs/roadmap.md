@@ -98,8 +98,12 @@ Forward-looking only: known gaps, planned features, and open design questions.
   / `handleHeartbeat`'s proxy-loop path (`reader_sm.zig`) and fragmented-change sends
   (`sendFragsToProxyLocked`, `writer_sm.zig`) still send under lock. Out of scope for the
   original fix; a mirror pass is needed.
-- **Writer send pacing (flow control), for history replay and repair** — nothing paces what
-  a writer sends.
+- **Writer send pacing (flow control), for live data, history replay and repair** — nothing
+  paces what a writer sends.
+  - **Live data.** A fragmented sample goes out as one burst of DATA_FRAGs: a 100 KB
+    sample at 1 KB fragments is about 100 back-to-back datagrams, more than a Linux
+    receive buffer at its default holds while its reader is slow. A reader then loses the
+    end of each burst, and every repair repeats it.
   - **Best-effort history replay.** A `TRANSIENT_LOCAL` writer sends a newly matched
     `BEST_EFFORT` reader its whole history at once (`replayHistoryToProxyUnlocked`). It
     copies every unfragmented sample up to the next fragmented one, then sends the copies;
@@ -108,9 +112,16 @@ Forward-looking only: known gaps, planned features, and open design questions.
     immediately.
 
   A large history or a large fragmented sample therefore goes out as one burst. Revisit
-  together, once there is tooling to measure throughput and loss under load: a per-writer
-  send budget or rate, an asynchronous publish mode, and delayed, batched repair (see
-  `nack_response_delay` under LocatorSelector above).
+  together with the zzest performance work, which can measure throughput and loss under
+  load: a per-writer send budget or rate, an asynchronous publish mode, and delayed, batched
+  repair (see `nack_response_delay` under LocatorSelector above). All of it is the sender's
+  own; none needs a protocol change.
+- **Default socket buffer sizes** — `transport.udp` and `transport.tcp` request no buffer
+  size by default (0, the OS default), so a UDP socket on Linux holds about 208 KiB. Larger
+  defaults for UDP, such as 1 MiB to receive and 256 KiB to send, would absorb bursts like
+  the one above. Pick them with the zzest performance work and per target: an embedded
+  transport has its own config and its own memory to size them from. TCP stays at the OS
+  default, which grows with each connection's needs.
 
   Smaller, independent improvements to the best-effort replay:
   - Send in fixed-size batches, so its copy is bounded by the batch rather than the history.
