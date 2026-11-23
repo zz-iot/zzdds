@@ -150,7 +150,7 @@ pub const WriterProxy = struct {
     /// In-progress fragment reassembly, keyed by writer sequence number.
     /// Each entry accumulates DATA_FRAG payloads until complete, then delivers
     /// the assembled change through the normal handleData path.
-    reassembly: std.AutoHashMapUnmanaged(SequenceNumber, ReassemblyEntry),
+    reassembly: std.AutoArrayHashMapUnmanaged(SequenceNumber, ReassemblyEntry),
     /// True once this proxy has completed the reader-side readiness signal
     /// (or, for BEST_EFFORT proxies, immediately at match -- no handshake
     /// exists). Sticky: never cleared by a later stale/duplicate HEARTBEAT.
@@ -210,8 +210,7 @@ pub const WriterProxy = struct {
         self.received.deinit(alloc);
         for (self.pending_changes.items) |*ch| alloc.free(ch.data);
         self.pending_changes.deinit(alloc);
-        var it = self.reassembly.valueIterator();
-        while (it.next()) |entry| entry.deinit(alloc);
+        for (self.reassembly.values()) |*entry| entry.deinit(alloc);
         self.reassembly.deinit(alloc);
     }
 
@@ -730,7 +729,7 @@ pub const StatefulReader = struct {
         // Retire the completed buffer even when validation/admission fails. A
         // retransmission may rebuild it; no stale completed buffer pins memory.
         defer {
-            var removed = wp.?.reassembly.fetchRemove(sn).?;
+            var removed = wp.?.reassembly.fetchSwapRemove(sn).?;
             removed.value.received.deinit();
             self.alloc.free(removed.value.data);
         }
@@ -970,30 +969,20 @@ pub const StatefulReader = struct {
         }.below);
     }
 
-    /// Frees `wp`'s partly reassembled samples whose SN `drop` picks. The map
-    /// may not change while it is iterated, so each scan collects a batch of
-    /// SNs to remove: one scan per batch, not one per sample.
+    /// Frees `wp`'s partly reassembled samples whose SN `drop` picks, in one
+    /// pass: walking down, a swap-remove moves in only an entry already seen.
     fn dropReassemblyIf(
         alloc: std.mem.Allocator,
         wp: *WriterProxy,
         arg: SequenceNumber,
         comptime drop: fn (*const WriterProxy, SequenceNumber, SequenceNumber) bool,
     ) void {
-        while (true) {
-            var batch: [64]SequenceNumber = undefined;
-            var n: usize = 0;
-            var it = wp.reassembly.keyIterator();
-            while (it.next()) |k| {
-                if (!drop(wp, k.*, arg)) continue;
-                batch[n] = k.*;
-                n += 1;
-                if (n == batch.len) break;
-            }
-            for (batch[0..n]) |sn| {
-                var removed = wp.reassembly.fetchRemove(sn).?;
-                removed.value.deinit(alloc);
-            }
-            if (n < batch.len) return;
+        var i = wp.reassembly.count();
+        while (i > 0) {
+            i -= 1;
+            if (!drop(wp, wp.reassembly.keys()[i], arg)) continue;
+            wp.reassembly.values()[i].deinit(alloc);
+            wp.reassembly.swapRemoveAt(i);
         }
     }
 
@@ -2085,16 +2074,16 @@ test "StatefulReader GAP frees a partly reassembled SN" {
     try reader.addMatchedWriter(try WriterProxy.init(testing.allocator, wguid, &.{}, &.{}, true));
     try reader.handleDataFrag(wguid, ZERO_TS, testFrag(1, 1, &.{ 1, 2, 3, 4 }));
     try reader.handleDataFrag(wguid, ZERO_TS, testFrag(3, 1, &.{ 1, 2, 3, 4 }));
-    try testing.expectEqual(@as(u32, 2), reader.writer_proxies.items[0].reassembly.count());
+    try testing.expectEqual(@as(usize, 2), reader.writer_proxies.items[0].reassembly.count());
 
     // The writer no longer has SN 1; SN 3 is still coming.
     reader.handleGap(wguid, 1, .{ .base = 2, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) });
     const wp = &reader.writer_proxies.items[0];
-    try testing.expectEqual(@as(u32, 1), wp.reassembly.count());
+    try testing.expectEqual(@as(usize, 1), wp.reassembly.count());
     try testing.expect(wp.reassembly.contains(3));
 }
 
-test "StatefulReader GAP frees more partly reassembled SNs than one cleanup batch" {
+test "StatefulReader GAP frees every partly reassembled SN it settles, among many" {
     var null_ctx: TestNullCtx = .{};
     const null_transport = Transport{ .ctx = &null_ctx, .vtable = &test_null_vtable };
     const reader = try StatefulReader.init(testing.allocator, makeGuid(44, 0xC7), null_transport, .keep_all, 0, true);
@@ -2108,7 +2097,7 @@ test "StatefulReader GAP frees more partly reassembled SNs than one cleanup batc
 
     reader.handleGap(wguid, 1, .{ .base = 151, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) });
     const wp = &reader.writer_proxies.items[0];
-    try testing.expectEqual(@as(u32, 1), wp.reassembly.count());
+    try testing.expectEqual(@as(usize, 1), wp.reassembly.count());
     try testing.expect(wp.reassembly.contains(200));
 }
 
@@ -2174,7 +2163,7 @@ test "checked sample processing precedes sequence accounting for DATA and fragme
         try reader.handleDataFrag(writer, ZERO_TS, first);
         try testing.expectError(error.InvalidSample, reader.handleDataFrag(writer, ZERO_TS, second));
         try testing.expect(!reader.writer_proxies.items[0].received.contains(2));
-        try testing.expectEqual(@as(u32, 0), reader.writer_proxies.items[0].reassembly.count());
+        try testing.expectEqual(@as(usize, 0), reader.writer_proxies.items[0].reassembly.count());
         first.serialized_payload = &.{1};
         try reader.handleDataFrag(writer, ZERO_TS, first);
         try reader.handleDataFrag(writer, ZERO_TS, second);
