@@ -1241,3 +1241,152 @@ test "addMatchedWriter: proxy-list append OOM releases self.mu instead of leakin
 
     try testing.expect(!r.isWriterMatched(writer_guid));
 }
+
+// ── Historical-data waits ─────────────────────────────────────────────────────
+//
+// docs/design/concurrency/operations.md#historical-data-wait-contract
+
+const history_wait = zzdds.protocol.history_wait;
+
+/// Matches a writer that owes history: its first HEARTBEAT will say how much.
+fn matchHistoryWriter(r: *StatefulReader, guid: Guid, port: u16) !void {
+    var wp = try WriterProxy.init(testing.allocator, guid, &.{Locator.udp4(.{ 127, 0, 0, 1 }, port)}, &.{}, true);
+    wp.history_established = false;
+    try r.addMatchedWriter(wp);
+}
+
+/// A first HEARTBEAT announcing no history: the writer then owes none.
+fn emptyHistory(r: *StatefulReader, guid: Guid) void {
+    r.handleHeartbeat(guid, READER_EID, 1, 0, 1, true);
+}
+
+const HistoryWait = struct {
+    waiter: history_wait.Waiter,
+    cap: history_wait.Capture,
+
+    /// Must not move afterwards.
+    fn begin(self: *HistoryWait, r: *StatefulReader, timeout_ns: ?i64) !void {
+        self.waiter = history_wait.Waiter.init(null, timeout_ns);
+        self.cap = .{ .waiter = &self.waiter };
+        self.waiter.expect();
+        try r.beginHistoryWait(&self.cap);
+    }
+
+    fn end(self: *HistoryWait, r: *StatefulReader) void {
+        r.endHistoryWait(&self.cap);
+        self.waiter.deinit();
+    }
+
+    fn outcome(self: *HistoryWait) ?history_wait.Outcome {
+        self.waiter.mu.lock();
+        defer self.waiter.mu.unlock();
+        return self.waiter.outcome;
+    }
+};
+
+fn historyReader(rec: *Recording) !*StatefulReader {
+    return StatefulReader.init(testing.allocator, makeGuid(0x01, READER_EID), rec.makeTransport(), .keep_all, 0, true);
+}
+
+test "a historical-data wait covers the writers that owed history when it began" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    const a = makeGuid(0x02, WRITER_EID);
+    const b = makeGuid(0x03, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+    // A writer with no history to deliver owes none.
+    try r.addMatchedWriter(try WriterProxy.init(testing.allocator, makeGuid(0x04, WRITER_EID), &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7302)}, &.{}, true));
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, null);
+    defer wait.end(r);
+    // A writer matched now does not join.
+    try matchHistoryWriter(r, b, 7301);
+    try testing.expectEqual(@as(?history_wait.Outcome, null), wait.outcome());
+    emptyHistory(r, a);
+    try testing.expectEqual(@as(?history_wait.Outcome, .satisfied), wait.outcome());
+}
+
+test "a historical-data wait is satisfied at once when no writer owes history" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, 0);
+    defer wait.end(r);
+    try testing.expectEqual(@as(?history_wait.Outcome, .satisfied), wait.outcome());
+}
+
+test "a writer that unmatches before delivering its history fails the wait" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    const a = makeGuid(0x02, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, null);
+    defer wait.end(r);
+    r.removeMatchedWriter(a);
+    try testing.expectEqual(@as(?history_wait.Outcome, .part_failed), wait.outcome());
+}
+
+test "a writer that has delivered its history stays done when it unmatches" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    const a = makeGuid(0x02, WRITER_EID);
+    const b = makeGuid(0x03, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+    try matchHistoryWriter(r, b, 7301);
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, null);
+    defer wait.end(r);
+    emptyHistory(r, a);
+    r.removeMatchedWriter(a);
+    try testing.expectEqual(@as(?history_wait.Outcome, null), wait.outcome());
+    emptyHistory(r, b);
+    try testing.expectEqual(@as(?history_wait.Outcome, .satisfied), wait.outcome());
+}
+
+test "history delivered at the deadline or later times the wait out" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    const a = makeGuid(0x02, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, 0);
+    defer wait.end(r);
+    emptyHistory(r, a);
+    try testing.expectEqual(@as(?history_wait.Outcome, .timed_out), wait.outcome());
+}
+
+test "closing a reader settles its historical-data waits, and any begun after" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    const a = makeGuid(0x02, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, null);
+    defer wait.end(r);
+    var late_wait: HistoryWait = undefined;
+    try late_wait.begin(r, 0);
+    defer late_wait.end(r);
+    r.closeHistoryWaits();
+    // Removing the writer afterwards does not turn the close into a failure.
+    r.removeMatchedWriter(a);
+    try testing.expectEqual(@as(?history_wait.Outcome, .closed), wait.outcome());
+    // Past its deadline, a wait the close settles has timed out.
+    try testing.expectEqual(@as(?history_wait.Outcome, .timed_out), late_wait.outcome());
+
+    var after: HistoryWait = undefined;
+    try after.begin(r, null);
+    defer after.end(r);
+    try testing.expectEqual(@as(?history_wait.Outcome, .closed), after.outcome());
+}

@@ -506,15 +506,13 @@ const match_on_register_vtable = proto.ProtocolReader.Vtable{
     .handle_gap = struct {
         fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.SequenceNumberSet) void {}
     }.f,
-    .historical_delivered = struct {
-        fn f(_: *anyopaque) bool {
-            return true;
+    .begin_history_wait = struct {
+        fn f(_: *anyopaque, cap: *zzdds.protocol.history_wait.Capture) error{OutOfMemory}!void {
+            cap.waiter.satisfied();
         }
     }.f,
-    .has_matched_writers = struct {
-        fn f(_: *anyopaque) bool {
-            return true;
-        }
+    .end_history_wait = struct {
+        fn f(_: *anyopaque, _: *zzdds.protocol.history_wait.Capture) void {}
     }.f,
     .deinit = struct {
         fn f(_: *anyopaque) void {}

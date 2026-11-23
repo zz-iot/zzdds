@@ -128,6 +128,18 @@ static int count_historical(SubState *state) {
     return n;
 }
 
+/* Polls until a writer matches `dr`, for up to HISTORICAL_WAIT_TIMEOUT_S.
+ * Returns 1 once one has, 0 if none did. */
+static int wait_for_match(DDS_DataReader dr) {
+    for (int waited_ms = 0; waited_ms < HISTORICAL_WAIT_TIMEOUT_S * 1000; waited_ms += POLL_PERIOD_MS) {
+        DDS_SubscriptionMatchedStatus matched;
+        memset(&matched, 0, sizeof(matched));
+        if (DDS_DataReader_get_subscription_matched_status(dr, &matched) == DDS_RETCODE_OK && matched.current_count > 0) return 1;
+        sleep_ms(POLL_PERIOD_MS);
+    }
+    return 0;
+}
+
 /* After a historical shortfall: prints what the reader reports, then keeps
  * taking for SHORTFALL_RECHECK_MS. Samples that turn up late mean the wait
  * returned too early; lost ones mean the writer never sent them. */
@@ -239,6 +251,14 @@ int main(int argc, char **argv) {
     HistoryEventDataReader reader;
     HistoryEventDataReader_init(&reader, dr);
     state.reader = &reader;
+
+    /* wait_for_historical_data() waits for the writers matched when it is
+     * called, and with none returns OK at once: wait for the publisher's
+     * writer to match first. */
+    if (!wait_for_match(dr)) {
+        fprintf(stderr, "FAIL: no writer matched within %d s\n", HISTORICAL_WAIT_TIMEOUT_S);
+        return 1;
+    }
 
     /* The API this whole example exists to exercise: block until the
      * TRANSIENT_LOCAL historical replay has actually landed, before

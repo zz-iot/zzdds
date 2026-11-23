@@ -100,6 +100,17 @@ fn countHistorical(state: *State) i32 {
     return n;
 }
 
+/// Polls until a writer matches `dr`, for up to HISTORICAL_WAIT_TIMEOUT_S.
+fn waitForMatch(dr: DDS.DataReader, io: std.Io) bool {
+    var waited: u64 = 0;
+    while (waited < @as(u64, HISTORICAL_WAIT_TIMEOUT_S) * std.time.ns_per_s) : (waited += POLL_PERIOD_NS) {
+        var matched: DDS.SubscriptionMatchedStatus = undefined;
+        if (dr.get_subscription_matched_status(&matched) == DDS.RETCODE_OK and matched.current_count > 0) return true;
+        sleepNs(io, POLL_PERIOD_NS);
+    }
+    return false;
+}
+
 /// After a historical shortfall: prints what the reader reports, then keeps
 /// taking for SHORTFALL_RECHECK_NS. Samples that turn up late mean the wait
 /// returned too early; lost ones mean the writer never sent them.
@@ -220,6 +231,14 @@ pub fn main(init: std.process.Init) !void {
     }
     std.debug.print("Create reader for topic: HistoryEvent\n", .{});
     state.reader = catchup_gen.HistoryEventDataReader.init(dr, alloc);
+
+    // wait_for_historical_data() waits for the writers matched when it is
+    // called, and with none returns OK at once: wait for the publisher's
+    // writer to match first.
+    if (!waitForMatch(dr, io)) {
+        std.debug.print("FAIL: no writer matched within {d} s\n", .{HISTORICAL_WAIT_TIMEOUT_S});
+        std.process.exit(1);
+    }
 
     // The API this whole example exists to exercise: block until the
     // TRANSIENT_LOCAL historical replay has actually landed, before taking

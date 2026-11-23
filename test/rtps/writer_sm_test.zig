@@ -2571,7 +2571,7 @@ test "an acknowledgment wait covers the readers matched and the changes written 
     ackThrough(w, a, 2, 1);
     try testing.expectEqual(@as(?ack_wait.Outcome, null), wait.outcome());
     ackThrough(w, a, 3, 2);
-    try testing.expectEqual(@as(?ack_wait.Outcome, .acknowledged), wait.outcome());
+    try testing.expectEqual(@as(?ack_wait.Outcome, .satisfied), wait.outcome());
 }
 
 test "an acknowledgment wait is acknowledged at once when no reader owes one" {
@@ -2583,7 +2583,7 @@ test "an acknowledgment wait is acknowledged at once when no reader owes one" {
     var wait: AckWait = undefined;
     try wait.begin(w, 0);
     defer wait.end(w);
-    try testing.expectEqual(@as(?ack_wait.Outcome, .acknowledged), wait.outcome());
+    try testing.expectEqual(@as(?ack_wait.Outcome, .satisfied), wait.outcome());
 
     // A best-effort reader never owes one.
     _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "x");
@@ -2592,14 +2592,14 @@ test "an acknowledgment wait is acknowledged at once when no reader owes one" {
     var wait2: AckWait = undefined;
     try wait2.begin(w, 0);
     defer wait2.end(w);
-    try testing.expectEqual(ack_wait.Outcome.acknowledged, wait2.waiter.wait());
+    try testing.expectEqual(ack_wait.Outcome.satisfied, wait2.waiter.wait());
 
     // Nor does a reader matched after the changes, which it is not sent.
     try w.addMatchedReader(try reliableProxy(makeGuid(0x04, READER_EID), 7205));
     var wait3: AckWait = undefined;
     try wait3.begin(w, 0);
     defer wait3.end(w);
-    try testing.expectEqual(ack_wait.Outcome.acknowledged, wait3.waiter.wait());
+    try testing.expectEqual(ack_wait.Outcome.satisfied, wait3.waiter.wait());
 }
 
 test "a reader that unmatches owes nothing more, even matched again" {
@@ -2619,7 +2619,7 @@ test "a reader that unmatches owes nothing more, even matched again" {
     try testing.expectEqual(@as(?ack_wait.Outcome, null), wait.outcome());
     // The last captured reader unmatching settles the wait.
     w.removeMatchedReader(b);
-    try testing.expectEqual(@as(?ack_wait.Outcome, .acknowledged), wait.outcome());
+    try testing.expectEqual(@as(?ack_wait.Outcome, .satisfied), wait.outcome());
 }
 
 test "a reader no longer reliable owes no acknowledgment" {
@@ -2633,7 +2633,7 @@ test "a reader no longer reliable owes no acknowledgment" {
     defer wait.end(w);
     // A refresh keeps the match, now best effort.
     try testing.expect(!try w.addOrRefreshMatchedReader(try ReaderProxy.init(testing.allocator, a, &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7200)}, &.{}, false, false)));
-    try testing.expectEqual(@as(?ack_wait.Outcome, .acknowledged), wait.outcome());
+    try testing.expectEqual(@as(?ack_wait.Outcome, .satisfied), wait.outcome());
 }
 
 test "an acknowledgment arriving at the deadline or later times the wait out" {
@@ -2662,12 +2662,12 @@ test "closing a writer settles its acknowledgment waits, and any begun after" {
     w.closeAckWaits();
     // Removing the reader afterwards cannot turn it into an acknowledgment.
     w.removeMatchedReader(a);
-    try testing.expectEqual(@as(?ack_wait.Outcome, .writer_closed), wait.outcome());
+    try testing.expectEqual(@as(?ack_wait.Outcome, .part_failed), wait.outcome());
 
     var late: AckWait = undefined;
     try late.begin(w, null);
     defer late.end(w);
-    try testing.expectEqual(@as(?ack_wait.Outcome, .writer_closed), late.outcome());
+    try testing.expectEqual(@as(?ack_wait.Outcome, .part_failed), late.outcome());
 }
 
 test "a caller blocked on an acknowledgment wait wakes when another thread acknowledges" {
@@ -2689,7 +2689,7 @@ test "a caller blocked on an acknowledgment wait wakes when another thread ackno
     const t = try std.Thread.spawn(.{}, Blocked.run, .{ &wait.waiter, &got });
     ackThrough(w, a, 3, 1);
     t.join();
-    try testing.expectEqual(ack_wait.Outcome.acknowledged, got);
+    try testing.expectEqual(ack_wait.Outcome.satisfied, got);
 }
 
 test "a writer closing after the deadline leaves its wait timed out" {
@@ -2721,7 +2721,7 @@ test "a reader that became best effort owes nothing, even made reliable again" {
     try testing.expect(!try w.addOrRefreshMatchedReader(try ReaderProxy.init(testing.allocator, a, &.{loc}, &.{}, false, false)));
     try testing.expect(!try w.addOrRefreshMatchedReader(try ReaderProxy.init(testing.allocator, a, &.{loc}, &.{}, false, true)));
     ackThrough(w, b, 3, 1);
-    try testing.expectEqual(@as(?ack_wait.Outcome, .acknowledged), wait.outcome());
+    try testing.expectEqual(@as(?ack_wait.Outcome, .satisfied), wait.outcome());
 }
 
 test "an acknowledgment wait covers the last change written, not a sequence number taken without one" {
@@ -2736,5 +2736,5 @@ test "an acknowledgment wait covers the last change written, not a sequence numb
     try wait.begin(w, null);
     defer wait.end(w);
     ackThrough(w, a, 3, 1);
-    try testing.expectEqual(@as(?ack_wait.Outcome, .acknowledged), wait.outcome());
+    try testing.expectEqual(@as(?ack_wait.Outcome, .satisfied), wait.outcome());
 }

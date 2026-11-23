@@ -20,7 +20,9 @@ const guid_mod = @import("../rtps/guid.zig");
 const history_mod = @import("../rtps/history.zig");
 const unmatched_mod = @import("../rtps/unmatched_cache.zig");
 const submsg_mod = @import("../rtps/message/submessage.zig");
+pub const waiter = @import("waiter.zig");
 pub const ack_wait = @import("ack_wait.zig");
+pub const history_wait = @import("history_wait.zig");
 
 pub const Guid = guid_mod.Guid;
 pub const GuidPrefix = guid_mod.GuidPrefix;
@@ -727,20 +729,15 @@ pub const ProtocolReader = struct {
             gap_list: SequenceNumberSet,
         ) void,
 
-        /// Returns true when all matched TRANSIENT_LOCAL writers have delivered their
-        /// complete history up to the floor sequence number established by the first
-        /// HEARTBEAT.  Writers that do not have history_expected set are always considered
-        /// delivered.  Returns true immediately when no writers are matched -- callers
-        /// waiting for a bounded duration must not treat that alone as "done"; see
-        /// has_matched_writers below.
-        historical_delivered: *const fn (ctx: *anyopaque) bool,
+        /// Begin the reader's part of a historical-data wait: capture the
+        /// matched writers that owe it history (history_expected), and settle
+        /// `cap.waiter` once each has delivered it, one unmatches first, or
+        /// the reader closes. `cap.waiter` must expect it; end_history_wait
+        /// ends it, settled or not.
+        begin_history_wait: *const fn (ctx: *anyopaque, cap: *history_wait.Capture) error{OutOfMemory}!void,
 
-        /// True once at least one writer has ever matched this reader (sticky --
-        /// does not reset on unmatch). Lets DataReader.wait_for_historical_data
-        /// distinguish "no writer will ever come" from "no writer has matched
-        /// *yet*", which historical_delivered() alone can't: both report the
-        /// same vacuous `true` when no writer is currently matched.
-        has_matched_writers: *const fn (ctx: *anyopaque) bool,
+        /// End a historical-data wait begin_history_wait began.
+        end_history_wait: *const fn (ctx: *anyopaque, cap: *history_wait.Capture) void,
 
         /// Destroy this reader and release its resources.
         deinit: *const fn (ctx: *anyopaque) void,
@@ -867,12 +864,12 @@ pub const ProtocolReader = struct {
         self.vtable.handle_gap(self.ctx, writer_guid, gap_start, gap_list);
     }
 
-    pub fn historicalDelivered(self: ProtocolReader) bool {
-        return self.vtable.historical_delivered(self.ctx);
+    pub fn beginHistoryWait(self: ProtocolReader, cap: *history_wait.Capture) error{OutOfMemory}!void {
+        return self.vtable.begin_history_wait(self.ctx, cap);
     }
 
-    pub fn hasMatchedWriters(self: ProtocolReader) bool {
-        return self.vtable.has_matched_writers(self.ctx);
+    pub fn endHistoryWait(self: ProtocolReader, cap: *history_wait.Capture) void {
+        self.vtable.end_history_wait(self.ctx, cap);
     }
 
     pub fn deinit(self: ProtocolReader) void {

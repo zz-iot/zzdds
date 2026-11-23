@@ -112,6 +112,16 @@ bool take_available(SubState *state) {
     return became_done;
 }
 
+// Polls until a writer matches `dr`, for up to HISTORICAL_WAIT_TIMEOUT_S.
+bool wait_for_match(::DDS::DataReader &dr) {
+    for (int waited_ms = 0; waited_ms < HISTORICAL_WAIT_TIMEOUT_S * 1000; waited_ms += POLL_PERIOD_MS) {
+        ::DDS::SubscriptionMatchedStatus matched{};
+        if (dr.get_subscription_matched_status(matched) == ::DDS::RETCODE_OK && matched.current_count > 0) return true;
+        sleep_ms(POLL_PERIOD_MS);
+    }
+    return false;
+}
+
 // After a historical shortfall: prints what the reader reports, then keeps
 // taking for SHORTFALL_RECHECK_MS. Samples that turn up late mean the wait
 // returned too early; lost ones mean the writer never sent them.
@@ -224,6 +234,14 @@ int main(int argc, char **argv) {
     auto dr_handle = dr->native_handle();
     HistoryEventDataReader reader(dr_handle);
     state.reader = &reader;
+
+    // wait_for_historical_data() waits for the writers matched when it is
+    // called, and with none returns OK at once: wait for the publisher's
+    // writer to match first.
+    if (!wait_for_match(*dr)) {
+        std::fprintf(stderr, "FAIL: no writer matched within %d s\n", HISTORICAL_WAIT_TIMEOUT_S);
+        return 1;
+    }
 
     // The API this whole example exists to exercise: block until the
     // TRANSIENT_LOCAL historical replay has actually landed, before taking

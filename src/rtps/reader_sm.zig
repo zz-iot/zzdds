@@ -7,6 +7,7 @@
 //!   Stores changes in a history cache; sends ACKNACK in response to HEARTBEAT.
 
 const std = @import("std");
+const history_wait = @import("../protocol/history_wait.zig");
 const log = @import("../log.zig");
 const trace = @import("../trace.zig");
 const mutex_mod = @import("../util/mutex.zig");
@@ -141,6 +142,8 @@ pub const WriterProxy = struct {
     last_hb_frag_count: ?i32,
     /// True when the remote writer offers RELIABLE delivery.
     reliable: bool,
+    /// Which match of the writer this is: a new match gets a new one.
+    match_id: u64 = 0,
     /// Highest sequence number of the writer's history at match time, as reported in the
     /// first HEARTBEAT.  Only meaningful when history_established is true.
     history_floor_sn: SequenceNumber,
@@ -298,10 +301,13 @@ pub const StatefulReader = struct {
     /// rematch, and the writer would ignore this reader until it climbed
     /// back past the old one. Wraps: writers compare counts modulo 2^32.
     ack_count: i32 = 0,
-    /// Sticky: true once any writer has ever matched, never reset back to
-    /// false on unmatch. See hasMatchedWriters()'s own doc comment for why
-    /// this needs to be "ever", not "currently".
-    ever_matched_writer: bool = false,
+    /// The last WriterProxy.match_id given.
+    last_match_id: u64 = 0,
+    /// The historical-data waits this reader has still to settle
+    /// (`beginHistoryWait`), and whether `closeHistoryWaits` has run.
+    /// Guarded by `mu`.
+    history_waits: std.ArrayListUnmanaged(*history_wait.Capture) = .empty,
+    history_waits_closed: bool = false,
     /// Callback fired when a writer proxy's protocol-ready state
     /// transitions. Mirrors StatefulWriter's identical field.
     protocol_ready_fn: ?*const fn (*anyopaque, Guid, bool) void = null,
@@ -358,6 +364,8 @@ pub const StatefulReader = struct {
     pub fn deinit(self: *Self) void {
         for (self.writer_proxies.items) |*wp| wp.deinit(self.alloc);
         self.writer_proxies.deinit(self.alloc);
+        std.debug.assert(self.history_waits.items.len == 0);
+        self.history_waits.deinit(self.alloc);
         self.cache.deinit();
         self.mu.deinit();
         if (self.sample_processor) |p| if (p.release) |release| release(p.ctx);
@@ -471,8 +479,9 @@ pub const StatefulReader = struct {
             return err;
         };
         if (commit) |c| c.install(c.ctx, true);
-        self.ever_matched_writer = true;
         const new_wp = &self.writer_proxies.items[self.writer_proxies.items.len - 1];
+        self.last_match_id += 1;
+        new_wp.match_id = self.last_match_id;
 
         // BEST_EFFORT proxies have no AckNack/Heartbeat handshake (RTPS
         // §8.4.15) to prove targeted delivery, so there's nothing to wait
@@ -577,6 +586,7 @@ pub const StatefulReader = struct {
             }
         }
         if (out.removed) if (unmatch) |u| u.remove(u.ctx, guid);
+        if (out.removed) self.settleHistoryWaitsLocked();
         if (lost > 0) if (self.callback) |cb| if (cb.on_sample_lost) |f| {
             out.lost = .{ .fn_ptr = f, .ctx = cb.ctx, .count = lost };
         };
@@ -1093,6 +1103,9 @@ pub const StatefulReader = struct {
                 }
             }
         }
+        // Delivered in order up to here: the history a wait counts on may
+        // now be in the cache.
+        self.settleHistoryWaitsLocked();
     }
 
     /// Handle a received HEARTBEAT from a matched writer.
@@ -1164,6 +1177,8 @@ pub const StatefulReader = struct {
             if (is_first_hb and !wp.history_established) {
                 wp.history_floor_sn = last_sn;
                 wp.history_established = true;
+                // The history may be none, or here already.
+                self.settleHistoryWaitsLocked();
             }
 
             self.tracer.submit(.{ .recv_heartbeat = .{
@@ -1272,35 +1287,110 @@ pub const StatefulReader = struct {
         }
     }
 
-    /// Returns true when all matched writers with history_expected have delivered their
-    /// complete history (cumulativeAck >= history_floor_sn).  Writers without history
-    /// tracking (history_established = true from the start) are always counted as done.
-    /// Returns true immediately when no writers are matched -- callers waiting for a
-    /// bounded duration (DataReader.wait_for_historical_data with a non-zero max_wait)
-    /// must not treat that as "done": see hasMatchedWriters()'s own doc comment, this
-    /// function alone can't tell "genuinely nothing to wait for" apart from "discovery
-    /// just hasn't matched a writer yet".
-    pub fn historicalDelivered(self: *Self) bool {
-        self.mu.lock();
-        defer self.mu.unlock();
-        for (self.writer_proxies.items) |*wp| {
-            if (!wp.history_established) return false;
-            if (wp.received.cumulativeAck() < wp.history_floor_sn) return false;
-        }
-        return true;
+    /// Whether `wp` still owes this reader history: its first HEARTBEAT has
+    /// not set how much, or what it set has not all been delivered in
+    /// order. A writer with no history to deliver never does.
+    fn owesHistory(wp: *const WriterProxy) bool {
+        return !wp.history_established or wp.received.cumulativeAck() < wp.history_floor_sn;
     }
 
-    /// True once at least one writer has matched this reader, ever (not
-    /// "currently matched" -- a writer that matched and later unmatched still
-    /// counts). Exists specifically so DataReader.wait_for_historical_data can
-    /// distinguish "no writer will ever come" from "no writer has matched
-    /// *yet*" -- historicalDelivered() alone reports the same vacuous `true`
-    /// for both when writer_proxies is currently empty, which is only correct
-    /// for the former.
-    pub fn hasMatchedWriters(self: *Self) bool {
+    /// Begins `cap`, a reader's part of a historical-data wait: captures
+    /// the matched writers that owe it history, and keeps `cap` to settle
+    /// once none does
+    /// (docs/design/concurrency/operations.md#historical-data-wait-contract).
+    /// Settles it at once if none owes any, or `closed` if the reader has
+    /// closed. `cap.waiter` must expect it; `endHistoryWait` ends it either
+    /// way.
+    pub fn beginHistoryWait(self: *Self, cap: *history_wait.Capture) error{OutOfMemory}!void {
         self.mu.lock();
         defer self.mu.unlock();
-        return self.ever_matched_writer;
+        if (self.history_waits_closed) return cap.waiter.settle(.closed);
+        var n: usize = 0;
+        for (self.writer_proxies.items) |*wp| {
+            if (owesHistory(wp)) n += 1;
+        }
+        if (n == 0) return cap.waiter.satisfied();
+        const sources = try self.alloc.alloc(history_wait.Capture.Source, n);
+        errdefer self.alloc.free(sources);
+        try self.history_waits.append(self.alloc, cap);
+        n = 0;
+        for (self.writer_proxies.items) |*wp| {
+            if (!owesHistory(wp)) continue;
+            sources[n] = .{ .guid = wp.guid, .match_id = wp.match_id };
+            n += 1;
+        }
+        cap.sources = sources;
+        cap.registered = true;
+    }
+
+    /// Ends `cap`, settled or not: the reader no longer settles it.
+    pub fn endHistoryWait(self: *Self, cap: *history_wait.Capture) void {
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (cap.registered) {
+                const i = std.mem.indexOfScalar(*history_wait.Capture, self.history_waits.items, cap).?;
+                _ = self.history_waits.swapRemove(i);
+                cap.registered = false;
+            }
+        }
+        self.alloc.free(cap.sources);
+        cap.sources = &.{};
+    }
+
+    /// Settles every historical-data wait not yet settled `closed` as the
+    /// reader closes, before its writers go. A later `beginHistoryWait`
+    /// settles at once.
+    pub fn closeHistoryWaits(self: *Self) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.history_waits_closed = true;
+        for (self.history_waits.items) |cap| {
+            cap.registered = false;
+            cap.waiter.settleClose(.closed);
+        }
+        self.history_waits.clearRetainingCapacity();
+    }
+
+    /// Settles the historical-data waits whose captured writers have each
+    /// delivered their history: satisfied, or timed out once past the
+    /// deadline. One whose writer unmatched first, even to match again, is
+    /// `part_failed`: that match's history can no longer arrive. Caller
+    /// must hold `mu`.
+    fn settleHistoryWaitsLocked(self: *Self) void {
+        var i = self.history_waits.items.len;
+        while (i > 0) {
+            i -= 1;
+            const cap = self.history_waits.items[i];
+            const outcome = self.historyOutcomeLocked(cap) orelse continue;
+            _ = self.history_waits.swapRemove(i);
+            cap.registered = false;
+            switch (outcome) {
+                .satisfied => if (cap.waiter.expired()) cap.waiter.settle(.timed_out) else cap.waiter.satisfied(),
+                else => cap.waiter.settle(outcome),
+            }
+        }
+    }
+
+    /// The outcome `cap` is settled with now, or null while a captured
+    /// writer still owes history.
+    /// A writer that has delivered stays done, whatever happens to it after.
+    fn historyOutcomeLocked(self: *Self, cap: *history_wait.Capture) ?history_wait.Outcome {
+        var owed = false;
+        for (cap.sources) |*src| {
+            if (src.done) continue;
+            const wp = self.writerProxyLocked(src.guid) orelse return .part_failed;
+            if (wp.match_id != src.match_id) return .part_failed;
+            if (owesHistory(wp)) owed = true else src.done = true;
+        }
+        return if (owed) null else .satisfied;
+    }
+
+    fn writerProxyLocked(self: *Self, guid: Guid) ?*const WriterProxy {
+        for (self.writer_proxies.items) |*wp| {
+            if (wp.guid.eql(guid)) return wp;
+        }
+        return null;
     }
 
     fn sendAckNackLocked(self: *Self, wp: *WriterProxy, last_sn: SequenceNumber, final: bool) void {

@@ -28,6 +28,7 @@ const handle_registry = @import("handle_registry.zig");
 const key_value = @import("key_value.zig");
 pub const KeyValue = key_value.KeyValue;
 const Mutex = @import("../util/mutex.zig").Mutex;
+const log_mod = @import("../log.zig");
 const time_mod = @import("../util/time.zig");
 const Hook = @import("../runtime/core.zig").Hook;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
@@ -435,6 +436,14 @@ pub const DataReaderImpl = struct {
     /// Automatic listener invocations, queued on the participant's listener
     /// context when it has one (see `raise`).
     listeners: listener_lane.PendingListeners = .{},
+    /// Set under `proto_mu` as deletion begins, before the subscriber
+    /// destroys `proto_reader` (`closeProto`): a call that finds it clear
+    /// there can still pin `proto_reader` (`acquireProto`).
+    proto_mu: Mutex = .{},
+    proto_closed: bool = false,
+    /// Whether a BEST_EFFORT historical-data wait has warned, once per
+    /// reader.
+    warned_best_effort_history: std.atomic.Value(bool) = .init(false),
     status_cond: ?*waitset.StatusConditionImpl,
 
     /// Cumulative count of incompatible-QoS events; incompat_total_change/
@@ -815,6 +824,23 @@ pub const DataReaderImpl = struct {
     }
     pub fn releaseQuiesce(self: *Self) void {
         self.quiesce.release(self, reallyDeinit);
+    }
+
+    /// Ends `acquireProto`: called before the subscriber destroys
+    /// `proto_reader`, which may then be freed once nothing pins it.
+    pub fn closeProto(self: *Self) void {
+        self.proto_mu.lock();
+        defer self.proto_mu.unlock();
+        self.proto_closed = true;
+    }
+
+    /// Pins `proto_reader` for a call that outlives one lock of it, such as
+    /// a wait or a loan; false once the reader's deletion has begun. A
+    /// `proto_reader.quiesceRelease()` unpins it.
+    pub fn acquireProto(self: *Self) bool {
+        self.proto_mu.lock();
+        defer self.proto_mu.unlock();
+        return !self.proto_closed and self.proto_reader.quiesceAcquire();
     }
 
     fn reallyDeinit(ctx: *anyopaque) void {
@@ -4021,58 +4047,41 @@ pub const DataReaderImpl = struct {
         return DDS.RETCODE_OK;
     }
 
+    /// Waits for the writers matched now that owe this reader history to
+    /// deliver it (docs/design/concurrency/operations.md#historical-data-wait-contract):
+    /// OK at once for a VOLATILE or BEST_EFFORT reader, or with no such
+    /// writer; ERROR if one unmatches first; ALREADY_DELETED if the reader
+    /// is deleted first.
     fn vtWaitForHistorical(ctx: *anyopaque, max_wait: *const DDS.Duration_t) DDS.ReturnCode_t {
         {
             const rc = cast(ctx).checkEnabledPrecondition();
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);
+        const timeout_ns = writer_mod.waitTimeoutNs(max_wait.*) catch return DDS.RETCODE_BAD_PARAMETER;
         if (self.qos.durability.kind == .VOLATILE_DURABILITY_QOS) return DDS.RETCODE_OK;
-
-        const POLL_NS: i64 = 1_000_000; // 1 ms
-        const is_zero_wait = max_wait.sec == 0 and max_wait.nanosec == 0;
-        const deadline_ns: ?i64 = if (max_wait.sec == DDS.DURATION_INFINITE_SEC and
-            max_wait.nanosec == DDS.DURATION_INFINITE_NSEC)
-            null
-        else blk: {
-            break :blk self.timer_clock.nowNs() +
-                @as(i64, max_wait.sec) * std.time.ns_per_s +
-                @as(i64, max_wait.nanosec);
-        };
-
-        // On a manual runtime, nothing else may be running it. A zero wait
-        // only checks.
-        if (self.listeners.runtimeOf()) |rt| if (!is_zero_wait and rt.canHelp()) {
-            return if (rt.helpUntil(deadline_ns, self, historicalReady)) DDS.RETCODE_OK else DDS.RETCODE_TIMEOUT;
-        };
-        while (true) {
-            if (self.proto_reader.historicalDelivered()) {
-                // historicalDelivered() reports the same vacuous `true` for
-                // "genuinely nothing to wait for" and "no writer has matched
-                // *yet*" (both look like an empty writer_proxies list). A
-                // zero-duration wait is a pure "check current state, don't
-                // block" query, so trust it immediately either way -- that
-                // matches this call's own documented zero-wait semantics.
-                // For a real (non-zero) wait, only trust it once we've seen
-                // at least one writer actually match; otherwise this would
-                // return OK on the very first poll for the single most
-                // common real call pattern (call this right after creating
-                // the reader, before discovery has had any chance to run) --
-                // found building zzdds-examples' `catchup` example, which
-                // does exactly that and got nothing back.
-                if (is_zero_wait or self.proto_reader.hasMatchedWriters()) return DDS.RETCODE_OK;
-            }
-            if (deadline_ns) |dl| {
-                if (self.timer_clock.nowNs() >= dl) return DDS.RETCODE_TIMEOUT;
-            }
-            self.timer_clock.sleepNs(POLL_NS);
+        if (self.qos.reliability.kind == .BEST_EFFORT_RELIABILITY_QOS) {
+            if (!self.warned_best_effort_history.swap(true, .monotonic))
+                log_mod.dcps.warn("reader: wait_for_historical_data on a BEST_EFFORT reader returns at once: nothing is owed it", .{});
+            return DDS.RETCODE_OK;
         }
-    }
+        if (!self.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
+        defer self.releaseQuiesce();
+        if (!self.acquireProto()) return DDS.RETCODE_ALREADY_DELETED;
+        defer self.proto_reader.quiesceRelease();
 
-    /// A nonzero historical-data wait is over: see the comment in
-    /// `vtWaitForHistorical` on why it needs a matched writer.
-    fn historicalReady(self: *Self) bool {
-        return self.proto_reader.historicalDelivered() and self.proto_reader.hasMatchedWriters();
+        var waiter = proto.waiter.Waiter.init(self.listeners.runtimeOf(), timeout_ns);
+        defer waiter.deinit();
+        var cap: proto.history_wait.Capture = .{ .waiter = &waiter };
+        waiter.expect();
+        self.proto_reader.beginHistoryWait(&cap) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        defer self.proto_reader.endHistoryWait(&cap);
+        return switch (waiter.wait()) {
+            .satisfied => DDS.RETCODE_OK,
+            .timed_out => DDS.RETCODE_TIMEOUT,
+            .part_failed => DDS.RETCODE_ERROR,
+            .closed => DDS.RETCODE_ALREADY_DELETED,
+        };
     }
 
     fn vtGetMatchedPubs(ctx: *anyopaque, handles: ?*DDS.InstanceHandleSeq) DDS.ReturnCode_t {
@@ -4347,7 +4356,7 @@ pub const DataReaderImpl = struct {
         // loan's whole lifetime (released alongside self's own ref in
         // vtReturnLoanRaw) closes the race regardless of check timing.
         // Symmetric with vtWriteRaw/vtLoanRaw's identical fix in writer.zig.
-        if (!self.proto_reader.quiesceAcquire()) {
+        if (!self.acquireProto()) {
             return DDS.RETCODE_ALREADY_DELETED;
         }
         var release_proto_now = true;
@@ -4414,7 +4423,7 @@ pub const DataReaderImpl = struct {
         if (!self.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
         var release_now = true;
         defer if (release_now) self.releaseQuiesce();
-        if (!self.proto_reader.quiesceAcquire()) {
+        if (!self.acquireProto()) {
             return DDS.RETCODE_ALREADY_DELETED;
         }
         var release_proto_now = true;

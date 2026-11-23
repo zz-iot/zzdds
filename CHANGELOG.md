@@ -10,6 +10,17 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-23
 
+- `wait_for_historical_data` waits for the writers that owe the reader history when it is
+  called, and returns OK at once when there are none. Before, a nonzero wait on a reader
+  no writer had matched yet waited for a first match. An application that needs a writer to
+  match first now waits for that (SUBSCRIPTION_MATCHED); the catchup examples do. A
+  BEST_EFFORT reader returns OK at once, and logs a warning once. A writer that unmatches
+  before delivering its history ends the wait with ERROR, and deleting the reader ends it
+  with ALREADY_DELETED; before, deleting the reader from another thread freed it under the
+  waiting call. A writer matched during the wait does not extend it, and the wait sleeps until
+  woken rather than polling every millisecond. A negative or unnormalized `max_wait` is
+  BAD_PARAMETER. Taking a loan from a reader being deleted can no longer pin its freed
+  protocol reader.
 - Deleting a DataWriter unregisters the instances it has registered, as DDS 1.4
   §2.2.2.4.1.6 says, whether by `delete_datawriter`, `delete_publisher` or a Publisher's or
   participant's `delete_contained_entities`: under `autodispose_unregistered_instances`

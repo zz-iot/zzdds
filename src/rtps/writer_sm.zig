@@ -1084,13 +1084,13 @@ pub const StatefulWriter = struct {
     pub fn beginAckWait(self: *Self, cap: *ack_wait.Capture) error{OutOfMemory}!void {
         self.mu.lock();
         defer self.mu.unlock();
-        if (self.ack_waits_closed) return cap.waiter.settle(.writer_closed);
+        if (self.ack_waits_closed) return cap.waiter.settle(.part_failed);
         const target = self.last_committed_sn;
         var n: usize = 0;
         for (self.reader_proxies.items) |*rp| {
             if (owesAck(rp, target)) n += 1;
         }
-        if (n == 0) return cap.waiter.acknowledged();
+        if (n == 0) return cap.waiter.satisfied();
         const readers = try self.alloc.alloc(ack_wait.Capture.Reader, n);
         errdefer self.alloc.free(readers);
         try self.ack_waits.append(self.alloc, cap);
@@ -1129,7 +1129,7 @@ pub const StatefulWriter = struct {
         self.ack_waits_closed = true;
         for (self.ack_waits.items) |cap| {
             cap.registered = false;
-            cap.waiter.settleClose(.writer_closed);
+            cap.waiter.settleClose(.part_failed);
         }
         self.ack_waits.clearRetainingCapacity();
     }
@@ -1152,7 +1152,7 @@ pub const StatefulWriter = struct {
             if (!self.capturedAckedLocked(cap)) continue;
             _ = self.ack_waits.swapRemove(i);
             cap.registered = false;
-            if (cap.waiter.expired()) cap.waiter.settle(.timed_out) else cap.waiter.acknowledged();
+            if (cap.waiter.expired()) cap.waiter.settle(.timed_out) else cap.waiter.satisfied();
         }
     }
 

@@ -80,11 +80,16 @@ live batch`, `Publisher: wrote live seq_num=`, `Publisher: done.`
    the harness, the app pattern itself is simple.
 2. Create participant → TypeSupport → topic → subscriber → DataReader with
    the same TRANSIENT_LOCAL/KEEP_ALL QoS and no listener yet.
-3. **Immediately after creating the reader, call
-   `wait_for_historical_data(max_wait)` — before taking anything.** This is
-   the API this whole example exists to exercise. Blocks until the cached
-   historical batch has actually been delivered (or `max_wait` elapses).
-4. Once `wait_for_historical_data` returns successfully, take everything
+3. Wait for the publisher's writer to match the reader, polling
+   `get_subscription_matched_status` for up to `max_wait`.
+   `wait_for_historical_data` waits only for the writers matched when it is
+   called, and with none returns OK at once (zzdds
+   `docs/design/concurrency/operations.md#historical-wait-compatibility`).
+4. **Then call `wait_for_historical_data(max_wait)` — before taking
+   anything.** This is the API this whole example exists to exercise. It
+   blocks until the cached historical batch has actually been delivered (or
+   `max_wait` elapses).
+5. Once `wait_for_historical_data` returns successfully, take everything
    currently available and confirm it's exactly the historical batch
    (`seq_num` 0–9, in order) — printing a `HISTORICAL BATCH COMPLETE`
    marker only after confirming the count and order, not just that the call
@@ -93,11 +98,11 @@ live batch`, `Publisher: wrote live seq_num=`, `Publisher: done.`
    waits for the samples to reach the reader, not for a listener to have
    taken them, so counting what a listener took right after the call
    returns races the listener's last take.
-5. Attach the `on_data_available` listener (`set_listener` delivers
+6. Attach the `on_data_available` listener (`set_listener` delivers
    anything that arrived since the take) and continue taking as live data
    arrives (`seq_num` 10–14), printing a distinct `LIVE SAMPLE` marker per
    item, until all 15 total samples have been seen.
-6. Exit successfully once both the historical batch and the live batch have
+7. Exit successfully once both the historical batch and the live batch have
    been fully and correctly observed, *in that order* (the one thing this
    example actually asserts programmatically: a sample never counted as
    "historical" after the `wait_for_historical_data` boundary, and never

@@ -24,11 +24,11 @@ This note says how the contracts map onto that model, and tracks what is still t
 
 ## Acknowledgment waits
 
-`src/protocol/ack_wait.zig` holds the two records.
+Two records serve an acknowledgment wait:
 
-* **`Waiter`:** one per call. It keeps the call's first outcome, and its caller sleeps
-  on it.
-* **`Capture`:** one writer's part of the call. It records the last committed sequence
+* **`Waiter`** (`src/protocol/waiter.zig`): one per call. It keeps the call's first
+  outcome, and its caller sleeps on it.
+* **`Capture`** (`src/protocol/ack_wait.zig`): one writer's part of the call. It records the last committed sequence
   number, and the reliable readers that owed an acknowledgment of it when the wait
   began, each by GUID and match.
 
@@ -39,7 +39,7 @@ owes nothing more, and matching again is a new match.
 Deleting a writer runs in this order:
 
 1. `DataWriterImpl.closeProto` stops new calls from pinning the protocol writer.
-2. The protocol writer's `deinit` settles every capture `writer_closed`. Its readers are
+2. The protocol writer's `deinit` settles every capture `part_failed`. Its readers are
    removed only after that, so their removal cannot look like acknowledgment.
 3. A DataWriter's wait returns ALREADY_DELETED. A Publisher's wait returns ERROR, unless
    the Publisher's own close came first and settled it ALREADY_DELETED.
@@ -47,13 +47,24 @@ Deleting a writer runs in this order:
 The Publisher's wait counts every reliable writer's capture before beginning any, so a
 writer acknowledged at once cannot settle the whole wait early.
 
+## Historical-data waits
+
+`src/protocol/history_wait.zig`'s `Capture` is the reader's part of the call. It records
+the matched writers that owed the reader history when the wait began, by GUID and match:
+those whose first HEARTBEAT has not yet said how much, and those that have not delivered
+it all in order. The `StatefulReader` settles it under its lock, after delivering to the
+DataReader's cache, so the history is there to take when the wait returns. A writer that
+has delivered stays done. One that unmatches before then fails the wait (ERROR), even if
+it matches again. The reader's close settles the wait first (ALREADY_DELETED), as a
+writer's does.
+
 ## Status
 
 | Operation | Status |
 | --- | --- |
 | DataWriter and Publisher `wait_for_acknowledgments` | Done |
-| DataReader `wait_for_historical_data` | Next: lifetime pin, close result, captured sources, no polling |
-| Blocking write | Planned: reserved capacity served oldest first, close before commit, per-instance limits, failed implicit registration undone, handle error codes |
+| DataReader `wait_for_historical_data` | Done |
+| Blocking write | Next: reserved capacity served oldest first, close before commit, per-instance limits, failed implicit registration undone, handle error codes |
 | Take after an allocation failure | Planned: no sample lost when building the output fails |
 | Take when a binding fails to decode | Planned: two-step take, so a binding can fail a decode and the samples return |
 | WaitSet waits | To audit |
