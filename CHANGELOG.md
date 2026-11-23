@@ -10,6 +10,13 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-23
 
+- Deleting a DataWriter unregisters the instances it has registered, as DDS 1.4
+  §2.2.2.4.1.6 says, whether by `delete_datawriter`, `delete_publisher` or a Publisher's or
+  participant's `delete_contained_entities`: under `autodispose_unregistered_instances`
+  its readers see them NOT_ALIVE_DISPOSED, and NOT_ALIVE_NO_WRITERS without it. A RELIABLE
+  writer waits for its readers to acknowledge the unregisters, for up to RELIABILITY
+  `max_blocking_time`, before discovery withdraws it. Before, it sent nothing for them, so a
+  reader saw the writer lost and its instances NOT_ALIVE_NO_WRITERS whatever the policy.
 - The Zig examples, integration tests and stress tests register their types' key
   projection (`projectKeyFromCdr`), as zidl's C, C++ and Java registrations do: their
   writers and readers keep each instance's key-only CDR rather than its first sample.

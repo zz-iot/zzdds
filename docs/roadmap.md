@@ -279,13 +279,6 @@ Forward-looking only: known gaps, planned features, and open design questions.
     reflection, and every one of zzdds's own `examples/`/`stress-tests/` registrations
     passes it — see `CHANGELOG.md` 2026-09-14. Closed; not a gap anymore.
 
-- **Deleting a DataWriter does not unregister its instances.** DDS 1.4 §2.2.2.4.1.6 says it
-  does, so under `autodispose_unregistered_instances` (TRUE by default) its readers should
-  see each instance NOT_ALIVE_DISPOSED (§2.2.3.21). zzdds sends nothing for them as the
-  writer goes: a reader sees the writer lost, and its instances NOT_ALIVE_NO_WRITERS,
-  whatever the policy. As it is deleted, the writer should write an unregister for each
-  instance it has registered, before discovery withdraws it.
-
 ### Selective CDR parse (`deserialize_selected`) — deferred follow-ups
 
 zidl v0.3.12 adds a mask-driven selective parser (`deserialize_selected(want)` /

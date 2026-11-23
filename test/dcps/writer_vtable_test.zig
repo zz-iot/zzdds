@@ -853,9 +853,11 @@ test "loan_raw: outstanding loan defers real protocol-writer teardown until the 
     // deinit loop) finds nothing and safely no-ops instead of double-freeing
     // the now-torn-down protocol writer.
     var fx = try SingleFixture.init(alloc);
+    // Its teardown deletes the writer without touching the protocol writer
+    // this test destroys: delete_datawriter would flush and unregister
+    // through it.
     defer fx.deinit();
     const dw = fx.makeWriter(.{}, null, 0);
-    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
     const pub_impl: *zzdds.dcps.PublisherImpl = @ptrCast(@alignCast(fx.pub_.ptr));
 
@@ -1049,9 +1051,11 @@ test "loan_raw: proto_writer already tearing down (but not yet freed) fails clea
     // for the whole test, so quiesceAcquire()'s tearing-down-bit check is
     // what rejects the loan, never a read of freed memory.
     var fx = try SingleFixture.init(alloc);
+    // Its teardown deletes the writer without touching the protocol writer
+    // this test destroys: delete_datawriter would flush and unregister
+    // through it.
     defer fx.deinit();
     const dw = fx.makeWriter(.{}, null, 0);
-    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
     const pub_impl: *zzdds.dcps.PublisherImpl = @ptrCast(@alignCast(fx.pub_.ptr));
 

@@ -1002,6 +1002,14 @@ pub const Runtime = struct {
         return self.options.mode == .manual;
     }
 
+    /// Whether a blocking wait on this thread may hold up the progress it
+    /// waits for: in a turn of a hosted runtime, this thread is a worker
+    /// that may be the one to run that progress, and it cannot help, as a
+    /// manual runtime's waiter does (`helpUntil`).
+    pub fn waitsBlockProgress(self: *const Runtime) bool {
+        return !self.canHelp() and inTurn();
+    }
+
     /// For a blocking call on a manual runtime: waits until `done(ctx)` or
     /// until the runtime clock reaches `deadline_ns` (null: no deadline),
     /// running due timers and internal turns meanwhile, never listener turns
