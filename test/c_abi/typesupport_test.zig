@@ -637,7 +637,7 @@ test "checked C registration rejects before DATA, fragment and prematch admissio
         try reader.handleDataFrag(writer, .zero, first);
         try testing.expectError(error.InvalidSample, reader.handleDataFrag(writer, .zero, second));
         try testing.expect(!reader.writer_proxies.items[0].received.contains(2));
-        try testing.expectEqual(@as(u32, 0), reader.writer_proxies.items[0].reassembly.count());
+        try testing.expectEqual(@as(usize, 0), reader.writer_proxies.items[0].reassembly.count());
         first.serialized_payload = &.{1};
         try reader.handleDataFrag(writer, .zero, first);
         try reader.handleDataFrag(writer, .zero, second);
