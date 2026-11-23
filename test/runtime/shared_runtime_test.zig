@@ -2193,6 +2193,36 @@ test "a write blocked on resource limits times out on the runtime clock when not
     m.runtime.deinit();
 }
 
+test "deleting a writer ends a write blocked on resource limits with AlreadyDeleted" {
+    var m: Manual = undefined;
+    m.init();
+    var pair: Pair = undefined;
+    // TRANSIENT_LOCAL keeps acknowledged samples: nothing frees space.
+    try pair.initWith(&m.runtime, limitedWriter(.TRANSIENT_LOCAL_DURABILITY_QOS));
+    m.runtime.releaseOwner();
+    try settle(&m);
+
+    try pair.write(0);
+    try pair.write(1);
+    try settle(&m);
+    // The blocked write's help runs the timer, which deletes the writer:
+    // the write is refused, not committed after the delete returned.
+    var del: DeleteWriterTimer = undefined;
+    del.init(&m.runtime, &pair);
+    defer del.context.deinit();
+    _ = m.runtime.armTimer(&del.timer, m.now());
+    const dw = pair.dw;
+    // The DataWriter stays allocated while the write holds it.
+    try testing.expect(dw.acquireQuiesce());
+    try testing.expectError(error.AlreadyDeleted, pair.write(2));
+    dw.releaseQuiesce();
+    try testing.expectEqual(DDS.RETCODE_OK, del.rc);
+
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
 test "a late reader's wait for historical data helps the runtime until the history arrives" {
     var m: Manual = undefined;
     m.init();

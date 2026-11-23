@@ -10,6 +10,17 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-23
 
+- A write blocked on RESOURCE_LIMITS reserves the room it is given, so writes waiting at
+  once can no longer all take one freed slot and overfill the history. The oldest waiting
+  write with room goes first. Deleting the writer ends a blocked write with
+  ALREADY_DELETED; before, it could still commit after the delete returned.
+  `max_samples_per_instance` bounds each instance, where it capped a keyed writer's whole
+  history. Under KEEP_LAST, a write that replaces its instance's oldest change takes no
+  room, where it was refused once the history held `max_samples`. A write that fails no
+  longer leaves registered an instance it registered. A handle naming another of the
+  writer's instances is PRECONDITION_NOT_MET, as DDS 1.4 §2.2.2.4.2.11 says, and one naming
+  none is still BAD_PARAMETER. A loan published after its writer's deletion began is
+  ALREADY_DELETED.
 - `wait_for_historical_data` waits for the writers that owe the reader history when it is
   called, and returns OK at once when there are none. Before, a nonzero wait on a reader
   no writer had matched yet waited for a first match. An application that needs a writer to

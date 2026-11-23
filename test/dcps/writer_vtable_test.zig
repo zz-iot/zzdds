@@ -829,7 +829,7 @@ test "loan_raw: an outstanding loan blocks delete_datawriter with PRECONDITION_N
     try testing.expectEqual(DDS.RETCODE_OK, fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw));
 }
 
-test "loan_raw: outstanding loan defers real protocol-writer teardown until the loan resolves" {
+test "loan_raw: outstanding loan defers real protocol-writer teardown until the loan resolves, and publishing it then is ALREADY_DELETED" {
     // Regression for a real, distinct race (Greptile PR #69 review, round
     // 3): checkDeleteContainedPrecondition() is a momentary read -- it
     // observing zero outstanding loans doesn't mean a concurrent loan_raw()
@@ -873,13 +873,14 @@ test "loan_raw: outstanding loan defers real protocol-writer teardown until the 
     // proto_writer's real resources are legitimately gone once
     // publish_loan_raw resolves the transferred ref and real teardown
     // finally runs, so there's nothing left to inspect on it afterward --
-    // the proof here is publish_loan_raw succeeding at all, not crashing on
-    // a use-after-free while it's still writing through the (correctly
-    // still-alive) protocol writer.
+    // the proof here is publish_loan_raw returning at all, not crashing on
+    // a use-after-free through the (correctly still-alive) protocol writer.
+    // Its destruction closed it to writes, so the publication is refused
+    // as the writer's deletion would refuse it.
     var key_hash_bytes = @as([16]u8, @splat(3));
     const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
     const rc = dw.vtable.publish_loan_raw(dw.ptr, &cdr_payload, &key_hash, DDS.HANDLE_NIL, .ALIVE_WRITE_KIND);
-    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, rc);
 }
 
 test "return_loan_raw: releasing the last quiesce ref doesn't touch self afterward" {
@@ -1095,9 +1096,32 @@ test "changeKindFromWriteKind: UNREGISTER_WRITE_KIND maps through autodispose_un
     try testing.expectEqual(DDS.RETCODE_OK, rc);
 }
 
+test "write_raw: max_samples_per_instance bounds each instance, not the whole history" {
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    var qos = DDS.DataWriterQos{};
+    qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    qos.resource_limits.max_samples = 10;
+    qos.resource_limits.max_samples_per_instance = 1;
+    const dw = fx.makeWriter(qos, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+
+    var payload_buf = [_]u8{0x02};
+    var payload_seq = DDS.OctetSeq{ ._buffer = &payload_buf, ._length = payload_buf.len, ._maximum = payload_buf.len, ._release = false };
+    const ts = DDS.Time_t{ .sec = DDS.TIME_INVALID_SEC, .nanosec = DDS.TIME_INVALID_NSEC };
+    var a_bytes = @as([16]u8, @splat(1));
+    var a = DDS.OctetSeq{ ._buffer = &a_bytes, ._length = 16, ._maximum = 16, ._release = false };
+    var b_bytes = @as([16]u8, @splat(2));
+    var b = DDS.OctetSeq{ ._buffer = &b_bytes, ._length = 16, ._maximum = 16, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.write_raw(dw.ptr, &a, DDS.HANDLE_NIL, &payload_seq, .ALIVE_WRITE_KIND, &ts));
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, dw.vtable.write_raw(dw.ptr, &a, DDS.HANDLE_NIL, &payload_seq, .ALIVE_WRITE_KIND, &ts));
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.write_raw(dw.ptr, &b, DDS.HANDLE_NIL, &payload_seq, .ALIVE_WRITE_KIND, &ts));
+}
+
 test "write_raw: an explicit instance_handle that doesn't match the key hash is rejected" {
     // Coverage gap #3 (vtWriteRaw): the
-    // `handle != HANDLE_NIL and !handleNamesKey(handle, kh)`
+    // `checkHandle`
     // mismatch-rejection branch was untested -- every existing write_raw
     // test passed HANDLE_NIL (which always skips this check).
     var fx = try SingleFixture.init(alloc);
@@ -1112,12 +1136,11 @@ test "write_raw: an explicit instance_handle that doesn't match the key hash is 
     const ts = DDS.Time_t{ .sec = DDS.TIME_INVALID_SEC, .nanosec = DDS.TIME_INVALID_NSEC };
     const impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
     const real_handle = impl.registerInstance(key_hash_bytes, &.{});
-    // Another instance's handle, and one never issued.
+    // Another instance's handle is PRECONDITION_NOT_MET; one never issued,
+    // BAD_PARAMETER (DDS 1.4 §2.2.2.4.2.11).
     const other_handle = impl.registerInstance(@as([16]u8, @splat(9)), &.{});
-    for ([_]DDS.InstanceHandle_t{ other_handle, real_handle + 1 }) |wrong_handle| {
-        const rc = dw.vtable.write_raw(dw.ptr, &key_hash_seq, wrong_handle, &payload_seq, .ALIVE_WRITE_KIND, &ts);
-        try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, rc);
-    }
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, dw.vtable.write_raw(dw.ptr, &key_hash_seq, other_handle, &payload_seq, .ALIVE_WRITE_KIND, &ts));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, dw.vtable.write_raw(dw.ptr, &key_hash_seq, other_handle + 1000, &payload_seq, .ALIVE_WRITE_KIND, &ts));
     try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.write_raw(dw.ptr, &key_hash_seq, real_handle, &payload_seq, .ALIVE_WRITE_KIND, &ts));
 }
 

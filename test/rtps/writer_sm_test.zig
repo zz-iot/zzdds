@@ -2462,6 +2462,7 @@ test "drop_acked: space freed by a coherent set's end wakes a wait helping a man
     const w = try StatefulWriter.init(testing.allocator, makeGuid(0x6B, WRITER_EID), rec.makeTransport(), .keep_all, 0, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
     w.drop_acked = true;
     w.attachRuntime(&runtime);
+    w.setWriteLimits(.{ .max_samples = 2 });
 
     w.beginCoherentSet(true);
     _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
@@ -2469,7 +2470,10 @@ test "drop_acked: space freed by a coherent set's end wakes a wait helping a man
     const Waiter = struct {
         fn run(writer: *StatefulWriter, freed: *bool) void {
             // Gives up after 10 s rather than hanging.
-            freed.* = writer.waitCacheBelow(2, 10 * std.time.ns_per_s);
+            var adm: WriteAdmission = .{ .instance = NIL_IH };
+            writer.admitWrite(&adm, true, 10 * std.time.ns_per_s) catch return;
+            writer.releaseAdmission(&adm);
+            freed.* = true;
         }
     };
     var freed = false;
@@ -2488,17 +2492,138 @@ test "drop_acked: space freed by a coherent set's end wakes a wait helping a man
     runtime.deinit();
 }
 
-test "waitCacheBelow: true once acknowledgments free space, false at its timeout otherwise" {
+// ── Write admission ───────────────────────────────────────────────────────────
+//
+// docs/design/concurrency/architecture.md#resource-waits-and-reservations
+
+const WriteAdmission = zzdds.protocol.WriteAdmission;
+
+fn instance(b: u8) InstanceHandle {
+    return @splat(b);
+}
+
+test "admitWrite: room once acknowledgments free it, a timeout otherwise" {
     const a = makeGuid(0x69, READER_EID);
     const b = makeGuid(0x6A, READER_EID);
     var rec: Recording = .{};
     const w = try makeDroppingWriter(&rec, a, b, true);
     defer w.deinit();
+    w.setWriteLimits(.{ .max_samples = 3 });
 
-    try testing.expect(!w.waitCacheBelow(3, 0));
+    var adm: WriteAdmission = .{ .instance = NIL_IH };
+    try testing.expectError(error.Timeout, w.admitWrite(&adm, true, 0));
+    // A writer that may not block runs out of resources instead.
+    try testing.expectError(error.OutOfResources, w.admitWrite(&adm, false, null));
     pureAck(w, a, 1, 1);
     pureAck(w, b, 1, 1);
-    try testing.expect(w.waitCacheBelow(3, 0));
+    try w.admitWrite(&adm, true, 0);
+    _ = try w.writeAdmitted(&adm, .alive, ZERO_TS, NIL_KH, "four");
+    try testing.expectEqual(@as(usize, 3), cacheLen(w));
+}
+
+test "admitWrite: room held for an admitted write is not given to another" {
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(testing.allocator, makeGuid(0x6C, WRITER_EID), rec.makeTransport(), .keep_all, 0, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    defer w.deinit();
+    w.setWriteLimits(.{ .max_samples = 1 });
+
+    var first: WriteAdmission = .{ .instance = NIL_IH };
+    var second: WriteAdmission = .{ .instance = NIL_IH };
+    try w.admitWrite(&first, true, 0);
+    try testing.expectError(error.Timeout, w.admitWrite(&second, true, 0));
+    // Given back, the room is the next write's.
+    w.releaseAdmission(&first);
+    try w.admitWrite(&second, true, 0);
+    w.releaseAdmission(&second);
+}
+
+test "admitWrite: max_samples_per_instance bounds each instance, not the whole history" {
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(testing.allocator, makeGuid(0x6D, WRITER_EID), rec.makeTransport(), .keep_all, 0, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    defer w.deinit();
+    w.setWriteLimits(.{ .max_samples = 4, .max_samples_per_instance = 1 });
+    _ = try w.write(.alive, ZERO_TS, instance(1), NIL_KH, "a");
+
+    var same: WriteAdmission = .{ .instance = instance(1) };
+    try testing.expectError(error.OutOfResources, w.admitWrite(&same, false, null));
+    var other: WriteAdmission = .{ .instance = instance(2) };
+    try w.admitWrite(&other, false, null);
+    w.releaseAdmission(&other);
+}
+
+test "admitWrite: under KEEP_LAST a change that replaces its instance's oldest takes no room" {
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(testing.allocator, makeGuid(0x6E, WRITER_EID), rec.makeTransport(), .keep_last, 1, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    defer w.deinit();
+    w.setWriteLimits(.{ .max_samples = 1 });
+    _ = try w.write(.alive, ZERO_TS, instance(1), NIL_KH, "a");
+
+    var same: WriteAdmission = .{ .instance = instance(1) };
+    try w.admitWrite(&same, false, null);
+    _ = try w.writeAdmitted(&same, .alive, ZERO_TS, NIL_KH, "b");
+    var other: WriteAdmission = .{ .instance = instance(2) };
+    try testing.expectError(error.OutOfResources, w.admitWrite(&other, false, null));
+}
+
+test "admitWrite: a newcomer does not take room an older waiter has room for" {
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(testing.allocator, makeGuid(0x6F, WRITER_EID), rec.makeTransport(), .keep_all, 0, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    defer w.deinit();
+    w.setWriteLimits(.{ .max_samples = 1, .max_samples_per_instance = 1 });
+
+    // A waiter for instance 1, queued before the newcomers, as one blocked
+    // in admitWrite is.
+    var older: WriteAdmission = .{ .instance = instance(1) };
+    {
+        w.mu.lock();
+        defer w.mu.unlock();
+        try w.admissions.append(testing.allocator, &older);
+    }
+    var newcomer: WriteAdmission = .{ .instance = instance(2) };
+    try testing.expectError(error.OutOfResources, w.admitWrite(&newcomer, false, null));
+    w.releaseAdmission(&older);
+    try w.admitWrite(&newcomer, false, null);
+    w.releaseAdmission(&newcomer);
+}
+
+test "closeWrites: refuses new writes and commits of admitted ones" {
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(testing.allocator, makeGuid(0x70, WRITER_EID), rec.makeTransport(), .keep_all, 0, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    defer w.deinit();
+
+    var admitted: WriteAdmission = .{ .instance = NIL_IH };
+    try w.admitWrite(&admitted, true, null);
+    w.closeWrites();
+    try testing.expectError(error.Closed, w.writeAdmitted(&admitted, .alive, ZERO_TS, NIL_KH, "late"));
+    try testing.expectEqual(@as(usize, 0), cacheLen(w));
+    var later: WriteAdmission = .{ .instance = NIL_IH };
+    try testing.expectError(error.Closed, w.admitWrite(&later, true, null));
+}
+
+test "closeWrites: ends a write waiting for room" {
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(testing.allocator, makeGuid(0x71, WRITER_EID), rec.makeTransport(), .keep_all, 0, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    defer w.deinit();
+    w.setWriteLimits(.{ .max_samples = 1 });
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "full");
+
+    const Blocked = struct {
+        fn run(writer: *StatefulWriter, out: *?anyerror) void {
+            var adm: WriteAdmission = .{ .instance = NIL_IH };
+            writer.admitWrite(&adm, true, null) catch |err| {
+                out.* = err;
+                return;
+            };
+            writer.releaseAdmission(&adm);
+            out.* = null;
+        }
+    };
+    var got: ?anyerror = error.Unset;
+    // Whether it blocks before the close or not, it ends Closed.
+    const t = try std.Thread.spawn(.{}, Blocked.run, .{ w, &got });
+    w.closeWrites();
+    t.join();
+    try testing.expectEqual(@as(?anyerror, error.Closed), got);
 }
 
 // ── Acknowledgment waits ──────────────────────────────────────────────────────

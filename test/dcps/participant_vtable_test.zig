@@ -507,6 +507,8 @@ test "publishLoan: a failed publish (RESOURCE_LIMITS) still fully releases the l
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.resource_limits.max_samples = 1;
     dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    // KEEP_ALL: under KEEP_LAST the second write would replace the first.
+    dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     const dw_impl = wlMakeWriter(&fx, "WLTopicFail", dw_qos);
 
     // Fill the one available slot with a plain write so the cache is at its limit.
