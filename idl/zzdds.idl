@@ -73,7 +73,8 @@ module zzdds {
         @default(FALSE) boolean reuse_connection_by_host;
         // As for UdpConfig, for every connection. Most OSes grow a TCP
         // buffer left at its default as the connection needs; a set size
-        // turns that off on Linux.
+        // turns that off on Linux. macOS still resizes a connected
+        // socket's buffers, in whole segments.
                         unsigned long recv_buffer_size;
                         unsigned long send_buffer_size;
     };

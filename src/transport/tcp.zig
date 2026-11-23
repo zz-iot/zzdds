@@ -1712,13 +1712,15 @@ test "the configured buffer sizes reach the listener, a dialed connection and an
         socketClose(conn.fd);
         std.testing.allocator.destroy(conn);
     }
-    try expectBufferSize(conn.fd, .receive, 40960);
-    try expectBufferSize(conn.fd, .send, 24576);
-
     const accepted = c.accept(listener, null, null);
     try std.testing.expect(accepted >= 0);
     const accepted_fd = sock.handle(accepted);
     defer socketClose(accepted_fd);
+
+    // Once connected, macOS sizes the buffers itself, in whole segments.
+    if (comptime builtin.os.tag.isDarwin()) return;
+    try expectBufferSize(conn.fd, .receive, 40960);
+    try expectBufferSize(conn.fd, .send, 24576);
     try expectBufferSize(accepted_fd, .receive, 40960);
     try expectBufferSize(accepted_fd, .send, 24576);
 }

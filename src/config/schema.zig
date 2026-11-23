@@ -87,7 +87,8 @@ pub const TcpConfig = struct {
 
     /// Socket buffer sizes to request (bytes), for every connection. 0 = OS
     /// default, which most OSes grow with the connection's needs; a set
-    /// size turns that off on Linux.
+    /// size turns that off on Linux. macOS still resizes a connected
+    /// socket's buffers, in whole segments.
     recv_buffer_size: u32 = 0,
     send_buffer_size: u32 = 0,
 };
