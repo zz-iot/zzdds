@@ -508,10 +508,9 @@ or an optimisation on an already-improved path):
   `examples/docs/design/`): `run.py`-style cross-binding pass/fail harnesses (discovery,
   participant-config); `assert_liveliness()` + AUTOMATIC/MANUAL_BY_PARTICIPANT +
   `on_liveliness_lost` (presence); `*_w_timestamp` symmetry + batch instance ops (registry);
-  Java's `instance_state` on the batch-take family. The `wait_for_historical_data`-should-
-  time-out negative case left out of `catchup` itself is no longer on this list — it's
-  covered by the `wait-for-historical-data` Integration-tier scenario instead (see
-  `docs/design/dcps-api-coverage-audit.md`).
+  Java's `instance_state` on the batch-take family. `wait_for_historical_data` beyond
+  `catchup`'s success path is covered by the `wait-for-historical-data` Integration-tier
+  scenario instead (see `docs/design/dcps-api-coverage-audit.md`).
 - **Cross-binding "never matched" failures — resolved: listeners installed after entity
   creation.** Root-caused 2026-10-02 from CI captures (`scripts/ci_net_diagnostics.py`,
   PR #96): in `liveliness-lost` (cpp subscriber ← c publisher) and `source-timestamp`

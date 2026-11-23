@@ -57,7 +57,9 @@ const keyHashFromInlineQos = reassembly_mod.keyHashFromInlineQos;
 /// code: they hand over, and on_flush (after the lock is released) acts.
 pub const DataCallback = struct {
     ctx: *anyopaque,
-    on_data: *const fn (ctx: *anyopaque, change: *const CacheChange) void,
+    /// Returns what the reader did with the change: a dropped one fails the
+    /// history it was owed with.
+    on_data: *const fn (ctx: *anyopaque, change: *const CacheChange) history_mod.Delivery,
     /// Called after the state machine's lock is released.
     on_sample_lost: ?*const fn (ctx: *anyopaque, count: i32) void = null,
     /// Called when an end-of-coherent-set marker arrives (see isEndMarker).
@@ -101,7 +103,7 @@ pub const StatelessReader = struct {
         self.mu.lock();
         const cb = self.callback;
         self.mu.unlock();
-        if (cb) |c| c.on_data(c.ctx, change);
+        if (cb) |c| _ = c.on_data(c.ctx, change);
     }
 };
 
@@ -151,6 +153,9 @@ pub const WriterProxy = struct {
     /// delivered to this reader.  Set to true on the first accepted HEARTBEAT; also true
     /// by default for writers that do not require history tracking.
     history_established: bool,
+    /// The first sequence number from this writer that was received but lost
+    /// before the reader kept it (see `history_mod.Delivery.dropped`).
+    first_dropped_sn: ?SequenceNumber = null,
     /// In-progress fragment reassembly, keyed by writer sequence number.
     /// Each entry accumulates DATA_FRAG payloads until complete, then delivers
     /// the assembled change through the normal handleData path.
@@ -174,6 +179,10 @@ pub const WriterProxy = struct {
     /// forever (RTPS's ACK/NACK retry protocol exists to recover from real
     /// media loss; a same-process match can't lose anything that way).
     is_local: bool = false,
+
+    fn noteDropped(self: *WriterProxy, sn: SequenceNumber) void {
+        if (self.first_dropped_sn == null or sn < self.first_dropped_sn.?) self.first_dropped_sn = sn;
+    }
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -954,11 +963,7 @@ pub const StatefulReader = struct {
             if (sn == prev_highest + 1) {
                 _ = wp.received.insert(self.alloc, sn) catch {};
                 if (!is_eoc) {
-                    try self.cache.addReaderChange(change);
-                    if (self.callback) |cb| {
-                        if (self.cache.getChangeForWriter(change.writer_guid, sn)) |cached| cb.on_data(cb.ctx, cached);
-                        self.flush_pending = true;
-                    }
+                    try self.deliverLocked(wp, &change);
                 } else {
                     // EOC marker: not cached, but notify the DCPS layer so it can
                     // flush the coherent WIP without adding a data sample to pending.
@@ -989,11 +994,7 @@ pub const StatefulReader = struct {
             _ = wp.received.insert(self.alloc, sn) catch {};
             dropReassemblyBelow(self.alloc, wp, sn);
             if (!is_eoc) {
-                try self.cache.addReaderChange(change);
-                if (self.callback) |cb| {
-                    if (self.cache.getChangeForWriter(change.writer_guid, sn)) |ch| cb.on_data(cb.ctx, ch);
-                    self.flush_pending = true;
-                }
+                try self.deliverLocked(wp, &change);
             } else if (self.callback) |cb| if (cb.on_eoc) |f| {
                 f(cb.ctx, &change);
                 self.flush_pending = true;
@@ -1076,6 +1077,18 @@ pub const StatefulReader = struct {
 
     /// Deliver all buffered pending changes with SNs in (prev_delivered, cumulativeAck()].
     /// Called under self.mu. Only meaningful when self.reliable = true.
+    /// Hands `change`, received from `wp`, to the cache and the callback,
+    /// and notes a change that was lost on the way: history owed with it
+    /// cannot complete. Caller must hold `mu`.
+    fn deliverLocked(self: *Self, wp: *WriterProxy, change: *const CacheChange) !void {
+        errdefer wp.noteDropped(change.sequence_number);
+        try self.cache.addReaderChange(change.*);
+        const cb = self.callback orelse return;
+        self.flush_pending = true;
+        const cached = self.cache.getChangeForWriter(change.writer_guid, change.sequence_number) orelse return;
+        if (cb.on_data(cb.ctx, cached) == .dropped) wp.noteDropped(change.sequence_number);
+    }
+
     fn deliverPendingLocked(self: *Self, wp: *WriterProxy, prev_delivered: SequenceNumber) void {
         var next_sn = prev_delivered + 1;
         while (next_sn <= wp.received.cumulativeAck()) : (next_sn += 1) {
@@ -1086,13 +1099,7 @@ pub const StatefulReader = struct {
                     defer self.alloc.free(pending_ch.data);
                     const is_eoc = isEndMarker(&pending_ch);
                     if (!is_eoc) {
-                        self.cache.addReaderChange(pending_ch) catch {};
-                        if (self.callback) |cb| {
-                            if (self.cache.getChangeForWriter(pending_ch.writer_guid, next_sn)) |cached| {
-                                cb.on_data(cb.ctx, cached);
-                            }
-                            self.flush_pending = true;
-                        }
+                        self.deliverLocked(wp, &pending_ch) catch {};
                     } else {
                         if (self.callback) |cb| if (cb.on_eoc) |f| {
                             f(cb.ctx, &pending_ch);
@@ -1294,6 +1301,13 @@ pub const StatefulReader = struct {
         return !wp.history_established or wp.received.cumulativeAck() < wp.history_floor_sn;
     }
 
+    /// Whether part of the history `wp` owed was received but dropped: it
+    /// can no longer arrive complete.
+    fn lostHistory(wp: *const WriterProxy) bool {
+        const sn = wp.first_dropped_sn orelse return false;
+        return wp.history_established and sn <= wp.history_floor_sn;
+    }
+
     /// Begins `cap`, a reader's part of a historical-data wait: captures
     /// the matched writers that owe it history, and keeps `cap` to settle
     /// once none does
@@ -1307,6 +1321,7 @@ pub const StatefulReader = struct {
         if (self.history_waits_closed) return cap.waiter.settle(.closed);
         var n: usize = 0;
         for (self.writer_proxies.items) |*wp| {
+            if (lostHistory(wp)) return cap.waiter.settle(.part_failed);
             if (owesHistory(wp)) n += 1;
         }
         if (n == 0) return cap.waiter.satisfied();
@@ -1347,16 +1362,17 @@ pub const StatefulReader = struct {
         self.history_waits_closed = true;
         for (self.history_waits.items) |cap| {
             cap.registered = false;
-            cap.waiter.settleClose(.closed);
+            cap.waiter.settleFailure(.closed);
         }
         self.history_waits.clearRetainingCapacity();
     }
 
     /// Settles the historical-data waits whose captured writers have each
     /// delivered their history: satisfied, or timed out once past the
-    /// deadline. One whose writer unmatched first, even to match again, is
-    /// `part_failed`: that match's history can no longer arrive. Caller
-    /// must hold `mu`.
+    /// deadline. One whose writer unmatched first, even to match again, or
+    /// whose history was dropped in part, is `part_failed`, or timed out
+    /// once past the deadline: that history can no longer arrive complete.
+    /// Caller must hold `mu`.
     fn settleHistoryWaitsLocked(self: *Self) void {
         var i = self.history_waits.items.len;
         while (i > 0) {
@@ -1367,7 +1383,7 @@ pub const StatefulReader = struct {
             cap.registered = false;
             switch (outcome) {
                 .satisfied => if (cap.waiter.expired()) cap.waiter.settle(.timed_out) else cap.waiter.satisfied(),
-                else => cap.waiter.settle(outcome),
+                else => cap.waiter.settleFailure(outcome),
             }
         }
     }
@@ -1380,7 +1396,7 @@ pub const StatefulReader = struct {
         for (cap.sources) |*src| {
             if (src.done) continue;
             const wp = self.writerProxyLocked(src.guid) orelse return .part_failed;
-            if (wp.match_id != src.match_id) return .part_failed;
+            if (wp.match_id != src.match_id or lostHistory(wp)) return .part_failed;
             if (owesHistory(wp)) owed = true else src.done = true;
         }
         return if (owed) null else .satisfied;
@@ -1532,9 +1548,10 @@ test "StatelessReader init and callback delivery" {
 
     const Ctx = struct {
         flag: *bool,
-        fn onData(ctx: *anyopaque, _: *const CacheChange) void {
+        fn onData(ctx: *anyopaque, _: *const CacheChange) history_mod.Delivery {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.flag.* = true;
+            return .kept;
         }
     };
     var ctx = Ctx{ .flag = &delivered };
@@ -1680,9 +1697,10 @@ test "StatefulReader BEST_EFFORT drops duplicates and earlier SNs after a late f
 
     var deliveries: usize = 0;
     const Cb = struct {
-        fn onData(ctx: *anyopaque, _: *const CacheChange) void {
+        fn onData(ctx: *anyopaque, _: *const CacheChange) history_mod.Delivery {
             const count: *usize = @ptrCast(@alignCast(ctx));
             count.* += 1;
+            return .kept;
         }
     };
 
@@ -1850,9 +1868,10 @@ test "StatefulReader takes data held from before the match on addOrRefreshMatche
 
     var delivered: usize = 0;
     const Cb = struct {
-        fn onData(ctx: *anyopaque, _: *const CacheChange) void {
+        fn onData(ctx: *anyopaque, _: *const CacheChange) history_mod.Delivery {
             const n: *usize = @ptrCast(@alignCast(ctx));
             n.* += 1;
+            return .kept;
         }
     };
     reader.setCallback(.{ .ctx = &delivered, .on_data = Cb.onData });
@@ -1913,9 +1932,10 @@ test "StatefulReader held data from before the match: out-of-order SN delivered 
 
     var delivered: usize = 0;
     const Cb = struct {
-        fn onData(ctx: *anyopaque, _: *const CacheChange) void {
+        fn onData(ctx: *anyopaque, _: *const CacheChange) history_mod.Delivery {
             const n: *usize = @ptrCast(@alignCast(ctx));
             n.* += 1;
+            return .kept;
         }
     };
     reader.setCallback(.{ .ctx = &delivered, .on_data = Cb.onData });
@@ -1963,10 +1983,11 @@ test "StatefulReader DATA_FRAG: source_timestamp and key_hash preserved through 
     const Ctx = struct {
         ts: time_mod.RtpsTimestamp = ZERO_TS,
         kh: [16]u8 = NIL_KH,
-        fn onData(ctx: *anyopaque, change: *const CacheChange) void {
+        fn onData(ctx: *anyopaque, change: *const CacheChange) history_mod.Delivery {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.ts = change.source_timestamp;
             self.kh = change.key_hash;
+            return .kept;
         }
     };
     var ctx = Ctx{};
@@ -2031,10 +2052,11 @@ test "StatefulReader DATA_FRAG: source_timestamp and key_hash preserved through 
     const Ctx = struct {
         ts: time_mod.RtpsTimestamp = ZERO_TS,
         kh: [16]u8 = NIL_KH,
-        fn onData(ctx: *anyopaque, change: *const CacheChange) void {
+        fn onData(ctx: *anyopaque, change: *const CacheChange) history_mod.Delivery {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.ts = change.source_timestamp;
             self.kh = change.key_hash;
+            return .kept;
         }
     };
     var ctx = Ctx{};
@@ -2098,10 +2120,11 @@ test "StatefulReader DATA_FRAG: a reassembly started before the match finishes a
     const Ctx = struct {
         data: [8]u8 = undefined,
         n: usize = 0,
-        fn onData(ctx: *anyopaque, change: *const CacheChange) void {
+        fn onData(ctx: *anyopaque, change: *const CacheChange) history_mod.Delivery {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             @memcpy(&self.data, change.data[0..8]);
             self.n += 1;
+            return .kept;
         }
     };
     var ctx = Ctx{};
@@ -2335,9 +2358,10 @@ test "StatefulReader reassembly limit: a reliable sample too large for it is cou
     const Ctx = struct {
         delivered: usize = 0,
         lost: i32 = 0,
-        fn onData(ctx: *anyopaque, _: *const CacheChange) void {
+        fn onData(ctx: *anyopaque, _: *const CacheChange) history_mod.Delivery {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.delivered += 1;
+            return .kept;
         }
         fn onLost(ctx: *anyopaque, count: i32) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -2400,9 +2424,10 @@ test "StatefulReader reassembly limit: a reliable sample held from before the ma
     const Ctx = struct {
         delivered: usize = 0,
         lost: i32 = 0,
-        fn onData(ctx: *anyopaque, _: *const CacheChange) void {
+        fn onData(ctx: *anyopaque, _: *const CacheChange) history_mod.Delivery {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.delivered += 1;
+            return .kept;
         }
         fn onLost(ctx: *anyopaque, count: i32) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -2446,10 +2471,11 @@ test "checked sample processing precedes sequence accounting for DATA and fragme
             hash[0] = 42;
             return hash;
         }
-        fn onData(ctx: *anyopaque, change: *const CacheChange) void {
+        fn onData(ctx: *anyopaque, change: *const CacheChange) history_mod.Delivery {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             std.debug.assert(change.key_hash[0] == 42);
             self.deliveries += 1;
+            return .kept;
         }
     };
     for ([_]bool{ false, true }) |reliable| {

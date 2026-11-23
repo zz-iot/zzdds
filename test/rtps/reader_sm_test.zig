@@ -261,13 +261,14 @@ const FlushProbe = struct {
     flush_calls: usize = 0,
     flush_unlocked: bool = true,
 
-    fn onData(ctx: *anyopaque, _: *const rtps.history.CacheChange) void {
+    fn onData(ctx: *anyopaque, _: *const rtps.history.CacheChange) rtps.history.Delivery {
         const p: *FlushProbe = @ptrCast(@alignCast(ctx));
         p.data_calls += 1;
         if (p.reader.mu.tryLock()) {
             p.reader.mu.unlock();
             p.data_under_lock = false;
         }
+        return .kept;
     }
 
     fn onFlush(ctx: *anyopaque) void {
@@ -640,9 +641,10 @@ test "handleData: duplicate SN is discarded without re-delivery" {
     var delivered: usize = 0;
     const Ctx = struct {
         count: *usize,
-        fn onData(ctx: *anyopaque, _: *const CacheChange) void {
+        fn onData(ctx: *anyopaque, _: *const CacheChange) rtps.history.Delivery {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.count.* += 1;
+            return .kept;
         }
     };
     var ctx = Ctx{ .count = &delivered };
@@ -756,13 +758,14 @@ const Recorder = struct {
         self.sns.deinit(self.alloc);
         self.data.deinit(self.alloc);
     }
-    fn onData(ctx: *anyopaque, ch: *const CacheChange) void {
+    fn onData(ctx: *anyopaque, ch: *const CacheChange) rtps.history.Delivery {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
-        self.sns.append(self.alloc, ch.sequence_number) catch return;
-        const copy = self.alloc.dupe(u8, ch.data) catch return;
+        self.sns.append(self.alloc, ch.sequence_number) catch return .kept;
+        const copy = self.alloc.dupe(u8, ch.data) catch return .kept;
         self.data.append(self.alloc, copy) catch {
             self.alloc.free(copy);
         };
+        return .kept;
     }
 };
 
@@ -1362,6 +1365,105 @@ test "history delivered at the deadline or later times the wait out" {
     try wait.begin(r, 0);
     defer wait.end(r);
     emptyHistory(r, a);
+    try testing.expectEqual(@as(?history_wait.Outcome, .timed_out), wait.outcome());
+}
+
+/// A reader's DCPS side that drops (or filters) the samples with the given
+/// sequence numbers and keeps the rest.
+const Disposer = struct {
+    drop: []const i64 = &.{},
+    filter: []const i64 = &.{},
+
+    fn onData(ctx: *anyopaque, ch: *const CacheChange) rtps.history.Delivery {
+        const self: *Disposer = @ptrCast(@alignCast(ctx));
+        if (std.mem.indexOfScalar(i64, self.drop, ch.sequence_number) != null) return .dropped;
+        if (std.mem.indexOfScalar(i64, self.filter, ch.sequence_number) != null) return .filtered;
+        return .kept;
+    }
+};
+
+/// Delivers writer `guid`'s samples `first`..`last` in order.
+fn deliverSamples(r: *StatefulReader, guid: Guid, first: i64, last: i64) !void {
+    var sn = first;
+    while (sn <= last) : (sn += 1) {
+        try r.handleData(guid, .{
+            .kind = .alive,
+            .writer_guid = guid,
+            .sequence_number = sn,
+            .source_timestamp = ZERO_TS,
+            .instance_handle = NIL_IH,
+            .key_hash = NIL_KH,
+            .data = "payload",
+        });
+    }
+}
+
+test "history the reader drops fails the wait; history it filters does not" {
+    for ([_]bool{ true, false }) |dropped| {
+        var rec: Recording = .{};
+        const r = try historyReader(&rec);
+        defer r.deinit();
+        var disposer: Disposer = if (dropped) .{ .drop = &.{1} } else .{ .filter = &.{1} };
+        r.setCallback(.{ .ctx = &disposer, .on_data = Disposer.onData });
+        const a = makeGuid(0x02, WRITER_EID);
+        try matchHistoryWriter(r, a, 7300);
+
+        var wait: HistoryWait = undefined;
+        try wait.begin(r, null);
+        defer wait.end(r);
+        // The writer's history is samples 1 and 2.
+        r.handleHeartbeat(a, READER_EID, 1, 2, 1, false);
+        try deliverSamples(r, a, 1, 2);
+        const expected: history_wait.Outcome = if (dropped) .part_failed else .satisfied;
+        try testing.expectEqual(@as(?history_wait.Outcome, expected), wait.outcome());
+    }
+}
+
+test "a dropped live sample does not fail a historical-data wait" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    var disposer: Disposer = .{ .drop = &.{3} };
+    r.setCallback(.{ .ctx = &disposer, .on_data = Disposer.onData });
+    const a = makeGuid(0x02, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+    r.handleHeartbeat(a, READER_EID, 1, 2, 1, false);
+    try deliverSamples(r, a, 1, 3);
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, null);
+    defer wait.end(r);
+    try testing.expectEqual(@as(?history_wait.Outcome, .satisfied), wait.outcome());
+}
+
+test "a historical-data wait begun after history was dropped fails at once" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    var disposer: Disposer = .{ .drop = &.{2} };
+    r.setCallback(.{ .ctx = &disposer, .on_data = Disposer.onData });
+    const a = makeGuid(0x02, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+    r.handleHeartbeat(a, READER_EID, 1, 2, 1, false);
+    try deliverSamples(r, a, 1, 2);
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, null);
+    defer wait.end(r);
+    try testing.expectEqual(@as(?history_wait.Outcome, .part_failed), wait.outcome());
+}
+
+test "a writer that unmatches at the deadline or later times the wait out" {
+    var rec: Recording = .{};
+    const r = try historyReader(&rec);
+    defer r.deinit();
+    const a = makeGuid(0x02, WRITER_EID);
+    try matchHistoryWriter(r, a, 7300);
+
+    var wait: HistoryWait = undefined;
+    try wait.begin(r, 0);
+    defer wait.end(r);
+    r.removeMatchedWriter(a);
     try testing.expectEqual(@as(?history_wait.Outcome, .timed_out), wait.outcome());
 }
 

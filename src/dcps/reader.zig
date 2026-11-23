@@ -1313,22 +1313,24 @@ pub const DataReaderImpl = struct {
         }
     }
 
-    /// Unlocks `mu` and frees `copy` for a sample onDataCb drops (ownership,
-    /// time or content filter, resource limits, OOM), notifying if tracking it
-    /// queued a coherent set.
-    fn dropSampleUnlock(self: *Self, copy: []u8, coherent_queued: bool) void {
-        self.mu.unlock();
-        self.alloc.free(copy);
-        if (coherent_queued) {
+    /// Unlocks `mu` and frees `copy` for a sample onDataCb leaves out
+    /// (ownership, time or content filter, resource limits, OOM), notifying
+    /// if tracking it queued a coherent set. Returns `how`, for onDataCb to
+    /// return.
+    fn dropSampleUnlock(self: *Self, copy: []u8, coherent_queued: bool, how: history_mod.Delivery) history_mod.Delivery {
+        defer if (coherent_queued) {
             if (self.status_cond) |sc| sc.notifyWakeup();
             self.deferListener(DDS.DATA_AVAILABLE_STATUS);
-        }
+        };
+        self.mu.unlock();
+        self.alloc.free(copy);
+        return how;
     }
 
     /// Counts a sample RESOURCE_LIMITS rejects for `reason`, then drops it as
     /// `dropSampleUnlock` does and raises on_sample_rejected. `ih` is its
     /// instance, or HANDLE_NIL for one the reader had no room to register.
-    fn rejectSampleUnlock(self: *Self, reason: DDS.SampleRejectedStatusKind, ih: DDS.InstanceHandle_t, copy: []u8, coherent_queued: bool) void {
+    fn rejectSampleUnlock(self: *Self, reason: DDS.SampleRejectedStatusKind, ih: DDS.InstanceHandle_t, copy: []u8, coherent_queued: bool) history_mod.Delivery {
         self.sample_rejected_total += 1;
         self.sample_rejected_total_change += 1;
         self.sample_rejected_last_reason = reason;
@@ -1339,16 +1341,19 @@ pub const DataReaderImpl = struct {
         if (self.status_cond) |sc| sc.notifyWakeup();
         self.deferListener(DDS.SAMPLE_REJECTED_STATUS);
         if (coherent_queued) self.deferListener(DDS.DATA_AVAILABLE_STATUS);
+        return .dropped;
     }
 
     /// Matches the DataCallback.on_data function pointer signature.
     /// Must not block; must not call back into the ProtocolReader.
-    fn onDataCb(ctx: *anyopaque, change: *const history_mod.CacheChange) void {
+    /// Returns what it did with the change: a dropped one fails the history
+    /// owed with it (wait_for_historical_data).
+    fn onDataCb(ctx: *anyopaque, change: *const history_mod.CacheChange) history_mod.Delivery {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        if (!self.quiesce.acquire()) return;
+        if (!self.quiesce.acquire()) return .dropped;
         defer self.quiesce.release(self, reallyDeinit);
 
-        const copy = self.alloc.dupe(u8, change.data) catch return;
+        const copy = self.alloc.dupe(u8, change.data) catch return .dropped;
         self.mu.lock();
 
         // COHERENT SETS: a sample counts toward its writer's set arriving
@@ -1365,7 +1370,7 @@ pub const DataReaderImpl = struct {
         // rejected, and one the reader has no memory to register dropped.
         const entry = self.instanceForKeyLocked(change.key_hash, DDS.HANDLE_NIL) catch |err| switch (err) {
             error.OutOfHandles => return self.rejectSampleUnlock(.REJECTED_BY_INSTANCE_LIMIT, DDS.HANDLE_NIL, copy, coherent_queued),
-            error.OutOfMemory => return self.dropSampleUnlock(copy, coherent_queued),
+            error.OutOfMemory => return self.dropSampleUnlock(copy, coherent_queued, .dropped),
         };
         const ih = entry.handle;
 
@@ -1410,7 +1415,7 @@ pub const DataReaderImpl = struct {
                 // A writer that does not own the instance still ends its
                 // registration by unregistering; only its sample is hidden.
                 self.untrackIfUnregisterLocked(change, ih);
-                return self.dropSampleUnlock(copy, coherent_queued);
+                return self.dropSampleUnlock(copy, coherent_queued, .filtered);
             }
         }
 
@@ -1425,7 +1430,7 @@ pub const DataReaderImpl = struct {
         const tbf_src_ns: i64 = if (tbf_active) change.source_timestamp.toTime().toNs() else 0;
         if (tbf_active) {
             if (entry.tbf_last_ns) |last| {
-                if (tbf_src_ns - last < sep_ns) return self.dropSampleUnlock(copy, coherent_queued);
+                if (tbf_src_ns - last < sep_ns) return self.dropSampleUnlock(copy, coherent_queued, .filtered);
             }
         }
 
@@ -1435,7 +1440,7 @@ pub const DataReaderImpl = struct {
         // per-instance window and owner cleanup below is reached.
         if (self.cft_filter) |*cft| {
             if (change.kind == .alive and !cft.matches(change.data))
-                return self.dropSampleUnlock(copy, coherent_queued);
+                return self.dropSampleUnlock(copy, coherent_queued, .filtered);
         }
 
         // COHERENT SET BUFFERING: a sample of a coherent set waits in its
@@ -1447,7 +1452,7 @@ pub const DataReaderImpl = struct {
             // Absent only if starting the set ran out of memory; then the set
             // is incomplete anyway.
             const wip = self.coherent_wip.getPtr(change.writer_guid) orelse
-                return self.dropSampleUnlock(copy, coherent_queued);
+                return self.dropSampleUnlock(copy, coherent_queued, .dropped);
             const states = self.applyChangeLocked(entry, change.key_hash, change.kind);
             self.storeKeyIfNeeded(entry, change.kind, copy);
             const src_time = change.source_timestamp.toTime();
@@ -1488,7 +1493,7 @@ pub const DataReaderImpl = struct {
             wip.samples.append(self.alloc, pc) catch {
                 // The set can no longer arrive complete.
                 wip.intact = false;
-                return self.dropSampleUnlock(copy, coherent_queued);
+                return self.dropSampleUnlock(copy, coherent_queued, .dropped);
             };
             self.untrackIfUnregisterLocked(change, ih);
             self.mu.unlock();
@@ -1497,7 +1502,7 @@ pub const DataReaderImpl = struct {
                 if (self.status_cond) |sc| sc.notifyWakeup();
                 self.deferListener(DDS.DATA_AVAILABLE_STATUS);
             }
-            return;
+            return .kept;
         }
 
         // KEEP_LAST: if history depth is limited, evict the oldest pending sample
@@ -1563,7 +1568,7 @@ pub const DataReaderImpl = struct {
                 null
         else
             null;
-        const pc = self.alloc.create(PendingChange) catch return self.dropSampleUnlock(copy, coherent_queued);
+        const pc = self.alloc.create(PendingChange) catch return self.dropSampleUnlock(copy, coherent_queued, .dropped);
         pc.* = .{
             .data = copy,
             .alloc = self.alloc,
@@ -1585,7 +1590,7 @@ pub const DataReaderImpl = struct {
 
         self.pending.append(self.alloc, pc) catch {
             self.alloc.destroy(pc);
-            return self.dropSampleUnlock(copy, coherent_queued);
+            return self.dropSampleUnlock(copy, coherent_queued, .dropped);
         };
         self.untrackIfUnregisterLocked(change, ih);
         // Stamp the TBF window now that the sample is committed to pending.
@@ -1607,6 +1612,7 @@ pub const DataReaderImpl = struct {
 
         // Fire listener if registered for DATA_AVAILABLE.
         self.deferListener(DDS.DATA_AVAILABLE_STATUS);
+        return .kept;
     }
 
     // ── Coherent sets (RTPS 2.5 §8.7.6) ───────────────────────────────────────

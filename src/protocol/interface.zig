@@ -159,7 +159,7 @@ pub const MatchedWriterInfo = struct {
 /// call back into the protocol reader.
 pub const DataCallback = struct {
     ctx: *anyopaque,
-    on_data: *const fn (ctx: *anyopaque, change: *const CacheChange) void,
+    on_data: *const fn (ctx: *anyopaque, change: *const CacheChange) history_mod.Delivery,
     /// Optional: called when gap processing marks `count` sequence numbers as
     /// irreversibly lost (never delivered). Called after the protocol
     /// reader's lock is released, since it reaches application listeners.

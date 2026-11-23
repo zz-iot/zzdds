@@ -1129,7 +1129,7 @@ pub const StatefulWriter = struct {
         self.ack_waits_closed = true;
         for (self.ack_waits.items) |cap| {
             cap.registered = false;
-            cap.waiter.settleClose(.part_failed);
+            cap.waiter.settleFailure(.part_failed);
         }
         self.ack_waits.clearRetainingCapacity();
     }

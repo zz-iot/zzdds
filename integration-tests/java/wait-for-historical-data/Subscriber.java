@@ -1,15 +1,15 @@
 // integration-tests/java/wait-for-historical-data -- subscriber (the late
 // joiner). Direct Java port of c/wait-for-historical-data/src/subscriber.c
 // -- see that file's header comment for the full scenario rationale
-// (negative-then-positive wait_for_historical_data() bar) and
+// (unmatched-then-positive wait_for_historical_data() bar) and
 // docs/design/integration-test-tier.md for the scenario spec.
 //
-// Required stdout markers: "Create topic:", "Subscriber: negative check (no
-// writer on its topic) correctly returned TIMEOUT.", "Create reader for
-// topic:", "Subscriber: wait_for_historical_data() returned", "HISTORICAL
-// BATCH COMPLETE (8 samples)", "LIVE SAMPLE seq_num=", "Subscriber: observed
-// historical batch then live batch correctly." Any failure path prints a
-// line starting "FAIL:" and exits nonzero.
+// Required stdout markers: "Create topic:", "Subscriber: unmatched check (no
+// writer on its topic) returned OK at once.", "Create reader for topic:",
+// "Subscriber: wait_for_historical_data() returned", "HISTORICAL BATCH
+// COMPLETE (8 samples)", "LIVE SAMPLE seq_num=", "Subscriber: observed
+// historical batch then live batch correctly." Any failure path prints a line
+// starting "FAIL:" and exits nonzero.
 
 import io.zzdds.dcps.Dcps;
 
@@ -18,11 +18,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class Subscriber {
     static final int HISTORICAL_COUNT = 8;
     static final int LIVE_COUNT = 4;
-    static final int NEGATIVE_WAIT_NSEC = 300_000_000;
+    static final int UNMATCHED_WAIT_NSEC = 300_000_000;
     static final int HISTORICAL_WAIT_TIMEOUT_S = 15;
     static final int RECEIVE_TIMEOUT_MS = 30000;
     static final int POLL_PERIOD_MS = 20;
-    // A topic of the same type that no process ever writes, for the negative case.
+    // A topic of the same type that no process ever writes, for the unmatched case.
     static final String UNPUBLISHED_TOPIC = "HistoryEventUnpublished";
 
     // Pure readiness check -- does NOT set allDone itself. See
@@ -72,6 +72,15 @@ public class Subscriber {
     }
 
     /** A reader's current matched count, for saying which endpoint a timeout is about. */
+    // Polls until a writer matches dr, for up to HISTORICAL_WAIT_TIMEOUT_S.
+    private static boolean waitForMatch(Dcps.DDS.DataReader dr) throws InterruptedException {
+        for (int waitedMs = 0; waitedMs < HISTORICAL_WAIT_TIMEOUT_S * 1000; waitedMs += POLL_PERIOD_MS) {
+            if (readerMatched(dr) > 0) return true;
+            Thread.sleep(POLL_PERIOD_MS);
+        }
+        return false;
+    }
+
     private static int readerMatched(Dcps.DDS.DataReader dr) {
         Dcps.DDS.SubscriptionMatchedStatus status = new Dcps.DDS.SubscriptionMatchedStatus();
         return dr.get_subscription_matched_status(status) == Dcps.DDS.RETCODE_OK.value ? status.get_current_count() : -1;
@@ -139,29 +148,29 @@ public class Subscriber {
             }
         };
 
-        // Negative case -- see c/wait-for-historical-data/src/subscriber.c's
-        // header comment. No process writes UNPUBLISHED_TOPIC, so a short,
-        // non-zero max_wait here is guaranteed to time out.
+        // Unmatched case -- see c/wait-for-historical-data/src/subscriber.c's
+        // header comment. No process writes UNPUBLISHED_TOPIC, so nothing
+        // owes this reader history: a non-zero max_wait returns OK at once.
         Dcps.DDS.Topic unpublished = dp.create_topic(UNPUBLISHED_TOPIC, "HistoryEvent", null, null, 0);
         if (unpublished == null) {
             System.err.println("FAIL: create_topic(" + UNPUBLISHED_TOPIC + ") failed");
             System.exit(1);
         }
-        Dcps.DDS.DataReader negReader = sub.create_datareader(unpublished, drQos, null, 0);
-        if (negReader == null) {
+        Dcps.DDS.DataReader unmatchedReader = sub.create_datareader(unpublished, drQos, null, 0);
+        if (unmatchedReader == null) {
             System.err.println("FAIL: create_datareader(" + UNPUBLISHED_TOPIC + ") failed");
             System.exit(1);
         }
-        Dcps.DDS.Duration_t negativeWait = new Dcps.DDS.Duration_t();
-        negativeWait.set_sec(0);
-        negativeWait.set_nanosec(NEGATIVE_WAIT_NSEC);
-        int negRc = negReader.wait_for_historical_data(negativeWait);
-        if (negRc != Dcps.DDS.RETCODE_TIMEOUT.value) {
-            System.err.println("FAIL: wait_for_historical_data() with no writer matched returned " + negRc + ", expected RETCODE_TIMEOUT (" + Dcps.DDS.RETCODE_TIMEOUT.value + ")");
+        Dcps.DDS.Duration_t unmatchedWait = new Dcps.DDS.Duration_t();
+        unmatchedWait.set_sec(0);
+        unmatchedWait.set_nanosec(UNMATCHED_WAIT_NSEC);
+        int unmatchedRc = unmatchedReader.wait_for_historical_data(unmatchedWait);
+        if (unmatchedRc != 0) {
+            System.err.println("FAIL: wait_for_historical_data() with no writer matched returned " + unmatchedRc + ", expected RETCODE_OK");
             System.exit(1);
         }
-        sub.delete_datareader(negReader);
-        System.out.println("Subscriber: negative check (no writer on its topic) correctly returned TIMEOUT.");
+        sub.delete_datareader(unmatchedReader);
+        System.out.println("Subscriber: unmatched check (no writer on its topic) returned OK at once.");
 
         // Create with no listener attached yet -- see this file's header
         // comment and c/wait-for-historical-data/src/subscriber.c's
@@ -175,9 +184,15 @@ public class Subscriber {
 
         readerBox[0] = new HistoryEventDataReader(rawReader);
 
-        // The positive case: block until discovery has matched the
-        // publisher's writer and its TRANSIENT_LOCAL historical replay has
-        // actually landed, before taking anything.
+        // The positive case: wait for the publisher's writer to match, then
+        // block until its TRANSIENT_LOCAL historical replay has actually
+        // landed, before taking anything. wait_for_historical_data() waits
+        // for the writers matched when it is called, so the match comes
+        // first.
+        if (!waitForMatch(rawReader)) {
+            System.err.println("FAIL: no writer matched within " + HISTORICAL_WAIT_TIMEOUT_S + " s");
+            System.exit(1);
+        }
         Dcps.DDS.Duration_t maxWait = new Dcps.DDS.Duration_t();
         maxWait.set_sec(HISTORICAL_WAIT_TIMEOUT_S);
         maxWait.set_nanosec(0);

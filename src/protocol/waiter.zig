@@ -73,10 +73,10 @@ pub const Waiter = struct {
         self.wake();
     }
 
-    /// Settles the wait `outcome` as what it waits on closes, unless it is
-    /// settled already, or timed out if the deadline has passed: a caller
-    /// running late still sees its timeout.
-    pub fn settleClose(self: *Waiter, outcome: Outcome) void {
+    /// Settles the wait `outcome`, a failure or a close of what it waits on,
+    /// unless it is settled already, or timed out if the deadline has passed:
+    /// a caller running late still sees its timeout.
+    pub fn settleFailure(self: *Waiter, outcome: Outcome) void {
         self.settle(if (self.expired()) .timed_out else outcome);
     }
 

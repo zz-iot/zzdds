@@ -55,8 +55,12 @@ those whose first HEARTBEAT has not yet said how much, and those that have not d
 it all in order. The `StatefulReader` settles it under its lock, after delivering to the
 DataReader's cache, so the history is there to take when the wait returns. A writer that
 has delivered stays done. One that unmatches before then fails the wait (ERROR), even if
-it matches again. The reader's close settles the wait first (ALREADY_DELETED), as a
-writer's does.
+it matches again. So does history the DataReader received but dropped: its data callback
+says what it did with each sample, and one RESOURCE_LIMITS rejected or there was no memory
+to keep cannot count as delivered. A filtered one (content, time, ownership) can. A wait
+begun once such a loss has happened fails at once. A failure at the deadline or later is
+a timeout. The reader's close settles the wait first (ALREADY_DELETED), as a writer's
+does.
 
 ## Status
 
