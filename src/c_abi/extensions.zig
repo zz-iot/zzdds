@@ -971,19 +971,21 @@ fn leasedWaitSet(waitset: ?*anyopaque) ?*WaitSetImpl {
     return @ptrCast(@alignCast(w.ptr));
 }
 
+/// `alloc` is the WaitSet's, read before the call: a destroy during a wait
+/// can free the WaitSet as the wait returns.
 fn finishLeased(
-    impl: *WaitSetImpl,
+    alloc: std.mem.Allocator,
     found: *std.ArrayListUnmanaged(waitset_mod.LeasedCondition),
     rc: DDS.ReturnCode_t,
     out: *?*WaitSetResult,
 ) DDS.ReturnCode_t {
     if (rc != DDS.RETCODE_OK) {
-        found.deinit(impl.alloc);
+        found.deinit(alloc);
         return rc;
     }
-    out.* = WaitSetResult.create(impl.alloc, found) orelse {
+    out.* = WaitSetResult.create(alloc, found) orelse {
         waitset_mod.releaseLeased(found.items);
-        found.deinit(impl.alloc);
+        found.deinit(alloc);
         return DDS.RETCODE_OUT_OF_RESOURCES;
     };
     return DDS.RETCODE_OK;
@@ -1001,7 +1003,8 @@ pub export fn zzdds_waitset_wait_leased(
     const t = timeout orelse return DDS.RETCODE_BAD_PARAMETER;
     const impl = leasedWaitSet(waitset) orelse return DDS.RETCODE_BAD_PARAMETER;
     var found: std.ArrayListUnmanaged(waitset_mod.LeasedCondition) = .empty;
-    return finishLeased(impl, &found, impl.waitLeased(&found, t), o);
+    const alloc = impl.alloc;
+    return finishLeased(alloc, &found, impl.waitLeased(&found, t), o);
 }
 
 /// DDS_WaitSet_get_conditions, leased: see zzdds_c.h.
@@ -1010,7 +1013,7 @@ pub export fn zzdds_waitset_get_conditions_leased(waitset: ?*anyopaque, out: ?*?
     o.* = null;
     const impl = leasedWaitSet(waitset) orelse return DDS.RETCODE_BAD_PARAMETER;
     var found: std.ArrayListUnmanaged(waitset_mod.LeasedCondition) = .empty;
-    return finishLeased(impl, &found, impl.getConditionsLeased(&found), o);
+    return finishLeased(impl.alloc, &found, impl.getConditionsLeased(&found), o);
 }
 
 pub export fn zzdds_waitset_result_length(result: ?*const WaitSetResult) callconv(.c) u32 {

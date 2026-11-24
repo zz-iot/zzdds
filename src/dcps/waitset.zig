@@ -457,14 +457,17 @@ pub const WaitSetImpl = struct {
             if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
         }
         seq.* = .{};
+        // Read before the wait: a destroy during it can free `self` as the
+        // wait lets go of it.
+        const alloc = self.alloc;
         var found: std.ArrayListUnmanaged(DDS.Condition) = .empty;
         const rc = self.waitInto(DDS.Condition, &found, timeout);
         if (rc != DDS.RETCODE_OK) {
-            found.deinit(self.alloc);
+            found.deinit(alloc);
             return rc;
         }
-        const buf = found.toOwnedSlice(self.alloc) catch {
-            found.deinit(self.alloc);
+        const buf = found.toOwnedSlice(alloc) catch {
+            found.deinit(alloc);
             return DDS.RETCODE_OUT_OF_RESOURCES;
         };
         seq._buffer = buf.ptr;
@@ -477,7 +480,9 @@ pub const WaitSetImpl = struct {
     /// `wait`, for a binding: each condition comes with a lease on its
     /// attachment's release context (see `AttachmentLease`), which the
     /// caller releases (`releaseLeased`) once it has built its result.
-    /// `out` must be empty; on any code but OK it is left empty.
+    /// `out` must be empty; on any code but OK it is left empty. `self` may
+    /// be freed by the time this returns (a destroy during the wait): read
+    /// what the caller needs from it, its allocator, beforehand.
     pub fn waitLeased(self: *Self, out: *std.ArrayListUnmanaged(LeasedCondition), timeout: *const DDS.Duration_t) DDS.ReturnCode_t {
         return self.waitInto(LeasedCondition, out, timeout);
     }
@@ -644,8 +649,10 @@ pub const WaitSetImpl = struct {
             self.conditions = .empty;
             // Under `mu`, as detach does, so a racing attach cannot slip in.
             for (self.released.items) |entry| unregisterFromCondition(self, entry.cond);
+            // Also under `mu`: a concurrent destroy's own shutdown waits for
+            // it, so the WaitSet cannot be freed under this wake.
+            wakeNotify(self);
         }
-        wakeNotify(self);
     }
 
     /// Shared by the plain, spec-mandated `attach_condition()` (`vtAttach`,
