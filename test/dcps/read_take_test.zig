@@ -728,3 +728,26 @@ test "takeWithQueryConditionRaw: only samples matching the QueryCondition's expr
     try testing.expectEqual(@as(usize, 1), filtered.items.len);
     try testing.expectEqual(@as(u8, 5), filtered.items[0].data[filtered.items[0].data.len - 1]);
 }
+
+test "ordered access: a KEEP_LAST replacement of a sample in the ordered batch stays out of it" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_LAST_HISTORY_QOS;
+    dr_qos.history.depth = 1;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
+    try writeAlive(pair.dw);
+    fx.settle();
+    {
+        pair.dr.mu.lock();
+        defer pair.dr.mu.unlock();
+        pair.dr.ordered_access_watermark = 1;
+    }
+    // Replaces the ordered sample: the replacement arrived after begin_access.
+    try writeAlive(pair.dw);
+    fx.settle();
+    try testing.expectEqual(@as(?usize, 0), pair.dr.ordered_access_watermark);
+    try testing.expectEqual(@as(usize, 1), pair.dr.pending.items.len);
+    try testing.expect(pair.dr.takeRaw() == null);
+}

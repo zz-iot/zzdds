@@ -2016,3 +2016,53 @@ test "take_next_instance_raw: within an ordered access it picks the next instanc
     try testing.expectEqual(@as(u8, 0x2), next.byte(0));
     try next.returnLoan(dr_dds);
 }
+
+const NotifyCount = struct {
+    n: usize = 0,
+    fn on(ctx: *anyopaque) void {
+        const self: *NotifyCount = @ptrCast(@alignCast(ctx));
+        self.n += 1;
+    }
+};
+
+test "a read, which changes sample and view states, and the end of an ordered access wake ReadCondition WaitSets" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    dr.pushBuiltinCdr(&sample(0xA), keyOf(1), DDS.HANDLE_NIL, .alive);
+    var count: NotifyCount = .{};
+    try testing.expect(DataReaderImpl.addDataNotifier(dr, .{ .ctx = &count, .on_data = NotifyCount.on }));
+    defer DataReaderImpl.removeDataNotifier(dr, &count);
+
+    var read: RawLoan = .{};
+    try read.read(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    try read.returnLoan(dr_dds);
+    try testing.expectEqual(@as(usize, 1), count.n);
+    var copy: RawLoan = .{ .payloads = .{ ._maximum = 1 } };
+    try copy.read(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    try copy.returnLoan(dr_dds);
+    try testing.expectEqual(@as(usize, 2), count.n);
+
+    dr.mu.lock();
+    dr.ordered_access_watermark = 0;
+    dr.endOrderedAccessLocked();
+    dr.mu.unlock();
+    try testing.expectEqual(@as(?usize, null), dr.ordered_access_watermark);
+    try testing.expectEqual(@as(usize, 3), count.n);
+}
+
+test "ReadCondition: a sample past its lifespan does not keep its trigger true" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    const any = dr_dds.vtable.create_readcondition(dr_dds.ptr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    defer _ = dr_dds.vtable.delete_readcondition(dr_dds.ptr, any);
+    try pushExpiredInstance(dr, alloc, 9, &sample(0xE));
+    try testing.expect(!triggered(any));
+}

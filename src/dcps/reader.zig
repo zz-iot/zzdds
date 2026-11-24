@@ -1572,6 +1572,11 @@ pub const DataReaderImpl = struct {
                     if (self.pending.items[i].info.instance_handle == ih) {
                         const evicted = self.pending.orderedRemove(i);
                         evicted.quiesce.beginTeardown(evicted, PendingChange.reallyFree);
+                        // One from the ordered window shrinks it: the
+                        // replacement arrived after begin_access.
+                        if (self.ordered_access_watermark) |*wm| if (i < wm.*) {
+                            wm.* -= 1;
+                        };
                         break;
                     }
                 }
@@ -2253,7 +2258,33 @@ pub const DataReaderImpl = struct {
         self.mu.lock();
         defer self.mu.unlock();
         if (self.coherent_committed_ready) return true;
-        return self.countSelectedLocked(sample_mask, view_mask, instance_mask, 1, null, maybe_qc) > 0;
+        // A sample past its lifespan, which a read or take would purge,
+        // does not count; the check purges nothing itself.
+        const now_ns = time_mod.nanoTimestamp();
+        for (self.pending.items[0..self.orderedWindowLocked()]) |pc| {
+            if (pc.expiry_ns) |exp| if (now_ns >= exp) continue;
+            if (self.selects(pc, sample_mask, view_mask, instance_mask, null, maybe_qc)) return true;
+        }
+        return false;
+    }
+
+    /// Wakes the WaitSets with a ReadCondition on this reader to rescan:
+    /// samples or their states changed. With `mu` held.
+    pub fn notifyDataWaitersLocked(self: *Self) void {
+        for (self.data_notifiers.items) |n| n.on_data(n.ctx);
+    }
+
+    /// Ends an ordered access (`Subscriber::end_access`): the samples that
+    /// arrived since `begin_access` become selectable. With `mu` held.
+    pub fn endOrderedAccessLocked(self: *Self) void {
+        self.ordered_access_watermark = null;
+        if (self.pending.items.len == 0) return;
+        // Re-arm DATA_AVAILABLE_STATUS so StatusCondition users wake on the
+        // next wait rather than missing the deferred samples, and wake
+        // ReadCondition WaitSets to rescan.
+        self.markDataAvailableLocked();
+        if (self.status_cond) |sc| sc.notifyWakeup();
+        self.notifyDataWaitersLocked();
     }
 
     pub fn hasPendingData(self: *Self) bool {
@@ -2481,6 +2512,9 @@ pub const DataReaderImpl = struct {
     ) error{OutOfMemory}!void {
         self.mu.lock();
         defer self.mu.unlock();
+        // Marking samples READ, and their instances NOT_NEW, can make a
+        // condition with other masks true: its WaitSets rescan.
+        defer self.notifyDataWaitersLocked();
         defer self.reclaimInstancesLocked();
         self.purgeExpiredLocked();
         const ih_sel = self.nextInstanceLocked(prev_instance_handle, sample_mask, view_mask, instance_mask, maybe_qc);
@@ -2574,6 +2608,9 @@ pub const DataReaderImpl = struct {
     ) error{OutOfMemory}!void {
         self.mu.lock();
         defer self.mu.unlock();
+        // Marking samples READ, and their instances NOT_NEW, can make a
+        // condition with other masks true: its WaitSets rescan.
+        defer self.notifyDataWaitersLocked();
         defer self.reclaimInstancesLocked();
         self.purgeExpiredLocked();
         const ih_sel: ?void = {};
@@ -2668,6 +2705,9 @@ pub const DataReaderImpl = struct {
     ) error{OutOfMemory}![]*PendingChange {
         self.mu.lock();
         defer self.mu.unlock();
+        // Marking samples READ, and their instances NOT_NEW, can make a
+        // condition with other masks true: its WaitSets rescan.
+        defer self.notifyDataWaitersLocked();
         defer self.reclaimInstancesLocked();
         self.purgeExpiredLocked();
         const window = self.pending.items[0..self.orderedWindowLocked()];
@@ -3005,6 +3045,9 @@ pub const DataReaderImpl = struct {
     ) error{OutOfMemory}![]*PendingChange {
         self.mu.lock();
         defer self.mu.unlock();
+        // Marking samples READ, and their instances NOT_NEW, can make a
+        // condition with other masks true: its WaitSets rescan.
+        defer self.notifyDataWaitersLocked();
         defer self.reclaimInstancesLocked();
         self.purgeExpiredLocked();
         const ih_sel = self.nextInstanceLocked(prev_instance_handle, sample_mask, view_mask, instance_mask, maybe_qc);

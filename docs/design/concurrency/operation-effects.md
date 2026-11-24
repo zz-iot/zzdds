@@ -151,10 +151,13 @@ only if the deadline has not passed when its scan is done, and otherwise is a TI
 
 A ReadCondition's or QueryCondition's trigger is whether a read or take with its masks,
 and its query, would return a sample now (`hasSelectableData`), as the level
-observation the contract describes. Every read and take, its trigger included, selects
+observation the contract describes; a sample past its lifespan does not count. A read,
+which marks samples READ and instances NOT_NEW, and the end of an ordered access wake the
+reader's ReadCondition WaitSets to rescan, as an arrival does. Every read and take, its
+trigger included, selects
 within an ordered access (`Subscriber::begin_access`) only from the samples it ordered:
-a prefix of the reader's queue, the watermark, which every take, expiry and restore
-inside it moves.
+a prefix of the reader's queue, the watermark, which every take, expiry, KEEP_LAST
+replacement and restore inside it moves.
 
 ## Status
 
