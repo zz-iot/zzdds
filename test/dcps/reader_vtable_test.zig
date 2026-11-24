@@ -1397,21 +1397,21 @@ test "takeFiltered: sweeps an already-expired (LIFESPAN) sample instead of retur
 // docs/design/concurrency/operations.md#admission-and-conversion-capability:
 // exhaustion before selection has no access effect.
 
-const RawCall = enum { take_copy, read_copy, take_loan, read_loan, take_next_copy, read_next_loan };
+const RawCall = enum { take_copy, read_copy, take_loan, read_loan, take_next_copy, read_next_copy, take_next_loan, read_next_loan };
 
 fn rawCall(dr: DDS.DataReader, call: RawCall, seq: *DDS.OctetSeqSeq, kh: *DDS.OctetSeq, infos: *DDS.SampleInfoSeq) DDS.ReturnCode_t {
     // A zero maximum asks for a loan; a nonzero one, for copies.
     var copies_buf: [1]DDS.OctetSeq = undefined;
     seq.* = switch (call) {
-        .take_loan, .read_loan, .read_next_loan => .{},
+        .take_loan, .read_loan, .take_next_loan, .read_next_loan => .{},
         else => .{ ._buffer = &copies_buf, ._length = 0, ._maximum = 1, ._release = false },
     };
     const any = .{ DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE };
     return switch (call) {
         .take_copy, .take_loan => dr.vtable.take_raw(dr.ptr, seq, kh, infos, DDS.HANDLE_NIL, nil.nil_readcondition, any[0], any[1], any[2], -1),
         .read_copy, .read_loan => dr.vtable.read_raw(dr.ptr, seq, kh, infos, DDS.HANDLE_NIL, nil.nil_readcondition, any[0], any[1], any[2], -1),
-        .take_next_copy => dr.vtable.take_next_instance_raw(dr.ptr, seq, kh, infos, DDS.HANDLE_NIL, nil.nil_readcondition, any[0], any[1], any[2], -1),
-        .read_next_loan => dr.vtable.read_next_instance_raw(dr.ptr, seq, kh, infos, DDS.HANDLE_NIL, nil.nil_readcondition, any[0], any[1], any[2], -1),
+        .take_next_copy, .take_next_loan => dr.vtable.take_next_instance_raw(dr.ptr, seq, kh, infos, DDS.HANDLE_NIL, nil.nil_readcondition, any[0], any[1], any[2], -1),
+        .read_next_copy, .read_next_loan => dr.vtable.read_next_instance_raw(dr.ptr, seq, kh, infos, DDS.HANDLE_NIL, nil.nil_readcondition, any[0], any[1], any[2], -1),
     };
 }
 
