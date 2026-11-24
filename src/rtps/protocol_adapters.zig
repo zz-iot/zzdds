@@ -85,6 +85,7 @@ pub const RtpsProtocolWriter = struct {
         // Before anything removes its readers, which would look like their
         // acknowledgments to a wait on them.
         self.writer.closeAckWaits();
+        self.writer.closeWrites();
         // Now, while the owner's runtime and transport are alive: an
         // outstanding write loan can hold this writer past its participant,
         // and the teardown below then touches neither.
@@ -147,7 +148,10 @@ pub const RtpsProtocolWriter = struct {
         .begin_ack_wait = vtBeginAckWait,
         .end_ack_wait = vtEndAckWait,
         .cache_len = vtCacheLen,
-        .wait_cache_below = vtWaitCacheBelow,
+        .set_write_limits = vtSetWriteLimits,
+        .admit_write = vtAdmitWrite,
+        .write_admitted = vtWriteAdmitted,
+        .release_admission = vtReleaseAdmission,
         .begin_coherent_set = vtBeginCoherentSet,
         .coherent_window_count = vtCoherentWindowCount,
         .end_coherent_set = vtEndCoherentSet,
@@ -250,9 +254,31 @@ pub const RtpsProtocolWriter = struct {
         self.writer.endAckWait(cap);
     }
 
-    fn vtWaitCacheBelow(ctx: *anyopaque, limit: usize, timeout_ns: ?i64) bool {
+    fn vtSetWriteLimits(ctx: *anyopaque, limits: protocol.WriteLimits) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.writer.waitCacheBelow(limit, timeout_ns);
+        self.writer.setWriteLimits(limits);
+    }
+
+    fn vtAdmitWrite(ctx: *anyopaque, adm: *protocol.WriteAdmission, may_block: bool, timeout_ns: ?i64) error{ Timeout, OutOfResources, Closed }!void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.writer.admitWrite(adm, may_block, timeout_ns);
+    }
+
+    fn vtWriteAdmitted(
+        ctx: *anyopaque,
+        adm: *protocol.WriteAdmission,
+        kind: history_mod.ChangeKind,
+        source_timestamp: history_mod.RtpsTimestamp,
+        key_hash: [16]u8,
+        data: []const u8,
+    ) anyerror!history_mod.SequenceNumber {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.writer.writeAdmitted(adm, kind, source_timestamp, key_hash, data);
+    }
+
+    fn vtReleaseAdmission(ctx: *anyopaque, adm: *protocol.WriteAdmission) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writer.releaseAdmission(adm);
     }
 
     fn vtRemoveMatchedReader(ctx: *anyopaque, guid: Guid) void {

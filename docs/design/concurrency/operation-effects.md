@@ -62,13 +62,34 @@ begun once such a loss has happened fails at once. A failure at the deadline or 
 a timeout. The reader's close settles the wait first (ALREADY_DELETED), as a writer's
 does.
 
+## Blocking writes
+
+A write first asks its `StatefulWriter` for room (`admitWrite`), without holding the
+DataWriter's `publish_mu`. The writer keeps its admissions in one list, oldest first:
+each waits for room or holds it. Room counts the history and the held admissions against
+`max_samples` and the instance's `max_samples_per_instance`. Under KEEP_LAST, a change
+that replaces its instance's oldest takes none, held or new: an instance grows by no more
+than its room below the depth. With neither limit set there is nothing to count. A waiter
+takes room only when no waiter ahead of it also has room and is still within its
+deadline, so a newcomer cannot take what an older write is owed, and an older write past
+its deadline holds nobody up. Close and the deadline are checked under the same lock, at
+that decision: a write that has waited to its deadline times out, even if room is freed
+then. A zero timeout only checks.
+
+Admitted, the write registers its instance under `publish_mu` and commits
+(`writeAdmitted`), which uses the held room. A writer closed in between refuses the
+commit, and a registration the write made is undone. Deletion closes writes as it
+settles acknowledgment waits, so a write blocked or admitted then returns
+ALREADY_DELETED, and none commits after the delete returns. A BEST_EFFORT writer never
+waits: no room is OUT_OF_RESOURCES.
+
 ## Status
 
 | Operation | Status |
 | --- | --- |
 | DataWriter and Publisher `wait_for_acknowledgments` | Done |
 | DataReader `wait_for_historical_data` | Done |
-| Blocking write | Next: reserved capacity served oldest first, close before commit, per-instance limits, failed implicit registration undone, handle error codes |
-| Take after an allocation failure | Planned: no sample lost when building the output fails |
+| Blocking write | Done |
+| Take after an allocation failure | Next: no sample lost when building the output fails |
 | Take when a binding fails to decode | Planned: two-step take, so a binding can fail a decode and the samples return |
 | WaitSet waits | To audit |

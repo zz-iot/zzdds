@@ -23,6 +23,7 @@ const locator_selector = @import("../transport/locator_selector.zig");
 const runtime_mod = @import("../runtime/core.zig");
 const CloseLatch = @import("../runtime/close_latch.zig").CloseLatch;
 const ack_wait = @import("../protocol/ack_wait.zig");
+const write_admission = @import("../protocol/write_admission.zig");
 
 const MessageBuilder = msg.builder.MessageBuilder;
 const SCRATCH_SIZE = msg.builder.SCRATCH_SIZE;
@@ -296,6 +297,9 @@ pub const StatelessWriter = struct {
 pub const ReaderMatch = struct { guid: Guid, id: u64 };
 
 /// State that a StatefulWriter tracks for each matched reader.
+pub const WriteLimits = write_admission.WriteLimits;
+pub const WriteAdmission = write_admission.WriteAdmission;
+
 pub const ReaderProxy = struct {
     guid: Guid,
     unicast_locators: std.ArrayListUnmanaged(Locator),
@@ -611,6 +615,13 @@ pub const StatefulWriter = struct {
     /// `closeAckWaits`.
     ack_waits: std.ArrayListUnmanaged(*ack_wait.Capture) = .empty,
     ack_waits_closed: bool = false,
+    /// RESOURCE_LIMITS for `admitWrite`, set once before any write
+    /// (`setWriteLimits`); 0 is no limit.
+    write_limits: WriteLimits = .{},
+    /// Writes admitted or waiting for room, oldest first (`admitWrite`),
+    /// and whether `closeWrites` has run. Guarded by `mu`.
+    admissions: std.ArrayListUnmanaged(*WriteAdmission) = .empty,
+    writes_closed: bool = false,
     /// The last sequence number `write` or `writeReserved` committed: what
     /// an acknowledgment wait covers. Not `cache.next_sn - 1`, which a
     /// write that failed may have taken. Guarded by `mu`.
@@ -994,6 +1005,8 @@ pub const StatefulWriter = struct {
         self.reader_proxies.deinit(self.alloc);
         std.debug.assert(self.ack_waits.items.len == 0);
         self.ack_waits.deinit(self.alloc);
+        std.debug.assert(self.admissions.items.len == 0);
+        self.admissions.deinit(self.alloc);
         self.coherent_pending_sns.deinit(self.alloc);
         self.end_markers.deinit(self.alloc);
         self.cache.deinit();
@@ -1020,38 +1033,173 @@ pub const StatefulWriter = struct {
         return self.allProxiesAckedLocked(target_sn);
     }
 
-    /// Waits until the cache holds fewer than `limit` changes, for a write
-    /// blocked on RESOURCE_LIMITS, or for `timeout_ns` (null: no limit). Space
-    /// frees as readers acknowledge (`drop_acked`) or KEEP_LAST evicts. On a
-    /// manual runtime the wait runs the runtime's internal work meanwhile, on
-    /// its clock. Returns false on timeout.
-    pub fn waitCacheBelow(self: *Self, limit: usize, timeout_ns: ?i64) bool {
-        if (self.runtime) |rt| if (rt.canHelp()) {
-            const Wait = struct {
-                writer: *Self,
-                limit: usize,
-                fn done(w: *const @This()) bool {
-                    w.writer.mu.lock();
-                    defer w.writer.mu.unlock();
-                    return w.writer.cache.len() < w.limit;
-                }
-            };
-            const deadline_ns = if (timeout_ns) |t| rt.clock.nowNs() +| t else null;
-            return rt.helpUntil(deadline_ns, &Wait{ .writer = self, .limit = limit }, Wait.done);
-        };
-        const deadline_ns = if (timeout_ns) |t| time_mod.nanoTimestamp() +| t else null;
+    pub fn setWriteLimits(self: *Self, limits: WriteLimits) void {
         self.mu.lock();
         defer self.mu.unlock();
-        while (self.cache.len() >= limit) {
+        self.write_limits = limits;
+    }
+
+    /// Admits a write of a change of `adm.instance`: reserves room for it
+    /// under the writer's RESOURCE_LIMITS, which `writeAdmitted` then uses
+    /// or `releaseAdmission` gives back
+    /// (docs/design/concurrency/architecture.md#resource-waits-and-reservations).
+    /// With no room, a writer that `may_block` (RELIABLE) waits for up to
+    /// `timeout_ns` (null: no limit) while readers acknowledge, the oldest
+    /// waiter that has room going first; one that may not returns
+    /// OutOfResources at once, as a RELIABLE one does when it cannot queue.
+    /// Closed once `closeWrites` has run, before or during the wait. A write
+    /// that has waited past its deadline times out rather than take room
+    /// freed since; a zero timeout only checks. On a manual runtime the wait
+    /// runs its internal work, on its clock.
+    pub fn admitWrite(self: *Self, adm: *WriteAdmission, may_block: bool, timeout_ns: ?i64) error{ Timeout, OutOfResources, Closed }!void {
+        const clock = self.admissionClock();
+        const deadline_ns: ?i64 = if (timeout_ns) |t| clock.nowNs() +| t else null;
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.writes_closed) return error.Closed;
+        self.admissions.ensureUnusedCapacity(self.alloc, 1) catch return error.OutOfResources;
+        adm.held = false;
+        adm.deadline_ns = if (may_block) deadline_ns else null;
+        self.admissions.appendAssumeCapacity(adm);
+        var waited = false;
+        while (true) {
+            if (self.writes_closed) {
+                self.leaveLocked(adm);
+                return error.Closed;
+            }
+            const now = clock.nowNs();
+            const expired = if (deadline_ns) |dl| now >= dl else false;
+            if ((!waited or !expired) and self.mayHoldLocked(adm, now)) {
+                adm.held = true;
+                return;
+            }
+            if (!may_block or expired) {
+                self.leaveLocked(adm);
+                return if (may_block) error.Timeout else error.OutOfResources;
+            }
+            waited = true;
+            if (self.runtime) |rt| if (rt.canHelp()) {
+                const Wait = struct {
+                    writer: *Self,
+                    adm: *const WriteAdmission,
+                    fn done(w: *const @This()) bool {
+                        w.writer.mu.lock();
+                        defer w.writer.mu.unlock();
+                        return w.writer.writes_closed or w.writer.mayHoldLocked(w.adm, w.writer.admissionClock().nowNs());
+                    }
+                };
+                self.mu.unlock();
+                _ = rt.helpUntil(deadline_ns, &Wait{ .writer = self, .adm = adm }, Wait.done);
+                self.mu.lock();
+                continue;
+            };
             if (deadline_ns) |dl| {
-                const now = time_mod.nanoTimestamp();
-                if (now >= dl) return false;
                 self.ack_cond.timedWaitNs(&self.mu, @intCast(dl - now)) catch {};
             } else {
                 self.ack_cond.wait(&self.mu);
             }
         }
+    }
+
+    /// Gives back an admission `writeAdmitted` did not use.
+    pub fn releaseAdmission(self: *Self, adm: *WriteAdmission) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.leaveLocked(adm);
+    }
+
+    /// Refuses every write from now on, and ends those waiting for room:
+    /// the writer is closing. A write already admitted is refused when it
+    /// commits (`writeAdmitted`).
+    pub fn closeWrites(self: *Self) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.writes_closed = true;
+        self.ack_cond.broadcast();
+        if (self.runtime) |rt| rt.wakeHelpers();
+    }
+
+    /// Takes `adm` out of `admissions`; those behind it may now have room.
+    fn leaveLocked(self: *Self, adm: *WriteAdmission) void {
+        const i = std.mem.indexOfScalar(*WriteAdmission, self.admissions.items, adm).?;
+        _ = self.admissions.orderedRemove(i);
+        adm.held = false;
+        self.ack_cond.broadcast();
+        if (self.runtime) |rt| rt.wakeHelpers();
+    }
+
+    /// The clock admission deadlines are on: the runtime's, else monotonic.
+    fn admissionClock(self: *const Self) time_mod.Clock {
+        return if (self.runtime) |rt| rt.clock else time_mod.monotonicClock();
+    }
+
+    /// Whether `adm`, still waiting, may take room now (`now` on the
+    /// writer's clock): there is room for it, and no waiter ahead of it
+    /// both has room and is still within its deadline.
+    fn mayHoldLocked(self: *Self, adm: *const WriteAdmission, now: i64) bool {
+        for (self.admissions.items) |other| {
+            if (other == adm) return self.hasRoomLocked(adm.instance);
+            if (other.held) continue;
+            if (other.deadline_ns) |dl| if (now >= dl) continue;
+            if (self.hasRoomLocked(other.instance)) return false;
+        }
+        unreachable;
+    }
+
+    /// Whether a change of `instance` fits the RESOURCE_LIMITS, counting
+    /// the room held for admitted writes. Under KEEP_LAST, a change that
+    /// replaces its instance's oldest takes no room, whether it is this one
+    /// or one held already.
+    fn hasRoomLocked(self: *Self, instance: InstanceHandle) bool {
+        const lim = self.write_limits;
+        if (lim.max_samples == 0 and lim.max_samples_per_instance == 0) return true;
+        const per_instance = self.instanceCountLocked(instance) + self.heldForLocked(instance);
+        if (self.keepLastDepth()) |depth| if (per_instance >= depth) return true;
+        if (lim.max_samples_per_instance > 0 and per_instance >= lim.max_samples_per_instance) return false;
+        if (lim.max_samples > 0 and self.cache.len() + self.heldGrowthLocked() >= lim.max_samples) return false;
         return true;
+    }
+
+    fn keepLastDepth(self: *const Self) ?usize {
+        return if (self.cache.kind == .keep_last and self.cache.depth > 0) self.cache.depth else null;
+    }
+
+    fn instanceCountLocked(self: *const Self, instance: InstanceHandle) usize {
+        var n: usize = 0;
+        for (self.cache.changes.items) |*ch| {
+            if (std.mem.eql(u8, &ch.instance_handle, &instance)) n += 1;
+        }
+        return n;
+    }
+
+    fn heldForLocked(self: *const Self, instance: InstanceHandle) usize {
+        var n: usize = 0;
+        for (self.admissions.items) |a| {
+            if (a.held and std.mem.eql(u8, &a.instance, &instance)) n += 1;
+        }
+        return n;
+    }
+
+    /// How much the held admissions will grow the history once they
+    /// commit: under KEEP_LAST, each instance by no more than its room
+    /// below the depth.
+    fn heldGrowthLocked(self: *const Self) usize {
+        const depth = self.keepLastDepth() orelse {
+            var n: usize = 0;
+            for (self.admissions.items) |a| n += @intFromBool(a.held);
+            return n;
+        };
+        var growth: usize = 0;
+        for (self.admissions.items, 0..) |a, i| {
+            if (!a.held) continue;
+            // Each instance once, at its first held admission.
+            const seen = for (self.admissions.items[0..i]) |b| {
+                if (b.held and std.mem.eql(u8, &b.instance, &a.instance)) break true;
+            } else false;
+            if (seen) continue;
+            growth += @min(self.heldForLocked(a.instance), depth -| self.instanceCountLocked(a.instance));
+        }
+        return growth;
     }
 
     /// With `drop_acked`, drops the changes every reliable reader has
@@ -2015,6 +2163,17 @@ pub const StatefulWriter = struct {
     ) !SequenceNumber {
         self.mu.lock();
         defer self.mu.unlock();
+        return self.writeLocked(kind, source_timestamp, instance_handle, key_hash, data);
+    }
+
+    fn writeLocked(
+        self: *Self,
+        kind: ChangeKind,
+        source_timestamp: RtpsTimestamp,
+        instance_handle: InstanceHandle,
+        key_hash: [16]u8,
+        data: []const u8,
+    ) !SequenceNumber {
         const sn = try self.cache.addWriterChange(kind, self.guid, source_timestamp, instance_handle, key_hash, data);
         if (self.coherent_active) {
             self.coherent_pending_sns.append(self.alloc, sn) catch |err| {
@@ -2031,6 +2190,24 @@ pub const StatefulWriter = struct {
         }
         self.last_committed_sn = sn;
         return sn;
+    }
+
+    /// `write`, for a change `admitWrite` admitted: uses its room, or gives
+    /// it back if the write fails. Closed if the writer has closed since.
+    pub fn writeAdmitted(
+        self: *Self,
+        adm: *WriteAdmission,
+        kind: ChangeKind,
+        source_timestamp: RtpsTimestamp,
+        key_hash: [16]u8,
+        data: []const u8,
+    ) !SequenceNumber {
+        self.mu.lock();
+        defer self.mu.unlock();
+        std.debug.assert(adm.held);
+        self.leaveLocked(adm);
+        if (self.writes_closed) return error.Closed;
+        return self.writeLocked(kind, source_timestamp, adm.instance, key_hash, data);
     }
 
     /// Makes room in the history for `n` changes, written later with

@@ -48,6 +48,12 @@ fn durationNs(d: DDS.Duration_t) i64 {
     return @as(i64, d.sec) * std.time.ns_per_s + @as(i64, d.nanosec);
 }
 
+/// A RESOURCE_LIMITS value as a protocol limit: 0 (and LENGTH_UNLIMITED,
+/// -1) for none.
+fn limitOf(v: i32) u32 {
+    return if (v > 0) @intCast(v) else 0;
+}
+
 /// A blocking call's `max_wait` in nanoseconds, null for DURATION_INFINITE;
 /// BadParameter for a negative or unnormalized duration.
 pub fn waitTimeoutNs(d: DDS.Duration_t) error{BadParameter}!?i64 {
@@ -368,6 +374,11 @@ pub const DataWriterImpl = struct {
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);
         self.cacheChangeable();
+        // RESOURCE_LIMITS are immutable: the history keeps to them from now.
+        proto_writer.setWriteLimits(.{
+            .max_samples = limitOf(self.qos.resource_limits.max_samples),
+            .max_samples_per_instance = limitOf(self.qos.resource_limits.max_samples_per_instance),
+        });
         // Wire up the StatusCondition.
         const sc = try waitset.StatusConditionImpl.init(
             alloc,
@@ -513,25 +524,23 @@ pub const DataWriterImpl = struct {
         data: []const u8,
     ) !history_mod.SequenceNumber {
         if (!self.enabled.load(.acquire)) return error.NotEnabled;
-        // RESOURCE_LIMITS enforcement (max_samples for keyless topics, where
-        // max_samples_per_instance == max_samples since there is one instance).
-        // 0 means unlimited; only enforce whichever limits are active (> 0).
-        const ms = self.qos.resource_limits.max_samples;
-        const msi = self.qos.resource_limits.max_samples_per_instance;
-        const max: i32 = if (ms > 0 and msi > 0) @min(ms, msi) else if (ms > 0) ms else if (msi > 0) msi else 0;
-        if (max > 0) {
-            const limit: usize = @intCast(max);
-            if (self.proto_writer.cacheLen() >= limit) {
-                if (self.qos.reliability.kind == .BEST_EFFORT_RELIABILITY_QOS) {
-                    return error.OutOfResources;
-                }
-                // RELIABLE: block for up to max_blocking_time while readers
-                // acknowledge (the DDS RELIABILITY QoS).
-                const mbt = self.qos.reliability.max_blocking_time;
-                const timeout_ns: ?i64 = if (mbt.sec == DDS.DURATION_INFINITE_SEC and mbt.nanosec == DDS.DURATION_INFINITE_NSEC) null else durationNs(mbt);
-                if (!self.proto_writer.waitCacheBelow(limit, timeout_ns)) return error.Timeout;
-            }
-        }
+        // Pinned for the write, which may wait: the writer's deletion closes
+        // it to writes rather than freeing it under one.
+        if (!self.acquireProto()) return error.AlreadyDeleted;
+        defer self.releaseProto();
+        // Room under RESOURCE_LIMITS, reserved until the write commits or
+        // fails (docs/design/concurrency/operation-effects.md#blocking-writes):
+        // a RELIABLE writer waits up to max_blocking_time while readers
+        // acknowledge, without holding `publish_mu`; a BEST_EFFORT one does
+        // not wait. A writer deleted first returns AlreadyDeleted.
+        var adm: proto.WriteAdmission = .{ .instance = key_hash };
+        const mbt = self.qos.reliability.max_blocking_time;
+        const timeout_ns: ?i64 = if (mbt.sec == DDS.DURATION_INFINITE_SEC and mbt.nanosec == DDS.DURATION_INFINITE_NSEC) null else durationNs(mbt);
+        const reliable = self.qos.reliability.kind != .BEST_EFFORT_RELIABILITY_QOS;
+        self.proto_writer.admitWrite(&adm, reliable, timeout_ns) catch |err| return switch (err) {
+            error.Closed => error.AlreadyDeleted,
+            else => |e| e,
+        };
 
         // An alive write registers its instance, if not already registered:
         // OutOfResources beyond RESOURCE_LIMITS `max_instances`. An unregister
@@ -539,12 +548,24 @@ pub const DataWriterImpl = struct {
         // (DDS 1.4 §2.2.2.4.2.7); the history keeps what it wrote.
         // `publish_mu` keeps both in publication order. A dispose carries the
         // key-only CDR, which a registered instance without a key yet keeps.
+        // A write that fails leaves no registration it made.
         var needs_key = false;
         const sn = blk: {
             self.publish_mu.lock();
             defer self.publish_mu.unlock();
-            if (kind == .alive) needs_key = self.registerForWrite(key_hash) catch return error.OutOfResources;
-            const sn = try self.proto_writer.write(kind, source_timestamp, key_hash, key_hash, data);
+            var registered: RegisterResult = .{};
+            if (kind == .alive) registered = self.registerForWrite(key_hash) catch {
+                self.proto_writer.releaseAdmission(&adm);
+                return error.OutOfResources;
+            };
+            needs_key = registered.needs_key;
+            const sn = self.proto_writer.writeAdmitted(&adm, kind, source_timestamp, key_hash, data) catch |err| {
+                if (registered.added) self.forgetInstance(key_hash);
+                return switch (err) {
+                    error.Closed => error.AlreadyDeleted,
+                    else => |e| e,
+                };
+            };
             if (kind.unregisters()) self.forgetInstance(key_hash);
             break :blk sn;
         };
@@ -665,14 +686,21 @@ pub const DataWriterImpl = struct {
         if (removed) |kv| self.alloc.free(kv.payload);
     }
 
-    /// Registers the instance an alive write writes, if it is not, and
-    /// returns whether it still needs its key. With `publish_mu` held.
-    fn registerForWrite(self: *Self, key_hash: [16]u8) error{ OutOfMemory, OutOfHandles }!bool {
+    const RegisterResult = struct {
+        /// The write registered the instance: a failed write forgets it.
+        added: bool = false,
+        /// The instance has no key yet.
+        needs_key: bool = false,
+    };
+
+    /// Registers the instance an alive write writes, if it is not. With
+    /// `publish_mu` held.
+    fn registerForWrite(self: *Self, key_hash: [16]u8) error{ OutOfMemory, OutOfHandles }!RegisterResult {
         self.instances_mu.lock();
         defer self.instances_mu.unlock();
         const e = try self.getOrPutInstanceLocked(key_hash);
         if (!e.found_existing) e.value.* = null;
-        return e.value.* == null;
+        return .{ .added = !e.found_existing, .needs_key = e.value.* == null };
     }
 
     /// Gives a registered instance `maybe_kv` if it has no key yet, and
@@ -722,13 +750,16 @@ pub const DataWriterImpl = struct {
         return self.instances.handleOfKey(key_hash) orelse DDS.HANDLE_NIL;
     }
 
-    /// Whether `handle` names the key hash's instance, as a write, dispose or
-    /// unregister given both requires.
-    fn handleNamesKey(self: *Self, handle: DDS.InstanceHandle_t, key_hash: [16]u8) bool {
+    /// What a write, dispose or unregister given both a handle and a key
+    /// returns for the pair (DDS 1.4 §2.2.2.4.2.7, .11): OK for HANDLE_NIL
+    /// or the key's instance; PRECONDITION_NOT_MET for another instance of
+    /// this writer; BAD_PARAMETER for a handle that names none.
+    fn checkHandle(self: *Self, handle: DDS.InstanceHandle_t, key_hash: [16]u8) DDS.ReturnCode_t {
+        if (handle == DDS.HANDLE_NIL) return DDS.RETCODE_OK;
         self.instances_mu.lock();
         defer self.instances_mu.unlock();
-        const key = self.instances.keyOf(handle) orelse return false;
-        return std.mem.eql(u8, &key, &key_hash);
+        const key = self.instances.keyOf(handle) orelse return DDS.RETCODE_BAD_PARAMETER;
+        return if (std.mem.eql(u8, &key, &key_hash)) DDS.RETCODE_OK else DDS.RETCODE_PRECONDITION_NOT_MET;
     }
 
     /// Copies the key of the instance `handle` names into `buf` if it fits,
@@ -1721,8 +1752,9 @@ pub const DataWriterImpl = struct {
         const payload = cdr_payload orelse return DDS.RETCODE_BAD_PARAMETER;
         const kh = keyHashFromOctetSeq(kh_seq) orelse return DDS.RETCODE_BAD_PARAMETER;
         const change_kind = self.changeKindFromWriteKind(kind) orelse return DDS.RETCODE_BAD_PARAMETER;
-        if (handle != DDS.HANDLE_NIL and !self.handleNamesKey(handle, kh)) {
-            return DDS.RETCODE_BAD_PARAMETER;
+        {
+            const rc = self.checkHandle(handle, kh);
+            if (rc != DDS.RETCODE_OK) return rc;
         }
         // Regression for a real concurrent use-after-free (Greptile PR #69
         // review): without this guard, delete_datawriter()'s
@@ -1737,6 +1769,7 @@ pub const DataWriterImpl = struct {
         _ = self.writeRaw(change_kind, rtpsTimestampFromRaw(source_timestamp), kh, data) catch |err| return switch (err) {
             error.OutOfResources => DDS.RETCODE_OUT_OF_RESOURCES,
             error.Timeout => DDS.RETCODE_TIMEOUT,
+            error.AlreadyDeleted => DDS.RETCODE_ALREADY_DELETED,
             else => DDS.RETCODE_ERROR,
         };
         return DDS.RETCODE_OK;
@@ -1776,7 +1809,7 @@ pub const DataWriterImpl = struct {
         // vtPublishLoanRaw/vtReturnLoanRaw) closes the race regardless of
         // check timing, reusing already-tested machinery instead of adding
         // new locking.
-        if (!self.proto_writer.quiesceAcquire()) {
+        if (!self.acquireProto()) {
             self.releaseQuiesce();
             return DDS.RETCODE_ALREADY_DELETED;
         }
@@ -1816,8 +1849,9 @@ pub const DataWriterImpl = struct {
         const kh_seq = key_hash orelse return DDS.RETCODE_BAD_PARAMETER;
         const kh = keyHashFromOctetSeq(kh_seq) orelse return DDS.RETCODE_BAD_PARAMETER;
         const change_kind = self.changeKindFromWriteKind(kind) orelse return DDS.RETCODE_BAD_PARAMETER;
-        if (handle != DDS.HANDLE_NIL and !self.handleNamesKey(handle, kh)) {
-            return DDS.RETCODE_BAD_PARAMETER;
+        {
+            const rc = self.checkHandle(handle, kh);
+            if (rc != DDS.RETCODE_OK) return rc;
         }
         // A null buffer means this isn't a value loan_raw() actually
         // returned (an empty-but-real loan has a non-null, zero-length
@@ -1837,6 +1871,7 @@ pub const DataWriterImpl = struct {
         _ = self.publishLoan(change_kind, time_mod.RtpsTimestamp.now(), kh, full_buf, used_len) catch |err| return switch (err) {
             error.OutOfResources => DDS.RETCODE_OUT_OF_RESOURCES,
             error.Timeout => DDS.RETCODE_TIMEOUT,
+            error.AlreadyDeleted => DDS.RETCODE_ALREADY_DELETED,
             else => DDS.RETCODE_ERROR,
         };
         return DDS.RETCODE_OK;

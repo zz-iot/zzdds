@@ -23,6 +23,9 @@ const submsg_mod = @import("../rtps/message/submessage.zig");
 pub const waiter = @import("waiter.zig");
 pub const ack_wait = @import("ack_wait.zig");
 pub const history_wait = @import("history_wait.zig");
+pub const write_admission = @import("write_admission.zig");
+pub const WriteLimits = write_admission.WriteLimits;
+pub const WriteAdmission = write_admission.WriteAdmission;
 
 pub const Guid = guid_mod.Guid;
 pub const GuidPrefix = guid_mod.GuidPrefix;
@@ -334,10 +337,28 @@ pub const ProtocolWriter = struct {
         /// Used to enforce RESOURCE_LIMITS.max_samples before writing.
         cache_len: *const fn (ctx: *anyopaque) usize,
 
-        /// Block until the writer's history cache holds fewer than `limit`
-        /// samples, or for `timeout_ns`, on the clock the writer schedules
-        /// by. Null `timeout_ns` waits indefinitely. Returns false on timeout.
-        wait_cache_below: *const fn (ctx: *anyopaque, limit: usize, timeout_ns: ?i64) bool,
+        /// Set the RESOURCE_LIMITS writes are admitted under, before any.
+        set_write_limits: *const fn (ctx: *anyopaque, limits: WriteLimits) void,
+
+        /// Admit a write of a change of `adm.instance`, reserving room for
+        /// it: with none, wait while readers acknowledge for up to
+        /// `timeout_ns` (null: no limit) if `may_block`, else OutOfResources.
+        /// Closed once the writer closes. write_admitted uses the room, or
+        /// release_admission gives it back.
+        admit_write: *const fn (ctx: *anyopaque, adm: *WriteAdmission, may_block: bool, timeout_ns: ?i64) error{ Timeout, OutOfResources, Closed }!void,
+
+        /// `write`, for an admitted change; Closed if the writer has closed.
+        write_admitted: *const fn (
+            ctx: *anyopaque,
+            adm: *WriteAdmission,
+            kind: ChangeKind,
+            source_timestamp: RtpsTimestamp,
+            key_hash: [16]u8,
+            data: []const u8,
+        ) anyerror!SequenceNumber,
+
+        /// Give back an admission write_admitted did not use.
+        release_admission: *const fn (ctx: *anyopaque, adm: *WriteAdmission) void,
 
         /// Begin a coherent set: subsequent write() calls are deferred until
         /// end_coherent_set().  `is_coherent_window` must be true when called from
@@ -500,8 +521,27 @@ pub const ProtocolWriter = struct {
         return self.vtable.cache_len(self.ctx);
     }
 
-    pub fn waitCacheBelow(self: ProtocolWriter, limit: usize, timeout_ns: ?i64) bool {
-        return self.vtable.wait_cache_below(self.ctx, limit, timeout_ns);
+    pub fn setWriteLimits(self: ProtocolWriter, limits: WriteLimits) void {
+        self.vtable.set_write_limits(self.ctx, limits);
+    }
+
+    pub fn admitWrite(self: ProtocolWriter, adm: *WriteAdmission, may_block: bool, timeout_ns: ?i64) error{ Timeout, OutOfResources, Closed }!void {
+        return self.vtable.admit_write(self.ctx, adm, may_block, timeout_ns);
+    }
+
+    pub fn writeAdmitted(
+        self: ProtocolWriter,
+        adm: *WriteAdmission,
+        kind: ChangeKind,
+        source_timestamp: RtpsTimestamp,
+        key_hash: [16]u8,
+        data: []const u8,
+    ) anyerror!SequenceNumber {
+        return self.vtable.write_admitted(self.ctx, adm, kind, source_timestamp, key_hash, data);
+    }
+
+    pub fn releaseAdmission(self: ProtocolWriter, adm: *WriteAdmission) void {
+        self.vtable.release_admission(self.ctx, adm);
     }
 
     pub fn beginCoherentSet(self: ProtocolWriter, is_coherent_window: bool) void {
