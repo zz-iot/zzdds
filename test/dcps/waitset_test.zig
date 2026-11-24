@@ -177,6 +177,12 @@ fn drNoop24(_: *anyopaque, _: ?*DDS.OctetSeqSeq, _: ?*DDS.OctetSeq, _: ?*DDS.Sam
 fn drNoop25(_: *anyopaque, _: ?*DDS.OctetSeqSeq, _: ?*DDS.OctetSeq, _: ?*DDS.SampleInfoSeq) DDS.ReturnCode_t {
     unreachable;
 }
+fn drNoop26(_: *anyopaque, _: ?*DDS.OctetSeqSeq, _: ?*DDS.OctetSeq, _: ?*DDS.SampleInfoSeq, _: ?*const DDS.OctetSeq) DDS.ReturnCode_t {
+    unreachable;
+}
+fn drNoop27(_: *anyopaque, _: bool) DDS.ReturnCode_t {
+    unreachable;
+}
 fn drNoDeinit(_: *anyopaque) void {}
 fn drNoCAbiHandle(_: *anyopaque) *anyopaque {
     unreachable;
@@ -217,6 +223,8 @@ const stub_dr_vtable = DDS.DataReader.Vtable{
     .take_next_instance_raw = drNoop24,
     .read_next_instance_raw = drNoop24,
     .return_loan_raw = drNoop25,
+    .return_loan_raw_failed = drNoop26,
+    .set_keep_undecodable = drNoop27,
     .deinit = drNoDeinit,
     .get_c_abi_handle = drNoCAbiHandle,
     .get_allocator = drNoAllocator,

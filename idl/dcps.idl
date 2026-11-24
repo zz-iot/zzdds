@@ -329,6 +329,13 @@ module DDS {
 
     typedef unsigned long   SampleStateMask;
     const SampleStateMask   ANY_SAMPLE_STATE            = 0xffff;
+    // zzdds extension, outside ANY_SAMPLE_STATE: a sample its binding could
+    // not decode, kept by a reader that set_keep_undecodable() (see
+    // return_loan_raw_failed()). Such a sample is READ, reports both bits,
+    // and is selected only by a mask with this bit: one that names it alone
+    // selects only such samples, and ANY_SAMPLE_STATE | this, every sample.
+    // Conditions and typed reads and takes, whose masks lack it, pass over it.
+    const SampleStateKind   UNDECODABLE_SAMPLE_STATE    = 0x0001 << 16;
 
     typedef unsigned long   ViewStateKind;
     const ViewStateKind     NEW_VIEW_STATE              = 0x0001 << 0;
@@ -1289,6 +1296,29 @@ module DDS {
             inout OctetSeqSeq   cdr_payloads,
             inout OctetSeq      key_hashes,
             inout SampleInfoSeq sample_infos);
+
+        // Release a prior loan-mode take_raw()/read_raw()/
+        // take_next_instance_raw()/read_next_instance_raw() result, as
+        // return_loan_raw() does, naming the samples its caller could not
+        // decode: failed holds one octet per returned sample, nonzero for one
+        // that failed. What becomes of those is set_keep_undecodable()'s
+        // policy. By default a taken one is dropped, with a warning logged
+        // once, and a read one left as it was. Kept, a taken one returns to
+        // the reader and a read one stays, each marked
+        // UNDECODABLE_SAMPLE_STATE, raising no DATA_AVAILABLE
+        // (docs/design/concurrency/operation-effects.md#two-step-take).
+        // BAD_PARAMETER if failed's length is not the result's, and
+        // PRECONDITION_NOT_MET for a copy-mode result, which only
+        // return_loan_raw() releases; either way nothing is released.
+        ReturnCode_t return_loan_raw_failed(
+            inout OctetSeqSeq   cdr_payloads,
+            inout OctetSeq      key_hashes,
+            inout SampleInfoSeq sample_infos,
+            in    OctetSeq      failed);
+
+        // Whether samples return_loan_raw_failed() names are kept, marked
+        // UNDECODABLE_SAMPLE_STATE, rather than dropped. Off by default.
+        ReturnCode_t set_keep_undecodable(in boolean keep);
     };
 
     // -----------------------------------------------------------------------

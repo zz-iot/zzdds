@@ -24,8 +24,10 @@ pub const WriteKind = enum { alive, dispose, unregister };
 pub const OwnedRawSample = struct {
     data: []u8,
     info: DDS.SampleInfo,
+    /// Set by a typed reader whose decode of it failed (zzdds's two-step take).
+    failed: bool = false,
 
-    pub fn deinit(self: @This()) void {
+    pub fn deinit(self: *const @This()) void {
         std.heap.page_allocator.free(self.data);
     }
 };

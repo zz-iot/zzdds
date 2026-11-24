@@ -232,6 +232,22 @@ Batching applies to the read/take side only. Write-loans stay single-buffer, non
 by design (see below) — batch write-loans were never proposed and aren't needed for the
 single-owner write-loan lifecycle.
 
+## Failed decodes: `return_loan_raw_failed`
+
+A loan whose caller could not decode some of its samples ends with `return_loan_raw_failed`
+rather than `return_loan_raw`, naming them with one octet per sample. By default a taken
+one is dropped and a read one left as it was. A reader that `set_keep_undecodable` keeps
+them instead, marked `UNDECODABLE_SAMPLE_STATE`, a sample-state bit outside
+`ANY_SAMPLE_STATE`: a taken one goes back to its place in the reader. zidl's typed reads
+and takes use this, and the Zig `OwnedRawSample` is a one-sample loan whose `failed` flag
+does the same. See
+[`concurrency/operation-effects.md`](concurrency/operation-effects.md#two-step-take).
+
+Two rules keep this safe. A sample taken on loan holds its instance from being forgotten
+until the loan ends, so the loan's instance handles stay valid and a restored sample finds
+its instance. A copy-mode take of a sample a read loan still pins copies it rather than
+freeing it under the loan.
+
 ## Owner handles: opaque, never a bare pointer
 
 Every loan operation (read or write, single or batch) hands back an opaque owner/loan

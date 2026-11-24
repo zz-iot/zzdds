@@ -300,6 +300,10 @@ public:
     ::DDS::ReturnCode_t return_loan_raw(DDS_OctetSeqSeq& cdr_payloads, DDS_OctetSeq& key_hashes, DDS_SampleInfoSeq& sample_infos) override {
         return dds_.return_loan_raw(cdr_payloads, key_hashes, sample_infos);
     }
+    ::DDS::ReturnCode_t return_loan_raw_failed(DDS_OctetSeqSeq& cdr_payloads, DDS_OctetSeq& key_hashes, DDS_SampleInfoSeq& sample_infos, ::DDS::OctetSeq failed) override {
+        return dds_.return_loan_raw_failed(cdr_payloads, key_hashes, sample_infos, std::move(failed));
+    }
+    ::DDS::ReturnCode_t set_keep_undecodable(bool keep) override { return dds_.set_keep_undecodable(keep); }
 
     // See TopicSupport's matching comment.
     // Identifies this class's entries in the family's shared cache.
