@@ -28,7 +28,10 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   and its reader cannot be deleted while one is out.
 - A sample taken on loan holds its instance from being forgotten until the loan ends, so a
   loan's instance handles stay valid. A copy-mode take of a sample a read loan still pins
-  copies it; before, it freed it under the loan.
+  copies it, made before the take changes anything; before, it freed it under the loan.
+- Within an ordered access (`Subscriber::begin_access`), a loan-mode read or take, and so
+  a typed one in any binding, returns only the samples `begin_access` ordered; later
+  arrivals wait for `end_access`. Before, only the Zig `takeRaw` kept to that.
 
 ## 2026-11-23
 
