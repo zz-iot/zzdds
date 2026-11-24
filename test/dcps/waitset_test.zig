@@ -1385,6 +1385,8 @@ test "QueryCondition: the query is evaluated holding the lock set_query_paramete
     const a = testing.allocator;
     const qc = try makeParamQC(a, "x = %0");
     defer qc.deinit();
+    // Built without the content-subscription profile, no query is evaluated.
+    if (qc.parsed_expr == null) return error.SkipZigTest;
     var params = [_][*:0]const u8{"1"};
     const p = stringSeq(&params);
     try testing.expectEqual(DDS.RETCODE_OK, qc.toDDSQueryCondition().set_query_parameters(&p));
