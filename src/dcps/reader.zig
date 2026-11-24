@@ -2872,10 +2872,15 @@ pub const DataReaderImpl = struct {
             pc.quiesce.release(pc, PendingChange.reallyFree);
             return false;
         }
+        // Within an ordered access, the sample came from the ordered window
+        // (a loan takes from nowhere else) and goes back into it.
+        const window = self.ordered_access_watermark;
+        if (window) |wm| at = @min(at, wm);
         self.pending.insert(self.alloc, at, pc) catch {
             pc.quiesce.release(pc, PendingChange.reallyFree);
             return false;
         };
+        if (self.ordered_access_watermark) |*wm| wm.* += 1;
         pc.info.sample_state = DDS.READ_SAMPLE_STATE | DDS.UNDECODABLE_SAMPLE_STATE;
         if (replaces) {
             // The instance's oldest, perhaps `pc` itself.
@@ -2883,6 +2888,9 @@ pub const DataReaderImpl = struct {
                 if (other.info.instance_handle != ih) continue;
                 const evicted = self.pending.orderedRemove(i);
                 evicted.quiesce.beginTeardown(evicted, PendingChange.reallyFree);
+                if (self.ordered_access_watermark) |*wm| if (i < wm.*) {
+                    wm.* -= 1;
+                };
                 break;
             }
         }

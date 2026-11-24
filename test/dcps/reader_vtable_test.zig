@@ -1865,3 +1865,31 @@ test "the reader's own single take of a pinned sample: out of memory for its cop
     try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
     try testing.expect(dr.status_changes & DDS.DATA_AVAILABLE_STATUS != 0);
 }
+
+test "return_loan_raw_failed: within an ordered access, a restored sample goes back into the ordered window" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    _ = dr_dds.vtable.set_keep_undecodable(dr_dds.ptr, true);
+    for ([_]u8{ 0xA, 0xB, 0xC }, 1..) |b, k| dr.pushBuiltinCdr(&sample(b), keyOf(@intCast(k)), DDS.HANDLE_NIL, .alive);
+    {
+        dr.mu.lock();
+        defer dr.mu.unlock();
+        dr.ordered_access_watermark = 2;
+    }
+
+    var a: RawLoan = .{};
+    try a.take(dr_dds, DDS.ANY_SAMPLE_STATE, 1);
+    try testing.expectEqual(DDS.RETCODE_OK, a.returnLoanFailed(dr_dds, &.{1}));
+    try testing.expectEqual(@as(?usize, 2), dr.ordered_access_watermark);
+    // A typed take passes over the undecodable A and still gets B, not C.
+    var b: RawLoan = .{};
+    try b.take(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    try testing.expectEqual(@as(usize, 1), b.len());
+    try testing.expectEqual(@as(u8, 0xB), b.byte(0));
+    try b.returnLoan(dr_dds);
+    try testing.expectEqual(@as(?usize, 1), dr.ordered_access_watermark);
+}
