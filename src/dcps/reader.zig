@@ -1572,6 +1572,11 @@ pub const DataReaderImpl = struct {
                     if (self.pending.items[i].info.instance_handle == ih) {
                         const evicted = self.pending.orderedRemove(i);
                         evicted.quiesce.beginTeardown(evicted, PendingChange.reallyFree);
+                        // One from the ordered window shrinks it: the
+                        // replacement arrived after begin_access.
+                        if (self.ordered_access_watermark) |*wm| if (i < wm.*) {
+                            wm.* -= 1;
+                        };
                         break;
                     }
                 }
@@ -2235,15 +2240,51 @@ pub const DataReaderImpl = struct {
     /// A ReadCondition's trigger. A sample kept undecodable does not count:
     /// no typed read or take would return it, so a WaitSet must not wake for
     /// it. (The condition's own state masks are not applied here.)
-    pub fn hasPendingDataFn(ctx: *anyopaque) bool {
+    pub fn hasPendingDataFn(ctx: *anyopaque, rc: *const waitset.ReadConditionImpl) bool {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.hasSelectableData(rc.sample_state_mask, rc.view_state_mask, rc.instance_state_mask, rc.owner_qc);
+    }
+
+    /// Whether a read or take with these masks (and query) would return a
+    /// sample now: a ReadCondition's or QueryCondition's trigger. A queued
+    /// coherent set, not yet visible, counts too.
+    pub fn hasSelectableData(
+        self: *Self,
+        sample_mask: DDS.SampleStateMask,
+        view_mask: DDS.ViewStateMask,
+        instance_mask: DDS.InstanceStateMask,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
+    ) bool {
         self.mu.lock();
         defer self.mu.unlock();
         if (self.coherent_committed_ready) return true;
-        for (self.pending.items) |pc| {
-            if (pc.info.sample_state & DDS.UNDECODABLE_SAMPLE_STATE == 0) return true;
+        // A sample past its lifespan, which a read or take would purge,
+        // does not count; the check purges nothing itself.
+        const now_ns = time_mod.nanoTimestamp();
+        for (self.pending.items[0..self.orderedWindowLocked()]) |pc| {
+            if (pc.expiry_ns) |exp| if (now_ns >= exp) continue;
+            if (self.selects(pc, sample_mask, view_mask, instance_mask, null, maybe_qc)) return true;
         }
         return false;
+    }
+
+    /// Wakes the WaitSets with a ReadCondition on this reader to rescan:
+    /// samples or their states changed. With `mu` held.
+    pub fn notifyDataWaitersLocked(self: *Self) void {
+        for (self.data_notifiers.items) |n| n.on_data(n.ctx);
+    }
+
+    /// Ends an ordered access (`Subscriber::end_access`): the samples that
+    /// arrived since `begin_access` become selectable. With `mu` held.
+    pub fn endOrderedAccessLocked(self: *Self) void {
+        self.ordered_access_watermark = null;
+        if (self.pending.items.len == 0) return;
+        // Re-arm DATA_AVAILABLE_STATUS so StatusCondition users wake on the
+        // next wait rather than missing the deferred samples, and wake
+        // ReadCondition WaitSets to rescan.
+        self.markDataAvailableLocked();
+        if (self.status_cond) |sc| sc.notifyWakeup();
+        self.notifyDataWaitersLocked();
     }
 
     pub fn hasPendingData(self: *Self) bool {
@@ -2333,38 +2374,7 @@ pub const DataReaderImpl = struct {
     /// Expired samples (LIFESPAN QoS) are silently discarded.
     /// The caller owns TakenSample.data and must free it with the reader's allocator.
     pub fn takeRaw(self: *Self) ?TakenSample {
-        self.mu.lock();
-        defer self.mu.unlock();
-        defer self.reclaimInstancesLocked();
-        self.resetDataAvailableLocked();
-        const now_ns = time_mod.nanoTimestamp();
-        while (self.pending.items.len > 0) {
-            // Honour the ordered-access window set by Subscriber.begin_access().
-            // Samples appended after the sort (new network arrivals during the window
-            // between begin_access and end_access) must not leak into the sorted batch;
-            // end_access() raises DATA_AVAILABLE again for them.
-            if (self.ordered_access_watermark) |wm| if (wm == 0) return null;
-            const pc = self.pending.orderedRemove(0);
-            if (self.ordered_access_watermark) |*wm| wm.* -= 1;
-            if (pc.expiry_ns) |exp| {
-                if (now_ns >= exp) {
-                    pc.quiesce.beginTeardown(pc, PendingChange.reallyFree);
-                    continue;
-                }
-            }
-            const info = pc.info;
-            const copy: ?[]u8 = if (pc.quiesce.shared()) self.alloc.dupe(u8, pc.data) catch {
-                // Out of memory: the sample stays, and so does its signal.
-                self.pending.insertAssumeCapacity(0, pc);
-                if (self.ordered_access_watermark) |*wm| wm.* += 1;
-                self.markDataAvailableLocked();
-                return null;
-            } else null;
-            var result = [1]TakenSample{.{ .data = self.takeOutLocked(pc, copy), .info = info }};
-            self.finalizeGenerationRanksLocked(&result);
-            return result[0];
-        }
-        return null;
+        return self.takeOne(true, null);
     }
 
     /// DDS take_next_instance semantics: dequeue one sample belonging to the
@@ -2374,55 +2384,7 @@ pub const DataReaderImpl = struct {
     /// Returns null when the queue has no qualifying sample.
     /// The caller owns TakenSample.data and must free with the reader's allocator.
     pub fn takeNextInstanceRaw(self: *Self, prev_instance_handle: DDS.InstanceHandle_t) ?TakenSample {
-        self.mu.lock();
-        defer self.mu.unlock();
-        defer self.reclaimInstancesLocked();
-        self.resetDataAvailableLocked();
-
-        const now_ns = time_mod.nanoTimestamp();
-
-        // Purge expired samples before scanning for the target instance.
-        var i: usize = 0;
-        while (i < self.pending.items.len) {
-            const pc = self.pending.items[i];
-            if (pc.expiry_ns) |exp| {
-                if (now_ns >= exp) {
-                    const expired = self.pending.orderedRemove(i);
-                    expired.quiesce.beginTeardown(expired, PendingChange.reallyFree);
-                    continue;
-                }
-            }
-            i += 1;
-        }
-
-        // Find the target instance handle.
-        var target_ih: ?DDS.InstanceHandle_t = null;
-        for (self.pending.items) |pc| {
-            const ih = pc.info.instance_handle;
-            if (prev_instance_handle == 0) {
-                if (target_ih == null or ih < target_ih.?) target_ih = ih;
-            } else if (ih > prev_instance_handle) {
-                if (target_ih == null or ih < target_ih.?) target_ih = ih;
-            }
-        }
-        const tgt = target_ih orelse return null;
-
-        for (self.pending.items, 0..) |pc, idx| {
-            if (pc.info.instance_handle == tgt) {
-                const info = pc.info;
-                const copy: ?[]u8 = if (pc.quiesce.shared()) self.alloc.dupe(u8, pc.data) catch {
-                    // Out of memory: the sample stays, and so does its signal.
-                    self.markDataAvailableLocked();
-                    return null;
-                } else null;
-                const data = self.takeOutLocked(pc, copy);
-                _ = self.pending.orderedRemove(idx);
-                var result = [1]TakenSample{.{ .data = data, .info = info }};
-                self.finalizeGenerationRanksLocked(&result);
-                return result[0];
-            }
-        }
-        return null;
+        return self.takeOne(true, prev_instance_handle);
     }
 
     /// Non-destructive analog to takeNextInstanceRaw: return (without removing) one
@@ -2431,49 +2393,26 @@ pub const DataReaderImpl = struct {
     /// Returns null when no qualifying sample exists.
     /// The caller owns TakenSample.data and must free with the reader's allocator.
     pub fn readNextInstanceRaw(self: *Self, prev_instance_handle: DDS.InstanceHandle_t) ?TakenSample {
-        self.mu.lock();
-        defer self.mu.unlock();
-        defer self.reclaimInstancesLocked();
-        self.resetDataAvailableLocked();
+        return self.takeOne(false, prev_instance_handle);
+    }
 
-        const now_ns = time_mod.nanoTimestamp();
-
-        // Purge expired samples before scanning.
-        var i: usize = 0;
-        while (i < self.pending.items.len) {
-            const pc = self.pending.items[i];
-            if (pc.expiry_ns) |exp| {
-                if (now_ns >= exp) {
-                    const expired = self.pending.orderedRemove(i);
-                    expired.quiesce.beginTeardown(expired, PendingChange.reallyFree);
-                    continue;
-                }
-            }
-            i += 1;
-        }
-
-        // Find the target instance handle (smallest ih > prev, or smallest overall if prev == 0).
-        var target_ih: ?DDS.InstanceHandle_t = null;
-        for (self.pending.items) |pc| {
-            const ih = pc.info.instance_handle;
-            if (prev_instance_handle == 0) {
-                if (target_ih == null or ih < target_ih.?) target_ih = ih;
-            } else if (ih > prev_instance_handle) {
-                if (target_ih == null or ih < target_ih.?) target_ih = ih;
-            }
-        }
-        const tgt = target_ih orelse return null;
-
-        for (self.pending.items) |pc| {
-            if (pc.info.instance_handle == tgt) {
-                const clone = self.alloc.dupe(u8, pc.data) catch return null;
-                markRead(pc);
-                var result = [1]TakenSample{.{ .data = clone, .info = pc.info }};
-                self.finalizeGenerationRanksLocked(&result);
-                return result[0];
-            }
-        }
-        return null;
+    /// One sample, any state, taken (`destructive`) or read, as the batch
+    /// selections do, from the next instance after `next_after` if given:
+    /// null if none, or out of memory, which changes nothing.
+    fn takeOne(self: *Self, destructive: bool, next_after: ?DDS.InstanceHandle_t) ?TakenSample {
+        var out: std.ArrayListUnmanaged(TakenSample) = .empty;
+        defer out.deinit(self.alloc);
+        const any = .{ DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE };
+        (if (next_after) |prev|
+            (if (destructive)
+                self.takeNextInstanceFiltered(&out, prev, any[0], any[1], any[2], 1, null)
+            else
+                self.readNextInstanceFiltered(&out, prev, any[0], any[1], any[2], 1, null))
+        else if (destructive)
+            self.takeFiltered(&out, any[0], any[1], any[2], 1, null, null)
+        else
+            self.readRaw(&out, any[0], any[1], any[2], 1, null, null)) catch return null;
+        return if (out.items.len == 0) null else out.items[0];
     }
 
     /// DDS `take_next_instance_w_condition` semantics: like `takeNextInstanceRaw`,
@@ -2537,6 +2476,8 @@ pub const DataReaderImpl = struct {
             }
         }
         self.pending.items.len = write;
+        // What it took came from the ordered window, which shrinks by as much.
+        if (self.ordered_access_watermark) |*wm| wm.* -= out.items.len - start;
         self.finalizeGenerationRanksLocked(out.items[start..]);
     }
 
@@ -2571,6 +2512,9 @@ pub const DataReaderImpl = struct {
     ) error{OutOfMemory}!void {
         self.mu.lock();
         defer self.mu.unlock();
+        // Marking samples READ, and their instances NOT_NEW, can make a
+        // condition with other masks true: its WaitSets rescan.
+        defer self.notifyDataWaitersLocked();
         defer self.reclaimInstancesLocked();
         self.purgeExpiredLocked();
         const ih_sel = self.nextInstanceLocked(prev_instance_handle, sample_mask, view_mask, instance_mask, maybe_qc);
@@ -2664,6 +2608,9 @@ pub const DataReaderImpl = struct {
     ) error{OutOfMemory}!void {
         self.mu.lock();
         defer self.mu.unlock();
+        // Marking samples READ, and their instances NOT_NEW, can make a
+        // condition with other masks true: its WaitSets rescan.
+        defer self.notifyDataWaitersLocked();
         defer self.reclaimInstancesLocked();
         self.purgeExpiredLocked();
         const ih_sel: ?void = {};
@@ -2758,6 +2705,9 @@ pub const DataReaderImpl = struct {
     ) error{OutOfMemory}![]*PendingChange {
         self.mu.lock();
         defer self.mu.unlock();
+        // Marking samples READ, and their instances NOT_NEW, can make a
+        // condition with other masks true: its WaitSets rescan.
+        defer self.notifyDataWaitersLocked();
         defer self.reclaimInstancesLocked();
         self.purgeExpiredLocked();
         const window = self.pending.items[0..self.orderedWindowLocked()];
@@ -3095,6 +3045,9 @@ pub const DataReaderImpl = struct {
     ) error{OutOfMemory}![]*PendingChange {
         self.mu.lock();
         defer self.mu.unlock();
+        // Marking samples READ, and their instances NOT_NEW, can make a
+        // condition with other masks true: its WaitSets rescan.
+        defer self.notifyDataWaitersLocked();
         defer self.reclaimInstancesLocked();
         self.purgeExpiredLocked();
         const ih_sel = self.nextInstanceLocked(prev_instance_handle, sample_mask, view_mask, instance_mask, maybe_qc);
@@ -3168,6 +3121,8 @@ pub const DataReaderImpl = struct {
             }
         }
         self.pending.items.len = write;
+        // What it took came from the ordered window, which shrinks by as much.
+        if (self.ordered_access_watermark) |*wm| wm.* -= out.items.len;
         self.holdInstancesLocked(out.items);
         self.finalizeGenerationRanksLockedPinned(out.items);
         _ = self.outstanding_loans.fetchAdd(out.items.len, .monotonic);
@@ -3237,6 +3192,8 @@ pub const DataReaderImpl = struct {
             }
         }
         self.pending.items.len = write;
+        // What it took came from the ordered window, which shrinks by as much.
+        if (self.ordered_access_watermark) |*wm| wm.* -= out.items.len - start;
         self.finalizeGenerationRanksLocked(out.items[start..]);
     }
 
@@ -3249,6 +3206,10 @@ pub const DataReaderImpl = struct {
                 if (now_ns >= exp) {
                     const expired = self.pending.orderedRemove(ei);
                     expired.quiesce.beginTeardown(expired, PendingChange.reallyFree);
+                    // One from the ordered window shrinks it.
+                    if (self.ordered_access_watermark) |*wm| if (ei < wm.*) {
+                        wm.* -= 1;
+                    };
                     continue;
                 }
             }
@@ -3282,7 +3243,9 @@ pub const DataReaderImpl = struct {
         maybe_ih: ?DDS.InstanceHandle_t,
         maybe_qc: ?*const waitset.QueryConditionImpl,
     ) usize {
-        return self.countSelectedInLocked(self.pending.items, sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc);
+        // Within an ordered access, only the samples begin_access ordered:
+        // a prefix of `pending`, so the first `n` a selection finds are in it.
+        return self.countSelectedInLocked(self.pending.items[0..self.orderedWindowLocked()], sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc);
     }
 
     fn countSelectedInLocked(
@@ -3304,9 +3267,10 @@ pub const DataReaderImpl = struct {
         return n;
     }
 
-    /// How many of `pending`'s samples a loan-mode read or take may select:
-    /// within an ordered access (`Subscriber.begin_access`), only those
-    /// ordered then (`ordered_access_watermark`). Caller holds `mu`.
+    /// How many of `pending`'s samples a read or take may select: within an
+    /// ordered access (`Subscriber.begin_access`), only those ordered then
+    /// (`ordered_access_watermark`). A take lowers the watermark by what it
+    /// takes. Caller holds `mu`.
     fn orderedWindowLocked(self: *const Self) usize {
         const wm = self.ordered_access_watermark orelse return self.pending.items.len;
         return @min(wm, self.pending.items.len);
@@ -3324,7 +3288,7 @@ pub const DataReaderImpl = struct {
         maybe_qc: ?*const waitset.QueryConditionImpl,
     ) ?DDS.InstanceHandle_t {
         var target: ?DDS.InstanceHandle_t = null;
-        for (self.pending.items) |pc| {
+        for (self.pending.items[0..self.orderedWindowLocked()]) |pc| {
             const ih = pc.info.instance_handle;
             if (prev != 0 and ih <= prev) continue;
             if (target != null and ih >= target.?) continue;
@@ -5122,7 +5086,7 @@ test "coherent access: WaitSet trigger survives multiple queued committed sets (
     try dr.coherent_committed.append(alloc, set2);
     dr.coherent_committed_ready = true;
 
-    try testing.expect(DataReaderImpl.hasPendingDataFn(@ptrCast(&dr)));
+    try testing.expect(dr.hasSelectableData(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, null));
 
     // First begin_access(): promotes set 1 only. Set 2 stays queued.
     dr.commitCoherentPendingLocked();
@@ -5140,7 +5104,7 @@ test "coherent access: WaitSet trigger survives multiple queued committed sets (
     // The regression: without also checking coherent_committed_ready, this
     // would wrongly return false here, permanently starving the WaitSet even
     // though set 2 is still waiting.
-    try testing.expect(DataReaderImpl.hasPendingDataFn(@ptrCast(&dr)));
+    try testing.expect(dr.hasSelectableData(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, null));
 
     // Second begin_access(): promotes set 2. Nothing left after this.
     dr.commitCoherentPendingLocked();
@@ -5152,7 +5116,7 @@ test "coherent access: WaitSet trigger survives multiple queued committed sets (
         pc.quiesce.beginTeardown(pc, PendingChange.reallyFree);
     }
 
-    try testing.expect(!DataReaderImpl.hasPendingDataFn(@ptrCast(&dr)));
+    try testing.expect(!dr.hasSelectableData(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, null));
 }
 
 test "takeRaw: expired LIFESPAN sample is silently discarded" {

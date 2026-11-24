@@ -10,6 +10,14 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-24
 
+- A ReadCondition's trigger applies its state masks, and a QueryCondition's its query,
+  too: it is true while a read or take with them would return a sample. Before, either was
+  true while the reader held any sample, so a WaitSet woke for one its read could not
+  return, such as a NOT_READ condition over READ samples.
+- Within an ordered access (`Subscriber::begin_access`), every read and take keeps to the
+  samples `begin_access` ordered, next-instance and copy-mode ones too, and a condition's
+  trigger sees only those. A sample whose lifespan ends within that batch no longer lets
+  a later arrival in.
 - A blocking call from a listener on a hosted runtime helps the runtime, as on a manual
   runtime, rather than block the worker running it, which may be the only one free to
   process what the call waits for: `wait_for_acknowledgments` on a writer or publisher,

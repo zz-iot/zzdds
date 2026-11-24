@@ -82,7 +82,7 @@ var g_has_data: bool = false;
 var g_reader_sentinel: u8 = 0;
 var g_notify_fn: ?DataNotifyFn = null;
 
-fn readerHasData(_: *anyopaque) bool {
+fn readerHasData(_: *anyopaque, _: *const ReadConditionImpl) bool {
     return g_has_data;
 }
 fn readerAddNotify(_: *anyopaque, n: DataNotifyFn) bool {
