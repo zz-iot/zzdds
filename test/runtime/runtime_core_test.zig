@@ -1015,20 +1015,20 @@ test "hosted workers keep each context's turns exclusive while threads submit" {
     runtime.deinit();
 }
 
-/// Records, in its turn, whether a blocking wait there may hold up progress.
+/// Records, in its turn, whether a blocking wait there helps the runtime.
 const WaitProbe = struct {
     req: rt.Request = rt.Request.init(run),
     runtime: *rt.Runtime,
-    blocks: ?bool = null,
+    helps: ?bool = null,
 
     fn run(req: *rt.Request, _: *rt.Turn) rt.Outcome {
         const self: *WaitProbe = @fieldParentPtr("req", req);
-        self.blocks = self.runtime.waitsBlockProgress();
+        self.helps = self.runtime.helpsHere();
         return .done;
     }
 };
 
-test "only a wait in a hosted runtime's turn may hold up its progress" {
+test "a wait helps a manual runtime anywhere, and a hosted one only in its turns" {
     // A manual runtime's waiter helps, in a turn or not.
     var m: Manual = undefined;
     m.init(.{ .mode = .manual });
@@ -1036,13 +1036,13 @@ test "only a wait in a hosted runtime's turn may hold up its progress" {
     var mprobe = WaitProbe{ .runtime = &m.runtime };
     try m.runtime.submit(null, &mctx, &mprobe.req);
     _ = try m.runtime.drive(10, 0);
-    try testing.expectEqual(@as(?bool, false), mprobe.blocks);
-    try testing.expect(!m.runtime.waitsBlockProgress());
+    try testing.expectEqual(@as(?bool, true), mprobe.helps);
+    try testing.expect(m.runtime.helpsHere());
     mctx.deinit();
     try m.retire();
 
-    // A hosted runtime's one worker, in a turn, may be the one a wait needs;
-    // a thread outside its turns is not.
+    // A hosted runtime's worker, in a turn, may be the one a wait needs, so
+    // the wait helps; a thread outside its turns only observes.
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
     var backend = rt.IoBackend.init(threaded.io());
@@ -1050,7 +1050,7 @@ test "only a wait in a hosted runtime's turn may hold up its progress" {
     var ctx = rt.Context.init(&runtime, 4);
     var probe = WaitProbe{ .runtime = &runtime };
     try runtime.submit(null, &ctx, &probe.req);
-    try testing.expect(!runtime.waitsBlockProgress());
+    try testing.expect(!runtime.helpsHere());
     var hosted = try rt.Hosted.init(testing.allocator, threaded.io(), &runtime, 1);
     hosted.start() catch |err| {
         runtime.releaseOwner();
@@ -1059,7 +1059,7 @@ test "only a wait in a hosted runtime's turn may hold up its progress" {
     };
     runtime.releaseOwner();
     hosted.join();
-    try testing.expectEqual(@as(?bool, true), probe.blocks);
+    try testing.expectEqual(@as(?bool, true), probe.helps);
     ctx.deinit();
     runtime.deinit();
 }

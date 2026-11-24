@@ -823,9 +823,8 @@ pub const DataWriterImpl = struct {
     /// destroyed and discovery withdraws it, which a reader may learn of
     /// before the unregisters arrive, dropping them: a RELIABLE writer waits
     /// for its matched readers to acknowledge them, for up to RELIABILITY
-    /// `max_blocking_time`, as a blocking write would. Not in a hosted
-    /// runtime's turn, as a listener deleting it runs: that worker may be the
-    /// one to process the acknowledgments.
+    /// `max_blocking_time`, as a blocking write would: from a listener, the
+    /// wait helps the runtime run the turns that process them.
     pub fn unregisterAllForDelete(self: *Self) void {
         const kind: history_mod.ChangeKind = if (self.autodispose.load(.monotonic))
             .not_alive_disposed_unregistered
@@ -858,7 +857,6 @@ pub const DataWriterImpl = struct {
         if (last_sn == null) return;
         if (self.qos.reliability.kind == .BEST_EFFORT_RELIABILITY_QOS) return;
         const runtime = self.listeners.runtimeOf();
-        if (runtime) |rt| if (rt.waitsBlockProgress()) return;
         const mbt = self.qos.reliability.max_blocking_time;
         const timeout_ns: ?i64 = if (mbt.sec == DDS.DURATION_INFINITE_SEC and mbt.nanosec == DDS.DURATION_INFINITE_NSEC) null else durationNs(mbt);
         // As wait_for_acknowledgments does: its frontier, the last write,

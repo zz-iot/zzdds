@@ -432,7 +432,9 @@ pub const Runtime = struct {
     timers: TimerHeap = .{},
     armed_timers: u32 = 0,
     timer_order: u64 = 0,
-    /// Blocking calls in `helpUntil`.
+    /// Blocking calls in `helpUntil`. Changed under `gate`, but always
+    /// accessed atomically: `wakeForWork` and a hosted turn's end read it
+    /// without `gate`.
     helpers: u32 = 0,
     /// Admissions and turns in progress. Incremented before the lifecycle
     /// state is read, so retirement cannot miss an admission.
@@ -579,7 +581,7 @@ pub const Runtime = struct {
         ctx.appendLocked(req);
         const scheduled = ctx.scheduleIfIdleLocked();
         ctx.gate.unlock();
-        if (scheduled) self.backend.wake();
+        if (scheduled) self.wakeForWork();
     }
 
     /// Submits work that continues an already admitted operation, using
@@ -614,7 +616,7 @@ pub const Runtime = struct {
         ctx.appendLocked(req);
         const scheduled = ctx.scheduleIfIdleLocked();
         ctx.gate.unlock();
-        if (scheduled) self.backend.wake();
+        if (scheduled) self.wakeForWork();
     }
 
     /// Makes a waiting request ready. A token from an older wait is ignored.
@@ -641,7 +643,7 @@ pub const Runtime = struct {
             else => {},
         }
         ctx.gate.unlock();
-        if (scheduled) self.backend.wake();
+        if (scheduled) self.wakeForWork();
     }
 
     /// Ends an admission or turn. Everything that lets a retiring runtime stop
@@ -803,9 +805,17 @@ pub const Runtime = struct {
         const on_closed = if (ctx.closeIfDrainedLocked()) ctx.on_closed else null;
         ctx.gate.unlock();
         self.endBusy();
-        if (scheduled) self.backend.wake();
-        // What the turn changed may end a helper's wait.
-        if (self.options.mode == .manual) self.wakeHelpers();
+        if (scheduled) self.wakeForWork();
+        // What the turn changed may end a helper's wait. A hosted runtime
+        // has helpers only in callback chains, so it reads their count
+        // without `gate`: a helper counts itself before its first `done`
+        // check, which synchronizes with the change it waits for, so a
+        // helper this misses sees the change there.
+        if (self.options.mode == .manual) {
+            self.wakeHelpers();
+        } else if (@atomicLoad(u32, &self.helpers, .seq_cst) > 0) {
+            self.backend.wakeAll();
+        }
         if (builtin.is_test) {
             if (self.test_hooks.before_on_done) |hook| {
                 self.test_hooks.before_on_done = null;
@@ -1002,32 +1012,37 @@ pub const Runtime = struct {
         return self.options.mode == .manual;
     }
 
-    /// Whether a blocking wait on this thread may hold up the progress it
-    /// waits for: in a turn of a hosted runtime, this thread is a worker
-    /// that may be the one to run that progress, and it cannot help, as a
-    /// manual runtime's waiter does (`helpUntil`).
-    pub fn waitsBlockProgress(self: *const Runtime) bool {
-        return !self.canHelp() and inTurn();
+    /// Whether a blocking call on this thread helps this runtime
+    /// (`helpUntil`): any caller of a manual runtime, and a callback-chain
+    /// caller of a hosted one, running one of its turns. That thread is one
+    /// of its workers, perhaps the only one free to run the work the call
+    /// waits for (docs/design/concurrency/operations.md#stable-helping-policy).
+    pub fn helpsHere(self: *const Runtime) bool {
+        if (self.canHelp()) return true;
+        const c = running_context orelse return false;
+        return c.runtime == self;
     }
 
-    /// For a blocking call on a manual runtime: waits until `done(ctx)` or
+    /// For a blocking call that `helpsHere`: waits until `done(ctx)` or
     /// until the runtime clock reaches `deadline_ns` (null: no deadline),
     /// running due timers and internal turns meanwhile, never listener turns
     /// (docs/design/concurrency/runtime.md#simple-driver-operation). Unlike
-    /// `drive`, any number of callers may help at once, alongside a driver.
-    /// A turn of this runtime ends the wait to recheck `done`; whatever else
-    /// can make it true calls `wakeHelpers`. Returns `done`'s last result.
+    /// `drive`, any number of callers may help at once, alongside a driver
+    /// or hosted workers. A turn of this runtime ends the wait to recheck
+    /// `done`; whatever else can make it true calls `wakeHelpers`. Returns
+    /// `done`'s last result.
     pub fn helpUntil(self: *Runtime, deadline_ns: ?i64, ctx: anytype, comptime done: fn (@TypeOf(ctx)) bool) bool {
-        std.debug.assert(self.canHelp());
+        std.debug.assert(self.helpsHere());
         // Counted before `done` is first checked, under `gate` as
         // `wakeHelpers` reads it: a change made before a waker's check is
-        // seen by that first check.
+        // seen by that first check. Atomic for `wakeForWork`, which reads it
+        // without `gate`.
         self.gate.lock();
-        self.helpers += 1;
+        _ = @atomicRmw(u32, &self.helpers, .Add, 1, .seq_cst);
         self.gate.unlock();
         defer {
             self.gate.lock();
-            self.helpers -= 1;
+            _ = @atomicRmw(u32, &self.helpers, .Sub, 1, .seq_cst);
             self.gate.unlock();
         }
         while (true) {
@@ -1058,9 +1073,23 @@ pub const Runtime = struct {
     /// this runtime's turns that may satisfy one.
     pub fn wakeHelpers(self: *Runtime) void {
         self.gate.lock();
-        const helping = self.helpers > 0;
+        // Atomic: `wakeForWork` touches the count without `gate`.
+        const helping = @atomicLoad(u32, &self.helpers, .seq_cst) > 0;
         self.gate.unlock();
         if (helping) self.backend.wakeAll();
+    }
+
+    /// Wakes a waiter for a context made ready. A helper that took the
+    /// single wake might find only a listener turn, which it never runs,
+    /// while a driver or worker that could run it sleeps on; so with helpers,
+    /// every waiter wakes too. The count is read after the wake: a helper
+    /// waiting when the wake was issued counted itself before it began to
+    /// wait, and a read-modify-write, unlike a load, cannot miss that count
+    /// in favour of an older value. One counted later began waiting after
+    /// the wake, which it cannot take.
+    fn wakeForWork(self: *Runtime) void {
+        self.backend.wake();
+        if (@atomicRmw(u32, &self.helpers, .Add, 0, .seq_cst) > 0) self.backend.wakeAll();
     }
 
     /// One hosted worker's loop: run ready work, otherwise wait for it, until

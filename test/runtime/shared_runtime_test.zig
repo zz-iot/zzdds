@@ -2303,6 +2303,98 @@ test "a wait from a listener helps internal work and runs no other listener" {
     m.runtime.deinit();
 }
 
+/// From a reader's first data listener call, on a hosted runtime's only
+/// worker, blocks on what only that worker can supply: the acknowledgment of
+/// a further write, or room in a writer that holds two (`limitedWriter`).
+/// Triggered by a write from the test once the pair is set up.
+const BlockFromListener = struct {
+    pair: *Pair,
+    io: std.Io,
+    action: enum { wait_for_acks, fill_history },
+    called: std.atomic.Value(bool) = .init(false),
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+    failed: ?anyerror = null,
+    done: std.Io.Event = .unset,
+
+    fn listener(self: *BlockFromListener) DDS.DataReaderListener {
+        return .{ .listener_data = self, .on_data_available = onData };
+    }
+
+    fn onData(_: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
+        const self: *BlockFromListener = @ptrCast(@alignCast(ld.?));
+        if (self.called.swap(true, .acq_rel)) return;
+        defer self.done.set(self.io);
+        switch (self.action) {
+            .wait_for_acks => {
+                self.pair.write(1) catch |err| {
+                    self.failed = err;
+                    return;
+                };
+                self.rc = self.pair.dw_h.wait_for_acknowledgments(seconds(1));
+            },
+            // Two more fill the history if the first is not yet
+            // acknowledged; the third finds it full either way.
+            .fill_history => for (1..4) |i| self.pair.write(i) catch |err| {
+                self.failed = err;
+                return;
+            },
+        }
+    }
+
+    /// Sets up `pair` on `h`'s runtime with this listener on its reader,
+    /// and writes the sample that calls it.
+    fn run(self: *BlockFromListener, h: *HostedRuntime, o_in: PairOptions) !void {
+        var o = o_in;
+        o.dr_listener = self.listener();
+        o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+        self.pair.initWith(&h.runtime, o) catch |err| {
+            h.runtime.releaseOwner();
+            h.hosted.join();
+            return err;
+        };
+        h.runtime.releaseOwner();
+        try self.pair.write(0);
+        try self.done.waitTimeout(self.io, ten_seconds);
+    }
+};
+
+/// RELIABLE KEEP_ALL endpoints.
+fn reliablePair() PairOptions {
+    var o: PairOptions = .{};
+    o.dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    o.dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    o.dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    o.dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    return o;
+}
+
+test "a wait for acknowledgments from a listener on a hosted runtime's only worker helps it" {
+    // The worker running the listener is the only one to process the
+    // reader's acknowledgment: waiting without helping would time out.
+    var h: HostedRuntime = undefined;
+    try h.init(1);
+    var pair: Pair = undefined;
+    var bl: BlockFromListener = .{ .pair = &pair, .io = h.io(), .action = .wait_for_acks };
+    try bl.run(&h, reliablePair());
+    try testing.expectEqual(@as(?anyerror, null), bl.failed);
+    try testing.expectEqual(DDS.RETCODE_OK, bl.rc);
+
+    try pair.deinit();
+    try h.deinit();
+}
+
+test "a write blocked on resource limits from a listener on a hosted runtime's only worker helps it" {
+    var h: HostedRuntime = undefined;
+    try h.init(1);
+    var pair: Pair = undefined;
+    var bl: BlockFromListener = .{ .pair = &pair, .io = h.io(), .action = .fill_history };
+    try bl.run(&h, limitedWriter(.VOLATILE_DURABILITY_QOS));
+    try testing.expectEqual(@as(?anyerror, null), bl.failed);
+
+    try pair.deinit();
+    try h.deinit();
+}
+
 // ── Deletion and running listeners ────────────────────────────────────────────
 
 /// A hosted runtime and its workers. Must not move after `init`.
