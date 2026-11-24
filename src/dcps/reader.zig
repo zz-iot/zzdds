@@ -146,6 +146,14 @@ fn durationIsActive(d: DDS.Duration_t) bool {
 /// `coherent_committed` stay by-value (unaffected) — they stage samples
 /// *before* they become reachable via `pending`, so nothing can loan them
 /// yet.
+/// A raw read's or take's loan-mode result, kept in `loan_table` until
+/// `return_loan_raw` or `return_loan_raw_failed` ends it.
+const Loan = struct {
+    pcs: []*PendingChange,
+    /// Taken (out of the queue) rather than read (pinned in it).
+    taken: bool,
+};
+
 pub const PendingChange = struct {
     /// Full CDR payload (4-byte encap header + CDR bytes).  Owned by this struct.
     /// Empty for NOT_ALIVE_DISPOSED / NOT_ALIVE_UNREGISTERED changes.
@@ -177,6 +185,9 @@ pub const PendingChange = struct {
     /// (destructive) loan, where the initial count=1 already *is* the loan's
     /// own sole reference -- see that function's doc comment.
     quiesce: EntityQuiesce = .{},
+    /// When it joined the reader's queue, in the reader's own count: a
+    /// sample a failed decode restores goes back among the others by it.
+    arrival: u64 = 0,
 
     /// By-value free — still used for `CoherentWipEntry.samples`/
     /// `coherent_committed` entries, which remain by-value (see the type
@@ -368,6 +379,11 @@ const NotAlive = struct {
     held: bool = false,
 };
 
+/// Marks `pc` READ, keeping `UNDECODABLE_SAMPLE_STATE`.
+fn markRead(pc: *PendingChange) void {
+    pc.info.sample_state = DDS.READ_SAMPLE_STATE | (pc.info.sample_state & DDS.UNDECODABLE_SAMPLE_STATE);
+}
+
 fn matchesSample(
     pc: *const PendingChange,
     sample_mask: DDS.SampleStateMask,
@@ -375,7 +391,11 @@ fn matchesSample(
     instance_mask: DDS.InstanceStateMask,
     maybe_ih: ?DDS.InstanceHandle_t,
 ) bool {
-    if (pc.info.sample_state & sample_mask == 0) return false;
+    // A sample kept undecodable is selected only by a mask that names it
+    // (`UNDECODABLE_SAMPLE_STATE`), whatever else the mask has.
+    if (pc.info.sample_state & DDS.UNDECODABLE_SAMPLE_STATE != 0) {
+        if (sample_mask & DDS.UNDECODABLE_SAMPLE_STATE == 0) return false;
+    } else if (pc.info.sample_state & sample_mask == 0) return false;
     if (pc.info.view_state & view_mask == 0) return false;
     if (pc.info.instance_state & instance_mask == 0) return false;
     if (maybe_ih) |ih| if (pc.info.instance_handle != ih) return false;
@@ -452,6 +472,17 @@ pub const DataReaderImpl = struct {
     /// Whether a BEST_EFFORT historical-data wait has warned, once per
     /// reader.
     warned_best_effort_history: std.atomic.Value(bool) = .init(false),
+    /// `set_keep_undecodable`: samples `return_loan_raw_failed` names are
+    /// kept, marked UNDECODABLE_SAMPLE_STATE, rather than dropped.
+    keep_undecodable: std.atomic.Value(bool) = .init(false),
+    /// Whether dropping an undecodable sample has been logged.
+    warned_undecodable: std.atomic.Value(bool) = .init(false),
+    /// The next `PendingChange.arrival`, under `mu`.
+    next_arrival: u64 = 0,
+    /// How many samples taken on loan hold each instance, by key hash,
+    /// under `mu`: an instance with one out is not forgotten, so a failed
+    /// decode can restore it and the loan's instance handles stay valid.
+    loan_holds: std.AutoArrayHashMapUnmanaged([16]u8, u32) = .empty,
     status_cond: ?*waitset.StatusConditionImpl,
 
     /// Cumulative count of incompatible-QoS events; incompat_total_change/
@@ -547,7 +578,7 @@ pub const DataReaderImpl = struct {
     /// used (`RawOutput`), guarded by `loan_table_mu`: the table always has
     /// room for them.
     loan_table_reserved: u32 = 0,
-    loan_table: std.AutoHashMapUnmanaged(*anyopaque, []*PendingChange) = .empty,
+    loan_table: std.AutoHashMapUnmanaged(*anyopaque, Loan) = .empty,
     /// The coherent set each writer is in the middle of sending, keyed by
     /// writer GUID so that different writers' sets accumulate independently.
     coherent_wip: std.AutoHashMapUnmanaged(Guid, CoherentWipEntry),
@@ -911,6 +942,7 @@ pub const DataReaderImpl = struct {
         // outstanding_loans == 0 (so loan_table is empty) by the time we get
         // here -- this only frees the hashmap's own backing allocation.
         self.loan_table.deinit(self.alloc);
+        self.loan_holds.deinit(self.alloc);
         var wip_it = self.coherent_wip.valueIterator();
         while (wip_it.next()) |v| {
             for (v.samples.items) |p| p.deinit();
@@ -1012,6 +1044,7 @@ pub const DataReaderImpl = struct {
         if (self.reclaim_candidates.count() == 0) return;
         @memset(self.reclaim_candidates.values(), false);
         for (self.pending.items) |pc| self.markCandidateHeldLocked(pc.key_hash);
+        for (self.loan_holds.keys()) |key_hash| self.markCandidateHeldLocked(key_hash);
         var wip_it = self.coherent_wip.valueIterator();
         while (wip_it.next()) |wip| for (wip.samples.items) |pc| self.markCandidateHeldLocked(pc.key_hash);
         for (self.coherent_committed.items) |cs| for (cs.samples.items) |pc| self.markCandidateHeldLocked(pc.key_hash);
@@ -1217,7 +1250,7 @@ pub const DataReaderImpl = struct {
             return;
         };
         pc.* = .{ .data = copy, .alloc = self.alloc, .info = info, .key_hash = key_hash };
-        self.pending.append(self.alloc, pc) catch {
+        self.appendPendingLocked(pc) catch {
             self.mu.unlock();
             self.alloc.destroy(pc);
             self.alloc.free(copy);
@@ -1600,7 +1633,7 @@ pub const DataReaderImpl = struct {
             .key_hash = change.key_hash,
         };
 
-        self.pending.append(self.alloc, pc) catch {
+        self.appendPendingLocked(pc) catch {
             self.alloc.destroy(pc);
             return self.dropSampleUnlock(copy, coherent_queued, .dropped);
         };
@@ -2068,7 +2101,7 @@ pub const DataReaderImpl = struct {
                     },
                     .key_hash = key_hash,
                 };
-                self.pending.append(self.alloc, pc) catch {
+                self.appendPendingLocked(pc) catch {
                     self.alloc.destroy(pc);
                     self.alloc.free(empty);
                     continue;
@@ -2156,7 +2189,7 @@ pub const DataReaderImpl = struct {
                 return;
             };
             pc.* = cppc;
-            self.pending.appendAssumeCapacity(pc);
+            self.appendPendingAssumeCapacityLocked(pc);
         }
         set.samples.deinit(self.alloc);
         if (self.pending.items.len > start) self.markDataAvailableLocked();
@@ -2193,11 +2226,18 @@ pub const DataReaderImpl = struct {
     /// though `coherent_committed` still holds further complete sets --
     /// nothing would ever wake the application to call begin_access() again.
     /// Used as the `has_data_fn` in ReadConditionImpl. ctx is a *DataReaderImpl.
+    /// A ReadCondition's trigger. A sample kept undecodable does not count:
+    /// no typed read or take would return it, so a WaitSet must not wake for
+    /// it. (The condition's own state masks are not applied here.)
     pub fn hasPendingDataFn(ctx: *anyopaque) bool {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
         defer self.mu.unlock();
-        return self.pending.items.len > 0 or self.coherent_committed_ready;
+        if (self.coherent_committed_ready) return true;
+        for (self.pending.items) |pc| {
+            if (pc.info.sample_state & DDS.UNDECODABLE_SAMPLE_STATE == 0) return true;
+        }
+        return false;
     }
 
     pub fn hasPendingData(self: *Self) bool {
@@ -2306,8 +2346,13 @@ pub const DataReaderImpl = struct {
                     continue;
                 }
             }
-            var result = [1]TakenSample{.{ .data = pc.data, .info = pc.info }};
-            self.alloc.destroy(pc);
+            const info = pc.info;
+            const data = self.takeOutLocked(pc) orelse {
+                self.pending.insertAssumeCapacity(0, pc);
+                if (self.ordered_access_watermark) |*wm| wm.* += 1;
+                return null;
+            };
+            var result = [1]TakenSample{.{ .data = data, .info = info }};
             self.finalizeGenerationRanksLocked(&result);
             return result[0];
         }
@@ -2356,9 +2401,10 @@ pub const DataReaderImpl = struct {
 
         for (self.pending.items, 0..) |pc, idx| {
             if (pc.info.instance_handle == tgt) {
-                var result = [1]TakenSample{.{ .data = pc.data, .info = pc.info }};
+                const info = pc.info;
+                const data = self.takeOutLocked(pc) orelse return null;
                 _ = self.pending.orderedRemove(idx);
-                self.alloc.destroy(pc);
+                var result = [1]TakenSample{.{ .data = data, .info = info }};
                 self.finalizeGenerationRanksLocked(&result);
                 return result[0];
             }
@@ -2408,7 +2454,7 @@ pub const DataReaderImpl = struct {
         for (self.pending.items) |pc| {
             if (pc.info.instance_handle == tgt) {
                 const clone = self.alloc.dupe(u8, pc.data) catch return null;
-                pc.info.sample_state = DDS.READ_SAMPLE_STATE;
+                markRead(pc);
                 var result = [1]TakenSample{.{ .data = clone, .info = pc.info }};
                 self.finalizeGenerationRanksLocked(&result);
                 return result[0];
@@ -2463,10 +2509,14 @@ pub const DataReaderImpl = struct {
         const start = out.items.len;
         var write: usize = 0;
         for (self.pending.items) |pc| {
-            if (out.items.len - start < n and self.selects(pc, sample_mask, view_mask, instance_mask, ih, maybe_qc)) {
-                out.appendAssumeCapacity(.{ .data = pc.data, .info = pc.info, .key_hash = pc.key_hash });
-                self.alloc.destroy(pc);
-            } else {
+            const take = out.items.len - start < n and self.selects(pc, sample_mask, view_mask, instance_mask, ih, maybe_qc);
+            const info = pc.info;
+            const key_hash = pc.key_hash;
+            if (take) if (self.takeOutLocked(pc)) |data| {
+                out.appendAssumeCapacity(.{ .data = data, .info = info, .key_hash = key_hash });
+                continue;
+            };
+            {
                 self.pending.items[write] = pc;
                 write += 1;
             }
@@ -2529,7 +2579,7 @@ pub const DataReaderImpl = struct {
         if (ih_sel != null) for (self.pending.items) |pc| {
             if (selected >= n) break;
             if (!self.selects(pc, sample_mask, view_mask, instance_mask, ih_sel.?, maybe_qc)) continue;
-            pc.info.sample_state = DDS.READ_SAMPLE_STATE;
+            markRead(pc);
             selected += 1;
         };
         self.finalizeGenerationRanksLocked(out.items[start..]);
@@ -2622,7 +2672,7 @@ pub const DataReaderImpl = struct {
         if (ih_sel != null) for (self.pending.items) |pc| {
             if (selected >= n) break;
             if (!self.selects(pc, sample_mask, view_mask, instance_mask, maybe_ih, maybe_qc)) continue;
-            pc.info.sample_state = DDS.READ_SAMPLE_STATE;
+            markRead(pc);
             selected += 1;
         };
         self.finalizeGenerationRanksLocked(out.items[start..]);
@@ -2681,7 +2731,7 @@ pub const DataReaderImpl = struct {
         return self.pinSamplesForLoanPrepared(sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc, null);
     }
 
-    fn pinSamplesForLoanPrepared(
+    pub fn pinSamplesForLoanPrepared(
         self: *Self,
         sample_mask: DDS.SampleStateMask,
         view_mask: DDS.ViewStateMask,
@@ -2710,7 +2760,7 @@ pub const DataReaderImpl = struct {
             // while still resident in `pending`.
             if (!pc.quiesce.acquire()) continue;
             out.appendAssumeCapacity(pc);
-            pc.info.sample_state = DDS.READ_SAMPLE_STATE;
+            markRead(pc);
         }
         self.finalizeGenerationRanksLockedPinned(out.items);
         _ = self.outstanding_loans.fetchAdd(out.items.len, .monotonic);
@@ -2719,6 +2769,158 @@ pub const DataReaderImpl = struct {
 
     /// Release read-loan pins previously acquired by `pinSamplesForLoan`.
     /// Does not free `samples` itself -- that array is caller-owned.
+    /// Ends `loan`, its slice included: gives back its samples and, for a
+    /// taken one, its instance holds. `failed` (`return_loan_raw_failed`),
+    /// one octet per sample, names those its caller could not decode: under
+    /// `keep_undecodable`, a taken one is restored (`restoreLocked`) and a
+    /// read one marked UNDECODABLE_SAMPLE_STATE; otherwise a taken one is
+    /// dropped and a read one left as it was.
+    fn endLoan(self: *Self, loan: Loan, failed: ?[]const u8) void {
+        defer self.alloc.free(loan.pcs);
+        self.endLoanSamples(loan.pcs, loan.taken, failed);
+    }
+
+    /// Ends one sample of a native raw take's or read's loan (`raw_ops`'s
+    /// `OwnedRawSample`), `failed` naming it undecoded, and releases the
+    /// reader and protocol-reader refs it held. Its reader may be freed.
+    pub fn endLoanedSample(self: *Self, pc: *PendingChange, taken: bool, failed: bool) void {
+        const flags = [1]u8{1};
+        self.endLoanSamples(&.{pc}, taken, if (failed) &flags else null);
+        // proto_reader's ref first, while self is still alive; self's own
+        // last, since it may free self.
+        self.proto_reader.quiesceRelease();
+        self.releaseQuiesce();
+    }
+
+    /// `endLoan` for `pcs`, without freeing the slice.
+    fn endLoanSamples(self: *Self, pcs: []const *PendingChange, taken: bool, failed: ?[]const u8) void {
+        defer _ = self.outstanding_loans.fetchSub(pcs.len, .monotonic);
+        const any_failed = if (failed) |f| std.mem.indexOfNone(u8, f, &.{0}) != null else false;
+        const keep = any_failed and self.keep_undecodable.load(.monotonic);
+        if (any_failed and !keep and taken and !self.warned_undecodable.swap(true, .monotonic))
+            log_mod.dcps.warn("reader: dropped a sample its binding could not decode (set_keep_undecodable keeps them)", .{});
+        if (!taken and !keep) {
+            for (pcs) |pc| pc.quiesce.release(pc, PendingChange.reallyFree);
+            return;
+        }
+        var lost: i32 = 0;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (taken) {
+                // Holds first, while every sample is still alive to read its
+                // key from; no instance is forgotten before reclaim below,
+                // by when a restored sample holds its own.
+                self.releaseHoldsLocked(pcs);
+                for (pcs, 0..) |pc, i| {
+                    if (keep and failed.?[i] != 0) {
+                        if (!self.restoreLocked(pc)) lost += 1;
+                    } else pc.quiesce.release(pc, PendingChange.reallyFree);
+                }
+                self.reclaimInstancesLocked();
+            } else {
+                for (pcs, failed.?) |pc, f| {
+                    if (f != 0) pc.info.sample_state |= DDS.UNDECODABLE_SAMPLE_STATE;
+                    pc.quiesce.release(pc, PendingChange.reallyFree);
+                }
+            }
+        }
+        if (lost > 0) self.notifySampleLost(lost);
+    }
+
+    /// Returns `pc`, taken on loan and not decoded, to the queue: READ and
+    /// UNDECODABLE_SAMPLE_STATE, in its place by arrival, raising no
+    /// DATA_AVAILABLE. It keeps to the history and RESOURCE_LIMITS as an
+    /// arrival would. Past its lifespan, it goes. Under KEEP_LAST, one its
+    /// instance has no room for pushes the instance's oldest out, as a
+    /// replacement would: itself, if `depth` newer ones arrived since.
+    /// Otherwise, one that no longer fits `max_samples` or
+    /// `max_samples_per_instance` goes, lost, as does one there is no memory
+    /// to restore. Gives back one it drops. Returns false for one lost.
+    fn restoreLocked(self: *Self, pc: *PendingChange) bool {
+        if (pc.expiry_ns) |exp| if (time_mod.nanoTimestamp() >= exp) {
+            pc.quiesce.release(pc, PendingChange.reallyFree);
+            return true;
+        };
+        const ih = pc.info.instance_handle;
+        var count: usize = 0;
+        var at: usize = self.pending.items.len;
+        for (self.pending.items, 0..) |other, i| {
+            if (at == self.pending.items.len and other.arrival > pc.arrival) at = i;
+            if (other.info.instance_handle == ih) count += 1;
+        }
+        const depth: ?usize = if (self.qos.history.kind == .KEEP_LAST_HISTORY_QOS) @intCast(@max(1, self.qos.history.depth)) else null;
+        const replaces = if (depth) |d| count >= d else false;
+        const rl = self.qos.resource_limits;
+        const fits = replaces or
+            ((rl.max_samples_per_instance <= 0 or count < @as(usize, @intCast(rl.max_samples_per_instance))) and
+                (rl.max_samples <= 0 or self.pending.items.len < @as(usize, @intCast(rl.max_samples))));
+        if (!fits) {
+            pc.quiesce.release(pc, PendingChange.reallyFree);
+            return false;
+        }
+        self.pending.insert(self.alloc, at, pc) catch {
+            pc.quiesce.release(pc, PendingChange.reallyFree);
+            return false;
+        };
+        pc.info.sample_state = DDS.READ_SAMPLE_STATE | DDS.UNDECODABLE_SAMPLE_STATE;
+        if (replaces) {
+            // The instance's oldest, perhaps `pc` itself.
+            for (self.pending.items, 0..) |other, i| {
+                if (other.info.instance_handle != ih) continue;
+                const evicted = self.pending.orderedRemove(i);
+                evicted.quiesce.beginTeardown(evicted, PendingChange.reallyFree);
+                break;
+            }
+        }
+        return true;
+    }
+
+    /// Holds the instances of `taken`, samples just taken on loan, from
+    /// being forgotten until the loan ends. `loan_holds` has room for them.
+    fn holdInstancesLocked(self: *Self, taken: []const *PendingChange) void {
+        for (taken) |pc| {
+            const gop = self.loan_holds.getOrPutAssumeCapacity(pc.key_hash);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += 1;
+        }
+    }
+
+    fn releaseHoldsLocked(self: *Self, taken: []const *PendingChange) void {
+        for (taken) |pc| {
+            const held = self.loan_holds.getPtr(pc.key_hash).?;
+            held.* -= 1;
+            if (held.* == 0) _ = self.loan_holds.swapRemove(pc.key_hash);
+        }
+    }
+
+    /// Appends `pc` to the queue, stamped with its arrival.
+    fn appendPendingLocked(self: *Self, pc: *PendingChange) error{OutOfMemory}!void {
+        try self.pending.ensureUnusedCapacity(self.alloc, 1);
+        self.appendPendingAssumeCapacityLocked(pc);
+    }
+
+    fn appendPendingAssumeCapacityLocked(self: *Self, pc: *PendingChange) void {
+        pc.arrival = self.next_arrival;
+        self.next_arrival += 1;
+        self.pending.appendAssumeCapacity(pc);
+    }
+
+    /// Takes `pc`, out of the queue, for a copy-mode take: its data, moved
+    /// out with `pc` freed, or copied when a read loan still pins `pc`, which
+    /// that loan's end then frees. Null, out of memory for the copy: the
+    /// caller leaves `pc` queued. With `mu` held.
+    fn takeOutLocked(self: *Self, pc: *PendingChange) ?[]u8 {
+        if (!pc.quiesce.shared()) {
+            const data = pc.data;
+            self.alloc.destroy(pc);
+            return data;
+        }
+        const copy = self.alloc.dupe(u8, pc.data) catch return null;
+        pc.quiesce.beginTeardown(pc, PendingChange.reallyFree);
+        return copy;
+    }
+
     pub fn releasePinnedSamples(self: *Self, samples: []const *PendingChange) void {
         for (samples) |pc| {
             pc.quiesce.release(pc, PendingChange.reallyFree);
@@ -2754,7 +2956,7 @@ pub const DataReaderImpl = struct {
         return self.takeSamplesForLoanPrepared(sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc, null);
     }
 
-    fn takeSamplesForLoanPrepared(
+    pub fn takeSamplesForLoanPrepared(
         self: *Self,
         sample_mask: DDS.SampleStateMask,
         view_mask: DDS.ViewStateMask,
@@ -2773,6 +2975,7 @@ pub const DataReaderImpl = struct {
         var out: std.ArrayListUnmanaged(*PendingChange) = .empty;
         errdefer out.deinit(self.alloc);
         try out.ensureTotalCapacityPrecise(self.alloc, n);
+        try self.loan_holds.ensureUnusedCapacity(self.alloc, n);
         if (prepare) |p| try p.prepare(p.ctx, n);
         self.resetDataAvailableLocked();
         var write: usize = 0;
@@ -2785,6 +2988,7 @@ pub const DataReaderImpl = struct {
             }
         }
         self.pending.items.len = write;
+        self.holdInstancesLocked(out.items);
         self.finalizeGenerationRanksLockedPinned(out.items);
         _ = self.outstanding_loans.fetchAdd(out.items.len, .monotonic);
         return self.ownedSlice(*PendingChange, &out);
@@ -2809,7 +3013,7 @@ pub const DataReaderImpl = struct {
         return self.pinNextInstanceForLoanPrepared(prev_instance_handle, sample_mask, view_mask, instance_mask, max_samples, maybe_qc, null);
     }
 
-    fn pinNextInstanceForLoanPrepared(
+    pub fn pinNextInstanceForLoanPrepared(
         self: *Self,
         prev_instance_handle: DDS.InstanceHandle_t,
         sample_mask: DDS.SampleStateMask,
@@ -2838,7 +3042,7 @@ pub const DataReaderImpl = struct {
             // while still resident in `pending`.
             if (!pc.quiesce.acquire()) continue;
             out.appendAssumeCapacity(pc);
-            pc.info.sample_state = DDS.READ_SAMPLE_STATE;
+            markRead(pc);
         }
         self.finalizeGenerationRanksLockedPinned(out.items);
         _ = self.outstanding_loans.fetchAdd(out.items.len, .monotonic);
@@ -2862,7 +3066,7 @@ pub const DataReaderImpl = struct {
         return self.takeNextInstanceForLoanPrepared(prev_instance_handle, sample_mask, view_mask, instance_mask, max_samples, maybe_qc, null);
     }
 
-    fn takeNextInstanceForLoanPrepared(
+    pub fn takeNextInstanceForLoanPrepared(
         self: *Self,
         prev_instance_handle: DDS.InstanceHandle_t,
         sample_mask: DDS.SampleStateMask,
@@ -2881,6 +3085,7 @@ pub const DataReaderImpl = struct {
         var out: std.ArrayListUnmanaged(*PendingChange) = .empty;
         errdefer out.deinit(self.alloc);
         try out.ensureTotalCapacityPrecise(self.alloc, n);
+        try self.loan_holds.ensureUnusedCapacity(self.alloc, n);
         if (prepare) |p| try p.prepare(p.ctx, n);
         self.resetDataAvailableLocked();
         var write: usize = 0;
@@ -2893,6 +3098,7 @@ pub const DataReaderImpl = struct {
             }
         }
         self.pending.items.len = write;
+        self.holdInstancesLocked(out.items);
         self.finalizeGenerationRanksLockedPinned(out.items);
         _ = self.outstanding_loans.fetchAdd(out.items.len, .monotonic);
         return self.ownedSlice(*PendingChange, &out);
@@ -2946,10 +3152,14 @@ pub const DataReaderImpl = struct {
         const start = out.items.len;
         var write: usize = 0;
         for (self.pending.items) |pc| {
-            if (out.items.len - start < n and self.selects(pc, sample_mask, view_mask, instance_mask, maybe_ih, maybe_qc)) {
-                out.appendAssumeCapacity(.{ .data = pc.data, .info = pc.info, .key_hash = pc.key_hash });
-                self.alloc.destroy(pc);
-            } else {
+            const take = out.items.len - start < n and self.selects(pc, sample_mask, view_mask, instance_mask, maybe_ih, maybe_qc);
+            const info = pc.info;
+            const key_hash = pc.key_hash;
+            if (take) if (self.takeOutLocked(pc)) |data| {
+                out.appendAssumeCapacity(.{ .data = data, .info = info, .key_hash = key_hash });
+                continue;
+            };
+            {
                 self.pending.items[write] = pc;
                 write += 1;
             }
@@ -3420,6 +3630,8 @@ pub const DataReaderImpl = struct {
         .take_next_instance_raw = vtTakeNextInstanceRaw,
         .read_next_instance_raw = vtReadNextInstanceRaw,
         .return_loan_raw = vtReturnLoanRaw,
+        .return_loan_raw_failed = vtReturnLoanRawFailed,
+        .set_keep_undecodable = vtSetKeepUndecodable,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandle,
         .get_allocator = vtGetAllocator,
@@ -4429,7 +4641,7 @@ pub const DataReaderImpl = struct {
                 try self.takeSamplesForLoanPrepared(f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_ih, f.maybe_qc, output.prepareOutput())
             else
                 try self.pinSamplesForLoanPrepared(f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_ih, f.maybe_qc, output.prepareOutput());
-            try self.buildRawOutputFromPins(&output, pcs, payloads_seq, hashes_seq, infos_seq);
+            try self.buildRawOutputFromPins(&output, .{ .pcs = pcs, .taken = destructive }, payloads_seq, hashes_seq, infos_seq);
         } else {
             var out: std.ArrayListUnmanaged(TakenSample) = .empty;
             defer out.deinit(self.alloc);
@@ -4496,7 +4708,7 @@ pub const DataReaderImpl = struct {
                 try self.takeNextInstanceForLoanPrepared(previous_handle, f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_qc, output.prepareOutput())
             else
                 try self.pinNextInstanceForLoanPrepared(previous_handle, f.sample_states, f.view_states, f.instance_states, max_samples, f.maybe_qc, output.prepareOutput());
-            try self.buildRawOutputFromPins(&output, pcs, payloads_seq, hashes_seq, infos_seq);
+            try self.buildRawOutputFromPins(&output, .{ .pcs = pcs, .taken = destructive }, payloads_seq, hashes_seq, infos_seq);
         } else {
             var out: std.ArrayListUnmanaged(TakenSample) = .empty;
             defer out.deinit(self.alloc);
@@ -4514,15 +4726,13 @@ pub const DataReaderImpl = struct {
     /// the batch in `loan_table` (keyed by the descriptor array's pointer
     /// identity) so `return_loan_raw` can find it again. Takes ownership of
     /// `pcs` (frees the slice itself on every path, including empty/error).
-    fn buildRawOutputFromPins(self: *Self, output: *RawOutput, pcs: []*PendingChange, payloads_seq: *DDS.OctetSeqSeq, hashes_seq: *DDS.OctetSeq, infos_seq: *DDS.SampleInfoSeq) !void {
+    fn buildRawOutputFromPins(self: *Self, output: *RawOutput, loan: Loan, payloads_seq: *DDS.OctetSeqSeq, hashes_seq: *DDS.OctetSeq, infos_seq: *DDS.SampleInfoSeq) !void {
+        const pcs = loan.pcs;
         if (pcs.len == 0) {
             self.alloc.free(pcs);
             return;
         }
-        errdefer {
-            self.releasePinnedSamples(pcs);
-            self.alloc.free(pcs);
-        }
+        errdefer self.endLoan(loan, null);
         try output.fit(pcs.len);
         for (pcs, 0..) |pc, i| {
             output.descriptors[i] = .{ ._buffer = pc.data.ptr, ._length = @intCast(pc.data.len), ._maximum = @intCast(pc.data.len), ._release = false };
@@ -4532,7 +4742,7 @@ pub const DataReaderImpl = struct {
         {
             self.loan_table_mu.lock();
             defer self.loan_table_mu.unlock();
-            self.loan_table.putAssumeCapacityNoClobber(output.descriptors.ptr, pcs);
+            self.loan_table.putAssumeCapacityNoClobber(output.descriptors.ptr, loan);
             self.loan_table_reserved -= 1;
             output.loan_slot = false;
         }
@@ -4637,15 +4847,35 @@ pub const DataReaderImpl = struct {
     /// as any other pin release); absent means copy-mode (each descriptor
     /// independently owns its own buffer, freed directly here).
     fn vtReturnLoanRaw(ctx: *anyopaque, cdr_payloads: ?*DDS.OctetSeqSeq, key_hashes: ?*DDS.OctetSeq, sample_infos: ?*DDS.SampleInfoSeq) DDS.ReturnCode_t {
+        return cast(ctx).returnLoanRaw(cdr_payloads, key_hashes, sample_infos, null);
+    }
+
+    fn vtReturnLoanRawFailed(ctx: *anyopaque, cdr_payloads: ?*DDS.OctetSeqSeq, key_hashes: ?*DDS.OctetSeq, sample_infos: ?*DDS.SampleInfoSeq, failed: ?*const DDS.OctetSeq) DDS.ReturnCode_t {
+        return cast(ctx).returnLoanRaw(cdr_payloads, key_hashes, sample_infos, failed orelse return DDS.RETCODE_BAD_PARAMETER);
+    }
+
+    fn vtSetKeepUndecodable(ctx: *anyopaque, keep: bool) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        const rc = self.checkEnabled();
+        if (rc != DDS.RETCODE_OK) return rc;
+        self.keep_undecodable.store(keep, .monotonic);
+        return DDS.RETCODE_OK;
+    }
+
+    /// `return_loan_raw`, and with `failed`, `return_loan_raw_failed`.
+    fn returnLoanRaw(self: *Self, cdr_payloads: ?*DDS.OctetSeqSeq, key_hashes: ?*DDS.OctetSeq, sample_infos: ?*DDS.SampleInfoSeq, failed: ?*const DDS.OctetSeq) DDS.ReturnCode_t {
         {
             // A deleted reader still takes its loans back.
-            const rc = cast(ctx).checkEnabled();
+            const rc = self.checkEnabled();
             if (rc != DDS.RETCODE_OK) return rc;
         }
-        const self = cast(ctx);
         const payloads_seq = cdr_payloads orelse return DDS.RETCODE_BAD_PARAMETER;
         const hashes_seq = key_hashes orelse return DDS.RETCODE_BAD_PARAMETER;
         const infos_seq = sample_infos orelse return DDS.RETCODE_BAD_PARAMETER;
+        const failed_flags: ?[]const u8 = if (failed) |f|
+            (if (f._buffer) |b| b[0..f._length] else &.{})
+        else
+            null;
 
         // Whether this call must release the transferred quiesce refs (both
         // self's own and proto_reader's -- see below). Deferred to the very
@@ -4659,13 +4889,20 @@ pub const DataReaderImpl = struct {
             const n = payloads_seq._maximum;
             const descriptors = descriptors_ptr[0..n];
 
-            self.loan_table_mu.lock();
-            const found = self.loan_table.fetchRemove(descriptors_ptr);
-            self.loan_table_mu.unlock();
+            const found = blk: {
+                self.loan_table_mu.lock();
+                defer self.loan_table_mu.unlock();
+                if (failed_flags) |flags| {
+                    // Checked before anything is released: a refused call
+                    // leaves the result as it was.
+                    const loan = self.loan_table.get(descriptors_ptr) orelse return DDS.RETCODE_PRECONDITION_NOT_MET;
+                    if (flags.len != loan.pcs.len) return DDS.RETCODE_BAD_PARAMETER;
+                }
+                break :blk self.loan_table.fetchRemove(descriptors_ptr);
+            };
 
             if (found) |kv| {
-                self.releasePinnedSamples(kv.value);
-                self.alloc.free(kv.value);
+                self.endLoan(kv.value, failed_flags);
                 // Only a loan-mode result (found in loan_table) carries the
                 // quiesce refs the originating loan-mode take_raw()/
                 // read_raw() call transferred here instead of releasing
@@ -4679,6 +4916,9 @@ pub const DataReaderImpl = struct {
                 }
             }
             self.alloc.free(descriptors);
+        } else if (failed_flags) |flags| {
+            // An empty result: nothing to have failed.
+            if (flags.len != 0) return DDS.RETCODE_BAD_PARAMETER;
         }
         if (hashes_seq._buffer) |hb| self.alloc.free(hb[0..hashes_seq._maximum]);
         if (infos_seq._buffer) |ib| self.alloc.free(ib[0..infos_seq._maximum]);
@@ -4904,6 +5144,7 @@ fn deinitTestReader(dr: *DataReaderImpl, alloc: std.mem.Allocator) void {
     dr.deinitInstances(alloc);
     dr.retired_listeners.deinit(alloc);
     dr.listener_ex_box.releaseHold(alloc);
+    dr.loan_holds.deinit(alloc);
 }
 
 test "InstanceEntry.applyChange: disposed_generation_count increments only on resurrection from DISPOSED" {
@@ -5218,8 +5459,10 @@ test "takeSamplesForLoan/releasePinnedSamples: destructive -- removes from pendi
     try testing.expectEqualSlices(u8, &.{0xAA}, taken[0].data);
     try testing.expectEqualSlices(u8, &.{0xBB}, taken[1].data);
 
-    dr.releasePinnedSamples(taken);
+    // Ended as return_loan_raw ends it, releasing its instance holds too.
+    dr.endLoanSamples(taken, true, null);
     try testing.expectEqual(@as(usize, 0), dr.outstanding_loans.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), dr.loan_holds.count());
     // Freed for real here (not deferred to deinitTestReader's sweep, since
     // pending is already empty) -- testing.allocator's leak check at scope
     // exit is the actual assertion that this didn't leak.

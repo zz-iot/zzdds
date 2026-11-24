@@ -1457,3 +1457,300 @@ test "take_raw and read_raw: out of memory at any point, they leave every sample
         try testing.expect(fail_at > 0);
     }
 }
+
+// ── Two-step take ─────────────────────────────────────────────────────────────
+//
+// docs/design/concurrency/operation-effects.md#two-step-take
+
+fn keyOf(b: u8) [16]u8 {
+    return @splat(b);
+}
+
+/// A loan-mode raw result, to end with returnLoan or returnLoanFailed.
+const RawLoan = struct {
+    payloads: DDS.OctetSeqSeq = .{},
+    hashes: DDS.OctetSeq = .{},
+    infos: DDS.SampleInfoSeq = .{},
+
+    fn take(self: *RawLoan, dr: DDS.DataReader, ss: DDS.SampleStateMask, max: i32) !void {
+        try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.take_raw(dr.ptr, &self.payloads, &self.hashes, &self.infos, DDS.HANDLE_NIL, nil.nil_readcondition, ss, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, max));
+    }
+
+    fn read(self: *RawLoan, dr: DDS.DataReader, ss: DDS.SampleStateMask, max: i32) !void {
+        try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.read_raw(dr.ptr, &self.payloads, &self.hashes, &self.infos, DDS.HANDLE_NIL, nil.nil_readcondition, ss, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, max));
+    }
+
+    fn len(self: *const RawLoan) usize {
+        return self.payloads._length;
+    }
+
+    fn byte(self: *const RawLoan, i: usize) u8 {
+        const d = self.payloads._buffer.?[i];
+        return d._buffer.?[d._length - 1];
+    }
+
+    fn returnLoan(self: *RawLoan, dr: DDS.DataReader) !void {
+        try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.return_loan_raw(dr.ptr, &self.payloads, &self.hashes, &self.infos));
+    }
+
+    fn returnLoanFailed(self: *RawLoan, dr: DDS.DataReader, failed: []const u8) DDS.ReturnCode_t {
+        const seq = DDS.OctetSeq{ ._buffer = @constCast(failed.ptr), ._length = @intCast(failed.len), ._maximum = @intCast(failed.len), ._release = false };
+        return dr.vtable.return_loan_raw_failed(dr.ptr, &self.payloads, &self.hashes, &self.infos, &seq);
+    }
+};
+
+const UNDECODABLE = DDS.UNDECODABLE_SAMPLE_STATE;
+
+fn sample(b: u8) [5]u8 {
+    return .{ 0x00, 0x01, 0x00, 0x00, b };
+}
+
+test "return_loan_raw_failed: by default a taken sample its binding could not decode is dropped" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    dr.pushBuiltinCdr(&sample(0xA), keyOf(1), DDS.HANDLE_NIL, .alive);
+    dr.pushBuiltinCdr(&sample(0xB), keyOf(2), DDS.HANDLE_NIL, .alive);
+
+    var loan: RawLoan = .{};
+    try loan.take(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    try testing.expectEqual(@as(usize, 2), loan.len());
+    try testing.expectEqual(DDS.RETCODE_OK, loan.returnLoanFailed(dr_dds, &.{ 1, 0 }));
+    try testing.expectEqual(@as(usize, 0), dr.outstanding_loans.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), dr.pending.items.len);
+}
+
+test "return_loan_raw_failed: kept, a taken sample returns READ and undecodable, selected only by a mask that names it" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.set_keep_undecodable(dr_dds.ptr, true));
+    dr.pushBuiltinCdr(&sample(0xA), keyOf(1), DDS.HANDLE_NIL, .alive);
+    dr.pushBuiltinCdr(&sample(0xB), keyOf(2), DDS.HANDLE_NIL, .alive);
+    const any = dr_dds.vtable.create_readcondition(dr_dds.ptr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    defer _ = dr_dds.vtable.delete_readcondition(dr_dds.ptr, any);
+
+    var loan: RawLoan = .{};
+    try loan.take(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    try testing.expectEqual(DDS.RETCODE_OK, loan.returnLoanFailed(dr_dds, &.{ 1, 0 }));
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
+    try testing.expectEqual(DDS.READ_SAMPLE_STATE | UNDECODABLE, dr.pending.items[0].info.sample_state);
+    // No DATA_AVAILABLE, and an ANY condition does not trigger on it.
+    try testing.expect(dr.status_changes & DDS.DATA_AVAILABLE_STATUS == 0);
+    try testing.expect(!any.vtable.get_trigger_value(any.ptr));
+
+    var plain: RawLoan = .{};
+    try plain.take(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    try testing.expectEqual(@as(usize, 0), plain.len());
+    try plain.returnLoan(dr_dds);
+    var kept: RawLoan = .{};
+    try kept.take(dr_dds, UNDECODABLE, -1);
+    try testing.expectEqual(@as(usize, 1), kept.len());
+    try testing.expectEqual(@as(u8, 0xA), kept.byte(0));
+    try testing.expectEqual(DDS.READ_SAMPLE_STATE | UNDECODABLE, kept.infos._buffer.?[0].sample_state);
+    try kept.returnLoan(dr_dds);
+    try testing.expectEqual(@as(usize, 0), dr.pending.items.len);
+}
+
+test "return_loan_raw_failed: a restored sample goes back to its place by arrival" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    _ = dr_dds.vtable.set_keep_undecodable(dr_dds.ptr, true);
+    for ([_]u8{ 0xA, 0xB, 0xC }, 1..) |b, k| dr.pushBuiltinCdr(&sample(b), keyOf(@intCast(k)), DDS.HANDLE_NIL, .alive);
+
+    // B alone, then a later arrival D.
+    {
+        dr.mu.lock();
+        defer dr.mu.unlock();
+        markRead(dr.pending.items[0]);
+        markRead(dr.pending.items[2]);
+    }
+    var loan: RawLoan = .{};
+    try loan.take(dr_dds, DDS.NOT_READ_SAMPLE_STATE, -1);
+    try testing.expectEqual(@as(usize, 1), loan.len());
+    dr.pushBuiltinCdr(&sample(0xD), keyOf(4), DDS.HANDLE_NIL, .alive);
+    try testing.expectEqual(DDS.RETCODE_OK, loan.returnLoanFailed(dr_dds, &.{1}));
+
+    var all: RawLoan = .{};
+    try all.read(dr_dds, DDS.ANY_SAMPLE_STATE | UNDECODABLE, -1);
+    defer all.returnLoan(dr_dds) catch {};
+    try testing.expectEqual(@as(usize, 4), all.len());
+    for ([_]u8{ 0xA, 0xB, 0xC, 0xD }, 0..) |b, i| try testing.expectEqual(b, all.byte(i));
+}
+
+fn markRead(pc: *PendingChange) void {
+    pc.info.sample_state = DDS.READ_SAMPLE_STATE;
+}
+
+test "return_loan_raw_failed: kept, a read sample is marked undecodable and stays" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    _ = dr_dds.vtable.set_keep_undecodable(dr_dds.ptr, true);
+    dr.pushBuiltinCdr(&sample(0xA), keyOf(1), DDS.HANDLE_NIL, .alive);
+
+    var loan: RawLoan = .{};
+    try loan.read(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    try testing.expectEqual(DDS.RETCODE_OK, loan.returnLoanFailed(dr_dds, &.{1}));
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
+    try testing.expectEqual(DDS.READ_SAMPLE_STATE | UNDECODABLE, dr.pending.items[0].info.sample_state);
+    // A read keeps the mark.
+    var again: RawLoan = .{};
+    try again.read(dr_dds, UNDECODABLE, -1);
+    try testing.expectEqual(@as(usize, 1), again.len());
+    try again.returnLoan(dr_dds);
+    try testing.expectEqual(DDS.READ_SAMPLE_STATE | UNDECODABLE, dr.pending.items[0].info.sample_state);
+}
+
+test "return_loan_raw_failed: the wrong length, or a copy-mode result, is refused and releases nothing" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    dr.pushBuiltinCdr(&sample(0xA), keyOf(1), DDS.HANDLE_NIL, .alive);
+    dr.pushBuiltinCdr(&sample(0xB), keyOf(2), DDS.HANDLE_NIL, .alive);
+
+    var loan: RawLoan = .{};
+    try loan.take(dr_dds, DDS.ANY_SAMPLE_STATE, 1);
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, loan.returnLoanFailed(dr_dds, &.{ 1, 1 }));
+    try testing.expectEqual(@as(usize, 1), dr.outstanding_loans.load(.monotonic));
+    try loan.returnLoan(dr_dds);
+
+    var copy: RawLoan = .{ .payloads = .{ ._maximum = 1 } };
+    try copy.take(dr_dds, DDS.ANY_SAMPLE_STATE, 1);
+    try testing.expectEqual(@as(usize, 1), copy.len());
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, copy.returnLoanFailed(dr_dds, &.{1}));
+    try copy.returnLoan(dr_dds);
+}
+
+test "return_loan_raw_failed: a restored sample keeps to RESOURCE_LIMITS: one that no longer fits is lost" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    var qos = DDS.DataReaderQos{};
+    qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    qos.resource_limits.max_samples = 1;
+    const dr_dds = fx.makeReaderQos(qos, nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    _ = dr_dds.vtable.set_keep_undecodable(dr_dds.ptr, true);
+    dr.pushBuiltinCdr(&sample(0xA), keyOf(1), DDS.HANDLE_NIL, .alive);
+
+    var loan: RawLoan = .{};
+    try loan.take(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    dr.pushBuiltinCdr(&sample(0xB), keyOf(2), DDS.HANDLE_NIL, .alive);
+    try testing.expectEqual(DDS.RETCODE_OK, loan.returnLoanFailed(dr_dds, &.{1}));
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
+    try testing.expectEqual(@as(u8, 0xB), dr.pending.items[0].data[4]);
+    var lost: DDS.SampleLostStatus = undefined;
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.get_sample_lost_status(dr_dds.ptr, &lost));
+    try testing.expectEqual(@as(i32, 1), lost.total_count);
+}
+
+test "return_loan_raw_failed: under KEEP_LAST a restored sample its instance has newer samples for goes, as a replacement would" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    var qos = DDS.DataReaderQos{};
+    qos.history.kind = .KEEP_LAST_HISTORY_QOS;
+    qos.history.depth = 1;
+    const dr_dds = fx.makeReaderQos(qos, nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    _ = dr_dds.vtable.set_keep_undecodable(dr_dds.ptr, true);
+    dr.pushBuiltinCdr(&sample(0xA), keyOf(1), DDS.HANDLE_NIL, .alive);
+
+    var loan: RawLoan = .{};
+    try loan.take(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    dr.pushBuiltinCdr(&sample(0xB), keyOf(1), DDS.HANDLE_NIL, .alive);
+    try testing.expectEqual(DDS.RETCODE_OK, loan.returnLoanFailed(dr_dds, &.{1}));
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
+    try testing.expectEqual(@as(u8, 0xB), dr.pending.items[0].data[4]);
+    var lost: DDS.SampleLostStatus = undefined;
+    _ = dr_dds.vtable.get_sample_lost_status(dr_dds.ptr, &lost);
+    try testing.expectEqual(@as(i32, 0), lost.total_count);
+}
+
+test "take_raw: a sample on loan holds its instance from being forgotten until the loan ends" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    // Not alive, and no writer has it: forgotten once no sample holds it.
+    dr.pushBuiltinCdr(&.{}, keyOf(7), DDS.HANDLE_NIL, .not_alive_disposed_unregistered);
+
+    var loan: RawLoan = .{};
+    try loan.take(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    try testing.expectEqual(@as(usize, 1), loan.len());
+    {
+        dr.mu.lock();
+        defer dr.mu.unlock();
+        try testing.expect(dr.instances.handleOfKey(keyOf(7)) != null);
+    }
+    try loan.returnLoan(dr_dds);
+    dr.mu.lock();
+    defer dr.mu.unlock();
+    try testing.expect(dr.instances.handleOfKey(keyOf(7)) == null);
+}
+
+test "take_raw: a copy-mode take of a sample a read loan pins copies it, and the loan stays valid" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    dr.pushBuiltinCdr(&sample(0xA), keyOf(1), DDS.HANDLE_NIL, .alive);
+
+    var pinned: RawLoan = .{};
+    try pinned.read(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    var copy: RawLoan = .{ .payloads = .{ ._maximum = 1 } };
+    try copy.take(dr_dds, DDS.ANY_SAMPLE_STATE, 1);
+    try testing.expectEqual(@as(usize, 1), copy.len());
+    try testing.expectEqual(@as(u8, 0xA), copy.byte(0));
+    try copy.returnLoan(dr_dds);
+    // The pinned sample's data is still the reader's, until its loan ends.
+    try testing.expectEqual(@as(u8, 0xA), pinned.byte(0));
+    try pinned.returnLoan(dr_dds);
+}
+
+test "OwnedRawSample: one ended failed is restored, kept, as return_loan_raw_failed would" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    _ = dr_dds.vtable.set_keep_undecodable(dr_dds.ptr, true);
+    dr.pushBuiltinCdr(&sample(0xA), keyOf(1), DDS.HANDLE_NIL, .alive);
+    dr.pushBuiltinCdr(&sample(0xB), keyOf(2), DDS.HANDLE_NIL, .alive);
+
+    var out: std.ArrayListUnmanaged(zzdds.OwnedRawSample) = .empty;
+    defer out.deinit(alloc);
+    try zzdds.takeFilteredRaw(dr_dds, &out, -1, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, null, alloc);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    try testing.expectEqual(@as(usize, 2), dr.outstanding_loans.load(.monotonic));
+    out.items[0].failed = true;
+    for (out.items) |*s| s.deinit();
+    try testing.expectEqual(@as(usize, 0), dr.outstanding_loans.load(.monotonic));
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
+    try testing.expectEqual(DDS.READ_SAMPLE_STATE | UNDECODABLE, dr.pending.items[0].info.sample_state);
+    try testing.expectEqual(@as(u8, 0xA), dr.pending.items[0].data[4]);
+}

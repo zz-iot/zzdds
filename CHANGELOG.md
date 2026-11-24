@@ -8,6 +8,28 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-24
+
+- A typed read or take keeps a sample its binding cannot decode rather than lose it, with
+  zidl `v0.3.42-zig.0.17.1`. The binding takes on loan, decodes from the reader's own
+  buffers, and returns what failed with the new `DataReader::return_loan_raw_failed`. By
+  default the reader drops such a sample, logging a warning once, as before. A reader that
+  calls `set_keep_undecodable(true)` keeps it instead, READ and marked
+  `UNDECODABLE_SAMPLE_STATE`, for the application to collect with `take_raw` (that bit
+  in its mask): to log it, save it, or read the fields it can. The bit is outside
+  `ANY_SAMPLE_STATE`, so typed reads and takes and ReadConditions pass over such a
+  sample, and restoring it raises no DATA_AVAILABLE. A restored sample goes back to its
+  place by arrival and keeps to the history and RESOURCE_LIMITS: under KEEP_LAST it is
+  replaced as an arrival would be, and under KEEP_ALL one that no longer fits is counted
+  SAMPLE_LOST. A typed batch read or take now returns the samples that decoded, where one
+  failure failed the batch and lost all of it.
+- A Zig `OwnedRawSample` (`takeRaw`, `takeFilteredRaw` and the rest) is a loan of the
+  reader's sample, not a copy: `deinit` ends it, `failed` names one that did not decode,
+  and its reader cannot be deleted while one is out.
+- A sample taken on loan holds its instance from being forgotten until the loan ends, so a
+  loan's instance handles stay valid. A copy-mode take of a sample a read loan still pins
+  copies it; before, it freed it under the loan.
+
 ## 2026-11-23
 
 - A raw read or take (`read_raw`, `take_raw` and the next-instance forms, copy or loan)

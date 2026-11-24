@@ -33,16 +33,98 @@ const GuardConditionImpl = dcps_waitset.GuardConditionImpl;
 /// Write kind for module-level write operations.
 pub const WriteKind = enum { alive, dispose, unregister };
 
-/// A raw sample taken from a DataReader.  Caller must call deinit() when done.
+/// A raw sample taken or read from a DataReader: a loan of the reader's own
+/// sample, which `deinit` ends. `data` is valid until then, and while one is
+/// out its reader cannot be deleted. A caller that could not decode it sets
+/// `failed` first: `deinit` then hands it to the reader's
+/// `set_keep_undecodable` policy, as `return_loan_raw_failed` does
+/// (docs/design/concurrency/operation-effects.md#two-step-take).
 pub const OwnedRawSample = struct {
     data: []u8,
     info: DDS.SampleInfo,
-    _alloc: std.mem.Allocator,
+    failed: bool = false,
+    _reader: *DataReaderImpl,
+    _pc: *dcps_reader.PendingChange,
+    _taken: bool,
 
-    pub fn deinit(self: @This()) void {
-        self._alloc.free(self.data);
+    pub fn deinit(self: *const @This()) void {
+        self._reader.endLoanedSample(self._pc, self._taken, self.failed);
     }
 };
+
+/// What a native raw take or read selects.
+const LoanSelection = union(enum) {
+    samples: struct {
+        ss: DDS.SampleStateMask = DDS.ANY_SAMPLE_STATE,
+        vs: DDS.ViewStateMask = DDS.ANY_VIEW_STATE,
+        is: DDS.InstanceStateMask = DDS.ANY_INSTANCE_STATE,
+        ih: ?DDS.InstanceHandle_t = null,
+        qc: ?*const dcps_waitset.QueryConditionImpl = null,
+    },
+    next_instance: struct {
+        prev: DDS.InstanceHandle_t,
+        ss: DDS.SampleStateMask = DDS.ANY_SAMPLE_STATE,
+        vs: DDS.ViewStateMask = DDS.ANY_VIEW_STATE,
+        is: DDS.InstanceStateMask = DDS.ANY_INSTANCE_STATE,
+        qc: ?*const dcps_waitset.QueryConditionImpl = null,
+    },
+};
+
+/// Takes (`taken`) or reads up to `max` samples on loan into `out`, each an
+/// `OwnedRawSample` that keeps its reader alive until it ends. `out` grows
+/// with `caller_alloc` before anything is selected, so running out of memory
+/// changes nothing.
+fn loanInto(
+    impl: *DataReaderImpl,
+    taken: bool,
+    sel: LoanSelection,
+    max: i32,
+    out: *std.ArrayListUnmanaged(OwnedRawSample),
+    caller_alloc: std.mem.Allocator,
+) !void {
+    if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
+    defer impl.releaseQuiesce();
+    if (!impl.acquireProto()) return error.AlreadyDeleted;
+    defer impl.proto_reader.quiesceRelease();
+    const Prep = struct {
+        out: *std.ArrayListUnmanaged(OwnedRawSample),
+        alloc: std.mem.Allocator,
+        fn prepare(ctx: *anyopaque, n: usize) error{OutOfMemory}!void {
+            const p: *@This() = @ptrCast(@alignCast(ctx));
+            try p.out.ensureUnusedCapacity(p.alloc, n);
+        }
+    };
+    var prep: Prep = .{ .out = out, .alloc = caller_alloc };
+    const prepare: dcps_reader.PrepareOutput = .{ .ctx = &prep, .prepare = Prep.prepare };
+    const pcs = switch (sel) {
+        .samples => |f| if (taken)
+            try impl.takeSamplesForLoanPrepared(f.ss, f.vs, f.is, max, f.ih, f.qc, prepare)
+        else
+            try impl.pinSamplesForLoanPrepared(f.ss, f.vs, f.is, max, f.ih, f.qc, prepare),
+        .next_instance => |f| if (taken)
+            try impl.takeNextInstanceForLoanPrepared(f.prev, f.ss, f.vs, f.is, max, f.qc, prepare)
+        else
+            try impl.pinNextInstanceForLoanPrepared(f.prev, f.ss, f.vs, f.is, max, f.qc, prepare),
+    };
+    defer impl.alloc.free(pcs);
+    for (pcs) |pc| {
+        // Each sample holds its own refs, which its `deinit` releases. This
+        // call's refs keep both alive, so these cannot fail.
+        std.debug.assert(impl.acquireQuiesce());
+        std.debug.assert(impl.acquireProto());
+        out.appendAssumeCapacity(.{ .data = pc.data, .info = pc.info, ._reader = impl, ._pc = pc, ._taken = taken });
+    }
+}
+
+/// One sample on loan, or null if none (or out of memory).
+fn loanOne(reader: DDS.DataReader, taken: bool, sel: LoanSelection) ?OwnedRawSample {
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    var buf: [1]OwnedRawSample = undefined;
+    var out: std.ArrayListUnmanaged(OwnedRawSample) = .initBuffer(&buf);
+    // `out` has room for the one sample: it never allocates.
+    loanInto(impl, taken, sel, 1, &out, impl.alloc) catch return null;
+    return if (out.items.len == 1) out.items[0] else null;
+}
 
 fn toChangeKind(kind: WriteKind, impl: *DataWriterImpl) history_mod.ChangeKind {
     return switch (kind) {
@@ -261,69 +343,36 @@ pub fn lookupInstanceWriter(writer: DDS.DataWriter, key_hash: [16]u8) DDS.Instan
 
 // ── Reader operations ─────────────────────────────────────────────────────────
 
-/// Pop the next pending sample from the reader, or return null if empty.
-/// Caller owns the returned OwnedRawSample and must call deinit().
+/// Takes the next pending sample on loan, or null if none.
+/// The caller must `deinit` the returned sample.
 pub fn takeRaw(reader: DDS.DataReader) ?OwnedRawSample {
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
-    if (!impl.acquireQuiesce()) return null;
-    defer impl.releaseQuiesce();
-    const taken = impl.takeRaw() orelse return null;
-    return .{ .data = taken.data, .info = taken.info, ._alloc = impl.alloc };
+    return loanOne(reader, true, .{ .samples = .{} });
 }
 
-/// Non-destructively return the next pending sample, or null if empty.
-/// The sample's sample_state is updated to READ.
-/// Caller owns the returned OwnedRawSample and must call deinit().
+/// Non-destructively returns the next pending sample on loan, or null if
+/// none. The sample's sample_state is updated to READ.
+/// The caller must `deinit` the returned sample.
 pub fn readNextSampleRaw(reader: DDS.DataReader) ?OwnedRawSample {
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
-    if (!impl.acquireQuiesce()) return null;
-    defer impl.releaseQuiesce();
-    // readRaw with ANY masks, limit 1, and no instance filter.
-    var out: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
-    defer {
-        for (out.items) |s| impl.alloc.free(s.data);
-        out.deinit(impl.alloc);
-    }
-    impl.readRaw(
-        &out,
-        DDS.ANY_SAMPLE_STATE,
-        DDS.ANY_VIEW_STATE,
-        DDS.ANY_INSTANCE_STATE,
-        1,
-        null,
-        null,
-    ) catch return null;
-    if (out.items.len == 0) return null;
-    const s = out.items[0];
-    out.items.len = 0; // prevent deinit from double-freeing
-    return .{ .data = s.data, .info = s.info, ._alloc = impl.alloc };
+    return loanOne(reader, false, .{ .samples = .{} });
 }
 
-/// Pop the next sample for the "next" instance after `prev` (HANDLE_NIL = first).
-/// Caller owns the returned OwnedRawSample and must call deinit().
+/// Takes the next sample of the "next" instance after `prev` (HANDLE_NIL =
+/// first) on loan. The caller must `deinit` the returned sample.
 pub fn takeNextInstanceRaw(
     reader: DDS.DataReader,
     prev: DDS.InstanceHandle_t,
 ) ?OwnedRawSample {
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
-    if (!impl.acquireQuiesce()) return null;
-    defer impl.releaseQuiesce();
-    const taken = impl.takeNextInstanceRaw(prev) orelse return null;
-    return .{ .data = taken.data, .info = taken.info, ._alloc = impl.alloc };
+    return loanOne(reader, true, .{ .next_instance = .{ .prev = prev } });
 }
 
-/// Non-destructively return the next sample for the "next" instance after `prev`.
-/// The sample's sample_state is updated to READ.
-/// Caller owns the returned OwnedRawSample and must call deinit().
+/// Non-destructively returns the next sample of the "next" instance after
+/// `prev` on loan. The sample's sample_state is updated to READ.
+/// The caller must `deinit` the returned sample.
 pub fn readNextInstanceRaw(
     reader: DDS.DataReader,
     prev: DDS.InstanceHandle_t,
 ) ?OwnedRawSample {
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
-    if (!impl.acquireQuiesce()) return null;
-    defer impl.releaseQuiesce();
-    const taken = impl.readNextInstanceRaw(prev) orelse return null;
-    return .{ .data = taken.data, .info = taken.info, ._alloc = impl.alloc };
+    return loanOne(reader, false, .{ .next_instance = .{ .prev = prev } });
 }
 
 /// Batch take: remove and return samples matching the given masks.
@@ -340,24 +389,7 @@ pub fn takeFilteredRaw(
     caller_alloc: std.mem.Allocator,
 ) !void {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
-    if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
-    defer impl.releaseQuiesce();
-    var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
-    defer {
-        for (tmp.items) |s| impl.alloc.free(s.data);
-        tmp.deinit(impl.alloc);
-    }
-    try impl.takeFiltered(&tmp, ss, vs, is, max, maybe_ih, null);
-    // `out`'s backing storage must grow with `caller_alloc` (whatever the caller
-    // will later use to deinit it) — not `impl.alloc`, which is this reader's own
-    // internal allocator and is generally a different instance from the caller's.
-    // Each item's `.data` buffer legitimately stays impl.alloc-owned via its own
-    // `._alloc` field; only the container's growth allocator needs to match here.
-    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
-    for (tmp.items) |s| {
-        out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
-    }
-    tmp.items.len = 0; // transferred ownership; prevent deinit double-free
+    try loanInto(impl, true, .{ .samples = .{ .ss = ss, .vs = vs, .is = is, .ih = maybe_ih } }, max, out, caller_alloc);
 }
 
 /// Batch take restricted to a QueryCondition: state masks come from the
@@ -378,28 +410,13 @@ pub fn takeWithQueryConditionRaw(
     caller_alloc: std.mem.Allocator,
 ) !void {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
-    if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
-    defer impl.releaseQuiesce();
     const qc_impl: *const dcps_waitset.QueryConditionImpl = @ptrCast(@alignCast(qc.ptr));
-    var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
-    defer {
-        for (tmp.items) |s| impl.alloc.free(s.data);
-        tmp.deinit(impl.alloc);
-    }
-    try impl.takeFiltered(
-        &tmp,
-        qc_impl.rc.sample_state_mask,
-        qc_impl.rc.view_state_mask,
-        qc_impl.rc.instance_state_mask,
-        max,
-        null,
-        qc_impl,
-    );
-    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
-    for (tmp.items) |s| {
-        out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
-    }
-    tmp.items.len = 0;
+    try loanInto(impl, true, .{ .samples = .{
+        .ss = qc_impl.rc.sample_state_mask,
+        .vs = qc_impl.rc.view_state_mask,
+        .is = qc_impl.rc.instance_state_mask,
+        .qc = qc_impl,
+    } }, max, out, caller_alloc);
 }
 
 /// Batch take restricted to an arbitrary ReadCondition -- which may itself be
@@ -420,28 +437,13 @@ pub fn takeWithReadConditionRaw(
     caller_alloc: std.mem.Allocator,
 ) !void {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
-    if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
-    defer impl.releaseQuiesce();
     const rc_impl: *const dcps_waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
-    var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
-    defer {
-        for (tmp.items) |s| impl.alloc.free(s.data);
-        tmp.deinit(impl.alloc);
-    }
-    try impl.takeFiltered(
-        &tmp,
-        rc_impl.sample_state_mask,
-        rc_impl.view_state_mask,
-        rc_impl.instance_state_mask,
-        max,
-        null,
-        rc_impl.owner_qc,
-    );
-    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
-    for (tmp.items) |s| {
-        out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
-    }
-    tmp.items.len = 0;
+    try loanInto(impl, true, .{ .samples = .{
+        .ss = rc_impl.sample_state_mask,
+        .vs = rc_impl.view_state_mask,
+        .is = rc_impl.instance_state_mask,
+        .qc = rc_impl.owner_qc,
+    } }, max, out, caller_alloc);
 }
 
 /// Non-destructive analog of `takeWithReadConditionRaw` -- the raw path to
@@ -454,28 +456,13 @@ pub fn readWithReadConditionRaw(
     caller_alloc: std.mem.Allocator,
 ) !void {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
-    if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
-    defer impl.releaseQuiesce();
     const rc_impl: *const dcps_waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
-    var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
-    defer {
-        for (tmp.items) |s| impl.alloc.free(s.data);
-        tmp.deinit(impl.alloc);
-    }
-    try impl.readRaw(
-        &tmp,
-        rc_impl.sample_state_mask,
-        rc_impl.view_state_mask,
-        rc_impl.instance_state_mask,
-        max,
-        null,
-        rc_impl.owner_qc,
-    );
-    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
-    for (tmp.items) |s| {
-        out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
-    }
-    tmp.items.len = 0;
+    try loanInto(impl, false, .{ .samples = .{
+        .ss = rc_impl.sample_state_mask,
+        .vs = rc_impl.view_state_mask,
+        .is = rc_impl.instance_state_mask,
+        .qc = rc_impl.owner_qc,
+    } }, max, out, caller_alloc);
 }
 
 /// Batch take restricted to an arbitrary ReadCondition AND scoped to the
@@ -493,28 +480,14 @@ pub fn takeNextInstanceWithReadConditionRaw(
     caller_alloc: std.mem.Allocator,
 ) !void {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
-    if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
-    defer impl.releaseQuiesce();
     const rc_impl: *const dcps_waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
-    var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
-    defer {
-        for (tmp.items) |s| impl.alloc.free(s.data);
-        tmp.deinit(impl.alloc);
-    }
-    try impl.takeNextInstanceFiltered(
-        &tmp,
-        prev,
-        rc_impl.sample_state_mask,
-        rc_impl.view_state_mask,
-        rc_impl.instance_state_mask,
-        max,
-        rc_impl.owner_qc,
-    );
-    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
-    for (tmp.items) |s| {
-        out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
-    }
-    tmp.items.len = 0;
+    try loanInto(impl, true, .{ .next_instance = .{
+        .prev = prev,
+        .ss = rc_impl.sample_state_mask,
+        .vs = rc_impl.view_state_mask,
+        .is = rc_impl.instance_state_mask,
+        .qc = rc_impl.owner_qc,
+    } }, max, out, caller_alloc);
 }
 
 /// Non-destructive analog of `takeNextInstanceWithReadConditionRaw` -- the raw
@@ -528,28 +501,14 @@ pub fn readNextInstanceWithReadConditionRaw(
     caller_alloc: std.mem.Allocator,
 ) !void {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
-    if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
-    defer impl.releaseQuiesce();
     const rc_impl: *const dcps_waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
-    var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
-    defer {
-        for (tmp.items) |s| impl.alloc.free(s.data);
-        tmp.deinit(impl.alloc);
-    }
-    try impl.readNextInstanceFiltered(
-        &tmp,
-        prev,
-        rc_impl.sample_state_mask,
-        rc_impl.view_state_mask,
-        rc_impl.instance_state_mask,
-        max,
-        rc_impl.owner_qc,
-    );
-    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
-    for (tmp.items) |s| {
-        out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
-    }
-    tmp.items.len = 0;
+    try loanInto(impl, false, .{ .next_instance = .{
+        .prev = prev,
+        .ss = rc_impl.sample_state_mask,
+        .vs = rc_impl.view_state_mask,
+        .is = rc_impl.instance_state_mask,
+        .qc = rc_impl.owner_qc,
+    } }, max, out, caller_alloc);
 }
 
 /// Batch read: non-destructively return samples matching the given masks.
@@ -566,21 +525,7 @@ pub fn readFilteredRaw(
     caller_alloc: std.mem.Allocator,
 ) !void {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
-    if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
-    defer impl.releaseQuiesce();
-    var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
-    defer {
-        for (tmp.items) |s| impl.alloc.free(s.data);
-        tmp.deinit(impl.alloc);
-    }
-    try impl.readRaw(&tmp, ss, vs, is, max, maybe_ih, null);
-    // See takeFilteredRaw: `out` must grow with the caller's allocator, not
-    // impl.alloc, since the caller (not this reader) owns and will deinit `out`.
-    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
-    for (tmp.items) |s| {
-        out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
-    }
-    tmp.items.len = 0;
+    try loanInto(impl, false, .{ .samples = .{ .ss = ss, .vs = vs, .is = is, .ih = maybe_ih } }, max, out, caller_alloc);
 }
 
 /// get_key_value: as `getKeyValueWriter`, for the instance `handle` names

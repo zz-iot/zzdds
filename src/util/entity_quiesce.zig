@@ -111,6 +111,11 @@ pub const EntityQuiesce = struct {
 
     /// Whether `beginTeardown()` has run. Only meaningful to a caller holding
     /// a reference, which keeps the entity from being freed meanwhile.
+    /// Whether anything besides the entity's own reference holds it now.
+    pub fn shared(self: *const EntityQuiesce) bool {
+        return self.state.load(.acquire) & count_mask > 1;
+    }
+
     pub fn tearingDown(self: *const EntityQuiesce) bool {
         return self.state.load(.acquire) & tearing_down_bit != 0;
     }

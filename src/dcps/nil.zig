@@ -793,6 +793,16 @@ var nil_datareader_vtable = DDS.DataReader.Vtable{
             return DDS.RETCODE_ERROR;
         }
     }.f,
+    .return_loan_raw_failed = struct {
+        fn f(_: *anyopaque, _: ?*DDS.OctetSeqSeq, _: ?*DDS.OctetSeq, _: ?*DDS.SampleInfoSeq, _: ?*const DDS.OctetSeq) DDS.ReturnCode_t {
+            return DDS.RETCODE_ERROR;
+        }
+    }.f,
+    .set_keep_undecodable = struct {
+        fn f(_: *anyopaque, _: bool) DDS.ReturnCode_t {
+            return DDS.RETCODE_ERROR;
+        }
+    }.f,
     .deinit = nilDeinit,
     .get_c_abi_handle = nilDatareaderGetCAbiHandle,
     .get_allocator = nilGetAllocator,
