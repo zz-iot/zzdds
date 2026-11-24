@@ -10,6 +10,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-23
 
+- A raw read or take (`read_raw`, `take_raw` and the next-instance forms, copy or loan)
+  that runs out of memory changes nothing: it makes its output, copies and loan slot before
+  it takes, marks READ or pins a sample. Before, a take that ran out of memory building its
+  output lost the samples it had taken, and a read left some samples READ that it never
+  returned. A read-loan that runs short now fails whole, rather than returning part of its
+  batch.
 - A write blocked on RESOURCE_LIMITS reserves the room it is given, so writes waiting at
   once can no longer all take one freed slot and overfill the history. The oldest waiting
   write with room goes first. Deleting the writer ends a blocked write with
