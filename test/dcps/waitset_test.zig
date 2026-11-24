@@ -1336,3 +1336,74 @@ test "WaitSet: a later look that runs past the deadline is a timeout, though it 
     while (runtime.getState() != .backend_stopped) _ = runtime.drive(64, 0) catch break;
     runtime.deinit();
 }
+
+// ── QueryCondition parameters ─────────────────────────────────────────────────
+
+fn makeParamQC(a: std.mem.Allocator, expression: []const u8) !*QueryConditionImpl {
+    return QueryConditionImpl.init(
+        a,
+        stubDataReader(),
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        expression,
+        DDS.StringSeq{},
+        readerHasData,
+        &g_reader_sentinel,
+        readerAddNotify,
+        readerRemoveNotify,
+        readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
+    );
+}
+
+fn stringSeq(items: [][*:0]const u8) DDS.StringSeq {
+    return .{ ._buffer = items.ptr, ._length = @intCast(items.len), ._maximum = @intCast(items.len), ._release = false };
+}
+
+test "QueryCondition: set_query_parameters wakes the WaitSets it is attached to" {
+    const a = testing.allocator;
+    g_has_data = false;
+    const qc = try makeParamQC(a, "");
+    defer qc.deinit();
+    const ws = try WaitSetImpl.init(a);
+    defer ws.deinit();
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().attach_condition(qc.toCondition()));
+    // Consumes the wake the attach sent.
+    var seq: DDS.ConditionSeq = .{};
+    try testing.expectEqual(DDS.RETCODE_TIMEOUT, ws.toDDSWaitSet().wait(&seq, DURATION_ZERO));
+    try testing.expect(!ws.notified);
+
+    var params = [_][*:0]const u8{"1"};
+    const p = stringSeq(&params);
+    try testing.expectEqual(DDS.RETCODE_OK, qc.toDDSQueryCondition().set_query_parameters(&p));
+    try testing.expect(ws.notified);
+}
+
+test "QueryCondition: the query is evaluated holding the lock set_query_parameters replaces its parameters under" {
+    const a = testing.allocator;
+    const qc = try makeParamQC(a, "x = %0");
+    defer qc.deinit();
+    // Built without the content-subscription profile, no query is evaluated.
+    if (qc.parsed_expr == null) return error.SkipZigTest;
+    var params = [_][*:0]const u8{"1"};
+    const p = stringSeq(&params);
+    try testing.expectEqual(DDS.RETCODE_OK, qc.toDDSQueryCondition().set_query_parameters(&p));
+    const Getter = struct {
+        var held: ?bool = null;
+        fn func(ctx: *anyopaque, _: []const u8, _: []const u8, _: []u8) ?zzdds.dcps.filter.FilterValue {
+            const q: *QueryConditionImpl = @ptrCast(@alignCast(ctx));
+            // Called mid-evaluation: the parameters' lock must be held.
+            if (q.params_mu.tryLock()) {
+                q.params_mu.unlock();
+                held = false;
+            } else held = true;
+            return .{ .int = 1 };
+        }
+    };
+    Getter.held = null;
+    const getter: zzdds.dcps.filter.CdrFieldGetter = .{ .ctx = qc, .func = Getter.func };
+    try testing.expect(qc.matchSample(&.{}, getter));
+    try testing.expectEqual(@as(?bool, true), Getter.held);
+}

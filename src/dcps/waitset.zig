@@ -1552,6 +1552,9 @@ pub const QueryConditionImpl = struct {
     rc: ReadConditionImpl,
     query_expression: [:0]u8, // null-terminated for C API
     query_parameters: std.ArrayListUnmanaged([]u8),
+    /// Guards `query_parameters`: `set_query_parameters` replaces them while
+    /// a read, a take or a WaitSet's trigger check evaluates the query.
+    params_mu: Mutex = .{},
     /// Parsed AST of `query_expression`.  Null when the expression is empty
     /// or the content_subscription_profile is disabled.  A malformed expression
     /// returns error.ParseError from init, so the caller returns NIL.
@@ -1676,6 +1679,9 @@ pub const QueryConditionImpl = struct {
         var pool = filter_mod.ScratchPool{};
         var ctx = FieldCtx{ .payload = payload, .get_fn = get_field_fn, .pool = &pool };
         const accessor = filter_mod.FieldAccessor{ .ctx = &ctx, .get = FieldCtx.get };
+        const params_mu = @constCast(&self.params_mu);
+        params_mu.lock();
+        defer params_mu.unlock();
         const params_slice: []const []const u8 = @ptrCast(self.query_parameters.items);
         return filter_mod.eval(self.parsed_expr, accessor, params_slice);
     }
@@ -1822,6 +1828,8 @@ pub const QueryConditionImpl = struct {
             }
         }
         seq.* = .{};
+        self.params_mu.lock();
+        defer self.params_mu.unlock();
         const n = self.query_parameters.items.len;
         if (n == 0) return DDS.RETCODE_OK;
         const buf = self.alloc.alloc([*:0]const u8, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
@@ -1843,12 +1851,7 @@ pub const QueryConditionImpl = struct {
         const self = cast(ctx);
         // Build into a temporary list first so the old params survive any OOM.
         var tmp: std.ArrayListUnmanaged([]u8) = .empty;
-        const seq = params orelse {
-            for (self.query_parameters.items) |p| self.alloc.free(p);
-            self.query_parameters.clearRetainingCapacity();
-            return DDS.RETCODE_OK;
-        };
-        if (seq._buffer) |b| {
+        if (params) |seq| if (seq._buffer) |b| {
             for (b[0..seq._length]) |p| {
                 const copy = self.alloc.dupe(u8, std.mem.span(p)) catch {
                     for (tmp.items) |s| self.alloc.free(s);
@@ -1862,11 +1865,21 @@ pub const QueryConditionImpl = struct {
                     return DDS.RETCODE_OUT_OF_RESOURCES;
                 };
             }
-        }
-        // All copies succeeded — swap in and free old.
-        for (self.query_parameters.items) |p| self.alloc.free(p);
-        self.query_parameters.deinit(self.alloc);
-        self.query_parameters = tmp;
+        };
+        // All copies succeeded: swap them in under the lock evaluation
+        // takes, and free the old ones once nothing can be reading them.
+        var old = blk: {
+            self.params_mu.lock();
+            defer self.params_mu.unlock();
+            const old = self.query_parameters;
+            self.query_parameters = tmp;
+            break :blk old;
+        };
+        for (old.items) |p| self.alloc.free(p);
+        old.deinit(self.alloc);
+        // The query may now match a sample it did not: a WaitSet the
+        // condition is attached to rescans.
+        self.rc.wakeups.notifyAll();
         return DDS.RETCODE_OK;
     }
 

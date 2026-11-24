@@ -10,6 +10,10 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-24
 
+- `QueryCondition::set_query_parameters` wakes the WaitSets the condition is attached to,
+  since the query may now match a sample it did not. Replacing a QueryCondition's
+  parameters while a read, a take or a WaitSet evaluates its query no longer frees them
+  under that evaluation.
 - A ReadCondition's trigger applies its state masks, and a QueryCondition's its query,
   too: it is true while a read or take with them would return a sample. Before, either was
   true while the reader held any sample, so a WaitSet woke for one its read could not
