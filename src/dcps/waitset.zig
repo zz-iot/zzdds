@@ -625,6 +625,11 @@ pub const WaitSetImpl = struct {
             if (out_accepted) |accepted| accepted.* = false;
             return DDS.RETCODE_ALREADY_DELETED;
         }
+        // Holds `self` through the wake: once the attach is made, the
+        // condition's own teardown may run its release hook, which may
+        // destroy the WaitSet.
+        const held = self.quiesce.acquireIfAlive();
+        defer if (held) self.quiesce.release(self, reallyDeinit);
         const rc = self.attachLocked(cond, release_ctx, release_fn, out_accepted);
         // A wait in progress rescans: the condition may already be true.
         if (rc == DDS.RETCODE_OK) wakeNotify(self);
