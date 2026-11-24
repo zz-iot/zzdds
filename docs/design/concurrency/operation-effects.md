@@ -141,10 +141,11 @@ A wait holds its WaitSet (`quiesce`) until it returns, so destroying the WaitSet
 meanwhile ends the wait, ALREADY_DELETED, rather than freeing it under the waiter.
 `shutdown`, which `destroy` runs first, closes the WaitSet for good under its lock and
 detaches the conditions. It wakes the wait, which then returns ALREADY_DELETED, as do
-later waits, attaches, detaches and `get_conditions`, and only then fires the release
-hooks, on its own thread, holding the WaitSet so that a hook may destroy it. A wait
-never waits on a hook; running the hooks on a cleanup executor, so that `shutdown`
-itself never does either, belongs with the binding result leases. A WaitSet admits one wait at a time: another, even with a zero
+later waits, attaches, detaches and `get_conditions`. `shutdown` runs no release hook,
+so it never waits on application code: it moves the withdrawn attachments, allocating
+nothing, to a list whose hooks run once the WaitSet is freed, on whichever thread frees
+it (`destroy`, or a wait returning after it). A binding's wrappers for the conditions
+thus stay alive until then, which reclamation is allowed to wait for. A WaitSet admits one wait at a time: another, even with a zero
 timeout, is PRECONDITION_NOT_MET. Attaching a condition wakes the wait to rescan.
 Only the first look may find a condition true past the deadline: a later one commits
 only if the deadline has not passed when its scan is done, and otherwise is a TIMEOUT.

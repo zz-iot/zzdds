@@ -214,6 +214,11 @@ pub const AttachedCondition = struct {
 pub const WaitSetImpl = struct {
     alloc: std.mem.Allocator,
     conditions: std.ArrayListUnmanaged(AttachedCondition),
+    /// The attachments `shutdown` withdrew, kept for their release hooks,
+    /// which run when the WaitSet is freed (`reallyDeinit`), not during
+    /// shutdown (docs/design/concurrency/operations.md#explicit-close-separate-destruction).
+    /// Their conditions are already unregistered: only the hooks remain.
+    released: std.ArrayListUnmanaged(AttachedCondition) = .empty,
     mu: Mutex, // protects `conditions`
     cv_mu: Mutex, // protects `notified`
     cv_cond: Condvar,
@@ -335,8 +340,10 @@ pub const WaitSetImpl = struct {
             unregisterFromCondition(self, entry.cond);
             entry.fireRelease();
         }
+        for (self.released.items) |entry| entry.fireRelease();
         self.ws_c_abi.free(self.alloc);
         self.conditions.deinit(self.alloc);
+        self.released.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -546,30 +553,24 @@ pub const WaitSetImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    /// Closes the WaitSet for good (idempotent): detaches its conditions and
-    /// ends a wait in progress with ALREADY_DELETED, then fires the
-    /// conditions' release hooks. Later waits, attaches, detaches and
-    /// get_conditions return ALREADY_DELETED. Frees nothing: `deinit` does.
+    /// Closes the WaitSet for good (idempotent): withdraws its conditions and
+    /// ends a wait in progress with ALREADY_DELETED. Later waits, attaches,
+    /// detaches and get_conditions return ALREADY_DELETED. The conditions'
+    /// release hooks run when the WaitSet is freed, not here, so shutdown
+    /// never waits on one. Frees nothing: `deinit` does.
     pub fn shutdown(self: *Self) void {
-        // Holds `self` to the end, though a release hook destroy it.
-        const held = self.quiesce.acquireIfAlive();
-        defer if (held) self.quiesce.release(self, reallyDeinit);
-        var entries: std.ArrayListUnmanaged(AttachedCondition) = .empty;
         {
             self.mu.lock();
             defer self.mu.unlock();
             if (self.closed.load(.acquire)) return;
             self.closed.store(true, .release);
-            entries = self.conditions;
+            // Moved, not copied: closing allocates nothing.
+            self.released = self.conditions;
             self.conditions = .empty;
             // Under `mu`, as detach does, so a racing attach cannot slip in.
-            for (entries.items) |entry| unregisterFromCondition(self, entry.cond);
+            for (self.released.items) |entry| unregisterFromCondition(self, entry.cond);
         }
-        // The wait ends first: it never waits on a hook. The hooks run with
-        // no lock held (see AttachedCondition.fireRelease), on this thread.
         wakeNotify(self);
-        for (entries.items) |entry| entry.fireRelease();
-        entries.deinit(self.alloc);
     }
 
     /// Shared by the plain, spec-mandated `attach_condition()` (`vtAttach`,
@@ -751,6 +752,10 @@ pub const WaitSetImpl = struct {
         // not attached. Read under self.mu, while the entry keeps `cond` alive.
         var retired = false;
         self.mu.lock();
+        if (self.closed.load(.acquire)) {
+            self.mu.unlock();
+            return DDS.RETCODE_ALREADY_DELETED;
+        }
         for (self.conditions.items, 0..) |entry, i| {
             if (entry.cond.ptr == cond.ptr) {
                 retired = conditionRetired(entry.cond);

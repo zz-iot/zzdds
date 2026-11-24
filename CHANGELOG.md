@@ -10,6 +10,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-24
 
+- `WaitSet::shutdown` no longer runs its conditions' release hooks, so it never waits on
+  application code: they run when the WaitSet is freed, by `destroy` or by a wait that
+  returns after it. Detaching after `shutdown` stays ALREADY_DELETED.
 - `QueryCondition::set_query_parameters` wakes the WaitSets the condition is attached to,
   since the query may now match a sample it did not. Replacing a QueryCondition's
   parameters while a read, a take or a WaitSet evaluates its query no longer frees them
