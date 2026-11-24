@@ -93,18 +93,6 @@ pub fn writerWaitForAck(dw: DDS.DataWriter, timeout: DDS.Duration_t) DDS.ReturnC
 
 // ── DataReader extras ─────────────────────────────────────────────────────────
 
-// ── TypeSupport ───────────────────────────────────────────────────────────────
-
-pub const TypeSupport = zzdds.dcps.TypeSupport;
-
-pub fn registerTypeSupport(
-    dp: DDS.DomainParticipant,
-    type_name: []const u8,
-    ts: TypeSupport,
-) bool {
-    return zzdds.registerTypeSupport(dp, type_name, ts);
-}
-
 // ── Nil sentinel helpers ──────────────────────────────────────────────────────
 // All nil entities share the same underlying nil_storage address (NIL_PTR).
 

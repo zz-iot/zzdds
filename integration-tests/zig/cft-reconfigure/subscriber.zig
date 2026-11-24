@@ -126,19 +126,10 @@ pub fn main(init: std.process.Init) !void {
     }
     defer _ = dpf.delete_participant(dp);
 
-    var ts_alloc = alloc;
-    if (!zzdds.registerTypeSupport(dp, "CftEvent", .{
-        .ctx = @ptrCast(&ts_alloc),
-        .compute_key_hash = cft_event_gen.CftEvent.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = cft_event_gen.CftEvent.projectKeyFromCdr },
-        .compute_key_hash_key_only = cft_event_gen.CftEvent.computeKeyHashFromCdrKeyOnly,
-        // Needed for ContentFilteredTopic expression evaluation at delivery
-        // time -- without this, the CFT reader silently receives everything
-        // unfiltered (the generated C-ABI TypeSupport_register() wires this
-        // in automatically; the raw Zig-native registerTypeSupport() call
-        // does not, so it must be passed explicitly here).
-        .get_field = cft_event_gen.CftEvent.getFieldFromCdr,
-    })) {
+    // The generated registration includes get_field, which evaluates the
+    // ContentFilteredTopic's expression at delivery time; without it the CFT
+    // reader would receive everything unfiltered.
+    if (!cft_event_gen.CftEventTypeSupport.register(dp, "CftEvent", alloc)) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
         std.process.exit(1);
     }

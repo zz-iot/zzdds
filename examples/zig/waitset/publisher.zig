@@ -136,14 +136,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    var ts_alloc = alloc;
-    if (!zzdds.registerTypeSupport(dp, "WaitsetSample", .{
-        .ctx = @ptrCast(&ts_alloc),
-        .compute_key_hash = sample_gen.WaitsetSample.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = sample_gen.WaitsetSample.projectKeyFromCdr },
-        .has_key = sample_gen.WaitsetSample.has_key,
-        .compute_key_hash_key_only = sample_gen.WaitsetSample.computeKeyHashFromCdrKeyOnly,
-    })) {
+    if (!sample_gen.WaitsetSampleTypeSupport.register(dp, "WaitsetSample", alloc)) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
         std.process.exit(1);
     }

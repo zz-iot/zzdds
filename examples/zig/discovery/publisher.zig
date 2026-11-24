@@ -104,14 +104,7 @@ pub fn main(init: std.process.Init) !void {
     }
     defer _ = dpf.delete_participant(dp);
 
-    var ts_alloc = alloc;
-    if (!zzdds.registerTypeSupport(dp, TOPIC_NAME, .{
-        .ctx = @ptrCast(&ts_alloc),
-        .compute_key_hash = ping_gen.DiscoveryPing.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = ping_gen.DiscoveryPing.projectKeyFromCdr },
-        .has_key = ping_gen.DiscoveryPing.has_key,
-        .compute_key_hash_key_only = ping_gen.DiscoveryPing.computeKeyHashFromCdrKeyOnly,
-    })) {
+    if (!ping_gen.DiscoveryPingTypeSupport.register(dp, TOPIC_NAME, alloc)) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
         std.process.exit(1);
     }

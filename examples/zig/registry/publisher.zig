@@ -88,16 +88,9 @@ pub fn main(init: std.process.Init) !void {
     }
     defer _ = dpf.delete_participant(dp);
 
-    var ts_alloc = alloc;
-    if (!zzdds.registerTypeSupport(dp, "SensorReading", .{
-        .ctx = @ptrCast(&ts_alloc),
-        .compute_key_hash = registry_gen.SensorReading.computeKeyHashFromCdr,
-        .has_key = registry_gen.SensorReading.has_key,
-        .compute_key_hash_key_only = registry_gen.SensorReading.computeKeyHashFromCdrKeyOnly,
-        // An instance keeps its key-only CDR for get_key_value, not its
-        // first sample.
-        .key_projection = .{ .ctx = undefined, .project = registry_gen.SensorReading.projectKeyFromCdr },
-    })) {
+    // The generated registration includes the key projection: an instance
+    // keeps its key-only CDR for get_key_value, not its first sample.
+    if (!registry_gen.SensorReadingTypeSupport.register(dp, "SensorReading", alloc)) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
         std.process.exit(1);
     }

@@ -157,14 +157,7 @@ pub fn main(init: std.process.Init) !void {
     }
     defer _ = dpf.delete_participant(dp);
 
-    var ts_alloc = alloc;
-    if (!zzdds.registerTypeSupport(dp, "LoanedPing", .{
-        .ctx = @ptrCast(&ts_alloc),
-        .compute_key_hash = loaned_ping_gen.LoanedPing.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = loaned_ping_gen.LoanedPing.projectKeyFromCdr },
-        .has_key = loaned_ping_gen.LoanedPing.has_key,
-        .compute_key_hash_key_only = loaned_ping_gen.LoanedPing.computeKeyHashFromCdrKeyOnly,
-    })) {
+    if (!loaned_ping_gen.LoanedPingTypeSupport.register(dp, "LoanedPing", alloc)) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
         std.process.exit(1);
     }

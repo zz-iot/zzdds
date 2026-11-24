@@ -170,12 +170,11 @@ const Setup = struct {
     topic: DDS.Topic,
 };
 
-/// `factory` and `ts_alloc` are caller-owned storage that must outlive
-/// everything (the TypeSupport ctx is a `*const std.mem.Allocator` the
-/// generated key-hash path dereferences on every keyed write).
+/// `factory` is caller-owned storage that must outlive everything. The
+/// registration keeps its own copy of `alloc` for decoding keys.
 fn commonSetup(
     factory: *zzdds.DomainParticipantFactory,
-    ts_alloc: *std.mem.Allocator,
+    alloc: std.mem.Allocator,
     cfg: Config,
 ) Setup {
     factory.* = zzdds.createFactory() catch {
@@ -190,13 +189,7 @@ fn commonSetup(
         std.process.exit(1);
     }
 
-    if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
-        .ctx = @ptrCast(ts_alloc),
-        .compute_key_hash = gen.Message.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = gen.Message.projectKeyFromCdr },
-        .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
-        .has_key = gen.Message.has_key,
-    })) {
+    if (!gen.MessageTypeSupport.register(dp, TYPE_NAME, alloc)) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
         std.process.exit(1);
     }
@@ -241,8 +234,7 @@ fn pid() i64 {
 
 fn runPub(io: std.Io, alloc: std.mem.Allocator, cfg: Config) !void {
     var factory: zzdds.DomainParticipantFactory = undefined;
-    var ts_alloc = alloc;
-    const s = commonSetup(&factory, &ts_alloc, cfg);
+    const s = commonSetup(&factory, alloc, cfg);
 
     const publisher = s.dp.create_publisher(.{}, null, 0);
     if (publisher.ptr == zzdds.dcps.NIL_PTR) {
@@ -304,8 +296,7 @@ fn runPub(io: std.Io, alloc: std.mem.Allocator, cfg: Config) !void {
 
 fn runSub(io: std.Io, alloc: std.mem.Allocator, cfg: Config) !void {
     var factory: zzdds.DomainParticipantFactory = undefined;
-    var ts_alloc = alloc;
-    const s = commonSetup(&factory, &ts_alloc, cfg);
+    const s = commonSetup(&factory, alloc, cfg);
 
     const subscriber = s.dp.create_subscriber(.{}, null, 0);
     if (subscriber.ptr == zzdds.dcps.NIL_PTR) {

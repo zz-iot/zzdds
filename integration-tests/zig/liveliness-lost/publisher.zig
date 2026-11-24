@@ -90,13 +90,7 @@ pub fn main(init: std.process.Init) !void {
     }
     defer _ = dpf.delete_participant(dp);
 
-    var ts_alloc = alloc;
-    if (!zzdds.registerTypeSupport(dp, "LivelinessEvent", .{
-        .ctx = @ptrCast(&ts_alloc),
-        .compute_key_hash = liveliness_event_gen.LivelinessEvent.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = liveliness_event_gen.LivelinessEvent.projectKeyFromCdr },
-        .compute_key_hash_key_only = liveliness_event_gen.LivelinessEvent.computeKeyHashFromCdrKeyOnly,
-    })) {
+    if (!liveliness_event_gen.LivelinessEventTypeSupport.register(dp, "LivelinessEvent", alloc)) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
         std.process.exit(1);
     }

@@ -312,16 +312,14 @@ at receive time, not something replayed against a reader's own history when para
 change.
 
 **Zig-native gotcha found building this**: the raw `zzdds.registerTypeSupport()` call
-(used directly by Zig-native apps, bypassing the generated `TypeSupport.register()`
-convenience wrapper C/C++/Java call through) does not wire up `TypeSupport.get_field`
-automatically -- without it, a CFT reader silently receives *everything* unfiltered, no
-error anywhere, since `get_field == null` degrades to "CFT evaluation deferred" rather
-than failing loudly. Every zidl-generated Zig type provides a matching `getFieldFromCdr`
-function for exactly this; must be passed explicitly:
-`.get_field = CftEvent.getFieldFromCdr`. Found because the C/C++/Java ports all worked
-immediately while the Zig port's filtered reader passed everything through unfiltered on
-the first run -- see `zig/cft-reconfigure/subscriber.zig`'s `registerTypeSupport()` call
-comment.
+the Zig port first used, hand-building its TypeSupport, left out `TypeSupport.get_field`
+-- without it, a CFT reader silently receives *everything* unfiltered, no error anywhere,
+since `get_field == null` degrades to "CFT evaluation deferred" rather than failing
+loudly. Found because the C/C++/Java ports, which register through their generated
+`TypeSupport.register()`, all worked immediately while the Zig port's filtered reader
+passed everything through unfiltered on the first run. Since zidl 0.3.43 the Zig ports
+register through the generated `{Type}TypeSupport.register` too, which includes
+`get_field` -- see `zig/cft-reconfigure/subscriber.zig`.
 
 **Timeout note**: `MATCH_TIMEOUT_MS` is 40s here, not the 20s every other match-wait in
 this tier uses -- this scenario waits for *two* readers to match (witness + filtered),

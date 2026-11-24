@@ -101,13 +101,7 @@ pub fn main(init: std.process.Init) !void {
     }
     defer _ = dpf.delete_participant(dp);
 
-    var ts_alloc = alloc;
-    if (!zzdds.registerTypeSupport(dp, "SessionEvent", .{
-        .ctx = @ptrCast(&ts_alloc),
-        .compute_key_hash = session_event_gen.SessionEvent.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = session_event_gen.SessionEvent.projectKeyFromCdr },
-        .compute_key_hash_key_only = session_event_gen.SessionEvent.computeKeyHashFromCdrKeyOnly,
-    })) {
+    if (!session_event_gen.SessionEventTypeSupport.register(dp, "SessionEvent", alloc)) {
         std.debug.print("FAIL: registerTypeSupport(SessionEvent) failed\n", .{});
         std.process.exit(1);
     }

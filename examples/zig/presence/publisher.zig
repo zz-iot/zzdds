@@ -96,14 +96,7 @@ pub fn main(init: std.process.Init) !void {
     }
     defer _ = dpf.delete_participant(dp);
 
-    var ts_alloc = alloc;
-    if (!zzdds.registerTypeSupport(dp, "PresenceBeacon", .{
-        .ctx = @ptrCast(&ts_alloc),
-        .compute_key_hash = presence_gen.PresenceBeacon.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = presence_gen.PresenceBeacon.projectKeyFromCdr },
-        .has_key = presence_gen.PresenceBeacon.has_key,
-        .compute_key_hash_key_only = presence_gen.PresenceBeacon.computeKeyHashFromCdrKeyOnly,
-    })) {
+    if (!presence_gen.PresenceBeaconTypeSupport.register(dp, "PresenceBeacon", alloc)) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
         std.process.exit(1);
     }

@@ -130,7 +130,6 @@ fn parseArgs(raw: std.process.Args, arena: std.mem.Allocator) !Config {
 }
 
 var g_alloc: std.mem.Allocator = undefined;
-var g_ts_alloc: std.mem.Allocator = undefined;
 var g_ops = std.atomic.Value(u64).init(0);
 var g_fail = std.atomic.Value(bool).init(false);
 
@@ -149,7 +148,6 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     g_alloc = gpa.allocator();
-    g_ts_alloc = g_alloc;
 
     const cfg = try parseArgs(init.minimal.args, init.arena.allocator());
 
@@ -230,13 +228,7 @@ fn runEntities(io: std.Io, cfg: Config) !void {
     }
     defer _ = dpf.delete_participant(dp);
 
-    if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
-        .ctx = @ptrCast(&g_ts_alloc),
-        .compute_key_hash = gen.Message.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = gen.Message.projectKeyFromCdr },
-        .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
-        .has_key = gen.Message.has_key,
-    })) {
+    if (!gen.MessageTypeSupport.register(dp, TYPE_NAME, g_alloc)) {
         fail("registerTypeSupport");
         return;
     }
@@ -471,14 +463,7 @@ fn runWaitset(io: std.Io, cfg: Config) !void {
     }
     defer _ = dpf.delete_participant(dp);
 
-    if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
-        .ctx = @ptrCast(&g_ts_alloc),
-        .compute_key_hash = gen.Message.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = gen.Message.projectKeyFromCdr },
-        .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
-        .has_key = gen.Message.has_key,
-        .get_field = gen.Message.getFieldFromCdr,
-    })) {
+    if (!gen.MessageTypeSupport.register(dp, TYPE_NAME, g_alloc)) {
         fail("registerTypeSupport");
         return;
     }
@@ -663,13 +648,7 @@ fn runListener(io: std.Io, cfg: Config) !void {
         .on_data_available = cbDataAvail,
     }, DDS.PUBLICATION_MATCHED_STATUS | DDS.SUBSCRIPTION_MATCHED_STATUS | DDS.DATA_AVAILABLE_STATUS);
 
-    if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
-        .ctx = @ptrCast(&g_ts_alloc),
-        .compute_key_hash = gen.Message.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = gen.Message.projectKeyFromCdr },
-        .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
-        .has_key = gen.Message.has_key,
-    })) {
+    if (!gen.MessageTypeSupport.register(dp, TYPE_NAME, g_alloc)) {
         fail("registerTypeSupport");
         return;
     }
@@ -830,14 +809,7 @@ fn runCft(io: std.Io, cfg: Config) !void {
     }
     defer _ = dpf.delete_participant(dp);
 
-    if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
-        .ctx = @ptrCast(&g_ts_alloc),
-        .compute_key_hash = gen.Message.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = gen.Message.projectKeyFromCdr },
-        .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
-        .has_key = gen.Message.has_key,
-        .get_field = gen.Message.getFieldFromCdr,
-    })) {
+    if (!gen.MessageTypeSupport.register(dp, TYPE_NAME, g_alloc)) {
         fail("registerTypeSupport");
         return;
     }
@@ -1007,13 +979,7 @@ fn participantsThread(ctx: ParticipantsCtx) void {
             .on_data_available = cbDataAvail,
         }, DDS.PUBLICATION_MATCHED_STATUS | DDS.SUBSCRIPTION_MATCHED_STATUS | DDS.DATA_AVAILABLE_STATUS);
 
-        if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
-            .ctx = @ptrCast(&g_ts_alloc),
-            .compute_key_hash = gen.Message.computeKeyHashFromCdr,
-            .key_projection = .{ .ctx = undefined, .project = gen.Message.projectKeyFromCdr },
-            .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
-            .has_key = gen.Message.has_key,
-        })) {
+        if (!gen.MessageTypeSupport.register(dp, TYPE_NAME, g_alloc)) {
             fail("participants: registerTypeSupport");
             _ = dpf.delete_participant(dp);
             factory.deinit();
@@ -1232,13 +1198,7 @@ fn runInstance(io: std.Io, cfg: Config) !void {
     }
     defer _ = dpf.delete_participant(dp);
 
-    if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
-        .ctx = @ptrCast(&g_ts_alloc),
-        .compute_key_hash = gen.Message.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = gen.Message.projectKeyFromCdr },
-        .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
-        .has_key = gen.Message.has_key,
-    })) {
+    if (!gen.MessageTypeSupport.register(dp, TYPE_NAME, g_alloc)) {
         fail("registerTypeSupport");
         return;
     }

@@ -86,13 +86,7 @@ pub fn main(init: std.process.Init) !void {
     }
     defer _ = dpf.delete_participant(dp);
 
-    var ts_alloc = alloc;
-    if (!zzdds.registerTypeSupport(dp, "CftEvent", .{
-        .ctx = @ptrCast(&ts_alloc),
-        .compute_key_hash = cft_event_gen.CftEvent.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = cft_event_gen.CftEvent.projectKeyFromCdr },
-        .compute_key_hash_key_only = cft_event_gen.CftEvent.computeKeyHashFromCdrKeyOnly,
-    })) {
+    if (!cft_event_gen.CftEventTypeSupport.register(dp, "CftEvent", alloc)) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
         std.process.exit(1);
     }

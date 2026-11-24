@@ -79,13 +79,7 @@ pub fn main(init: std.process.Init) !void {
     }
     defer _ = dpf.delete_participant(dp);
 
-    var ts_alloc = alloc;
-    if (!zzdds.registerTypeSupport(dp, "TimestampEvent", .{
-        .ctx = @ptrCast(&ts_alloc),
-        .compute_key_hash = timestamp_event_gen.TimestampEvent.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = timestamp_event_gen.TimestampEvent.projectKeyFromCdr },
-        .compute_key_hash_key_only = timestamp_event_gen.TimestampEvent.computeKeyHashFromCdrKeyOnly,
-    })) {
+    if (!timestamp_event_gen.TimestampEventTypeSupport.register(dp, "TimestampEvent", alloc)) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
         std.process.exit(1);
     }
