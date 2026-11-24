@@ -1161,6 +1161,7 @@ fn nilGuardconditionGetCAbiHandle(ctx: *anyopaque) *anyopaque {
 
 var nil_waitset_vtable = DDS.WaitSet.Vtable{
     .destroy = nilDestroy,
+    .shutdown = nilDestroy,
     .wait = struct {
         fn f(_: *anyopaque, _: ?*DDS.ConditionSeq, _: *const DDS.Duration_t) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;

@@ -817,8 +817,9 @@ contract item; today's generated panic is not the desired recoverable path.
 <a id="explicit-close-separate-destruction"></a>
 ### Explicit close, separate destruction
 
-Provide an idempotent, permanent, non-draining close operation on the zzdds WaitSet
-extension interface. The standard WaitSet interface remains unchanged. A safely live
+Provide an idempotent, permanent, non-draining close operation: `WaitSet::shutdown`,
+a zzdds extension on the WaitSet interface in dcps.idl, named so as not to collide with
+the bindings' own `close` (Java's, for one, destroys the WaitSet). A safely live
 wrapper/handle can call close repeatedly and receive OK. Close is not a reset or a
 one-shot interruption; a GuardCondition remains the standard reusable stop signal.
 

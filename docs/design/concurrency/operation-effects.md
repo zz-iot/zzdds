@@ -135,6 +135,21 @@ A read that fails marks the samples it names `UNDECODABLE_SAMPLE_STATE` under th
 and changes nothing otherwise. A reader's samples marked so count toward its limits like
 any other, so under KEEP_ALL, samples the application never collects can fill the cache.
 
+## WaitSet waits
+
+A wait holds its WaitSet (`quiesce`) until it returns, so destroying the WaitSet
+meanwhile ends the wait, ALREADY_DELETED, rather than freeing it under the waiter.
+`shutdown`, which `destroy` runs first, closes the WaitSet for good under its lock and
+detaches the conditions. It wakes the wait, which then returns ALREADY_DELETED, as do
+later waits, attaches, detaches and `get_conditions`, and only then fires the release
+hooks, on its own thread, holding the WaitSet so that a hook may destroy it. A wait
+never waits on a hook; running the hooks on a cleanup executor, so that `shutdown`
+itself never does either, belongs with the binding result leases. A WaitSet admits one wait at a time: another, even with a zero
+timeout, is PRECONDITION_NOT_MET. Attaching a condition wakes the wait to rescan.
+Only the first look may find a condition true past the deadline: a later one commits
+only if the deadline has not passed when its scan is done, and otherwise is a TIMEOUT. What a condition's trigger tests, and which samples an ordered access
+lets a read or take see, are the next part.
+
 ## Status
 
 | Operation | Status |
@@ -144,4 +159,6 @@ any other, so under KEEP_ALL, samples the application never collects can fill th
 | Blocking write | Done |
 | Take after an allocation failure | Done |
 | Take when a binding fails to decode | Done: `return_loan_raw_failed`, `set_keep_undecodable`; zidl's typed reads and takes use them |
-| WaitSet waits | To audit: a ReadCondition's trigger does not apply its state masks (it skips undecodable samples only) |
+| WaitSet lifetime, admission and deadline | Done |
+| WaitSet condition triggers | Next: a ReadCondition's trigger does not apply its state masks or query (it skips undecodable samples only); next-instance and copy-mode takes ignore an ordered access's window |
+| WaitSet results in C++ and Java | Later: a selected result's wrappers are not leased through conversion |
