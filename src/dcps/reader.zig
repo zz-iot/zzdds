@@ -868,6 +868,12 @@ pub const DataReaderImpl = struct {
     pub fn releaseQuiesce(self: *Self) void {
         self.quiesce.release(self, reallyDeinit);
     }
+    /// Another reference to a reader its caller already holds one on: it
+    /// succeeds even once the reader's deletion has begun, which the held
+    /// reference defers. `releaseQuiesce` ends it.
+    pub fn retainQuiesce(self: *Self) void {
+        std.debug.assert(self.quiesce.acquireIfAlive());
+    }
 
     /// Ends `acquireProto`: called before the subscriber destroys
     /// `proto_reader`, which may then be freed once nothing pins it.
@@ -2347,12 +2353,14 @@ pub const DataReaderImpl = struct {
                 }
             }
             const info = pc.info;
-            const data = self.takeOutLocked(pc) orelse {
+            const copy: ?[]u8 = if (pc.quiesce.shared()) self.alloc.dupe(u8, pc.data) catch {
+                // Out of memory: the sample stays, and so does its signal.
                 self.pending.insertAssumeCapacity(0, pc);
                 if (self.ordered_access_watermark) |*wm| wm.* += 1;
+                self.markDataAvailableLocked();
                 return null;
-            };
-            var result = [1]TakenSample{.{ .data = data, .info = info }};
+            } else null;
+            var result = [1]TakenSample{.{ .data = self.takeOutLocked(pc, copy), .info = info }};
             self.finalizeGenerationRanksLocked(&result);
             return result[0];
         }
@@ -2402,7 +2410,12 @@ pub const DataReaderImpl = struct {
         for (self.pending.items, 0..) |pc, idx| {
             if (pc.info.instance_handle == tgt) {
                 const info = pc.info;
-                const data = self.takeOutLocked(pc) orelse return null;
+                const copy: ?[]u8 = if (pc.quiesce.shared()) self.alloc.dupe(u8, pc.data) catch {
+                    // Out of memory: the sample stays, and so does its signal.
+                    self.markDataAvailableLocked();
+                    return null;
+                } else null;
+                const data = self.takeOutLocked(pc, copy);
                 _ = self.pending.orderedRemove(idx);
                 var result = [1]TakenSample{.{ .data = data, .info = info }};
                 self.finalizeGenerationRanksLocked(&result);
@@ -2504,19 +2517,21 @@ pub const DataReaderImpl = struct {
         const tgt = self.nextInstanceLocked(prev_instance_handle, sample_mask, view_mask, instance_mask, maybe_qc);
         const n = if (tgt) |ih| self.countSelectedLocked(sample_mask, view_mask, instance_mask, max_samples, ih, maybe_qc) else 0;
         try self.prepareLocked(TakenSample, out, n, prepare);
+        const copies: []?[]u8 = if (tgt) |ih| try self.copyPinnedLocked(n, .{ .ss = sample_mask, .vs = view_mask, .is = instance_mask, .ih = ih, .qc = maybe_qc }) else &.{};
+        defer self.freeCopies(copies);
         self.resetDataAvailableLocked();
         const ih = tgt orelse return;
         const start = out.items.len;
         var write: usize = 0;
         for (self.pending.items) |pc| {
-            const take = out.items.len - start < n and self.selects(pc, sample_mask, view_mask, instance_mask, ih, maybe_qc);
-            const info = pc.info;
-            const key_hash = pc.key_hash;
-            if (take) if (self.takeOutLocked(pc)) |data| {
-                out.appendAssumeCapacity(.{ .data = data, .info = info, .key_hash = key_hash });
-                continue;
-            };
-            {
+            const k = out.items.len - start;
+            if (k < n and self.selects(pc, sample_mask, view_mask, instance_mask, ih, maybe_qc)) {
+                const info = pc.info;
+                const key_hash = pc.key_hash;
+                const copy = if (copies.len > 0) copies[k] else null;
+                if (copies.len > 0) copies[k] = null;
+                out.appendAssumeCapacity(.{ .data = self.takeOutLocked(pc, copy), .info = info, .key_hash = key_hash });
+            } else {
                 self.pending.items[write] = pc;
                 write += 1;
             }
@@ -2745,14 +2760,14 @@ pub const DataReaderImpl = struct {
         defer self.mu.unlock();
         defer self.reclaimInstancesLocked();
         self.purgeExpiredLocked();
-        const ih_sel: ??DDS.InstanceHandle_t = maybe_ih;
-        const n = if (ih_sel != null) self.countSelectedLocked(sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc) else 0;
+        const window = self.pending.items[0..self.orderedWindowLocked()];
+        const n = self.countSelectedInLocked(window, sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc);
         var out: std.ArrayListUnmanaged(*PendingChange) = .empty;
         errdefer out.deinit(self.alloc);
         try out.ensureTotalCapacityPrecise(self.alloc, n);
         if (prepare) |p| try p.prepare(p.ctx, n);
         self.resetDataAvailableLocked();
-        for (self.pending.items) |pc| {
+        for (window) |pc| {
             if (out.items.len >= n) break;
             if (!self.selects(pc, sample_mask, view_mask, instance_mask, maybe_ih, maybe_qc)) continue;
             // Structurally unreachable today: acquire-vs-eviction are both
@@ -2782,13 +2797,11 @@ pub const DataReaderImpl = struct {
 
     /// Ends one sample of a native raw take's or read's loan (`raw_ops`'s
     /// `OwnedRawSample`), `failed` naming it undecoded, and releases the
-    /// reader and protocol-reader refs it held. Its reader may be freed.
+    /// reader ref it held (`retainQuiesce`). Its reader may be freed. Ending
+    /// a sample never touches the protocol reader, so it holds none of that.
     pub fn endLoanedSample(self: *Self, pc: *PendingChange, taken: bool, failed: bool) void {
         const flags = [1]u8{1};
         self.endLoanSamples(&.{pc}, taken, if (failed) &flags else null);
-        // proto_reader's ref first, while self is still alive; self's own
-        // last, since it may free self.
-        self.proto_reader.quiesceRelease();
         self.releaseQuiesce();
     }
 
@@ -2907,19 +2920,66 @@ pub const DataReaderImpl = struct {
     }
 
     /// Takes `pc`, out of the queue, for a copy-mode take: its data, moved
-    /// out with `pc` freed, or copied when a read loan still pins `pc`, which
-    /// that loan's end then frees. Null, out of memory for the copy: the
-    /// caller leaves `pc` queued. With `mu` held.
-    fn takeOutLocked(self: *Self, pc: *PendingChange) ?[]u8 {
-        if (!pc.quiesce.shared()) {
-            const data = pc.data;
-            self.alloc.destroy(pc);
-            return data;
+    /// out with `pc` freed, or `copy` of it, made beforehand because a read
+    /// loan pins `pc` (`copyPinnedLocked`), which that loan's end then frees.
+    /// With `mu` held, under which alone a loan pins a sample.
+    fn takeOutLocked(self: *Self, pc: *PendingChange, copy: ?[]u8) []u8 {
+        if (copy) |c| {
+            pc.quiesce.beginTeardown(pc, PendingChange.reallyFree);
+            return c;
         }
-        const copy = self.alloc.dupe(u8, pc.data) catch return null;
-        pc.quiesce.beginTeardown(pc, PendingChange.reallyFree);
-        return copy;
+        std.debug.assert(!pc.quiesce.shared());
+        const data = pc.data;
+        self.alloc.destroy(pc);
+        return data;
     }
+
+    /// Copies, before a copy-mode take changes anything, the payloads of the
+    /// samples it will take (the first `n` `pending` samples `sel` selects)
+    /// that a read loan pins, which `takeOutLocked` cannot move: one entry
+    /// per sample taken, null for one not pinned. Empty if none is pinned.
+    /// The caller frees it with `freeCopies`. With `mu` held.
+    fn copyPinnedLocked(self: *Self, n: usize, sel: Selection) error{OutOfMemory}![]?[]u8 {
+        var pinned = false;
+        var k: usize = 0;
+        for (self.pending.items) |pc| {
+            if (k >= n) break;
+            if (!sel.selects(self, pc)) continue;
+            if (pc.quiesce.shared()) pinned = true;
+            k += 1;
+        }
+        if (!pinned) return &.{};
+        const copies = try self.alloc.alloc(?[]u8, n);
+        @memset(copies, null);
+        errdefer self.freeCopies(copies);
+        k = 0;
+        for (self.pending.items) |pc| {
+            if (k >= n) break;
+            if (!sel.selects(self, pc)) continue;
+            if (pc.quiesce.shared()) copies[k] = try self.alloc.dupe(u8, pc.data);
+            k += 1;
+        }
+        return copies;
+    }
+
+    fn freeCopies(self: *Self, copies: []?[]u8) void {
+        if (copies.len == 0) return;
+        for (copies) |c| if (c) |d| self.alloc.free(d);
+        self.alloc.free(copies);
+    }
+
+    /// What a read or take selects, for `copyPinnedLocked`.
+    const Selection = struct {
+        ss: DDS.SampleStateMask,
+        vs: DDS.ViewStateMask,
+        is: DDS.InstanceStateMask,
+        ih: ?DDS.InstanceHandle_t,
+        qc: ?*const waitset.QueryConditionImpl,
+
+        fn selects(sel: Selection, r: *const Self, pc: *const PendingChange) bool {
+            return r.selects(pc, sel.ss, sel.vs, sel.is, sel.ih, sel.qc);
+        }
+    };
 
     pub fn releasePinnedSamples(self: *Self, samples: []const *PendingChange) void {
         for (samples) |pc| {
@@ -2970,8 +3030,8 @@ pub const DataReaderImpl = struct {
         defer self.mu.unlock();
         defer self.reclaimInstancesLocked();
         self.purgeExpiredLocked();
-        const ih_sel: ??DDS.InstanceHandle_t = maybe_ih;
-        const n = if (ih_sel != null) self.countSelectedLocked(sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc) else 0;
+        const window = self.orderedWindowLocked();
+        const n = self.countSelectedInLocked(self.pending.items[0..window], sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc);
         var out: std.ArrayListUnmanaged(*PendingChange) = .empty;
         errdefer out.deinit(self.alloc);
         try out.ensureTotalCapacityPrecise(self.alloc, n);
@@ -2979,8 +3039,8 @@ pub const DataReaderImpl = struct {
         if (prepare) |p| try p.prepare(p.ctx, n);
         self.resetDataAvailableLocked();
         var write: usize = 0;
-        for (self.pending.items) |pc| {
-            if (out.items.len < n and self.selects(pc, sample_mask, view_mask, instance_mask, maybe_ih, maybe_qc)) {
+        for (self.pending.items, 0..) |pc, i| {
+            if (i < window and out.items.len < n and self.selects(pc, sample_mask, view_mask, instance_mask, maybe_ih, maybe_qc)) {
                 out.appendAssumeCapacity(pc);
             } else {
                 self.pending.items[write] = pc;
@@ -2988,6 +3048,8 @@ pub const DataReaderImpl = struct {
             }
         }
         self.pending.items.len = write;
+        // What it took came from the window, which shrinks by as much.
+        if (self.ordered_access_watermark) |*wm| wm.* -= out.items.len;
         self.holdInstancesLocked(out.items);
         self.finalizeGenerationRanksLockedPinned(out.items);
         _ = self.outstanding_loans.fetchAdd(out.items.len, .monotonic);
@@ -3148,18 +3210,20 @@ pub const DataReaderImpl = struct {
         self.purgeExpiredLocked();
         const n = self.countSelectedLocked(sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc);
         try self.prepareLocked(TakenSample, out, n, prepare);
+        const copies = try self.copyPinnedLocked(n, .{ .ss = sample_mask, .vs = view_mask, .is = instance_mask, .ih = maybe_ih, .qc = maybe_qc });
+        defer self.freeCopies(copies);
         self.resetDataAvailableLocked();
         const start = out.items.len;
         var write: usize = 0;
         for (self.pending.items) |pc| {
-            const take = out.items.len - start < n and self.selects(pc, sample_mask, view_mask, instance_mask, maybe_ih, maybe_qc);
-            const info = pc.info;
-            const key_hash = pc.key_hash;
-            if (take) if (self.takeOutLocked(pc)) |data| {
-                out.appendAssumeCapacity(.{ .data = data, .info = info, .key_hash = key_hash });
-                continue;
-            };
-            {
+            const k = out.items.len - start;
+            if (k < n and self.selects(pc, sample_mask, view_mask, instance_mask, maybe_ih, maybe_qc)) {
+                const info = pc.info;
+                const key_hash = pc.key_hash;
+                const copy = if (copies.len > 0) copies[k] else null;
+                if (copies.len > 0) copies[k] = null;
+                out.appendAssumeCapacity(.{ .data = self.takeOutLocked(pc, copy), .info = info, .key_hash = key_hash });
+            } else {
                 self.pending.items[write] = pc;
                 write += 1;
             }
@@ -3210,13 +3274,34 @@ pub const DataReaderImpl = struct {
         maybe_ih: ?DDS.InstanceHandle_t,
         maybe_qc: ?*const waitset.QueryConditionImpl,
     ) usize {
+        return self.countSelectedInLocked(self.pending.items, sample_mask, view_mask, instance_mask, max_samples, maybe_ih, maybe_qc);
+    }
+
+    fn countSelectedInLocked(
+        self: *const Self,
+        items: []const *PendingChange,
+        sample_mask: DDS.SampleStateMask,
+        view_mask: DDS.ViewStateMask,
+        instance_mask: DDS.InstanceStateMask,
+        max_samples: i32,
+        maybe_ih: ?DDS.InstanceHandle_t,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
+    ) usize {
         const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
         var n: usize = 0;
-        for (self.pending.items) |pc| {
+        for (items) |pc| {
             if (n >= limit) break;
             if (self.selects(pc, sample_mask, view_mask, instance_mask, maybe_ih, maybe_qc)) n += 1;
         }
         return n;
+    }
+
+    /// How many of `pending`'s samples a loan-mode read or take may select:
+    /// within an ordered access (`Subscriber.begin_access`), only those
+    /// ordered then (`ordered_access_watermark`). Caller holds `mu`.
+    fn orderedWindowLocked(self: *const Self) usize {
+        const wm = self.ordered_access_watermark orelse return self.pending.items.len;
+        return @min(wm, self.pending.items.len);
     }
 
     /// The instance a next-instance read or take selects from: the smallest

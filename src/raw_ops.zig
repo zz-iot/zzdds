@@ -108,10 +108,10 @@ fn loanInto(
     };
     defer impl.alloc.free(pcs);
     for (pcs) |pc| {
-        // Each sample holds its own refs, which its `deinit` releases. This
-        // call's refs keep both alive, so these cannot fail.
-        std.debug.assert(impl.acquireQuiesce());
-        std.debug.assert(impl.acquireProto());
+        // Each sample holds the reader, until its `deinit`: retained from
+        // this call's own ref, so even a deletion begun meanwhile (which
+        // the sample's loan then defers) cannot refuse it.
+        impl.retainQuiesce();
         out.appendAssumeCapacity(.{ .data = pc.data, .info = pc.info, ._reader = impl, ._pc = pc, ._taken = taken });
     }
 }

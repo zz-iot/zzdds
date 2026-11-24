@@ -1754,3 +1754,114 @@ test "OwnedRawSample: one ended failed is restored, kept, as return_loan_raw_fai
     try testing.expectEqual(DDS.READ_SAMPLE_STATE | UNDECODABLE, dr.pending.items[0].info.sample_state);
     try testing.expectEqual(@as(u8, 0xA), dr.pending.items[0].data[4]);
 }
+
+test "retainQuiesce: a reference held when deletion begins can still be retained, where acquiring is refused" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+
+    // As a native raw take holds the reader while it selects.
+    try testing.expect(dr.acquireQuiesce());
+    try testing.expectEqual(DDS.RETCODE_OK, fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds));
+    try testing.expect(!dr.acquireQuiesce());
+    // Each sample it hands out retains the reader instead.
+    dr.retainQuiesce();
+    dr.releaseQuiesce();
+    // The last release frees the reader: the leak check is the assertion.
+    dr.releaseQuiesce();
+}
+
+test "loan-mode takes and reads keep to the ordered-access window begin_access set" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    for ([_]u8{ 0xA, 0xB, 0xC }, 1..) |b, k| dr.pushBuiltinCdr(&sample(b), keyOf(@intCast(k)), DDS.HANDLE_NIL, .alive);
+    // Two ordered; the third arrived after.
+    {
+        dr.mu.lock();
+        defer dr.mu.unlock();
+        dr.ordered_access_watermark = 2;
+    }
+
+    var read: RawLoan = .{};
+    try read.read(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    try testing.expectEqual(@as(usize, 2), read.len());
+    try read.returnLoan(dr_dds);
+
+    const first = zzdds.takeRaw(dr_dds) orelse return error.NoSample;
+    try testing.expectEqual(@as(u8, 0xA), first.data[4]);
+    first.deinit();
+    var rest: RawLoan = .{};
+    try rest.take(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    try testing.expectEqual(@as(usize, 1), rest.len());
+    try testing.expectEqual(@as(u8, 0xB), rest.byte(0));
+    try rest.returnLoan(dr_dds);
+    try testing.expect(zzdds.takeRaw(dr_dds) == null);
+    try testing.expectEqual(@as(?usize, 0), dr.ordered_access_watermark);
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
+}
+
+test "a copy-mode take of a sample a read loan pins: out of memory for its copy, nothing changes" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    dr.pushBuiltinCdr(&sample(0xA), keyOf(1), DDS.HANDLE_NIL, .alive);
+    dr.pushBuiltinCdr(&sample(0xB), keyOf(2), DDS.HANDLE_NIL, .alive);
+
+    var pinned: RawLoan = .{};
+    try pinned.read(dr_dds, DDS.ANY_SAMPLE_STATE, 1);
+    defer pinned.returnLoan(dr_dds) catch {};
+
+    const original = dr.alloc;
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        try testing.expect(fail_at < 64);
+        var failing = std.testing.FailingAllocator.init(original, .{ .fail_index = fail_at, .resize_fail_index = fail_at });
+        dr.alloc = failing.allocator();
+        var copy: RawLoan = .{ .payloads = .{ ._maximum = 2 } };
+        const rc = dr_dds.vtable.take_raw(dr_dds.ptr, &copy.payloads, &copy.hashes, &copy.infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1);
+        dr.alloc = original;
+        if (rc == DDS.RETCODE_OUT_OF_RESOURCES) {
+            try testing.expectEqual(@as(usize, 2), dr.pending.items.len);
+            continue;
+        }
+        try testing.expectEqual(DDS.RETCODE_OK, rc);
+        try testing.expectEqual(@as(usize, 2), copy.len());
+        try copy.returnLoan(dr_dds);
+        break;
+    }
+    try testing.expect(fail_at > 0);
+    // The pinned sample's data is still the reader's.
+    try testing.expectEqual(@as(u8, 0xA), pinned.byte(0));
+}
+
+test "the reader's own single take of a pinned sample: out of memory for its copy, the sample and its signal stay" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    dr.pushBuiltinCdr(&sample(0xA), keyOf(1), DDS.HANDLE_NIL, .alive);
+
+    var pinned: RawLoan = .{};
+    try pinned.read(dr_dds, DDS.ANY_SAMPLE_STATE, 1);
+    defer pinned.returnLoan(dr_dds) catch {};
+
+    const original = dr.alloc;
+    var failing = std.testing.FailingAllocator.init(original, .{ .fail_index = 0 });
+    dr.alloc = failing.allocator();
+    const taken = dr.takeRaw();
+    dr.alloc = original;
+    try testing.expect(taken == null);
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
+    try testing.expect(dr.status_changes & DDS.DATA_AVAILABLE_STATUS != 0);
+}
