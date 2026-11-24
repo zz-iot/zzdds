@@ -24,7 +24,8 @@ pub const Outcome = enum {
 /// that owns it. Lock order: that entity's lock, then this one.
 pub const Waiter = struct {
     clock: time_mod.Clock,
-    /// The manual runtime the wait helps, woken when the wait is settled.
+    /// The runtime the wait helps when it `helpsHere`, woken when the
+    /// wait is settled.
     runtime: ?*runtime_mod.Runtime,
     deadline_ns: ?i64,
     mu: Mutex = .{},
@@ -97,15 +98,16 @@ pub const Waiter = struct {
         if (self.runtime) |rt| rt.wakeHelpers();
     }
 
-    /// The outcome, waiting for it until the deadline. On a manual runtime
-    /// the wait runs its internal work meanwhile.
+    /// The outcome, waiting for it until the deadline. On a manual runtime,
+    /// or a hosted one from one of its turns, the wait runs its internal
+    /// work meanwhile.
     pub fn wait(self: *Waiter) Outcome {
         // A zero max_wait only checks: it neither helps nor blocks.
         if (self.expired()) {
             self.settle(.timed_out);
             return self.outcomeNow();
         }
-        if (self.runtime) |rt| if (rt.canHelp()) {
+        if (self.runtime) |rt| if (rt.helpsHere()) {
             _ = rt.helpUntil(self.deadline_ns, self, isSettled);
             self.mu.lock();
             defer self.mu.unlock();

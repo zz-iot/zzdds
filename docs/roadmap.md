@@ -1026,9 +1026,12 @@ finishes once its other listeners in progress, and that traversal, return. On a 
 created with that runtime, `wait_for_acknowledgments` on a writer or publisher, and
 `wait_for_historical_data` run internal turns and due timers until they are satisfied or
 their deadline (on the runtime clock) passes, never listener turns, including when called
-from a listener; on a hosted runtime they only observe. A RELIABLE write that finds its
-history full (RESOURCE_LIMITS) waits the same way, for up to `max_blocking_time`, while
-readers acknowledge. Without a selection, creation
+from a listener. On a hosted runtime they only observe, except from one of its own
+turns, such as a listener's: that worker may be the only one free to run what they wait
+for, so they help as on a manual runtime. A RELIABLE write that finds its history full
+(RESOURCE_LIMITS) waits the same way, for up to `max_blocking_time`, while readers
+acknowledge, and so does a RELIABLE writer's deletion while its unregisters are
+acknowledged. Without a selection, creation
 uses the process's default runtime: a hosted one with two workers, started at the first
 such creation and retired with its last participant (the next creation starts another),
 unless the application installs a runtime of its own (creation then fails once that one
