@@ -10,6 +10,14 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-24
 
+- A blocking call from a listener on a hosted runtime helps the runtime, as on a manual
+  runtime, rather than block the worker running it, which may be the only one free to
+  process what the call waits for: `wait_for_acknowledgments` on a writer or publisher,
+  `wait_for_historical_data`, a RELIABLE write waiting for room under RESOURCE_LIMITS,
+  and a RELIABLE writer's deletion waiting for its unregisters to be acknowledged, which
+  from a listener used to skip that wait. With one worker these timed out, or waited
+  forever without a deadline. The call runs internal turns and due timers only, never
+  another listener (docs/design/concurrency/operations.md#stable-helping-policy).
 - A WaitSet holds itself while a thread waits on it: destroying it meanwhile ends the wait
   with ALREADY_DELETED; before, it freed the WaitSet under the waiting thread. The new
   `WaitSet::shutdown` closes a WaitSet for good without freeing it: it detaches its

@@ -1049,8 +1049,9 @@ pub const StatefulWriter = struct {
     /// OutOfResources at once, as a RELIABLE one does when it cannot queue.
     /// Closed once `closeWrites` has run, before or during the wait. A write
     /// that has waited past its deadline times out rather than take room
-    /// freed since; a zero timeout only checks. On a manual runtime the wait
-    /// runs its internal work, on its clock.
+    /// freed since; a zero timeout only checks. On a manual runtime, or a
+    /// hosted one from one of its turns, the wait runs its internal work,
+    /// on its clock.
     pub fn admitWrite(self: *Self, adm: *WriteAdmission, may_block: bool, timeout_ns: ?i64) error{ Timeout, OutOfResources, Closed }!void {
         const clock = self.admissionClock();
         const deadline_ns: ?i64 = if (timeout_ns) |t| clock.nowNs() +| t else null;
@@ -1078,7 +1079,7 @@ pub const StatefulWriter = struct {
                 return if (may_block) error.Timeout else error.OutOfResources;
             }
             waited = true;
-            if (self.runtime) |rt| if (rt.canHelp()) {
+            if (self.runtime) |rt| if (rt.helpsHere()) {
                 const Wait = struct {
                     writer: *Self,
                     adm: *const WriteAdmission,
