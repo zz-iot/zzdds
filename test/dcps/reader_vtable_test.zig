@@ -1843,7 +1843,7 @@ test "a copy-mode take of a sample a read loan pins: out of memory for its copy,
     try testing.expectEqual(@as(u8, 0xA), pinned.byte(0));
 }
 
-test "the reader's own single take of a pinned sample: out of memory for its copy, the sample and its signal stay" {
+test "the reader's own single take of a pinned sample: out of memory for its copy, nothing changes" {
     const alloc = testing.allocator;
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
@@ -1856,6 +1856,7 @@ test "the reader's own single take of a pinned sample: out of memory for its cop
     try pinned.read(dr_dds, DDS.ANY_SAMPLE_STATE, 1);
     defer pinned.returnLoan(dr_dds) catch {};
 
+    const status = dr.status_changes;
     const original = dr.alloc;
     var failing = std.testing.FailingAllocator.init(original, .{ .fail_index = 0 });
     dr.alloc = failing.allocator();
@@ -1863,7 +1864,7 @@ test "the reader's own single take of a pinned sample: out of memory for its cop
     dr.alloc = original;
     try testing.expect(taken == null);
     try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
-    try testing.expect(dr.status_changes & DDS.DATA_AVAILABLE_STATUS != 0);
+    try testing.expectEqual(status, dr.status_changes);
 }
 
 test "return_loan_raw_failed: within an ordered access, a restored sample goes back into the ordered window" {
@@ -1892,4 +1893,126 @@ test "return_loan_raw_failed: within an ordered access, a restored sample goes b
     try testing.expectEqual(@as(u8, 0xB), b.byte(0));
     try b.returnLoan(dr_dds);
     try testing.expectEqual(@as(?usize, 1), dr.ordered_access_watermark);
+}
+
+// ── Condition triggers and the ordered window ─────────────────────────────────
+//
+// docs/design/concurrency/operations.md#level-observation-not-a-queue-of-trigger-events
+
+fn triggered(c: DDS.ReadCondition) bool {
+    return c.vtable.as_Condition(c.ptr).get_trigger_value();
+}
+
+test "ReadCondition: its trigger applies its own state masks" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    const not_read = dr_dds.vtable.create_readcondition(dr_dds.ptr, DDS.NOT_READ_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    defer _ = dr_dds.vtable.delete_readcondition(dr_dds.ptr, not_read);
+    const read = dr_dds.vtable.create_readcondition(dr_dds.ptr, DDS.READ_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    defer _ = dr_dds.vtable.delete_readcondition(dr_dds.ptr, read);
+
+    try testing.expect(!triggered(not_read) and !triggered(read));
+    dr.pushBuiltinCdr(&sample(0xA), keyOf(1), DDS.HANDLE_NIL, .alive);
+    try testing.expect(triggered(not_read) and !triggered(read));
+    var loan: RawLoan = .{};
+    try loan.read(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    try loan.returnLoan(dr_dds);
+    // Only a READ sample left: a NOT_READ condition no longer wakes a WaitSet.
+    try testing.expect(!triggered(not_read) and triggered(read));
+}
+
+test "ReadCondition: within an ordered access its trigger sees only the ordered window" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    const any = dr_dds.vtable.create_readcondition(dr_dds.ptr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    defer _ = dr_dds.vtable.delete_readcondition(dr_dds.ptr, any);
+    dr.pushBuiltinCdr(&sample(0xA), keyOf(1), DDS.HANDLE_NIL, .alive);
+    dr.pushBuiltinCdr(&sample(0xB), keyOf(2), DDS.HANDLE_NIL, .alive);
+    {
+        dr.mu.lock();
+        defer dr.mu.unlock();
+        dr.ordered_access_watermark = 1;
+    }
+    var loan: RawLoan = .{};
+    try loan.take(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    try testing.expectEqual(@as(usize, 1), loan.len());
+    try loan.returnLoan(dr_dds);
+    // B arrived after begin_access: nothing selectable until end_access.
+    try testing.expect(!triggered(any));
+}
+
+test "copy-mode and next-instance reads and takes keep to the ordered window, and expiry within it shrinks it" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    // An expired sample, two live ones, then one after begin_access.
+    try pushExpiredInstance(dr, alloc, 9, &sample(0xE));
+    for ([_]u8{ 0xA, 0xB, 0xC }, 1..) |b, k| dr.pushBuiltinCdr(&sample(b), keyOf(@intCast(k)), DDS.HANDLE_NIL, .alive);
+    {
+        dr.mu.lock();
+        defer dr.mu.unlock();
+        dr.ordered_access_watermark = 3;
+    }
+
+    var read: RawLoan = .{ .payloads = .{ ._maximum = 4 } };
+    try read.read(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    // The purge took the expired one from the window: A and B are left.
+    try testing.expectEqual(@as(usize, 2), read.len());
+    try read.returnLoan(dr_dds);
+    try testing.expectEqual(@as(?usize, 2), dr.ordered_access_watermark);
+
+    var next: RawLoan = .{ .payloads = .{ ._maximum = 4 } };
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.take_next_instance_raw(dr_dds.ptr, &next.payloads, &next.hashes, &next.infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+    try testing.expectEqual(@as(usize, 1), next.len());
+    try next.returnLoan(dr_dds);
+    try testing.expectEqual(@as(?usize, 1), dr.ordered_access_watermark);
+
+    var rest: RawLoan = .{ .payloads = .{ ._maximum = 4 } };
+    try rest.take(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    try testing.expectEqual(@as(usize, 1), rest.len());
+    try testing.expectEqual(@as(u8, 0xB), rest.byte(0));
+    try rest.returnLoan(dr_dds);
+    try testing.expectEqual(@as(?usize, 0), dr.ordered_access_watermark);
+    // C waits for end_access.
+    try testing.expect(dr.takeNextInstanceRaw(DDS.HANDLE_NIL) == null);
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
+}
+
+test "take_next_instance_raw: within an ordered access it picks the next instance among the ordered samples only" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    // Instance 1 has the lowest handle; its first sample is taken.
+    dr.pushBuiltinCdr(&sample(0x1), keyOf(1), DDS.HANDLE_NIL, .alive);
+    var first: RawLoan = .{};
+    try first.take(dr_dds, DDS.ANY_SAMPLE_STATE, -1);
+    try first.returnLoan(dr_dds);
+    dr.pushBuiltinCdr(&sample(0x2), keyOf(2), DDS.HANDLE_NIL, .alive);
+    {
+        dr.mu.lock();
+        defer dr.mu.unlock();
+        dr.ordered_access_watermark = 1;
+    }
+    // Instance 1 again, after begin_access.
+    dr.pushBuiltinCdr(&sample(0x3), keyOf(1), DDS.HANDLE_NIL, .alive);
+
+    var next: RawLoan = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.take_next_instance_raw(dr_dds.ptr, &next.payloads, &next.hashes, &next.infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+    try testing.expectEqual(@as(usize, 1), next.len());
+    try testing.expectEqual(@as(u8, 0x2), next.byte(0));
+    try next.returnLoan(dr_dds);
 }

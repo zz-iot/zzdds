@@ -147,8 +147,14 @@ never waits on a hook; running the hooks on a cleanup executor, so that `shutdow
 itself never does either, belongs with the binding result leases. A WaitSet admits one wait at a time: another, even with a zero
 timeout, is PRECONDITION_NOT_MET. Attaching a condition wakes the wait to rescan.
 Only the first look may find a condition true past the deadline: a later one commits
-only if the deadline has not passed when its scan is done, and otherwise is a TIMEOUT. What a condition's trigger tests, and which samples an ordered access
-lets a read or take see, are the next part.
+only if the deadline has not passed when its scan is done, and otherwise is a TIMEOUT.
+
+A ReadCondition's or QueryCondition's trigger is whether a read or take with its masks,
+and its query, would return a sample now (`hasSelectableData`), as the level
+observation the contract describes. Every read and take, its trigger included, selects
+within an ordered access (`Subscriber::begin_access`) only from the samples it ordered:
+a prefix of the reader's queue, the watermark, which every take, expiry and restore
+inside it moves.
 
 ## Status
 
@@ -160,5 +166,5 @@ lets a read or take see, are the next part.
 | Take after an allocation failure | Done |
 | Take when a binding fails to decode | Done: `return_loan_raw_failed`, `set_keep_undecodable`; zidl's typed reads and takes use them |
 | WaitSet lifetime, admission and deadline | Done |
-| WaitSet condition triggers | Next: a ReadCondition's trigger does not apply its state masks or query (it skips undecodable samples only); next-instance and copy-mode takes ignore an ordered access's window |
+| WaitSet condition triggers and the ordered window | Done |
 | WaitSet results in C++ and Java | Later: a selected result's wrappers are not leased through conversion |

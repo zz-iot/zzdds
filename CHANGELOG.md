@@ -10,6 +10,14 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-24
 
+- A ReadCondition's trigger applies its state masks, and a QueryCondition's its query,
+  too: it is true while a read or take with them would return a sample. Before, either was
+  true while the reader held any sample, so a WaitSet woke for one its read could not
+  return, such as a NOT_READ condition over READ samples.
+- Within an ordered access (`Subscriber::begin_access`), every read and take keeps to the
+  samples `begin_access` ordered, next-instance and copy-mode ones too, and a condition's
+  trigger sees only those. A sample whose lifespan ends within that batch no longer lets
+  a later arrival in.
 - A WaitSet holds itself while a thread waits on it: destroying it meanwhile ends the wait
   with ALREADY_DELETED; before, it freed the WaitSet under the waiting thread. The new
   `WaitSet::shutdown` closes a WaitSet for good without freeing it: it detaches its

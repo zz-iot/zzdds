@@ -1131,8 +1131,9 @@ pub const ReadConditionImpl = struct {
     sample_state_mask: DDS.SampleStateMask,
     view_state_mask: DDS.ViewStateMask,
     instance_state_mask: DDS.InstanceStateMask,
-    /// Returns true if the reader has pending data matching the masks.
-    has_data_fn: *const fn (reader_ptr: *anyopaque) bool,
+    /// Whether the reader has a sample this condition selects: its masks,
+    /// and for a QueryCondition (`owner_qc`) its query.
+    has_data_fn: *const fn (reader_ptr: *anyopaque, rc: *const ReadConditionImpl) bool,
     /// Opaque pointer to the owning DataReaderImpl (used by add/remove_notify_fn).
     reader_ctx: *anyopaque,
     /// Called by vtAttach: adds a DataNotifyFn to the DataReader. False means
@@ -1200,7 +1201,7 @@ pub const ReadConditionImpl = struct {
         sample_states: DDS.SampleStateMask,
         view_states: DDS.ViewStateMask,
         instance_states: DDS.InstanceStateMask,
-        has_data_fn: *const fn (reader_ptr: *anyopaque) bool,
+        has_data_fn: *const fn (reader_ptr: *anyopaque, rc: *const ReadConditionImpl) bool,
         reader_ctx: *anyopaque,
         add_notify_fn: *const fn (reader_ctx: *anyopaque, n: DataNotifyFn) bool,
         remove_notify_fn: *const fn (reader_ctx: *anyopaque, waitset_ctx: *anyopaque) void,
@@ -1388,7 +1389,7 @@ pub const ReadConditionImpl = struct {
 
     fn vtGetTrigger(ctx: *anyopaque) bool {
         const self = cast(ctx);
-        return self.has_data_fn(self.reader.ptr);
+        return self.has_data_fn(self.reader.ptr, self);
     }
 
     fn vtGetSampleMask(ctx: *anyopaque) DDS.SampleStateMask {
@@ -1575,7 +1576,7 @@ pub const QueryConditionImpl = struct {
         instance_states: DDS.InstanceStateMask,
         query_expression: []const u8,
         query_parameters: DDS.StringSeq,
-        has_data_fn: *const fn (reader_ptr: *anyopaque) bool,
+        has_data_fn: *const fn (reader_ptr: *anyopaque, rc: *const ReadConditionImpl) bool,
         reader_ctx: *anyopaque,
         add_notify_fn: *const fn (reader_ctx: *anyopaque, n: DataNotifyFn) bool,
         remove_notify_fn: *const fn (reader_ctx: *anyopaque, waitset_ctx: *anyopaque) void,
@@ -1792,7 +1793,7 @@ pub const QueryConditionImpl = struct {
 
     fn vtGetTrigger(ctx: *anyopaque) bool {
         const self = cast(ctx);
-        return self.rc.has_data_fn(self.rc.reader.ptr);
+        return self.rc.has_data_fn(self.rc.reader.ptr, &self.rc);
     }
 
     fn vtGetSampleMask(ctx: *anyopaque) DDS.SampleStateMask {
