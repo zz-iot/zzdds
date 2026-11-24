@@ -229,6 +229,9 @@ pub const WaitSetImpl = struct {
     /// Set for good by `shutdown` (and so `destroy`), under `mu`: waits,
     /// attaches, detaches and get_conditions then return ALREADY_DELETED.
     closed: std.atomic.Value(bool) = .init(false),
+    /// Set by the first `deinit`: a release hook may destroy the WaitSet
+    /// again while that `deinit` runs, which then must not tear it down twice.
+    destroyed: std.atomic.Value(bool) = .init(false),
     /// A wait has been admitted and not yet returned; guarded by `cv_mu`.
     /// A WaitSet admits one wait at a time
     /// (docs/design/concurrency/operations.md#one-admitted-invocation-live-membership).
@@ -305,6 +308,7 @@ pub const WaitSetImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        if (self.destroyed.swap(true, .acq_rel)) return;
         // A wait in progress returns ALREADY_DELETED and holds `self` until
         // it has (`quiesce`).
         self.shutdown();

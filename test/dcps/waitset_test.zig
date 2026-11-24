@@ -1241,6 +1241,23 @@ test "WaitSet: a release hook that destroys the WaitSet during shutdown is safe"
     try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().shutdown());
 }
 
+test "WaitSet: a release hook that destroys the WaitSet while it is being destroyed is safe" {
+    const a = testing.allocator;
+    const gc = try GuardConditionImpl.init(a);
+    defer gc.deinit();
+    const ws = try WaitSetImpl.init(a);
+    const Hook = struct {
+        fn f(ctx: ?*anyopaque) callconv(.c) void {
+            const w: *WaitSetImpl = @ptrCast(@alignCast(ctx.?));
+            _ = w.toDDSWaitSet().destroy();
+        }
+    };
+    try testing.expectEqual(DDS.RETCODE_OK, ws.attachConditionWithRelease(gc.toCondition(), ws, Hook.f, null));
+    // Torn down once, freed once: the leak and use-after-free checks are
+    // the assertions.
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().destroy());
+}
+
 test "WaitSet: shutdown wakes a wait before running release hooks" {
     const a = testing.allocator;
     const gc = try GuardConditionImpl.init(a);
