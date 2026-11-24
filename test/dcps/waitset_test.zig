@@ -1223,3 +1223,99 @@ test "WaitSet: a condition that becomes true at the deadline or later is a timeo
     while (runtime.getState() != .backend_stopped) _ = runtime.drive(64, 0) catch break;
     runtime.deinit();
 }
+
+test "WaitSet: a release hook that destroys the WaitSet during shutdown is safe" {
+    const a = testing.allocator;
+    const gc = try GuardConditionImpl.init(a);
+    defer gc.deinit();
+    const ws = try WaitSetImpl.init(a);
+    const Hook = struct {
+        fn f(ctx: ?*anyopaque) callconv(.c) void {
+            const w: *WaitSetImpl = @ptrCast(@alignCast(ctx.?));
+            _ = w.toDDSWaitSet().destroy();
+        }
+    };
+    try testing.expectEqual(DDS.RETCODE_OK, ws.attachConditionWithRelease(gc.toCondition(), ws, Hook.f, null));
+    // The hook frees the WaitSet once shutdown lets go: the leak and
+    // use-after-free checks are the assertions.
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().shutdown());
+}
+
+test "WaitSet: shutdown wakes a wait before running release hooks" {
+    const a = testing.allocator;
+    const gc = try GuardConditionImpl.init(a);
+    defer gc.deinit();
+    const ws = try WaitSetImpl.init(a);
+    defer ws.deinit();
+    const Hook = struct {
+        var woken: ?bool = null;
+        fn f(ctx: ?*anyopaque) callconv(.c) void {
+            const w: *WaitSetImpl = @ptrCast(@alignCast(ctx.?));
+            w.cv_mu.lock();
+            defer w.cv_mu.unlock();
+            woken = w.notified;
+        }
+    };
+    Hook.woken = null;
+    try testing.expectEqual(DDS.RETCODE_OK, ws.attachConditionWithRelease(gc.toCondition(), ws, Hook.f, null));
+    // Consumes the wake the attach sent.
+    var seq: DDS.ConditionSeq = .{};
+    try testing.expectEqual(DDS.RETCODE_TIMEOUT, ws.toDDSWaitSet().wait(&seq, DURATION_ZERO));
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().shutdown());
+    // A waiter, had there been one, was woken before any hook ran: it
+    // never waits on one.
+    try testing.expectEqual(@as(?bool, true), Hook.woken);
+}
+
+/// A StatusCondition whose status, when looked at, moves a manual clock to
+/// `at_ns` and reports a status: a scan that crosses that moment.
+const CrossingStatus = struct {
+    var clock: ?*zzdds.util.time.ManualClock = null;
+    var at_ns: i64 = 0;
+    var looks: usize = 0;
+    fn get(_: *anyopaque) DDS.StatusMask {
+        looks += 1;
+        // The wait's first look finds nothing.
+        if (looks == 1) return 0;
+        const c = clock.?;
+        const now = c.ns.load(.acquire);
+        if (now < at_ns) c.advance(at_ns - now);
+        return DDS.DATA_AVAILABLE_STATUS;
+    }
+};
+
+test "WaitSet: a later look that runs past the deadline is a timeout, though it found a condition true" {
+    const a = testing.allocator;
+    var sb = zzdds.runtime.ScriptedBackend.init(0);
+    var runtime = zzdds.runtime.Runtime.init(sb.clock(), sb.backend(), .{ .mode = .manual });
+    CrossingStatus.clock = &sb.clock_state;
+    CrossingStatus.at_ns = DURATION_10MS.nanosec;
+    CrossingStatus.looks = 0;
+    const sc = try StatusConditionImpl.init(a, stubEntity(), CrossingStatus.get);
+    defer sc.deinit();
+    const ws = try WaitSetImpl.initHelping(a, &runtime);
+    _ = ws.toDDSWaitSet().attach_condition(sc.toCondition());
+
+    // Wakes the wait for a second look halfway to the deadline.
+    const Waker = struct {
+        timer: zzdds.runtime.Timer,
+        sc: *StatusConditionImpl,
+        fn fire(t: *zzdds.runtime.Timer, _: *zzdds.runtime.Turn) void {
+            const self: *@This() = @fieldParentPtr("timer", t);
+            self.sc.notifyWakeup();
+        }
+    };
+    var context = zzdds.runtime.Context.init(&runtime, 4);
+    var waker: Waker = .{ .timer = zzdds.runtime.Timer.init(&context, Waker.fire), .sc = sc };
+    _ = runtime.armTimer(&waker.timer, DURATION_10MS.nanosec / 2);
+
+    var seq: DDS.ConditionSeq = .{};
+    try testing.expectEqual(DDS.RETCODE_TIMEOUT, ws.toDDSWaitSet().wait(&seq, DURATION_10MS));
+    try testing.expectEqual(@as(usize, 2), CrossingStatus.looks);
+
+    ws.deinit();
+    context.deinit();
+    runtime.releaseOwner();
+    while (runtime.getState() != .backend_stopped) _ = runtime.drive(64, 0) catch break;
+    runtime.deinit();
+}

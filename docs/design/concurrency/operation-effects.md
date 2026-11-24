@@ -139,13 +139,15 @@ any other, so under KEEP_ALL, samples the application never collects can fill th
 
 A wait holds its WaitSet (`quiesce`) until it returns, so destroying the WaitSet
 meanwhile ends the wait, ALREADY_DELETED, rather than freeing it under the waiter.
-`shutdown`, which `destroy` runs first, closes the WaitSet for good under its lock:
-it detaches the conditions, firing their release hooks, and wakes the wait, which
-then returns ALREADY_DELETED, as do later waits, attaches, detaches and
-`get_conditions`. A WaitSet admits one wait at a time: another, even with a zero
+`shutdown`, which `destroy` runs first, closes the WaitSet for good under its lock and
+detaches the conditions. It wakes the wait, which then returns ALREADY_DELETED, as do
+later waits, attaches, detaches and `get_conditions`, and only then fires the release
+hooks, on its own thread, holding the WaitSet so that a hook may destroy it. A wait
+never waits on a hook; running the hooks on a cleanup executor, so that `shutdown`
+itself never does either, belongs with the binding result leases. A WaitSet admits one wait at a time: another, even with a zero
 timeout, is PRECONDITION_NOT_MET. Attaching a condition wakes the wait to rescan.
-Only the first look may find a condition true past the deadline; a later one past it
-is a TIMEOUT. What a condition's trigger tests, and which samples an ordered access
+Only the first look may find a condition true past the deadline: a later one commits
+only if the deadline has not passed when its scan is done, and otherwise is a TIMEOUT. What a condition's trigger tests, and which samples an ordered access
 lets a read or take see, are the next part.
 
 ## Status

@@ -477,6 +477,15 @@ pub const WaitSetImpl = struct {
             }
             self.mu.unlock();
             if (triggered.items.len > 0) {
+                // A later look commits only before the deadline: checked now,
+                // the scan done, since it may have run past it.
+                if (!first) if (deadline_ns) |dl| {
+                    const now = if (helping) |r| r.clock.nowNs() else time_mod.nanoTimestamp();
+                    if (now >= dl) {
+                        triggered.deinit(self.alloc);
+                        return DDS.RETCODE_TIMEOUT;
+                    }
+                };
                 const buf = triggered.toOwnedSlice(self.alloc) catch {
                     triggered.deinit(self.alloc);
                     return DDS.RETCODE_OUT_OF_RESOURCES;
@@ -533,11 +542,14 @@ pub const WaitSetImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    /// Closes the WaitSet for good (idempotent): detaches its conditions,
-    /// firing their release hooks, and ends a wait in progress with
-    /// ALREADY_DELETED. Later waits, attaches, detaches and get_conditions
-    /// return ALREADY_DELETED. Frees nothing: `deinit` does.
+    /// Closes the WaitSet for good (idempotent): detaches its conditions and
+    /// ends a wait in progress with ALREADY_DELETED, then fires the
+    /// conditions' release hooks. Later waits, attaches, detaches and
+    /// get_conditions return ALREADY_DELETED. Frees nothing: `deinit` does.
     pub fn shutdown(self: *Self) void {
+        // Holds `self` to the end, though a release hook destroy it.
+        const held = self.quiesce.acquireIfAlive();
+        defer if (held) self.quiesce.release(self, reallyDeinit);
         var entries: std.ArrayListUnmanaged(AttachedCondition) = .empty;
         {
             self.mu.lock();
@@ -549,10 +561,11 @@ pub const WaitSetImpl = struct {
             // Under `mu`, as detach does, so a racing attach cannot slip in.
             for (entries.items) |entry| unregisterFromCondition(self, entry.cond);
         }
-        // Release hooks run with no lock held: see AttachedCondition.fireRelease.
+        // The wait ends first: it never waits on a hook. The hooks run with
+        // no lock held (see AttachedCondition.fireRelease), on this thread.
+        wakeNotify(self);
         for (entries.items) |entry| entry.fireRelease();
         entries.deinit(self.alloc);
-        wakeNotify(self);
     }
 
     /// Shared by the plain, spec-mandated `attach_condition()` (`vtAttach`,
