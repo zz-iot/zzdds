@@ -157,14 +157,7 @@ pub fn main(init: std.process.Init) !void {
     }
     defer _ = factory.toDDSFactory().delete_participant(dp);
 
-    var ts_alloc = alloc;
-    if (!zzdds.registerTypeSupport(dp, "ConfigPing", .{
-        .ctx = @ptrCast(&ts_alloc),
-        .compute_key_hash = ping_gen.ConfigPing.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = ping_gen.ConfigPing.projectKeyFromCdr },
-        .has_key = ping_gen.ConfigPing.has_key,
-        .compute_key_hash_key_only = ping_gen.ConfigPing.computeKeyHashFromCdrKeyOnly,
-    })) {
+    if (!ping_gen.ConfigPingTypeSupport.register(dp, "ConfigPing", alloc)) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
         std.process.exit(1);
     }

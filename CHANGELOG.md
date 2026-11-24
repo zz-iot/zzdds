@@ -10,6 +10,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-24
 
+- The Zig examples, integration tests and stress tests register their types through
+  zidl `v0.3.43-zig.0.17.1`'s generated `{Type}TypeSupport.register`, as the C, C++ and
+  Java ones do, instead of building the TypeSupport by hand. Each now registers every
+  generated callback: `delete-contained-entities`' ContentFilteredTopic is evaluated in
+  the reader, which had no `get_field`, and `source-timestamp`'s keyed type registers
+  `has_key`, which it left out.
 - A typed read or take keeps a sample its binding cannot decode rather than lose it, with
   zidl `v0.3.42-zig.0.17.1`. The binding takes on loan, decodes from the reader's own
   buffers, and returns what failed with the new `DataReader::return_loan_raw_failed`. By

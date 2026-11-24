@@ -122,19 +122,10 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    // computeKeyHashFromCdr's ctx is a *const std.mem.Allocator (zidl's Zig
-    // backend keeps the rest of the runtime's explicit-allocator idiom rather
-    // than the C backend's global-allocator-override equivalent) -- HelloWorld
-    // is keyless so it's never actually dereferenced here, but a real example
-    // should still pass a real one rather than `undefined`.
-    var ts_alloc = alloc;
-    if (!zzdds.registerTypeSupport(dp, "HelloWorld", .{
-        .ctx = @ptrCast(&ts_alloc),
-        .compute_key_hash = hello_gen.HelloWorld.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = hello_gen.HelloWorld.projectKeyFromCdr },
-        .has_key = hello_gen.HelloWorld.has_key,
-        .compute_key_hash_key_only = hello_gen.HelloWorld.computeKeyHashFromCdrKeyOnly,
-    })) {
+    // Registers every callback zidl generates for HelloWorld. The registration
+    // keeps its own copy of `alloc`, which decodes variable-length keys (Zig's
+    // explicit-allocator idiom, where C uses a global allocator override).
+    if (!hello_gen.HelloWorldTypeSupport.register(dp, "HelloWorld", alloc)) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
         std.process.exit(1);
     }

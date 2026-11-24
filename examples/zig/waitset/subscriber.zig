@@ -136,19 +136,10 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    // Unlike hello_world, this registration needs `get_field` too, not just
-    // `compute_key_hash` -- the QueryCondition's "priority > %0" expression
-    // needs field-level access to evaluate (see create_querycondition's own
-    // precondition: a non-empty expression with no get_field returns NIL).
-    var ts_alloc = alloc;
-    if (!zzdds.registerTypeSupport(dp, "WaitsetSample", .{
-        .ctx = @ptrCast(&ts_alloc),
-        .compute_key_hash = sample_gen.WaitsetSample.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = sample_gen.WaitsetSample.projectKeyFromCdr },
-        .has_key = sample_gen.WaitsetSample.has_key,
-        .compute_key_hash_key_only = sample_gen.WaitsetSample.computeKeyHashFromCdrKeyOnly,
-        .get_field = sample_gen.WaitsetSample.getFieldFromCdr,
-    })) {
+    // The generated registration includes `get_field`, which the
+    // QueryCondition's "priority > %0" expression needs to evaluate
+    // (create_querycondition returns NIL for a non-empty expression without it).
+    if (!sample_gen.WaitsetSampleTypeSupport.register(dp, "WaitsetSample", alloc)) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
         std.process.exit(1);
     }

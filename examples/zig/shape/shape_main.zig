@@ -771,7 +771,7 @@ fn runSubscriber(
                 // No app-side CFT re-check needed here anymore: zzdds's own
                 // reader-side cft_filter (see reader.zig) already dropped any
                 // non-matching sample before this loop ever saw it, now that
-                // registerTypeSupport above sets get_field.
+                // the registration above sets get_field.
 
                 const extra_len = value.additional_payload_size._length;
                 const last_byte: ?u8 = if (extra_len > 0 and value.additional_payload_size._buffer != null)
@@ -1069,24 +1069,12 @@ pub fn main(init: std.process.Init) !void {
     defer dds.destroyParticipant(participant);
     const dp = participant.toDDS();
 
-    // computeKeyHashFromCdr/getFieldFromCdr's ctx is a *const std.mem.Allocator
-    // (zidl's Zig backend keeps the rest of the runtime's explicit-allocator
-    // idiom rather than the C backend's global-allocator-override equivalent)
-    // -- used for any variable-length fields either needs to allocate.
-    // Setting get_field here is what makes zzdds's own reader-side cft_filter
-    // (see reader.zig) activate automatically for ContentFilteredTopic-backed
-    // readers -- no app-side re-check needed (contrast with this file's
+    // The generated registration includes get_field, which makes zzdds's own
+    // reader-side cft_filter (see reader.zig) evaluate ContentFilteredTopic
+    // expressions -- no app-side re-check needed (contrast with this file's
     // history: it used to hand-call dds.cftMatchSample per received sample
     // because nothing ever set get_field; see zzdds's docs/roadmap.md).
-    var ts_alloc = alloc;
-    if (!dds.registerTypeSupport(dp, "ShapeType", .{
-        .ctx = @ptrCast(&ts_alloc),
-        .compute_key_hash = shape_gen.ShapeType.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = shape_gen.ShapeType.projectKeyFromCdr },
-        .has_key = shape_gen.ShapeType.has_key,
-        .compute_key_hash_key_only = shape_gen.ShapeType.computeKeyHashFromCdrKeyOnly,
-        .get_field = shape_gen.ShapeType.getFieldFromCdr,
-    })) {
+    if (!shape_gen.ShapeTypeTypeSupport.register(dp, "ShapeType", alloc)) {
         std.log.err("registerTypeSupport() failed", .{});
         std.process.exit(1);
     }

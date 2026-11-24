@@ -101,22 +101,11 @@ pub fn main(init: std.process.Init) !void {
     }
     defer _ = dpf.delete_participant(dp);
 
-    var ts_alloc = alloc;
-    if (!zzdds.registerTypeSupport(dp, "Position", .{
-        .ctx = @ptrCast(&ts_alloc),
-        .compute_key_hash = pose_group_gen.Position.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = pose_group_gen.Position.projectKeyFromCdr },
-        .compute_key_hash_key_only = pose_group_gen.Position.computeKeyHashFromCdrKeyOnly,
-    })) {
+    if (!pose_group_gen.PositionTypeSupport.register(dp, "Position", alloc)) {
         std.debug.print("FAIL: registerTypeSupport(Position) failed\n", .{});
         std.process.exit(1);
     }
-    if (!zzdds.registerTypeSupport(dp, "Velocity", .{
-        .ctx = @ptrCast(&ts_alloc),
-        .compute_key_hash = pose_group_gen.Velocity.computeKeyHashFromCdr,
-        .key_projection = .{ .ctx = undefined, .project = pose_group_gen.Velocity.projectKeyFromCdr },
-        .compute_key_hash_key_only = pose_group_gen.Velocity.computeKeyHashFromCdrKeyOnly,
-    })) {
+    if (!pose_group_gen.VelocityTypeSupport.register(dp, "Velocity", alloc)) {
         std.debug.print("FAIL: registerTypeSupport(Velocity) failed\n", .{});
         std.process.exit(1);
     }
