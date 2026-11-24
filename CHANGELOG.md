@@ -10,6 +10,15 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-24
 
+- A WaitSet holds itself while a thread waits on it: destroying it meanwhile ends the wait
+  with ALREADY_DELETED; before, it freed the WaitSet under the waiting thread. The new
+  `WaitSet::shutdown` closes a WaitSet for good without freeing it: it detaches its
+  conditions and ends a wait in progress, and later waits, attaches, detaches and
+  `get_conditions` return ALREADY_DELETED; shutdown again is OK. `destroy` shuts the
+  WaitSet down first. A second wait on a WaitSet while one is in progress, even with a
+  zero timeout, is PRECONDITION_NOT_MET. Attaching a condition that is already true now
+  wakes a wait in progress. A condition that becomes true at the deadline or later is a
+  TIMEOUT; only a wait's first look may still find one true.
 - The Zig examples, integration tests and stress tests register their types through
   zidl `v0.3.43-zig.0.17.1`'s generated `{Type}TypeSupport.register`, as the C, C++ and
   Java ones do, instead of building the TypeSupport by hand. Each now registers every

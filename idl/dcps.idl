@@ -302,6 +302,12 @@ module DDS {
             in Condition cond);
         ReturnCode_t get_conditions(
             inout ConditionSeq attached_conditions);
+        // zzdds extension: closes the WaitSet for good, without freeing it.
+        // A wait in progress returns ALREADY_DELETED, as do later waits,
+        // attaches, detaches and get_conditions; shutdown again is OK. Its
+        // conditions are detached, not deleted. destroy() shuts it down
+        // first (docs/design/concurrency/operations.md#explicit-close-separate-destruction).
+        ReturnCode_t shutdown();
     };
 
     // Constructed like WaitSet; see its comment.

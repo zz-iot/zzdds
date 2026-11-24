@@ -1075,3 +1075,151 @@ test "WaitSet: a nil condition is neither attached nor detached" {
     try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, dws.detach_condition(dcps.nil_condition));
     try testing.expectEqual(@as(usize, 0), ws.conditions.items.len);
 }
+
+// ── Lifetime and admission ────────────────────────────────────────────────────
+//
+// docs/design/concurrency/operations.md#waitset-waiting
+
+/// Returns once a wait on `ws` has been admitted.
+fn awaitAdmitted(ws: *WaitSetImpl) void {
+    while (true) {
+        ws.cv_mu.lock();
+        const admitted = ws.waiting;
+        ws.cv_mu.unlock();
+        if (admitted) return;
+        std.Thread.yield() catch {};
+    }
+}
+
+const Waiter = struct {
+    ws: DDS.WaitSet,
+    timeout: DDS.Duration_t = DURATION_INFINITE,
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+    found: u32 = 0,
+
+    fn run(self: *Waiter, alloc: std.mem.Allocator) void {
+        var active: DDS.ConditionSeq = .{};
+        self.rc = self.ws.wait(&active, self.timeout);
+        self.found = active._length;
+        if (active._release) if (active._buffer) |b| alloc.free(b[0..active._maximum]);
+    }
+};
+
+test "WaitSet: shutdown ends a wait in progress with ALREADY_DELETED" {
+    const a = testing.allocator;
+    const ws = try WaitSetImpl.init(a);
+    defer ws.deinit();
+    var waiter: Waiter = .{ .ws = ws.toDDSWaitSet() };
+    const thr = try std.Thread.spawn(.{}, Waiter.run, .{ &waiter, a });
+    awaitAdmitted(ws);
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().shutdown());
+    thr.join();
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, waiter.rc);
+}
+
+test "WaitSet: destroying a WaitSet a thread waits on ends the wait, then frees it" {
+    const a = testing.allocator;
+    const ws = try WaitSetImpl.init(a);
+    var waiter: Waiter = .{ .ws = ws.toDDSWaitSet() };
+    const thr = try std.Thread.spawn(.{}, Waiter.run, .{ &waiter, a });
+    awaitAdmitted(ws);
+    // The waiter holds the WaitSet until it returns; the leak check is the
+    // assertion that it is freed then.
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().destroy());
+    thr.join();
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, waiter.rc);
+}
+
+test "WaitSet: after shutdown every operation is ALREADY_DELETED, shutdown again is OK, and its conditions are detached, not deleted" {
+    const a = testing.allocator;
+    const gc = try GuardConditionImpl.init(a);
+    defer gc.deinit();
+    const ws = try WaitSetImpl.init(a);
+    defer ws.deinit();
+    const Release = struct {
+        var count: usize = 0;
+        fn f(_: ?*anyopaque) callconv(.c) void {
+            count += 1;
+        }
+    };
+    Release.count = 0;
+    try testing.expectEqual(DDS.RETCODE_OK, ws.attachConditionWithRelease(gc.toCondition(), null, Release.f, null));
+    const dws = ws.toDDSWaitSet();
+    try testing.expectEqual(DDS.RETCODE_OK, dws.shutdown());
+    try testing.expectEqual(@as(usize, 1), Release.count);
+    try testing.expectEqual(DDS.RETCODE_OK, dws.shutdown());
+
+    var seq: DDS.ConditionSeq = .{};
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, dws.wait(&seq, DURATION_ZERO));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, dws.attach_condition(gc.toCondition()));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, dws.detach_condition(gc.toCondition()));
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, dws.get_conditions(&seq));
+    // The condition is still usable.
+    try testing.expectEqual(DDS.RETCODE_OK, gc.toDDSGuardCondition().set_trigger_value(true));
+}
+
+test "WaitSet: a second wait while one is admitted is PRECONDITION_NOT_MET, even with a zero timeout" {
+    const a = testing.allocator;
+    const ws = try WaitSetImpl.init(a);
+    defer ws.deinit();
+    var waiter: Waiter = .{ .ws = ws.toDDSWaitSet() };
+    const thr = try std.Thread.spawn(.{}, Waiter.run, .{ &waiter, a });
+    awaitAdmitted(ws);
+    var seq: DDS.ConditionSeq = .{};
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, ws.toDDSWaitSet().wait(&seq, DURATION_ZERO));
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, ws.toDDSWaitSet().wait(&seq, DURATION_INFINITE));
+    _ = ws.toDDSWaitSet().shutdown();
+    thr.join();
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, waiter.rc);
+}
+
+test "WaitSet: attaching a condition already true wakes a wait in progress" {
+    const a = testing.allocator;
+    const gc = try GuardConditionImpl.init(a);
+    defer gc.deinit();
+    _ = gc.toDDSGuardCondition().set_trigger_value(true);
+    const ws = try WaitSetImpl.init(a);
+    defer ws.deinit();
+    var waiter: Waiter = .{ .ws = ws.toDDSWaitSet() };
+    const thr = try std.Thread.spawn(.{}, Waiter.run, .{ &waiter, a });
+    awaitAdmitted(ws);
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().attach_condition(gc.toCondition()));
+    thr.join();
+    try testing.expectEqual(DDS.RETCODE_OK, waiter.rc);
+    try testing.expectEqual(@as(u32, 1), waiter.found);
+}
+
+test "WaitSet: a condition that becomes true at the deadline or later is a timeout" {
+    const a = testing.allocator;
+    var sb = zzdds.runtime.ScriptedBackend.init(0);
+    var runtime = zzdds.runtime.Runtime.init(sb.clock(), sb.backend(), .{ .mode = .manual });
+    const gc = try GuardConditionImpl.init(a);
+    defer gc.deinit();
+    const ws = try WaitSetImpl.initHelping(a, &runtime);
+    _ = ws.toDDSWaitSet().attach_condition(gc.toCondition());
+
+    // Triggers the guard exactly at the deadline.
+    const Trigger = struct {
+        timer: zzdds.runtime.Timer,
+        gc: DDS.GuardCondition,
+        fn fire(t: *zzdds.runtime.Timer, _: *zzdds.runtime.Turn) void {
+            const self: *@This() = @fieldParentPtr("timer", t);
+            _ = self.gc.set_trigger_value(true);
+        }
+    };
+    var context = zzdds.runtime.Context.init(&runtime, 4);
+    var trigger: Trigger = .{ .timer = zzdds.runtime.Timer.init(&context, Trigger.fire), .gc = gc.toDDSGuardCondition() };
+    _ = runtime.armTimer(&trigger.timer, DURATION_10MS.nanosec);
+
+    var seq: DDS.ConditionSeq = .{};
+    try testing.expectEqual(DDS.RETCODE_TIMEOUT, ws.toDDSWaitSet().wait(&seq, DURATION_10MS));
+    // True now: a fresh wait finds it at once.
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().wait(&seq, DURATION_ZERO));
+    if (seq._release) if (seq._buffer) |b| a.free(b[0..seq._maximum]);
+
+    ws.deinit();
+    context.deinit();
+    runtime.releaseOwner();
+    while (runtime.getState() != .backend_stopped) _ = runtime.drive(64, 0) catch break;
+    runtime.deinit();
+}

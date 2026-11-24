@@ -226,6 +226,13 @@ pub const WaitSetImpl = struct {
     helping: ?*Runtime = null,
     /// Waits in progress that help the default runtime; guarded by `cv_mu`.
     default_waits: ?*DefaultWait = null,
+    /// Set for good by `shutdown` (and so `destroy`), under `mu`: waits,
+    /// attaches, detaches and get_conditions then return ALREADY_DELETED.
+    closed: std.atomic.Value(bool) = .init(false),
+    /// A wait has been admitted and not yet returned; guarded by `cv_mu`.
+    /// A WaitSet admits one wait at a time
+    /// (docs/design/concurrency/operations.md#one-admitted-invocation-live-membership).
+    waiting: bool = false,
     ws_c_abi: c_abi_handle.CachedCAbiHandle = .{},
     // Guards against a genuine use-after-free: WakeupList.invalidateAll()
     // (a condition's own teardown path) deliberately copies out its
@@ -298,6 +305,9 @@ pub const WaitSetImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // A wait in progress returns ALREADY_DELETED and holds `self` until
+        // it has (`quiesce`).
+        self.shutdown();
         self.quiesce.close();
         self.ws_c_abi.retire();
         self.quiesce.beginTeardown(self, reallyDeinit);
@@ -365,6 +375,7 @@ pub const WaitSetImpl = struct {
 
     const vtable = DDS.WaitSet.Vtable{
         .destroy = vtDestroy,
+        .shutdown = vtShutdown,
         .wait = vtWait,
         .attach_condition = vtAttach,
         .detach_condition = vtDetach,
@@ -391,6 +402,22 @@ pub const WaitSetImpl = struct {
     fn vtWait(ctx: *anyopaque, active: ?*DDS.ConditionSeq, timeout: *const DDS.Duration_t) DDS.ReturnCode_t {
         const seq = active orelse return DDS.RETCODE_BAD_PARAMETER;
         const self: *Self = @ptrCast(@alignCast(ctx));
+        // Holds `self` until the wait returns, so destroying the WaitSet
+        // meanwhile ends the wait rather than freeing it under the waiter.
+        if (!self.quiesce.acquire()) return DDS.RETCODE_ALREADY_DELETED;
+        defer self.quiesce.release(self, reallyDeinit);
+        if (self.closed.load(.acquire)) return DDS.RETCODE_ALREADY_DELETED;
+        {
+            self.cv_mu.lock();
+            defer self.cv_mu.unlock();
+            if (self.waiting) return DDS.RETCODE_PRECONDITION_NOT_MET;
+            self.waiting = true;
+        }
+        defer {
+            self.cv_mu.lock();
+            self.waiting = false;
+            self.cv_mu.unlock();
+        }
         // Reset the output sequence so stale entries from a prior call don't accumulate.
         if (seq._release) {
             if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
@@ -412,7 +439,15 @@ pub const WaitSetImpl = struct {
                 @as(i64, timeout.nanosec);
         };
 
-        while (true) {
+        var first = true;
+        while (true) : (first = false) {
+            if (self.closed.load(.acquire)) return DDS.RETCODE_ALREADY_DELETED;
+            // Only the first look may find a condition true once the
+            // deadline has passed: a later one must commit before it.
+            if (!first) if (deadline_ns) |dl| {
+                const now = if (helping) |r| r.clock.nowNs() else time_mod.nanoTimestamp();
+                if (now >= dl) return DDS.RETCODE_TIMEOUT;
+            };
             // Collect triggered conditions under the conditions lock, in a
             // single pass. A condition's get_trigger_value() can change
             // between two separate passes over self.conditions.items (e.g. a
@@ -492,6 +527,34 @@ pub const WaitSetImpl = struct {
         return self.attachConditionWithRelease(cond, null, null, null);
     }
 
+    fn vtShutdown(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.shutdown();
+        return DDS.RETCODE_OK;
+    }
+
+    /// Closes the WaitSet for good (idempotent): detaches its conditions,
+    /// firing their release hooks, and ends a wait in progress with
+    /// ALREADY_DELETED. Later waits, attaches, detaches and get_conditions
+    /// return ALREADY_DELETED. Frees nothing: `deinit` does.
+    pub fn shutdown(self: *Self) void {
+        var entries: std.ArrayListUnmanaged(AttachedCondition) = .empty;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (self.closed.load(.acquire)) return;
+            self.closed.store(true, .release);
+            entries = self.conditions;
+            self.conditions = .empty;
+            // Under `mu`, as detach does, so a racing attach cannot slip in.
+            for (entries.items) |entry| unregisterFromCondition(self, entry.cond);
+        }
+        // Release hooks run with no lock held: see AttachedCondition.fireRelease.
+        for (entries.items) |entry| entry.fireRelease();
+        entries.deinit(self.alloc);
+        wakeNotify(self);
+    }
+
     /// Shared by the plain, spec-mandated `attach_condition()` (`vtAttach`,
     /// via the C-ABI export `zzdds_waitset_attach_condition`, passing
     /// null/null) and the hand-written extension
@@ -545,8 +608,25 @@ pub const WaitSetImpl = struct {
             if (out_accepted) |accepted| accepted.* = false;
             return DDS.RETCODE_ALREADY_DELETED;
         }
+        const rc = self.attachLocked(cond, release_ctx, release_fn, out_accepted);
+        // A wait in progress rescans: the condition may already be true.
+        if (rc == DDS.RETCODE_OK) wakeNotify(self);
+        return rc;
+    }
+
+    fn attachLocked(
+        self: *Self,
+        cond: DDS.Condition,
+        release_ctx: ?*anyopaque,
+        release_fn: ?*const fn (?*anyopaque) callconv(.c) void,
+        out_accepted: ?*bool,
+    ) DDS.ReturnCode_t {
         self.mu.lock();
         defer self.mu.unlock();
+        if (self.closed.load(.acquire)) {
+            if (out_accepted) |oa| oa.* = false;
+            return DDS.RETCODE_ALREADY_DELETED;
+        }
         for (self.conditions.items) |entry| {
             if (entry.cond.ptr == cond.ptr) {
                 if (out_accepted) |oa| oa.* = false;
@@ -640,6 +720,7 @@ pub const WaitSetImpl = struct {
     fn vtDetach(ctx: *anyopaque, input: DDS.Condition) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (nil.isNil(input)) return DDS.RETCODE_BAD_PARAMETER;
+        if (self.closed.load(.acquire)) return DDS.RETCODE_ALREADY_DELETED;
         const cond = canonicalCondition(input);
         var removed: ?AttachedCondition = null;
         // A condition whose entity was deleted counts as detached already, as
@@ -679,6 +760,7 @@ pub const WaitSetImpl = struct {
             if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
         }
         seq.* = .{};
+        if (self.closed.load(.acquire)) return DDS.RETCODE_ALREADY_DELETED;
         const n = self.conditions.items.len;
         if (n == 0) return DDS.RETCODE_OK;
         const buf = self.alloc.alloc(DDS.Condition, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
@@ -753,7 +835,7 @@ pub const WaitSetImpl = struct {
         defer self.cv_mu.unlock();
         const notified = self.notified;
         self.notified = false;
-        return notified;
+        return notified or self.closed.load(.acquire);
     }
 
     /// Called from a condition's own teardown path (via WakeupHandle.invalidate)
@@ -1820,25 +1902,25 @@ test "WaitSet: a second condition's drain() still succeeds and invalidates itsel
     }
     const h = a_handle orelse return error.TestExpectedNonNull;
 
-    // `ws`'s own deinit(): sets the tearing-down bit and drops its own
-    // initial reference -- A's held reference (above) keeps the count above
-    // zero, so reallyDeinit() is deferred.
+    // `ws`'s own deinit(): shuts it down first, detaching both conditions
+    // (A's handle, already drained, is not in A's list to unregister), then
+    // sets the tearing-down bit and drops its own initial reference -- A's
+    // held reference (above) keeps the count above zero, so reallyDeinit()
+    // is deferred.
     ws.deinit();
+    try testing.expectEqual(@as(usize, 0), ws.conditions.items.len);
 
     // Condition B's real, complete teardown, running *after* the
-    // tearing-down bit was set. With the fix, its own drain()'s
-    // quiesceAcquire call (backed by EntityQuiesce.acquireIfAlive) still
-    // succeeds -- `ws` is demonstrably still alive, A's held reference
-    // proves it -- so vtInvalidateHandle correctly removes it from
-    // ws.conditions before it frees itself.
+    // tearing-down bit was set: shutdown already unregistered it, so it no
+    // longer reaches `ws` at all.
     gc_b.deinit();
-    try testing.expectEqual(@as(usize, 1), ws.conditions.items.len);
-    try testing.expectEqual(gc_a.toCondition().ptr, ws.conditions.items[0].cond.ptr);
+    try testing.expectEqual(@as(usize, 0), ws.conditions.items.len);
 
     // Finish simulating A's own drain()/invalidateAll(): invalidate then
-    // release, exactly like invalidateAll()'s own loop body. This is the
-    // last outstanding reference, so it triggers reallyDeinit() now --
-    // its bulk loop must find ws.conditions already empty (nothing left to
+    // release, exactly like invalidateAll()'s own loop body. Its entry is
+    // already gone, so invalidate releases nothing twice. This is the last
+    // outstanding reference, so it triggers reallyDeinit() now -- its bulk
+    // loop must find ws.conditions already empty (nothing left to
     // dereference).
     h.invalidate(h.ctx, gc_a);
     h.release(h.ctx);
