@@ -108,6 +108,16 @@ void check_conditions() {
     CHECK(ws->get_conditions(attached) == ::DDS::RETCODE_OK);
     CHECK(attached.size() == 1);
     CHECK(attached[0] == std::static_pointer_cast<::DDS::Condition>(gc));
+    // wait() too returns the attached object, built from the attachment's
+    // keep-alive, and a timed-out one leaves no conditions.
+    CHECK(gc->set_trigger_value(true) == ::DDS::RETCODE_OK);
+    ::DDS::ConditionSeq active;
+    CHECK(ws->wait(active, ::DDS::Duration_t{0, 0}) == ::DDS::RETCODE_OK);
+    CHECK(active.size() == 1);
+    CHECK(active[0] == std::static_pointer_cast<::DDS::Condition>(gc));
+    CHECK(gc->set_trigger_value(false) == ::DDS::RETCODE_OK);
+    CHECK(ws->wait(active, ::DDS::Duration_t{0, 0}) == ::DDS::RETCODE_TIMEOUT);
+    CHECK(active.empty());
     CHECK(ws->detach_condition(gc) == ::DDS::RETCODE_OK);
 }
 

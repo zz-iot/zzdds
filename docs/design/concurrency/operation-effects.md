@@ -145,7 +145,21 @@ later waits, attaches, detaches and `get_conditions`. `shutdown` runs no release
 so it never waits on application code: it moves the withdrawn attachments, allocating
 nothing, to a list whose hooks run once the WaitSet is freed, on whichever thread frees
 it (`destroy`, or a wait returning after it). A binding's wrappers for the conditions
-thus stay alive until then, which reclamation is allowed to wait for. A WaitSet admits one wait at a time: another, even with a zero
+thus stay alive until then, which reclamation is allowed to wait for.
+
+A binding builds a wait's result from its own objects, not from handles
+([retained result batch](operations.md#retained-result-batch)). An attachment's
+release context (C++'s `shared_ptr`, Java's global ref) is counted
+(`AttachmentLease`): the attachment holds one reference, and a leased wait or
+`get_conditions` takes another for each condition it selects, under the WaitSet's
+lock, while the attachment still holds its own. The binding copies its object from
+each context, then frees the result; the hook runs when the last reference goes, on
+that thread. A detach or deletion during the conversion thus never frees what it
+reads. A failed conversion is OUT_OF_RESOURCES with no conditions (a pending
+exception in Java), not the wait's code
+([completion versus conversion failure](operations.md#completion-versus-conversion-failure)).
+A condition attached without a hook, from C, comes back as its handle, as
+`DDS_WaitSet_wait` returns it. A WaitSet admits one wait at a time: another, even with a zero
 timeout, is PRECONDITION_NOT_MET. Attaching a condition wakes the wait to rescan.
 Only the first look may find a condition true past the deadline: a later one commits
 only if the deadline has not passed when its scan is done, and otherwise is a TIMEOUT.
@@ -171,4 +185,4 @@ replacement and restore inside it moves.
 | Take when a binding fails to decode | Done: `return_loan_raw_failed`, `set_keep_undecodable`; zidl's typed reads and takes use them |
 | WaitSet lifetime, admission and deadline | Done |
 | WaitSet condition triggers and the ordered window | Done |
-| WaitSet results in C++ and Java | Later: a selected result's wrappers are not leased through conversion |
+| WaitSet results in C++ and Java | Done: `zzdds_waitset_wait_leased`, `zzdds_waitset_get_conditions_leased` |

@@ -934,6 +934,112 @@ pub export fn zzdds_waitset_attach_condition_with_release(
     return impl.attachConditionWithRelease(c, release_ctx, release_fn, out_accepted);
 }
 
+/// A leased WaitSet result (see `zzdds_waitset_wait_leased`): each
+/// condition's attachment release context, held, plus a handle for a
+/// condition attached without one.
+pub const WaitSetResult = struct {
+    alloc: std.mem.Allocator,
+    items: []waitset_mod.LeasedCondition,
+    handles: []?*anyopaque,
+
+    fn create(alloc: std.mem.Allocator, found: *std.ArrayListUnmanaged(waitset_mod.LeasedCondition)) ?*WaitSetResult {
+        const r = alloc.create(WaitSetResult) catch return null;
+        const handles = alloc.alloc(?*anyopaque, found.items.len) catch {
+            alloc.destroy(r);
+            return null;
+        };
+        const items = found.toOwnedSlice(alloc) catch {
+            alloc.free(handles);
+            alloc.destroy(r);
+            return null;
+        };
+        // A leased condition's binding builds its result from the context:
+        // the condition itself may be gone once the WaitSet's lock is
+        // released. Only an unleased one is handed back as a handle, as the
+        // plain wait does.
+        for (items, handles) |item, *h| {
+            h.* = if (item.lease == null) item.cond.vtable.get_c_abi_handle(item.cond.ptr) else null;
+        }
+        r.* = .{ .alloc = alloc, .items = items, .handles = handles };
+        return r;
+    }
+};
+
+fn leasedWaitSet(waitset: ?*anyopaque) ?*WaitSetImpl {
+    const w = if (waitset) |h| zidl_bindings.unboxAs(DDS.WaitSet, h) else nil.nil_waitset;
+    if (w.ptr == nil.NIL_PTR) return null;
+    return @ptrCast(@alignCast(w.ptr));
+}
+
+fn finishLeased(
+    impl: *WaitSetImpl,
+    found: *std.ArrayListUnmanaged(waitset_mod.LeasedCondition),
+    rc: DDS.ReturnCode_t,
+    out: *?*WaitSetResult,
+) DDS.ReturnCode_t {
+    if (rc != DDS.RETCODE_OK) {
+        found.deinit(impl.alloc);
+        return rc;
+    }
+    out.* = WaitSetResult.create(impl.alloc, found) orelse {
+        waitset_mod.releaseLeased(found.items);
+        found.deinit(impl.alloc);
+        return DDS.RETCODE_OUT_OF_RESOURCES;
+    };
+    return DDS.RETCODE_OK;
+}
+
+/// DDS_WaitSet_wait for a binding that attached with
+/// zzdds_waitset_attach_condition_with_release: see zzdds_c.h.
+pub export fn zzdds_waitset_wait_leased(
+    waitset: ?*anyopaque,
+    timeout: ?*const DDS.Duration_t,
+    out: ?*?*WaitSetResult,
+) callconv(.c) DDS.ReturnCode_t {
+    const o = out orelse return DDS.RETCODE_BAD_PARAMETER;
+    o.* = null;
+    const t = timeout orelse return DDS.RETCODE_BAD_PARAMETER;
+    const impl = leasedWaitSet(waitset) orelse return DDS.RETCODE_BAD_PARAMETER;
+    var found: std.ArrayListUnmanaged(waitset_mod.LeasedCondition) = .empty;
+    return finishLeased(impl, &found, impl.waitLeased(&found, t), o);
+}
+
+/// DDS_WaitSet_get_conditions, leased: see zzdds_c.h.
+pub export fn zzdds_waitset_get_conditions_leased(waitset: ?*anyopaque, out: ?*?*WaitSetResult) callconv(.c) DDS.ReturnCode_t {
+    const o = out orelse return DDS.RETCODE_BAD_PARAMETER;
+    o.* = null;
+    const impl = leasedWaitSet(waitset) orelse return DDS.RETCODE_BAD_PARAMETER;
+    var found: std.ArrayListUnmanaged(waitset_mod.LeasedCondition) = .empty;
+    return finishLeased(impl, &found, impl.getConditionsLeased(&found), o);
+}
+
+pub export fn zzdds_waitset_result_length(result: ?*const WaitSetResult) callconv(.c) u32 {
+    const r = result orelse return 0;
+    return @intCast(r.items.len);
+}
+
+pub export fn zzdds_waitset_result_release_ctx(result: ?*const WaitSetResult, index: u32) callconv(.c) ?*anyopaque {
+    const r = result orelse return null;
+    if (index >= r.items.len) return null;
+    const l = r.items[index].lease orelse return null;
+    return l.ctx;
+}
+
+pub export fn zzdds_waitset_result_condition(result: ?*const WaitSetResult, index: u32) callconv(.c) ?*anyopaque {
+    const r = result orelse return null;
+    if (index >= r.items.len) return null;
+    return r.handles[index];
+}
+
+/// Releases the result's leases, which may run release hooks, and frees it.
+pub export fn zzdds_waitset_result_free(result: ?*WaitSetResult) callconv(.c) void {
+    const r = result orelse return;
+    waitset_mod.releaseLeased(r.items);
+    r.alloc.free(r.items);
+    r.alloc.free(r.handles);
+    r.alloc.destroy(r);
+}
+
 /// Explicitly install the process-wide configuration. Must be called before
 /// any factory has been created in this process (creating one
 /// resolves+commits the ambient default lazily on first use if this was never

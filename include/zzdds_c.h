@@ -114,6 +114,44 @@ DDS_ReturnCode_t zzdds_waitset_attach_condition_with_release(
     bool *out_accepted);
 
 /**
+ * A WaitSet's result for a binding (zzdds_waitset_wait_leased,
+ * zzdds_waitset_get_conditions_leased): for each condition, the release_ctx
+ * its attachment was made with, held, so that the binding can build its own
+ * result from it even if the condition is detached or deleted meanwhile.
+ * An attachment's release_fn runs once the attachment has ended and every
+ * result holding it has been freed, on the thread that drops the last one.
+ */
+typedef struct zzdds_waitset_result zzdds_waitset_result;
+
+/**
+ * DDS_WaitSet_wait, returning a result to free with zzdds_waitset_result_free.
+ * *out is NULL on any code but DDS_RETCODE_OK.
+ */
+DDS_ReturnCode_t zzdds_waitset_wait_leased(
+    DDS_WaitSet waitset,
+    const DDS_Duration_t *timeout,
+    zzdds_waitset_result **out);
+
+/** DDS_WaitSet_get_conditions, returning a result as zzdds_waitset_wait_leased does. */
+DDS_ReturnCode_t zzdds_waitset_get_conditions_leased(
+    DDS_WaitSet waitset,
+    zzdds_waitset_result **out);
+
+uint32_t zzdds_waitset_result_length(const zzdds_waitset_result *result);
+
+/** The condition's release_ctx, or NULL if it was attached without a release_fn. */
+void *zzdds_waitset_result_release_ctx(const zzdds_waitset_result *result, uint32_t index);
+
+/**
+ * The handle of a condition attached without a release_fn, as DDS_WaitSet_wait
+ * returns it; NULL for one with a release_ctx, whose binding uses that.
+ */
+DDS_Condition zzdds_waitset_result_condition(const zzdds_waitset_result *result, uint32_t index);
+
+/** Releases the result's hold on each release_ctx, possibly running release_fns, and frees it. */
+void zzdds_waitset_result_free(zzdds_waitset_result *result);
+
+/**
  * Resolve `path` as a zzdds TOML config file and install the result as the
  * process-wide configuration, in one step -- entirely through `allocator`
  * (NULL for the default, libc malloc/free). Must be called before any
