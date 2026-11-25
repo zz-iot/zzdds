@@ -235,3 +235,69 @@ test "a listener clearing itself from its own callback does not wait for itself"
     fx.write(dw);
     try testing.expectEqual(@as(u32, 1), state.calls);
 }
+
+// ── set_listener without memory ──────────────────────────────────────────────
+
+fn countReleases(data: ?*anyopaque) callconv(.c) void {
+    const n: *u32 = @ptrCast(@alignCast(data.?));
+    n.* += 1;
+}
+
+fn neverCalled() callconv(.c) void {}
+
+/// A registration of `L` with `data` and a release hook, and with one
+/// callback when `dispatching` (never called here).
+fn registration(comptime L: type, noop: L, data: *u32, dispatching: bool) L {
+    var l = noop;
+    l.listener_data = data;
+    l.release_listener_data = countReleases;
+    if (dispatching) {
+        inline for (@typeInfo(L).@"struct".field_names) |name| {
+            if (comptime std.mem.startsWith(u8, name, "on_")) {
+                @field(l, name) = @ptrCast(&neverCalled);
+                break;
+            }
+        }
+    }
+    return l;
+}
+
+/// Installs a listener, then fails to replace it for want of an identity
+/// record: OUT_OF_RESOURCES, the old one still installed and unreleased, the
+/// new one released once.
+fn expectFailedReplacementKeepsOld(entity: anytype, comptime L: type, noop: L) !void {
+    var old_releases: u32 = 0;
+    var new_releases: u32 = 0;
+    const old = registration(L, noop, &old_releases, false);
+    try testing.expectEqual(DDS.RETCODE_OK, entity.set_listener(old, 0));
+
+    const registry = &zzdds.util.listener_identity.global;
+    const saved = registry.alloc;
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    registry.alloc = failing.allocator();
+    const new = registration(L, noop, &new_releases, true);
+    const rc = entity.set_listener(new, 0);
+    registry.alloc = saved;
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, rc);
+    try testing.expectEqual(@as(u32, 1), new_releases);
+    try testing.expectEqual(@as(u32, 0), old_releases);
+    try testing.expectEqual(@as(?*anyopaque, &old_releases), entity.get_listener().listener_data);
+
+    try testing.expectEqual(DDS.RETCODE_OK, entity.set_listener(null, 0));
+    try testing.expectEqual(@as(u32, 1), old_releases);
+}
+
+test "set_listener: without memory for the replacement, every entity returns OUT_OF_RESOURCES and keeps its listener" {
+    var fx: Fixture = undefined;
+    try fx.init(testing.allocator);
+    defer fx.deinit();
+    const dw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    const dr = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+
+    try expectFailedReplacementKeepsOld(fx.dp_w, DDS.DomainParticipantListener, DDS.noop_DomainParticipantListener);
+    try expectFailedReplacementKeepsOld(fx.topic_w, DDS.TopicListener, DDS.noop_TopicListener);
+    try expectFailedReplacementKeepsOld(fx.pub_w, DDS.PublisherListener, DDS.noop_PublisherListener);
+    try expectFailedReplacementKeepsOld(fx.sub_r, DDS.SubscriberListener, DDS.noop_SubscriberListener);
+    try expectFailedReplacementKeepsOld(dw, DDS.DataWriterListener, DDS.noop_DataWriterListener);
+    try expectFailedReplacementKeepsOld(dr, DDS.DataReaderListener, DDS.noop_DataReaderListener);
+}

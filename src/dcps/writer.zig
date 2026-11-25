@@ -1150,21 +1150,22 @@ pub const DataWriterImpl = struct {
     pub fn setListenerEx(self: *Self, listener_ex: ZZDDS.DataWriterListenerEx, mask: DDS.StatusMask) DDS.ReturnCode_t {
         if (!self.quiesce.acquire()) return DDS.RETCODE_ALREADY_DELETED;
         defer self.quiesce.release(self, reallyDeinit);
-        self.swapListenerEx(listener_ex, mask);
-        return DDS.RETCODE_OK;
+        return self.swapListenerEx(listener_ex, mask);
     }
 
     /// Installs `new_listener_ex` and `mask`, retiring the registration it
     /// replaces (listener_box.zig's `Retired`): a dispatch already using
     /// that one keeps it alive until it returns.
-    fn swapListenerEx(self: *Self, new_listener_ex: ZZDDS.DataWriterListenerEx, mask: DDS.StatusMask) void {
-        const new_box = ListenerBox(ZZDDS.DataWriterListenerEx).create(self.alloc, new_listener_ex) catch
-            @panic("zzdds: out of memory boxing listener");
+    fn swapListenerEx(self: *Self, new_listener_ex: ZZDDS.DataWriterListenerEx, mask: DDS.StatusMask) DDS.ReturnCode_t {
+        // Owns the registration it was given (`adopt`): on failure the
+        // old one stays installed and this one is released.
+        const new_box = ListenerBox(ZZDDS.DataWriterListenerEx).adopt(self.alloc, new_listener_ex) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         const upto = self.retired_listeners.install(&self.listener_mu, &self.listener_ex_box, new_box);
         @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
         // From application code, returns once no callback uses what it
         // replaced (docs/design/concurrency/listeners.md#replacement-completion).
         self.retired_listeners.drain(self.alloc, &self.listener_mu, upto, !listener_lane.inCallbackChain());
+        return DDS.RETCODE_OK;
     }
 
     /// Call with no lock held. Returns a box the caller may safely read/
@@ -1494,8 +1495,7 @@ pub const DataWriterImpl = struct {
         // reference keeps it until the setter is done with it.
         if (!self.quiesce.acquire()) return DDS.RETCODE_ALREADY_DELETED;
         defer self.quiesce.release(self, reallyDeinit);
-        self.swapListenerEx(listenerExFromBase(if (a_listener) |l| l.* else DDS.noop_DataWriterListener), mask);
-        return DDS.RETCODE_OK;
+        return self.swapListenerEx(listenerExFromBase(if (a_listener) |l| l.* else DDS.noop_DataWriterListener), mask);
     }
 
     fn vtGetListener(ctx: *anyopaque) DDS.DataWriterListener {

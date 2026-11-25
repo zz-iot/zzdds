@@ -4022,7 +4022,8 @@ pub const DataReaderImpl = struct {
         // reference keeps it until the setter is done with it.
         if (!self.quiesce.acquire()) return DDS.RETCODE_ALREADY_DELETED;
         defer self.quiesce.release(self, reallyDeinit);
-        self.swapListenerEx(listenerExFromBase(if (a_listener) |l| l.* else DDS.noop_DataReaderListener), mask);
+        const swap_rc = self.swapListenerEx(listenerExFromBase(if (a_listener) |l| l.* else DDS.noop_DataReaderListener), mask);
+        if (swap_rc != DDS.RETCODE_OK) return swap_rc;
 
         // DDS status conditions/listeners are level-triggered, not
         // edge-triggered: enabling a listener for a status that's *already*
@@ -4066,18 +4067,19 @@ pub const DataReaderImpl = struct {
     pub fn setListenerEx(self: *Self, listener_ex: ZZDDS.DataReaderListenerEx, mask: DDS.StatusMask) DDS.ReturnCode_t {
         if (!self.quiesce.acquire()) return DDS.RETCODE_ALREADY_DELETED;
         defer self.quiesce.release(self, reallyDeinit);
-        self.swapListenerEx(listener_ex, mask);
-        return DDS.RETCODE_OK;
+        return self.swapListenerEx(listener_ex, mask);
     }
 
-    fn swapListenerEx(self: *Self, new_listener_ex: ZZDDS.DataReaderListenerEx, mask: DDS.StatusMask) void {
-        const new_box = ListenerBox(ZZDDS.DataReaderListenerEx).create(self.alloc, new_listener_ex) catch
-            @panic("zzdds: out of memory boxing listener");
+    fn swapListenerEx(self: *Self, new_listener_ex: ZZDDS.DataReaderListenerEx, mask: DDS.StatusMask) DDS.ReturnCode_t {
+        // Owns the registration it was given (`adopt`): on failure the
+        // old one stays installed and this one is released.
+        const new_box = ListenerBox(ZZDDS.DataReaderListenerEx).adopt(self.alloc, new_listener_ex) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         const upto = self.retired_listeners.install(&self.listener_mu, &self.listener_ex_box, new_box);
         @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
         // From application code, returns once no callback uses what it
         // replaced (docs/design/concurrency/listeners.md#replacement-completion).
         self.retired_listeners.drain(self.alloc, &self.listener_mu, upto, !listener_lane.inCallbackChain());
+        return DDS.RETCODE_OK;
     }
 
     /// Call with no lock held. Returns a box the caller may safely read/

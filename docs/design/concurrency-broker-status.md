@@ -86,7 +86,6 @@ bounded independently of these wire simplifications.
 
 | Item | Required resolution | Boundary already fixed |
 | --- | --- | --- |
-| Listener bridge ABI and resource-failure results | Select/version the generated identity/ownership/invocation-outcome descriptor and document permitted set_listener resource-exhaustion results and per-binding mappings | Preserve original dispatch pointer, canonicalize identity at registration, retain old registration on preparation failure, no exception crosses core frames, no new standard setter timeout |
 | External-loop platform ABI | Define clock-domain conversion, wake representation and platform-specific adapter descriptor/version validation | One outer driver, atomic arm/recheck, attach before participants/I/O, no live executor replacement or premature detach in v1 |
 
 Concrete queue/pool/container selection, internal cancellation batching and scheduling of

@@ -155,7 +155,7 @@ can be tracked across runtimes without granting execution permission there.
 6. **Bounded lifetime and failure.** Identity records retire only after registrations,
    claims and pending internal users release them. Generation reuse cannot substitute
    for lifetime protection. Registration capacity failure preserves the installed
-   registration; setter resource-failure mapping is an [open API item](../concurrency-broker-status.md#open-design-items). Internal stale
+   registration; a setter then returns OUT_OF_RESOURCES ([replacement completion](#replacement-completion)). Internal stale
    records surviving external quiescence must contain no borrowed application access.
 
 <a id="participant-nesting-limits"></a>
@@ -191,8 +191,9 @@ storage sizing a stable bound. Live mutation can be a later extension if justifi
 ### Binding identity and ownership
 
 Dispatch context, canonical identity and application ownership are separate. The
-identity and nesting rules above are required. Descriptor layout/version negotiation
-is an [open ABI item](../concurrency-broker-status.md#open-design-items).
+identity and nesting rules above are required. The generated listener structs carry no
+layout version: bindings are generated against the headers they ship with, so there is
+no negotiation before 1.0. Revisit it before any ABI freeze.
 
 Preserve the current dispatch context exactly as required by each generated trampoline.
 Supply canonical identity independently at registration, retain the resolved exclusion
@@ -223,9 +224,10 @@ application-context identity defaults. Canonical tokens must have an explicit na
 and lifetime; they cannot alias unrelated native or VM objects accidentally.
 
 The identity travels in a `listener_identity` field appended to each generated callback
-struct; a versioned registration descriptor or identity-query hook remain alternatives. Appending a field to existing generated callback structs
-is not automatically binary-compatible. Resolve layout/version negotiation and
-failure ownership in an implementation plan rather than changing OMG interfaces.
+struct. Appending a field is not binary-compatible with code built against the older
+struct, which is why the layout is tied to its headers (above).
+A registration's identity record is resolved when it is registered, for a listener with
+callbacks, so no callback finds it missing and runs unexcluded.
 New application controls remain in `zzdds.idl`; generated internal metadata does not
 require an application identity accessor.
 
@@ -290,13 +292,15 @@ explicit cleanup. Do not clear an unrelated pending exception at callback entry 
 continue normal conversion after a failed lookup/allocation.
 [JNI design, exception handling](https://docs.oracle.com/en/java/javase/24/docs/specs/jni/design.html#exception-handling).
 
-A void-return callback ABI requires an internal
-invocation-outcome mechanism: for example, a scoped per-invocation record accessible
-to generated bridges, or a versioned descriptor outcome hook. It must distinguish
-nested invocations, restore the outer frame on return, and carry the same explicit
-chain across supported binding/runtime transitions. One sticky thread-wide error
-flag is insufficient. Exact ABI shape is tracked with identity metadata in the index; no raw
-exception object is required to cross the ABI or be retained after reporting.
+Callbacks return void, so a bridge reports a failure through
+`zzdds_listener_invocation_failed(reason)` (`zzdds_c.h`), called on the callback's own
+thread before it returns: the listener threw, or its arguments could not be built and it
+was not called. The core marks the innermost listener call on that thread, per nesting
+depth, so a nested call's failure is its own and never its caller's. When the call ends,
+the core logs the failure, at most once per interval process-wide with a count of the
+rest, and an explicit `notify_datareaders` whose child failed stops its batch there and
+returns ERROR. No exception object crosses the ABI. An application-settable failure
+handler, replacing the default log, is a later `zzdds.idl` extension.
 
 Cleanup has one structured epilogue on every recoverable path: retire the active
 invocation frame, release callback rights/access guards and retained arguments,
@@ -858,9 +862,13 @@ not assert that the entity's current listener still equals the caller's argument
 if another setter subsequently changed it.
 
 Retirement bookkeeping must be bounded. Prepare all needed storage before committing
-a registration change; failure must leave the previous registration intact. The
-[open API items](../concurrency-broker-status.md#open-design-items) track the permitted
-resource-failure return mapping. No TIMEOUT is added to standard `set_listener`;
+a registration change; failure must leave the previous registration intact. Without
+memory for the new registration or its identity record, `set_listener` returns
+OUT_OF_RESOURCES, keeps the previous registration, and releases the one it was given,
+as a failed `create_*` does: no binding releases a registration it passed in. Each
+binding returns the code as is. Clearing a listener needs no identity record, though
+it still allocates its (empty) registration.
+No TIMEOUT is added to standard `set_listener`;
 this operation has no finite return-time guarantee if a callback never returns.
 
 <a id="standard-only-ownership-pattern"></a>

@@ -1785,6 +1785,14 @@ fn trackRelease(ctx: ?*anyopaque) callconv(.c) void {
     tracker.last_ctx = ctx;
 }
 
+test "zzdds_listener_invocation_failed: refused outside a listener call and for an unknown reason" {
+    try testing.expect(!extensions.zzdds_listener_invocation_failed(1));
+    zzdds.util.listener_box.enterCall();
+    defer zzdds.util.listener_box.leaveCall();
+    try testing.expect(!extensions.zzdds_listener_invocation_failed(0));
+    try testing.expect(!extensions.zzdds_listener_invocation_failed(3));
+}
+
 test "waitset: attach_condition_with_release fires on explicit detach_condition, exactly once" {
     const ws_boxed = try newWaitSetHandle();
     defer destroyWaitSetHandle(ws_boxed);

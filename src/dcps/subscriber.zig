@@ -841,18 +841,28 @@ pub const SubscriberImpl = struct {
         // its listener group, which they share.
         var traversal: ListenerTraversal = .{};
         traversal.begin(if (pinned.items.len > 0) pinned.items[0].listeners.group else null);
-        for (pinned.items) |r| {
+        defer traversal.end();
+        for (pinned.items, 0..) |r, i| {
             // Tracked, so a deletion of `r` from outside a callback waits for it.
             var call: ListenerCall = .{};
+            var child: listener_box_mod.ChildWatch = undefined;
+            child.begin();
             // Left to the reader's turn as its own kind, so DATA_ON_READERS
             // cannot take it there.
             if (r.listeners.enter(&call, listener_lane.NOTIFY_DATA_AVAILABLE)) {
                 _ = r.dispatchReaderDataAvailable();
                 r.listeners.leave(&call);
             }
+            child.end();
+            const failed = child.failed;
             r.releaseQuiesce();
+            // A child's listener failed: the batch stops there, its earlier
+            // effects kept (docs/design/concurrency/listeners.md#failure-after-dispatch-commit).
+            if (failed) {
+                for (pinned.items[i + 1 ..]) |rest| rest.releaseQuiesce();
+                return DDS.RETCODE_ERROR;
+            }
         }
-        traversal.end();
         return DDS.RETCODE_OK;
     }
 
@@ -918,8 +928,7 @@ pub const SubscriberImpl = struct {
         // reference keeps it until the setter is done with it.
         if (!self.quiesce.acquire()) return DDS.RETCODE_ALREADY_DELETED;
         defer self.quiesce.release(self, reallyDeinit);
-        self.swapListener(if (a_listener) |l| l.* else DDS.noop_SubscriberListener, mask);
-        return DDS.RETCODE_OK;
+        return self.swapListener(if (a_listener) |l| l.* else DDS.noop_SubscriberListener, mask);
     }
 
     fn vtGetListener(ctx: *anyopaque) DDS.SubscriberListener {
@@ -932,14 +941,16 @@ pub const SubscriberImpl = struct {
     /// Installs `new_listener` and `mask`, retiring the registration it
     /// replaces (listener_box.zig's `Retired`): a dispatch already using
     /// that one keeps it alive until it returns.
-    fn swapListener(self: *Self, new_listener: DDS.SubscriberListener, mask: DDS.StatusMask) void {
-        const new_box = ListenerBox(DDS.SubscriberListener).create(self.alloc, new_listener) catch
-            @panic("zzdds: out of memory boxing listener");
+    fn swapListener(self: *Self, new_listener: DDS.SubscriberListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
+        // Owns the registration it was given (`adopt`): on failure the
+        // old one stays installed and this one is released.
+        const new_box = ListenerBox(DDS.SubscriberListener).adopt(self.alloc, new_listener) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         const upto = self.retired_listeners.install(&self.listener_mu, &self.listener_box, new_box);
         @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
         // From application code, returns once no callback uses what it
         // replaced (docs/design/concurrency/listeners.md#replacement-completion).
         self.retired_listeners.drain(self.alloc, &self.listener_mu, upto, !listener_lane.inCallbackChain());
+        return DDS.RETCODE_OK;
     }
 
     /// Call with no lock held. Returns a box the caller may safely read/

@@ -1044,8 +1044,8 @@ unretained pointer, which the application keeps valid while it is installed and 
 waits run (the `ExecutionRuntime` binding API is designed in
 [factory construction](design/factory-construction.md), not built). Operations map the
 contracts' effect states (commit and cancellation) and waits onto endpoint locks as
-[operation effects](design/concurrency/operation-effects.md) describes: the
-acknowledgment and historical-data waits do so, and it lists what does not yet.
+[operation effects](design/concurrency/operation-effects.md) describes, for every
+operation it lists: waits, blocking writes, takes and WaitSets.
 The first vertical slice runs one reliable reader/writer pair through the same trace
 under a manual and a hosted driver: match, delivery, the acknowledgment and data waits, a
 missed deadline, and retirement begun from listeners, with the runtime's last owner

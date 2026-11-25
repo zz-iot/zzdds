@@ -803,3 +803,89 @@ test "DATA_ON_READERS: set as data arrives, waking the Subscriber's StatusCondit
     try readAll(dr_b, &out);
     try testing.expect(subStatusChanges(fx.sub_) & DDS.DATA_ON_READERS_STATUS == 0);
 }
+
+// ── A child listener's failure in notify_datareaders ─────────────────────────
+
+fn failDataAvailable(_: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
+    @as(*u32, @ptrCast(@alignCast(ld))).* += 1;
+    // As a binding's bridge does when its listener throws.
+    _ = zzdds.c_abi.extensions.zzdds_listener_invocation_failed(1);
+}
+
+test "notify_datareaders: a child listener's reported failure stops the batch with ERROR, its effects kept" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+
+    var failing_calls: u32 = 0;
+    var other_calls: u32 = 0;
+    const dw = fx.makeWriter(.{}, null, 0);
+    const failing = fx.makeReader(.{}, .{ .listener_data = &failing_calls, .on_data_available = failDataAvailable }, DDS.DATA_AVAILABLE_STATUS);
+    const other = fx.makeReader(.{}, .{ .listener_data = &other_calls, .on_data_available = countDataAvailable }, DDS.DATA_AVAILABLE_STATUS);
+
+    // Arrivals left unclaimed, for notify_datareaders.
+    @atomicStore(DDS.StatusMask, &failing.listener_mask, 0, .monotonic);
+    @atomicStore(DDS.StatusMask, &other.listener_mask, 0, .monotonic);
+    try write(dw);
+    fx.settle();
+    @atomicStore(DDS.StatusMask, &failing.listener_mask, DDS.DATA_AVAILABLE_STATUS, .monotonic);
+    @atomicStore(DDS.StatusMask, &other.listener_mask, DDS.DATA_AVAILABLE_STATUS, .monotonic);
+
+    try testing.expectEqual(DDS.RETCODE_ERROR, fx.sub_.notify_datareaders());
+    try testing.expectEqual(@as(u32, 1), failing_calls);
+    try testing.expectEqual(@as(u32, 0), other_calls);
+    // The failed call consumed its reader's change: it is not replayed.
+    // The next traversal reaches the reader the failure stopped short of.
+    try testing.expectEqual(DDS.RETCODE_OK, fx.sub_.notify_datareaders());
+    fx.settle();
+    try testing.expectEqual(@as(u32, 1), failing_calls);
+    try testing.expectEqual(@as(u32, 1), other_calls);
+}
+
+const FailAndClear = struct {
+    calls: u32 = 0,
+    reader: ?*DataReaderImpl = null,
+    released: u32 = 0,
+
+    fn onData(_: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
+        const self: *FailAndClear = @ptrCast(@alignCast(ld));
+        self.calls += 1;
+        _ = zzdds.c_abi.extensions.zzdds_listener_invocation_failed(1);
+        // The registration it clears is released after this call returns:
+        // a successful call of its own, which must not hide the failure.
+        const dds = self.reader.?.toDDSDataReader();
+        _ = dds.vtable.set_listener(dds.ptr, null, 0);
+    }
+
+    fn release(ld: ?*anyopaque) callconv(.c) void {
+        const self: *FailAndClear = @ptrCast(@alignCast(ld));
+        self.released += 1;
+    }
+};
+
+test "notify_datareaders: a failed child that clears its own listener still stops the batch with ERROR" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+
+    var state: FailAndClear = .{};
+    var other_calls: u32 = 0;
+    const dw = fx.makeWriter(.{}, null, 0);
+    const failing = fx.makeReader(.{}, .{
+        .listener_data = &state,
+        .on_data_available = FailAndClear.onData,
+        .release_listener_data = FailAndClear.release,
+    }, DDS.DATA_AVAILABLE_STATUS);
+    state.reader = failing;
+    const other = fx.makeReader(.{}, .{ .listener_data = &other_calls, .on_data_available = countDataAvailable }, DDS.DATA_AVAILABLE_STATUS);
+
+    @atomicStore(DDS.StatusMask, &failing.listener_mask, 0, .monotonic);
+    @atomicStore(DDS.StatusMask, &other.listener_mask, 0, .monotonic);
+    try write(dw);
+    fx.settle();
+    @atomicStore(DDS.StatusMask, &failing.listener_mask, DDS.DATA_AVAILABLE_STATUS, .monotonic);
+    @atomicStore(DDS.StatusMask, &other.listener_mask, DDS.DATA_AVAILABLE_STATUS, .monotonic);
+
+    try testing.expectEqual(DDS.RETCODE_ERROR, fx.sub_.notify_datareaders());
+    try testing.expectEqual(@as(u32, 1), state.calls);
+    try testing.expectEqual(@as(u32, 1), state.released);
+    try testing.expectEqual(@as(u32, 0), other_calls);
+}
