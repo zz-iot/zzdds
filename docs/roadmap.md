@@ -1458,6 +1458,20 @@ release notes).
   Connext does) is also possible future work; neither implies zero serialization. Locator
   kinds, PIDs, and protocol-interface hooks exist as scaffolding
   (`src/transport/interface.zig`, `src/rtps/pid.zig`, `src/protocol/interface.zig`).
+  Accepted design (RTPS over shared-memory inboxes with payloads by reference, plus
+  zidl-generated loaned view types): [`design/shmem-zero-copy.md`](design/shmem-zero-copy.md).
+- **Reliability traffic on reliable transports (SHMEM, TCP)** — the RTPS state machines
+  don't know their transport: over TCP and the planned SHMEM inboxes they still send
+  periodic HEARTBEATs and ACKNACKs and still fragment at the writer's `frag_size` (16 KB
+  by default), paying for reliability twice. Design eliding it: a SHMEM reader's
+  consumption cursor as its acknowledgment, heartbeats on demand (gaps, late joiners,
+  `wait_for_acknowledgments`), and a per-transport fragment size so TCP stops cutting
+  payloads into 16 KB pieces. It must stay robust to deliberate drops (a full SHMEM inbox
+  drops and relies on RTPS repair) and to TCP reconnects.
+- **Blocking `loan_raw`** — wait up to `max_blocking_time` for a free buffer instead of
+  failing with `OUT_OF_RESOURCES`. Deferred until a producer needs it: with per-reader
+  quotas and a growable SHMEM segment, exhaustion means a cap is too small, and RELIABLE
+  publish already blocks under RESOURCE_LIMITS.
 - **Other protocol/discovery plugins** — QUIC, MQTT, custom hardware channels, and
   mDNS/DNS-SD are extension points only; no v1 implementation is planned.
 - **PKCS#11** — out of scope for v1; the security plugin interface must not preclude it.
