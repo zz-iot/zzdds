@@ -4,6 +4,7 @@
 #include "zidl_allocator_pmr.hpp"
 
 #include <memory>
+#include <new>
 #include <memory_resource>
 #include <mutex>
 #include <unordered_map>
@@ -757,7 +758,64 @@ public:
         return rc;
     }
 
+    // Each result is built from its attachment's own keep-alive, which
+    // zzdds holds for this conversion (zzdds_waitset_wait_leased), not
+    // from a handle that a concurrent detach and delete could free first.
+    // A failed conversion is OUT_OF_RESOURCES, with no conditions.
+    ::DDS::ReturnCode_t wait(::DDS::ConditionSeq& active_conditions, ::DDS::Duration_t timeout) override
+    {
+        active_conditions.clear();
+        if (_zidl_is_retired()) return ::DDS::RETCODE_ALREADY_DELETED;
+        zzdds_waitset_result* r = nullptr;
+        auto rc = zzdds_waitset_wait_leased(handle_, reinterpret_cast<const DDS_Duration_t*>(&timeout), &r);
+        return fillLeased(rc, r, active_conditions);
+    }
+
+    ::DDS::ReturnCode_t get_conditions(::DDS::ConditionSeq& attached_conditions) override
+    {
+        attached_conditions.clear();
+        if (_zidl_is_retired()) return ::DDS::RETCODE_ALREADY_DELETED;
+        zzdds_waitset_result* r = nullptr;
+        auto rc = zzdds_waitset_get_conditions_leased(handle_, &r);
+        return fillLeased(rc, r, attached_conditions);
+    }
+
 private:
+    struct ResultGuard {
+        zzdds_waitset_result* r;
+        ~ResultGuard() { zzdds_waitset_result_free(r); }
+    };
+
+    static ::DDS::ReturnCode_t fillLeased(DDS_ReturnCode_t rc, zzdds_waitset_result* r, ::DDS::ConditionSeq& out)
+    {
+        // Frees the result, and so releases its holds, however this returns.
+        ResultGuard guard{r};
+        if (rc != DDS_RETCODE_OK) return rc;
+        const uint32_t n = zzdds_waitset_result_length(r);
+#if defined(__cpp_exceptions)
+        try {
+            appendLeased(r, n, out);
+        } catch (const std::bad_alloc&) {
+            out.clear();
+            return ::DDS::RETCODE_OUT_OF_RESOURCES;
+        }
+#else
+        appendLeased(r, n, out);
+#endif
+        return rc;
+    }
+
+    static void appendLeased(zzdds_waitset_result* r, uint32_t n, ::DDS::ConditionSeq& out)
+    {
+        out.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            if (auto* ctx = static_cast<ReleaseCtx*>(zzdds_waitset_result_release_ctx(r, i)))
+                out.push_back(ctx->cond);
+            else
+                out.push_back(::DDS::ConditionImpl::_getOrCreate(zzdds_waitset_result_condition(r, i)));
+        }
+    }
+
     // Owns the shared_ptr keepalive directly -- no shared map keyed by
     // handle to synchronize against release_trampoline with, so no
     // identity-vs-key ambiguity: a concurrent reattach for the same

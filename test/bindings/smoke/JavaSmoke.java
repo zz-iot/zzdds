@@ -287,6 +287,13 @@ public class JavaSmoke {
         java.util.ArrayList<Dcps.DDS.Condition> active = new java.util.ArrayList<>();
         check(ws.wait(active, timeout) == ok, "wait() on a triggered GuardCondition");
         check(active.size() == 1 && active.get(0) == gc, "wait() returns the GuardCondition object that was attached");
+        java.util.ArrayList<Dcps.DDS.Condition> attached = new java.util.ArrayList<>();
+        check(ws.get_conditions(attached) == ok && attached.size() == 1 && attached.get(0) == gc,
+              "get_conditions() returns the GuardCondition object that was attached");
+        check(gc.set_trigger_value(false) == ok, "set_trigger_value(false)");
+        timeout.set_sec(0);
+        check(ws.wait(active, timeout) == Dcps.DDS.RETCODE_TIMEOUT.value && active.isEmpty(),
+              "a timed-out wait() leaves no conditions");
         check(gc.destroy() == ok, "GuardCondition.destroy()");
         check(gc.destroy() == Dcps.DDS.RETCODE_ALREADY_DELETED.value, "a second destroy() is refused");
         ws.close();

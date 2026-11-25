@@ -1820,6 +1820,130 @@ test "waitset: attach_condition_with_release fires on explicit detach_condition,
     try testing.expectEqual(@as(u32, 1), tracker.fired_count);
 }
 
+fn guardConditionAsCondition(gc_boxed: *anyopaque) *anyopaque {
+    const gc_native = zidl_bindings.unboxAsView(DDS.GuardCondition, gc_boxed);
+    const cond_native = gc_native.vtable.as_Condition(gc_native.ptr);
+    return cond_native.vtable.get_c_abi_handle(cond_native.ptr);
+}
+
+test "waitset: a leased wait result holds the release context through a detach and the condition's deletion" {
+    const ws_boxed = try newWaitSetHandle();
+    defer destroyWaitSetHandle(ws_boxed);
+    const gc_boxed = try newGuardConditionHandle();
+    var gc_destroyed = false;
+    defer if (!gc_destroyed) destroyGuardConditionHandle(gc_boxed);
+    const c_boxed = guardConditionAsCondition(gc_boxed);
+
+    var tracker = ReleaseTracker{};
+    var accepted = false;
+    try testing.expectEqual(DDS.RETCODE_OK, extensions.zzdds_waitset_attach_condition_with_release(ws_boxed, c_boxed, &tracker, trackRelease, &accepted));
+    try testing.expect(accepted);
+    const gc = zidl_bindings.unboxAsView(DDS.GuardCondition, gc_boxed);
+    try testing.expectEqual(DDS.RETCODE_OK, gc.set_trigger_value(true));
+
+    const zero: DDS.Duration_t = .{ .sec = 0, .nanosec = 0 };
+    var result: ?*extensions.WaitSetResult = null;
+    try testing.expectEqual(DDS.RETCODE_OK, extensions.zzdds_waitset_wait_leased(ws_boxed, &zero, &result));
+    try testing.expectEqual(@as(u32, 1), extensions.zzdds_waitset_result_length(result));
+    try testing.expectEqual(@as(?*anyopaque, &tracker), extensions.zzdds_waitset_result_release_ctx(result, 0));
+    // A leased condition comes back by its context, not its handle.
+    try testing.expectEqual(@as(?*anyopaque, null), extensions.zzdds_waitset_result_condition(result, 0));
+
+    const ws = zidl_bindings.unboxAs(DDS.WaitSet, ws_boxed);
+    try testing.expectEqual(DDS.RETCODE_OK, ws.detach_condition(zidl_bindings.unboxAsView(DDS.Condition, c_boxed)));
+    destroyGuardConditionHandle(gc_boxed);
+    gc_destroyed = true;
+    // The result still holds the context: the hook waits for it.
+    try testing.expectEqual(@as(u32, 0), tracker.fired_count);
+    extensions.zzdds_waitset_result_free(result);
+    try testing.expectEqual(@as(u32, 1), tracker.fired_count);
+}
+
+test "waitset: a leased get_conditions returns a hooked condition by its context and a plain one by its handle" {
+    const ws_boxed = try newWaitSetHandle();
+    defer destroyWaitSetHandle(ws_boxed);
+    const hooked_gc = try newGuardConditionHandle();
+    defer destroyGuardConditionHandle(hooked_gc);
+    const plain_gc = try newGuardConditionHandle();
+    defer destroyGuardConditionHandle(plain_gc);
+    const hooked = guardConditionAsCondition(hooked_gc);
+    const plain = guardConditionAsCondition(plain_gc);
+
+    var tracker = ReleaseTracker{};
+    try testing.expectEqual(DDS.RETCODE_OK, extensions.zzdds_waitset_attach_condition_with_release(ws_boxed, hooked, &tracker, trackRelease, null));
+    try testing.expectEqual(DDS.RETCODE_OK, extensions.zzdds_waitset_attach_condition_with_release(ws_boxed, plain, null, null, null));
+
+    var result: ?*extensions.WaitSetResult = null;
+    try testing.expectEqual(DDS.RETCODE_OK, extensions.zzdds_waitset_get_conditions_leased(ws_boxed, &result));
+    defer extensions.zzdds_waitset_result_free(result);
+    try testing.expectEqual(@as(u32, 2), extensions.zzdds_waitset_result_length(result));
+    var saw_hooked = false;
+    var saw_plain = false;
+    for (0..2) |i| {
+        const idx: u32 = @intCast(i);
+        if (extensions.zzdds_waitset_result_release_ctx(result, idx)) |ctx| {
+            try testing.expectEqual(@as(*anyopaque, &tracker), ctx);
+            try testing.expectEqual(@as(?*anyopaque, null), extensions.zzdds_waitset_result_condition(result, idx));
+            saw_hooked = true;
+        } else {
+            try testing.expectEqual(@as(?*anyopaque, plain), extensions.zzdds_waitset_result_condition(result, idx));
+            saw_plain = true;
+        }
+    }
+    try testing.expect(saw_hooked and saw_plain);
+    // Out of range and NULL are safe.
+    try testing.expectEqual(@as(?*anyopaque, null), extensions.zzdds_waitset_result_release_ctx(result, 2));
+    try testing.expectEqual(@as(u32, 0), extensions.zzdds_waitset_result_length(null));
+}
+
+test "waitset: a leased wait that times out returns no result and holds nothing" {
+    const ws_boxed = try newWaitSetHandle();
+    defer destroyWaitSetHandle(ws_boxed);
+    const gc_boxed = try newGuardConditionHandle();
+    defer destroyGuardConditionHandle(gc_boxed);
+    var tracker = ReleaseTracker{};
+    try testing.expectEqual(DDS.RETCODE_OK, extensions.zzdds_waitset_attach_condition_with_release(ws_boxed, guardConditionAsCondition(gc_boxed), &tracker, trackRelease, null));
+    const zero: DDS.Duration_t = .{ .sec = 0, .nanosec = 0 };
+    var result: ?*extensions.WaitSetResult = null;
+    try testing.expectEqual(DDS.RETCODE_TIMEOUT, extensions.zzdds_waitset_wait_leased(ws_boxed, &zero, &result));
+    try testing.expectEqual(@as(?*extensions.WaitSetResult, null), result);
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, extensions.zzdds_waitset_wait_leased(ws_boxed, null, &result));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, extensions.zzdds_waitset_wait_leased(ws_boxed, &zero, null));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, extensions.zzdds_waitset_get_conditions_leased(null, &result));
+}
+
+test "waitset: a leased result that cannot be built holds nothing and runs no hook" {
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const ws = try zzdds.dcps.WaitSetImpl.init(fa.allocator());
+    defer ws.deinit();
+    const dws = ws.toDDSWaitSet();
+    const ws_boxed = dws.vtable.get_c_abi_handle(dws.ptr);
+    const gc = try zzdds.dcps.GuardConditionImpl.init(testing.allocator);
+    defer gc.deinit();
+    const cond = gc.toCondition();
+    var tracker = ReleaseTracker{};
+    try testing.expectEqual(DDS.RETCODE_OK, extensions.zzdds_waitset_attach_condition_with_release(ws_boxed, cond.vtable.get_c_abi_handle(cond.ptr), &tracker, trackRelease, null));
+    try testing.expectEqual(DDS.RETCODE_OK, gc.toDDSGuardCondition().set_trigger_value(true));
+
+    const zero: DDS.Duration_t = .{ .sec = 0, .nanosec = 0 };
+    const never = std.math.maxInt(usize);
+    // The wait's scan allocates first; each later allocation building the
+    // result fails in turn: the result, its handles, its items.
+    for (1..4) |k| {
+        fa.fail_index = fa.alloc_index + k;
+        fa.resize_fail_index = fa.resize_index;
+        var result: ?*extensions.WaitSetResult = null;
+        try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, extensions.zzdds_waitset_wait_leased(ws_boxed, &zero, &result));
+        try testing.expectEqual(@as(?*extensions.WaitSetResult, null), result);
+        fa.fail_index = never;
+        fa.resize_fail_index = never;
+        // Its hold was released: detaching runs the hook at once.
+        try testing.expectEqual(@as(u32, 0), tracker.fired_count);
+    }
+    try testing.expectEqual(DDS.RETCODE_OK, dws.detach_condition(cond));
+    try testing.expectEqual(@as(u32, 1), tracker.fired_count);
+}
+
 test "waitset: attach_condition_with_release fires when the WaitSet is destroyed while still attached" {
     const ws_boxed = try newWaitSetHandle();
     const gc_boxed = try newGuardConditionHandle();

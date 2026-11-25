@@ -17,6 +17,7 @@ pub const TopicImpl = @import("topic.zig").TopicImpl;
 pub const ContentFilteredTopicImpl = @import("topic.zig").ContentFilteredTopicImpl;
 pub const TopicUse = @import("topic.zig").TopicUse;
 pub const filter = @import("filter.zig");
+pub const waitset = @import("waitset.zig");
 pub const WaitSetImpl = @import("waitset.zig").WaitSetImpl;
 pub const GuardConditionImpl = @import("waitset.zig").GuardConditionImpl;
 pub const StatusConditionImpl = @import("waitset.zig").StatusConditionImpl;

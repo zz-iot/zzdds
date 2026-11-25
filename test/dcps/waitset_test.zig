@@ -1135,7 +1135,6 @@ test "WaitSet: after shutdown every operation is ALREADY_DELETED, shutdown again
     const gc = try GuardConditionImpl.init(a);
     defer gc.deinit();
     const ws = try WaitSetImpl.init(a);
-    defer ws.deinit();
     const Release = struct {
         var count: usize = 0;
         fn f(_: ?*anyopaque) callconv(.c) void {
@@ -1146,7 +1145,8 @@ test "WaitSet: after shutdown every operation is ALREADY_DELETED, shutdown again
     try testing.expectEqual(DDS.RETCODE_OK, ws.attachConditionWithRelease(gc.toCondition(), null, Release.f, null));
     const dws = ws.toDDSWaitSet();
     try testing.expectEqual(DDS.RETCODE_OK, dws.shutdown());
-    try testing.expectEqual(@as(usize, 1), Release.count);
+    // Its release hook runs when the WaitSet is freed, not at shutdown.
+    try testing.expectEqual(@as(usize, 0), Release.count);
     try testing.expectEqual(DDS.RETCODE_OK, dws.shutdown());
 
     var seq: DDS.ConditionSeq = .{};
@@ -1156,6 +1156,8 @@ test "WaitSet: after shutdown every operation is ALREADY_DELETED, shutdown again
     try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, dws.get_conditions(&seq));
     // The condition is still usable.
     try testing.expectEqual(DDS.RETCODE_OK, gc.toDDSGuardCondition().set_trigger_value(true));
+    ws.deinit();
+    try testing.expectEqual(@as(usize, 1), Release.count);
 }
 
 test "WaitSet: a second wait while one is admitted is PRECONDITION_NOT_MET, even with a zero timeout" {
@@ -1224,23 +1226,6 @@ test "WaitSet: a condition that becomes true at the deadline or later is a timeo
     runtime.deinit();
 }
 
-test "WaitSet: a release hook that destroys the WaitSet during shutdown is safe" {
-    const a = testing.allocator;
-    const gc = try GuardConditionImpl.init(a);
-    defer gc.deinit();
-    const ws = try WaitSetImpl.init(a);
-    const Hook = struct {
-        fn f(ctx: ?*anyopaque) callconv(.c) void {
-            const w: *WaitSetImpl = @ptrCast(@alignCast(ctx.?));
-            _ = w.toDDSWaitSet().destroy();
-        }
-    };
-    try testing.expectEqual(DDS.RETCODE_OK, ws.attachConditionWithRelease(gc.toCondition(), ws, Hook.f, null));
-    // The hook frees the WaitSet once shutdown lets go: the leak and
-    // use-after-free checks are the assertions.
-    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().shutdown());
-}
-
 test "WaitSet: a release hook that destroys the WaitSet while it is being destroyed is safe" {
     const a = testing.allocator;
     const gc = try GuardConditionImpl.init(a);
@@ -1258,30 +1243,29 @@ test "WaitSet: a release hook that destroys the WaitSet while it is being destro
     try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().destroy());
 }
 
-test "WaitSet: shutdown wakes a wait before running release hooks" {
+test "WaitSet: shutdown runs no release hook, and destroy runs each once, after a wait in progress has returned" {
     const a = testing.allocator;
     const gc = try GuardConditionImpl.init(a);
     defer gc.deinit();
     const ws = try WaitSetImpl.init(a);
-    defer ws.deinit();
     const Hook = struct {
-        var woken: ?bool = null;
-        fn f(ctx: ?*anyopaque) callconv(.c) void {
-            const w: *WaitSetImpl = @ptrCast(@alignCast(ctx.?));
-            w.cv_mu.lock();
-            defer w.cv_mu.unlock();
-            woken = w.notified;
+        var count: usize = 0;
+        fn f(_: ?*anyopaque) callconv(.c) void {
+            count += 1;
         }
     };
-    Hook.woken = null;
-    try testing.expectEqual(DDS.RETCODE_OK, ws.attachConditionWithRelease(gc.toCondition(), ws, Hook.f, null));
-    // Consumes the wake the attach sent.
-    var seq: DDS.ConditionSeq = .{};
-    try testing.expectEqual(DDS.RETCODE_TIMEOUT, ws.toDDSWaitSet().wait(&seq, DURATION_ZERO));
+    Hook.count = 0;
+    try testing.expectEqual(DDS.RETCODE_OK, ws.attachConditionWithRelease(gc.toCondition(), null, Hook.f, null));
+    var waiter: Waiter = .{ .ws = ws.toDDSWaitSet() };
+    const thr = try std.Thread.spawn(.{}, Waiter.run, .{ &waiter, a });
+    awaitAdmitted(ws);
     try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().shutdown());
-    // A waiter, had there been one, was woken before any hook ran: it
-    // never waits on one.
-    try testing.expectEqual(@as(?bool, true), Hook.woken);
+    try testing.expectEqual(@as(usize, 0), Hook.count);
+    thr.join();
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, waiter.rc);
+    try testing.expectEqual(@as(usize, 0), Hook.count);
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().destroy());
+    try testing.expectEqual(@as(usize, 1), Hook.count);
 }
 
 /// A StatusCondition whose status, when looked at, moves a manual clock to
@@ -1406,4 +1390,69 @@ test "QueryCondition: the query is evaluated holding the lock set_query_paramete
     const getter: zzdds.dcps.filter.CdrFieldGetter = .{ .ctx = qc, .func = Getter.func };
     try testing.expect(qc.matchSample(&.{}, getter));
     try testing.expectEqual(@as(?bool, true), Getter.held);
+}
+
+// ── Leased results under allocation failure ──────────────────────────────────
+
+test "WaitSet: a failed allocation in a hooked attach, a wait or its result holds nothing and runs no hook" {
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const a = fa.allocator();
+    const gc = try GuardConditionImpl.init(testing.allocator);
+    defer gc.deinit();
+    const ws = try WaitSetImpl.init(a);
+    const Hook = struct {
+        var count: usize = 0;
+        fn f(_: ?*anyopaque) callconv(.c) void {
+            count += 1;
+        }
+    };
+    Hook.count = 0;
+    const never = std.math.maxInt(usize);
+
+    // The lease's allocation fails: nothing is attached.
+    fa.fail_index = fa.alloc_index;
+    var accepted = true;
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, ws.attachConditionWithRelease(gc.toCondition(), null, Hook.f, &accepted));
+    try testing.expect(!accepted);
+    fa.fail_index = never;
+    var seq: DDS.ConditionSeq = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().get_conditions(&seq));
+    try testing.expectEqual(@as(u32, 0), seq._length);
+
+    try testing.expectEqual(DDS.RETCODE_OK, ws.attachConditionWithRelease(gc.toCondition(), null, Hook.f, &accepted));
+    try testing.expect(accepted);
+    try testing.expectEqual(DDS.RETCODE_OK, gc.toDDSGuardCondition().set_trigger_value(true));
+
+    // The scan's append fails, leased and plain.
+    var found: std.ArrayListUnmanaged(dcps.waitset.LeasedCondition) = .empty;
+    defer found.deinit(a);
+    fa.fail_index = fa.alloc_index;
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, ws.waitLeased(&found, &DURATION_ZERO));
+    try testing.expectEqual(@as(usize, 0), found.items.len);
+    fa.fail_index = fa.alloc_index;
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, ws.toDDSWaitSet().wait(&seq, DURATION_ZERO));
+    try testing.expectEqual(@as(u32, 0), seq._length);
+
+    // The plain result's final copy fails after the scan found the condition.
+    fa.fail_index = fa.alloc_index + 1;
+    fa.resize_fail_index = fa.resize_index;
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, ws.toDDSWaitSet().wait(&seq, DURATION_ZERO));
+    try testing.expectEqual(@as(u32, 0), seq._length);
+    fa.fail_index = never;
+    fa.resize_fail_index = never;
+
+    // A leased get_conditions that cannot reserve its result.
+    fa.fail_index = fa.alloc_index;
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, ws.getConditionsLeased(&found));
+    fa.fail_index = never;
+
+    // The wait succeeds: its lease outlives the detach.
+    try testing.expectEqual(DDS.RETCODE_OK, ws.waitLeased(&found, &DURATION_ZERO));
+    try testing.expectEqual(@as(usize, 1), found.items.len);
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().detach_condition(gc.toCondition()));
+    try testing.expectEqual(@as(usize, 0), Hook.count);
+    dcps.waitset.releaseLeased(found.items);
+    try testing.expectEqual(@as(usize, 1), Hook.count);
+    ws.deinit();
+    try testing.expectEqual(@as(usize, 1), Hook.count);
 }

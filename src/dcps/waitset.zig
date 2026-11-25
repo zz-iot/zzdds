@@ -197,8 +197,8 @@ pub const WakeupList = struct {
 /// — only `attachConditionWithRelease` populates them.
 pub const AttachedCondition = struct {
     cond: DDS.Condition,
-    release_ctx: ?*anyopaque = null,
-    release_fn: ?*const fn (?*anyopaque) callconv(.c) void = null,
+    /// Set by `attachConditionWithRelease` with a hook.
+    lease: ?*AttachmentLease = null,
 
     /// Never call while holding `WaitSetImpl.mu` (or any other lock this
     /// file takes) — `release_fn` is arbitrary caller-supplied code (a
@@ -207,13 +207,57 @@ pub const AttachedCondition = struct {
     /// without deadlocking. Every call site below fires this only after its
     /// own locked section has ended.
     fn fireRelease(self: AttachedCondition) void {
-        if (self.release_fn) |f| f(self.release_ctx);
+        if (self.lease) |l| l.release();
     }
 };
+
+/// An attachment's release hook and its binding's context, counted: the
+/// attachment holds one reference, and each leased result (`waitLeased`,
+/// `getConditionsLeased`) another, so a binding can build its result from
+/// the context (a C++ `shared_ptr`, a JNI global ref) even if the
+/// attachment ends meanwhile. The last release runs the hook.
+pub const AttachmentLease = struct {
+    alloc: std.mem.Allocator,
+    refs: std.atomic.Value(u32) = .init(1),
+    ctx: ?*anyopaque,
+    release_fn: *const fn (?*anyopaque) callconv(.c) void,
+
+    /// Under `WaitSetImpl.mu`, while the attachment holds its reference.
+    fn retain(self: *AttachmentLease) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    /// Never under a lock this file takes: it may run the hook.
+    pub fn release(self: *AttachmentLease) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const f = self.release_fn;
+        const ctx = self.ctx;
+        self.alloc.destroy(self);
+        f(ctx);
+    }
+};
+
+/// One condition of a leased result. `lease` is null for a condition
+/// attached without a release hook.
+pub const LeasedCondition = struct {
+    cond: DDS.Condition,
+    lease: ?*AttachmentLease,
+};
+
+/// Releases a leased result's leases and empties it. Never under a lock
+/// this file takes.
+pub fn releaseLeased(items: []const LeasedCondition) void {
+    for (items) |item| if (item.lease) |l| l.release();
+}
 
 pub const WaitSetImpl = struct {
     alloc: std.mem.Allocator,
     conditions: std.ArrayListUnmanaged(AttachedCondition),
+    /// The attachments `shutdown` withdrew, kept for their release hooks,
+    /// which run when the WaitSet is freed (`reallyDeinit`), not during
+    /// shutdown (docs/design/concurrency/operations.md#explicit-close-separate-destruction).
+    /// Their conditions are already unregistered: only the hooks remain.
+    released: std.ArrayListUnmanaged(AttachedCondition) = .empty,
     mu: Mutex, // protects `conditions`
     cv_mu: Mutex, // protects `notified`
     cv_cond: Condvar,
@@ -319,24 +363,14 @@ pub const WaitSetImpl = struct {
 
     fn reallyDeinit(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        // Unregister from every still-attached condition before freeing
-        // self, so their own WakeupList doesn't keep a WakeupHandle
-        // pointing at this (about-to-be-freed) WaitSet — the symmetric
-        // counterpart of a condition's own deinit() detaching from every
-        // WaitSet that still has it attached (see the file-level doc
-        // comment). Safe to assume every remaining entry is still live: a
-        // condition that was itself torn down first already removed itself
-        // from `self.conditions` via WakeupHandle.invalidate.
-        // unregisterFromCondition() below only locks each condition's own
-        // WakeupList mutex, never self.mu, so iterating self.conditions.items
-        // directly here (read-only) is safe. Same exclusivity is what makes
-        // firing each entry's release hook safe here too, with no lock held.
-        for (self.conditions.items) |entry| {
-            unregisterFromCondition(self, entry.cond);
-            entry.fireRelease();
-        }
+        // `deinit` shut the WaitSet down first, which unregistered every
+        // attachment from its condition and moved it to `released`. Only
+        // their hooks remain, run here with no lock held.
+        std.debug.assert(self.conditions.items.len == 0);
+        for (self.released.items) |entry| entry.fireRelease();
         self.ws_c_abi.free(self.alloc);
         self.conditions.deinit(self.alloc);
+        self.released.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -406,6 +440,54 @@ pub const WaitSetImpl = struct {
     fn vtWait(ctx: *anyopaque, active: ?*DDS.ConditionSeq, timeout: *const DDS.Duration_t) DDS.ReturnCode_t {
         const seq = active orelse return DDS.RETCODE_BAD_PARAMETER;
         const self: *Self = @ptrCast(@alignCast(ctx));
+        // Reset the output sequence so stale entries from a prior call don't accumulate.
+        if (seq._release) {
+            if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
+        }
+        seq.* = .{};
+        // Read before the wait: a destroy during it can free `self` as the
+        // wait lets go of it.
+        const alloc = self.alloc;
+        var found: std.ArrayListUnmanaged(DDS.Condition) = .empty;
+        const rc = self.waitInto(DDS.Condition, &found, timeout);
+        if (rc != DDS.RETCODE_OK) {
+            found.deinit(alloc);
+            return rc;
+        }
+        const buf = found.toOwnedSlice(alloc) catch {
+            found.deinit(alloc);
+            return DDS.RETCODE_OUT_OF_RESOURCES;
+        };
+        seq._buffer = buf.ptr;
+        seq._length = @intCast(buf.len);
+        seq._maximum = @intCast(buf.len);
+        seq._release = true;
+        return DDS.RETCODE_OK;
+    }
+
+    /// `wait`, for a binding: each condition comes with a lease on its
+    /// attachment's release context (see `AttachmentLease`), which the
+    /// caller releases (`releaseLeased`) once it has built its result.
+    /// `out` must be empty; on any code but OK it is left empty. `self` may
+    /// be freed by the time this returns (a destroy during the wait): read
+    /// what the caller needs from it, its allocator, beforehand.
+    pub fn waitLeased(self: *Self, out: *std.ArrayListUnmanaged(LeasedCondition), timeout: *const DDS.Duration_t) DDS.ReturnCode_t {
+        return self.waitInto(LeasedCondition, out, timeout);
+    }
+
+    fn resultItem(comptime Item: type, entry: AttachedCondition) Item {
+        if (Item == LeasedCondition) return .{ .cond = entry.cond, .lease = entry.lease };
+        return entry.cond;
+    }
+
+    /// Empties `out`, releasing any leases. Never under `mu`.
+    fn dropResult(comptime Item: type, out: *std.ArrayListUnmanaged(Item)) void {
+        if (Item == LeasedCondition) releaseLeased(out.items);
+        out.clearRetainingCapacity();
+    }
+
+    fn waitInto(self: *Self, comptime Item: type, out: *std.ArrayListUnmanaged(Item), timeout: *const DDS.Duration_t) DDS.ReturnCode_t {
+        std.debug.assert(out.items.len == 0);
         // Holds `self` until the wait returns, so destroying the WaitSet
         // meanwhile ends the wait rather than freeing it under the waiter.
         if (!self.quiesce.acquire()) return DDS.RETCODE_ALREADY_DELETED;
@@ -422,11 +504,6 @@ pub const WaitSetImpl = struct {
             self.waiting = false;
             self.cv_mu.unlock();
         }
-        // Reset the output sequence so stale entries from a prior call don't accumulate.
-        if (seq._release) {
-            if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
-        }
-        seq.* = .{};
         var default_wait: DefaultWait = undefined;
         const helping = self.helping orelse self.beginDefaultWait(&default_wait);
         defer if (self.helping == null and helping != null) self.endDefaultWait(&default_wait);
@@ -468,36 +545,34 @@ pub const WaitSetImpl = struct {
             // pass appending to a growable list can't observe that kind of
             // cross-pass inconsistency, since each condition's trigger value
             // is only ever read once per wait() attempt.
+            // A leased result takes its leases here, under `mu`, while the
+            // attachments still hold theirs.
+            var scan_oom = false;
             self.mu.lock();
-            var triggered: std.ArrayListUnmanaged(DDS.Condition) = .empty;
             for (self.conditions.items) |entry| {
                 if (!conditionRetired(entry.cond) and entry.cond.get_trigger_value()) {
-                    triggered.append(self.alloc, entry.cond) catch {
-                        triggered.deinit(self.alloc);
-                        self.mu.unlock();
-                        return DDS.RETCODE_OUT_OF_RESOURCES;
+                    out.append(self.alloc, resultItem(Item, entry)) catch {
+                        scan_oom = true;
+                        break;
                     };
+                    if (Item == LeasedCondition) if (entry.lease) |l| l.retain();
                 }
             }
             self.mu.unlock();
-            if (triggered.items.len > 0) {
+            if (scan_oom) {
+                dropResult(Item, out);
+                return DDS.RETCODE_OUT_OF_RESOURCES;
+            }
+            if (out.items.len > 0) {
                 // A later look commits only before the deadline: checked now,
                 // the scan done, since it may have run past it.
                 if (!first) if (deadline_ns) |dl| {
                     const now = if (helping) |r| r.clock.nowNs() else time_mod.nanoTimestamp();
                     if (now >= dl) {
-                        triggered.deinit(self.alloc);
+                        dropResult(Item, out);
                         return DDS.RETCODE_TIMEOUT;
                     }
                 };
-                const buf = triggered.toOwnedSlice(self.alloc) catch {
-                    triggered.deinit(self.alloc);
-                    return DDS.RETCODE_OUT_OF_RESOURCES;
-                };
-                seq._buffer = buf.ptr;
-                seq._length = @intCast(buf.len);
-                seq._maximum = @intCast(buf.len);
-                seq._release = true;
                 return DDS.RETCODE_OK;
             }
 
@@ -546,30 +621,26 @@ pub const WaitSetImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    /// Closes the WaitSet for good (idempotent): detaches its conditions and
-    /// ends a wait in progress with ALREADY_DELETED, then fires the
-    /// conditions' release hooks. Later waits, attaches, detaches and
-    /// get_conditions return ALREADY_DELETED. Frees nothing: `deinit` does.
+    /// Closes the WaitSet for good (idempotent): withdraws its conditions and
+    /// ends a wait in progress with ALREADY_DELETED. Later waits, attaches,
+    /// detaches and get_conditions return ALREADY_DELETED. The conditions'
+    /// release hooks run when the WaitSet is freed, not here, so shutdown
+    /// never waits on one. Frees nothing: `deinit` does.
     pub fn shutdown(self: *Self) void {
-        // Holds `self` to the end, though a release hook destroy it.
-        const held = self.quiesce.acquireIfAlive();
-        defer if (held) self.quiesce.release(self, reallyDeinit);
-        var entries: std.ArrayListUnmanaged(AttachedCondition) = .empty;
         {
             self.mu.lock();
             defer self.mu.unlock();
             if (self.closed.load(.acquire)) return;
             self.closed.store(true, .release);
-            entries = self.conditions;
+            // Moved, not copied: closing allocates nothing.
+            self.released = self.conditions;
             self.conditions = .empty;
             // Under `mu`, as detach does, so a racing attach cannot slip in.
-            for (entries.items) |entry| unregisterFromCondition(self, entry.cond);
+            for (self.released.items) |entry| unregisterFromCondition(self, entry.cond);
+            // Also under `mu`: a concurrent destroy's own shutdown waits for
+            // it, so the WaitSet cannot be freed under this wake.
+            wakeNotify(self);
         }
-        // The wait ends first: it never waits on a hook. The hooks run with
-        // no lock held (see AttachedCondition.fireRelease), on this thread.
-        wakeNotify(self);
-        for (entries.items) |entry| entry.fireRelease();
-        entries.deinit(self.alloc);
     }
 
     /// Shared by the plain, spec-mandated `attach_condition()` (`vtAttach`,
@@ -630,7 +701,20 @@ pub const WaitSetImpl = struct {
         // destroy the WaitSet.
         const held = self.quiesce.acquireIfAlive();
         defer if (held) self.quiesce.release(self, reallyDeinit);
-        const rc = self.attachLocked(cond, release_ctx, release_fn, out_accepted);
+        // Allocated before the attach, so it never allocates under `mu`.
+        const lease: ?*AttachmentLease = if (release_fn) |f| blk: {
+            const l = self.alloc.create(AttachmentLease) catch {
+                if (out_accepted) |accepted| accepted.* = false;
+                return DDS.RETCODE_OUT_OF_RESOURCES;
+            };
+            l.* = .{ .alloc = self.alloc, .ctx = release_ctx, .release_fn = f };
+            break :blk l;
+        } else null;
+        var accepted = false;
+        const rc = self.attachLocked(cond, lease, &accepted);
+        if (out_accepted) |oa| oa.* = accepted;
+        // Not stored: the caller cleans up its context itself.
+        if (lease) |l| if (rc != DDS.RETCODE_OK or !accepted) self.alloc.destroy(l);
         // A wait in progress rescans: the condition may already be true.
         if (rc == DDS.RETCODE_OK) wakeNotify(self);
         return rc;
@@ -639,8 +723,7 @@ pub const WaitSetImpl = struct {
     fn attachLocked(
         self: *Self,
         cond: DDS.Condition,
-        release_ctx: ?*anyopaque,
-        release_fn: ?*const fn (?*anyopaque) callconv(.c) void,
+        lease: ?*AttachmentLease,
         out_accepted: ?*bool,
     ) DDS.ReturnCode_t {
         self.mu.lock();
@@ -656,7 +739,7 @@ pub const WaitSetImpl = struct {
             }
         }
         if (out_accepted) |oa| oa.* = true;
-        self.conditions.append(self.alloc, .{ .cond = cond, .release_ctx = release_ctx, .release_fn = release_fn }) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.conditions.append(self.alloc, .{ .cond = cond, .lease = lease }) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         // Register push-notification with the condition. WakeupList has a
         // fixed WAKEUP_SLOTS capacity (see its own doc comment) -- if a 5th
         // WaitSet tries to attach to a condition already attached to
@@ -742,7 +825,6 @@ pub const WaitSetImpl = struct {
     fn vtDetach(ctx: *anyopaque, input: DDS.Condition) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (nil.isNil(input)) return DDS.RETCODE_BAD_PARAMETER;
-        if (self.closed.load(.acquire)) return DDS.RETCODE_ALREADY_DELETED;
         const cond = canonicalCondition(input);
         var removed: ?AttachedCondition = null;
         // A condition whose entity was deleted counts as detached already, as
@@ -751,6 +833,10 @@ pub const WaitSetImpl = struct {
         // not attached. Read under self.mu, while the entry keeps `cond` alive.
         var retired = false;
         self.mu.lock();
+        if (self.closed.load(.acquire)) {
+            self.mu.unlock();
+            return DDS.RETCODE_ALREADY_DELETED;
+        }
         for (self.conditions.items, 0..) |entry, i| {
             if (entry.cond.ptr == cond.ptr) {
                 retired = conditionRetired(entry.cond);
@@ -800,6 +886,23 @@ pub const WaitSetImpl = struct {
         seq._length = @intCast(count);
         seq._maximum = @intCast(n);
         seq._release = true;
+        return DDS.RETCODE_OK;
+    }
+
+    /// `get_conditions`, for a binding: leased as `waitLeased`'s result is.
+    /// `out` must be empty; on any code but OK it is left empty.
+    pub fn getConditionsLeased(self: *Self, out: *std.ArrayListUnmanaged(LeasedCondition)) DDS.ReturnCode_t {
+        std.debug.assert(out.items.len == 0);
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.closed.load(.acquire)) return DDS.RETCODE_ALREADY_DELETED;
+        // Reserved first: retaining then cannot fail halfway.
+        out.ensureTotalCapacity(self.alloc, self.conditions.items.len) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        for (self.conditions.items) |entry| {
+            if (conditionRetired(entry.cond)) continue;
+            out.appendAssumeCapacity(.{ .cond = entry.cond, .lease = entry.lease });
+            if (entry.lease) |l| l.retain();
+        }
         return DDS.RETCODE_OK;
     }
 

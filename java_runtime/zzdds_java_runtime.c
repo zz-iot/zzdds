@@ -375,20 +375,92 @@ static jint JNICALL zzdds_java_waitset_attach_condition(JNIEnv *env, jobject sel
     return rc;
 }
 
+extern jobject zidl_java_box_DDS_Condition(JNIEnv *env, void *handle);
+extern void DDS_Duration_t_from_java(JNIEnv *env, jobject obj, DDS_Duration_t *out);
+
+/* Fills `list` from a leased WaitSet result (zzdds_waitset_wait_leased), then
+ * frees the result whatever happens, releasing its holds. Each condition is
+ * a new local ref to its attachment's own global ref, which zzdds holds
+ * until the free, never a wrapper looked up by a handle that a concurrent
+ * detach and delete could free first. A failed conversion (a pending Java
+ * exception) is OUT_OF_RESOURCES, not the wait's own code. */
+static jint zzdds_java_waitset_fill_leased(JNIEnv *env, jint rc, zzdds_waitset_result *r, jobject list) {
+    jint out = rc;
+    jmethodID clear_id = NULL, add_id = NULL;
+    if (list != NULL) {
+        jclass cls = (*env)->GetObjectClass(env, list);
+        clear_id = (*env)->GetMethodID(env, cls, "clear", "()V");
+        if (clear_id != NULL) add_id = (*env)->GetMethodID(env, cls, "add", "(Ljava/lang/Object;)Z");
+        (*env)->DeleteLocalRef(env, cls);
+        if (clear_id != NULL && add_id != NULL) {
+            (*env)->CallVoidMethod(env, list, clear_id);
+            uint32_t n = rc == DDS_RETCODE_OK ? zzdds_waitset_result_length(r) : 0;
+            for (uint32_t i = 0; i < n && !(*env)->ExceptionCheck(env); ++i) {
+                zzdds_java_waitset_release_ctx *ctx = (zzdds_java_waitset_release_ctx *)zzdds_waitset_result_release_ctx(r, i);
+                jobject cond = ctx != NULL ? (*env)->NewLocalRef(env, ctx->global_ref)
+                                           : zidl_java_box_DDS_Condition(env, (void *)zzdds_waitset_result_condition(r, i));
+                if (cond == NULL) continue;
+                (*env)->CallBooleanMethod(env, list, add_id, cond);
+                (*env)->DeleteLocalRef(env, cond);
+            }
+        }
+    }
+    if ((*env)->ExceptionCheck(env)) {
+        out = (jint)DDS_RETCODE_OUT_OF_RESOURCES;
+        /* Leaves the exception pending for the caller, with no conditions. */
+        if (list != NULL && clear_id != NULL) {
+            jthrowable pending = (*env)->ExceptionOccurred(env);
+            (*env)->ExceptionClear(env);
+            (*env)->CallVoidMethod(env, list, clear_id);
+            if (!(*env)->ExceptionCheck(env)) (*env)->Throw(env, pending);
+            (*env)->DeleteLocalRef(env, pending);
+        }
+    }
+    zzdds_waitset_result_free(r);
+    return out;
+}
+
+static jint JNICALL zzdds_java_waitset_wait(JNIEnv *env, jobject self, jlong ptr, jobject active_conditions, jobject timeout) {
+    (void)self;
+    DDS_Duration_t c_timeout;
+    const DDS_Duration_t *p_timeout = NULL;
+    if (timeout != NULL) {
+        memset(&c_timeout, 0, sizeof(c_timeout));
+        DDS_Duration_t_from_java(env, timeout, &c_timeout);
+        p_timeout = &c_timeout;
+    }
+    zzdds_waitset_result *r = NULL;
+    jint rc = (jint)zzdds_waitset_wait_leased((void *)(intptr_t)ptr, p_timeout, &r);
+    return zzdds_java_waitset_fill_leased(env, rc, r, active_conditions);
+}
+
+static jint JNICALL zzdds_java_waitset_get_conditions(JNIEnv *env, jobject self, jlong ptr, jobject attached_conditions) {
+    (void)self;
+    zzdds_waitset_result *r = NULL;
+    jint rc = (jint)zzdds_waitset_get_conditions_leased((void *)(intptr_t)ptr, &r);
+    return zzdds_java_waitset_fill_leased(env, rc, r, attached_conditions);
+}
+
 /* zidl's generated JNI_OnLoad calls this (--java-jni-onload-hook in
  * build.zig) with the loading thread's JNIEnv, before any Java code can
- * reach a WaitSet: it routes WaitSetImpl's attach through
- * zzdds_java_waitset_attach_condition above. A failure leaves the generated
- * attach, without the keep-alive, rather than failing the library load. */
+ * reach a WaitSet: it routes WaitSetImpl's attach, wait and get_conditions
+ * through zzdds_java_waitset_attach_condition, zzdds_java_waitset_wait and
+ * zzdds_java_waitset_get_conditions above. A failure leaves the generated
+ * ones, without the keep-alive, rather than failing the library load. */
 jint zzdds_java_on_load(JavaVM *vm, JNIEnv *env) {
     (void)vm;
     jclass cls = (*env)->FindClass(env, "io/zzdds/dcps/WaitSetImpl");
     if (cls == NULL) { (*env)->ExceptionClear(env); return 0; }
+    /* Attach first: a wait reading release contexts needs attaches making them. */
     JNINativeMethod methods[] = {
         { (char *)"n_attach_condition", (char *)"(JLio/zzdds/dcps/Dcps$DDS$Condition;)I",
           (void *)zzdds_java_waitset_attach_condition },
+        { (char *)"n_wait", (char *)"(JLjava/util/List;Lio/zzdds/dcps/Dcps$DDS$Duration_t;)I",
+          (void *)zzdds_java_waitset_wait },
+        { (char *)"n_get_conditions", (char *)"(JLjava/util/List;)I",
+          (void *)zzdds_java_waitset_get_conditions },
     };
-    if ((*env)->RegisterNatives(env, cls, methods, 1) != 0) (*env)->ExceptionClear(env);
+    if ((*env)->RegisterNatives(env, cls, methods, 3) != 0) (*env)->ExceptionClear(env);
     (*env)->DeleteLocalRef(env, cls);
     return 0;
 }
