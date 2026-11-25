@@ -845,15 +845,16 @@ pub const SubscriberImpl = struct {
         for (pinned.items, 0..) |r, i| {
             // Tracked, so a deletion of `r` from outside a callback waits for it.
             var call: ListenerCall = .{};
-            var failed = false;
+            var child: listener_box_mod.ChildWatch = undefined;
+            child.begin();
             // Left to the reader's turn as its own kind, so DATA_ON_READERS
             // cannot take it there.
             if (r.listeners.enter(&call, listener_lane.NOTIFY_DATA_AVAILABLE)) {
-                listener_box_mod.clearLastCall();
                 _ = r.dispatchReaderDataAvailable();
-                failed = listener_box_mod.lastCallFailed();
                 r.listeners.leave(&call);
             }
+            child.end();
+            const failed = child.failed;
             r.releaseQuiesce();
             // A child's listener failed: the batch stops there, its earlier
             // effects kept (docs/design/concurrency/listeners.md#failure-after-dispatch-commit).

@@ -68,10 +68,12 @@ pub fn enterCall() void {
 pub fn leaveCall() void {
     calls -= 1;
     const bit = depthBit(calls);
-    last_failed = failed_bits & bit != 0;
-    if (last_failed) {
+    if (failed_bits & bit != 0) {
         failed_bits &= ~bit;
         noteFailure(reasons[calls]);
+        if (watch) |w| if (w.depth == calls) {
+            w.failed = true;
+        };
     }
 }
 
@@ -97,8 +99,9 @@ pub const Failure = enum(u8) {
 threadlocal var failed_bits: u64 = 0;
 threadlocal var reasons: [64]Failure = undefined;
 
-/// Whether the last listener call to end on this thread failed.
-threadlocal var last_failed: bool = false;
+/// The innermost explicit delegation on this thread watching its
+/// children's calls (`ChildWatch`).
+threadlocal var watch: ?*ChildWatch = null;
 
 fn depthBit(depth: u32) u64 {
     return if (depth < 64) @as(u64, 1) << @intCast(depth) else 0;
@@ -119,16 +122,24 @@ pub fn reportFailure(why: Failure) bool {
     return true;
 }
 
-/// For an explicit delegation (`notify_datareaders`): forgets the last
-/// call's outcome before running a child, so that `lastCallFailed` then
-/// tells whether the child failed. Calls nested in the child end before it.
-pub fn clearLastCall() void {
-    last_failed = false;
-}
+/// For an explicit delegation (`notify_datareaders`): whether a listener
+/// call it makes directly failed. Only calls at its own depth count: one
+/// nested inside such a call is that call's to handle, and a later call at
+/// that depth, such as a replaced registration's release, cannot undo it.
+pub const ChildWatch = struct {
+    depth: u32 = 0,
+    failed: bool = false,
+    outer: ?*ChildWatch = null,
 
-pub fn lastCallFailed() bool {
-    return last_failed;
-}
+    pub fn begin(self: *ChildWatch) void {
+        self.* = .{ .depth = calls, .outer = watch };
+        watch = self;
+    }
+
+    pub fn end(self: *ChildWatch) void {
+        watch = self.outer;
+    }
+};
 
 /// Failures are logged at most once per interval, process-wide, with a count
 /// of those left unlogged since: a listener that fails every call does not
@@ -236,8 +247,7 @@ pub fn ListenerBox(comptime T: type) type {
             };
             // Exclusion needs the identity record from the first callback
             // on: resolved here, so no dispatch finds it missing. A
-            // listener with no callbacks never dispatches, so clearing one
-            // allocates nothing it could fail on.
+            // listener with no callbacks never dispatches and needs none.
             if (hasCallbacks(listener) and self.identity() == null) {
                 self.releaseHold(alloc);
                 return error.OutOfMemory;
@@ -443,15 +453,30 @@ fn countRelease(data: ?*anyopaque) callconv(.c) void {
 
 test "listener call failures: marked on the innermost call, seen only by its caller, logged at a limited rate" {
     try testing.expect(!reportFailure(.exception));
+    var w: ChildWatch = undefined;
+    w.begin();
     enterCall();
+    {
+        // A call nested in the child fails, and the child handles it.
+        var inner: ChildWatch = undefined;
+        inner.begin();
+        enterCall();
+        try testing.expect(reportFailure(.arguments));
+        leaveCall();
+        inner.end();
+        try testing.expect(inner.failed);
+    }
+    leaveCall();
+    try testing.expect(!w.failed);
+    // The child itself fails; a later successful call at its depth (a
+    // release) does not undo that.
     enterCall();
-    try testing.expect(reportFailure(.arguments));
+    _ = reportFailure(.exception);
     leaveCall();
-    // The inner call failed; the outer one, which handled that, did not.
-    try testing.expect(lastCallFailed());
-    clearLastCall();
+    enterCall();
     leaveCall();
-    try testing.expect(!lastCallFailed());
+    w.end();
+    try testing.expect(w.failed);
 
     const before = failureLogCounts();
     for (0..2) |_| {

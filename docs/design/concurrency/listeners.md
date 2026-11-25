@@ -866,7 +866,8 @@ a registration change; failure must leave the previous registration intact. With
 memory for the new registration or its identity record, `set_listener` returns
 OUT_OF_RESOURCES, keeps the previous registration, and releases the one it was given,
 as a failed `create_*` does: no binding releases a registration it passed in. Each
-binding returns the code as is. Clearing a listener allocates nothing it could fail on.
+binding returns the code as is. Clearing a listener needs no identity record, though
+it still allocates its (empty) registration.
 No TIMEOUT is added to standard `set_listener`;
 this operation has no finite return-time guarantee if a callback never returns.
 
