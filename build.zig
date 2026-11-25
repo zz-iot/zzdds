@@ -61,19 +61,22 @@ fn findJniIncludeDir(b: *std.Build, java_path: []const u8) ?JniIncludeDirs {
 // entity (a base DDS::*Impl there would replace the cached wrapper and hand
 // callbacks a different object than the application holds).
 const cpp_impl_override_args = [_][]const u8{
-    "--cpp-impl-override",   "DDS::Topic=::zzdds::detail::TopicSupport",
-    "--cpp-impl-override",   "DDS::DataWriter=::zzdds::detail::DataWriterSupport",
-    "--cpp-impl-override",   "DDS::DataReader=::zzdds::detail::DataReaderSupport",
-    "--cpp-impl-override",   "DDS::Publisher=::zzdds::detail::PublisherSupport",
-    "--cpp-impl-override",   "DDS::Subscriber=::zzdds::detail::SubscriberSupport",
-    "--cpp-impl-override",   "DDS::ContentFilteredTopic=::zzdds::detail::ContentFilteredTopicSupport",
-    "--cpp-impl-override",   "DDS::DomainParticipant=::zzdds::detail::DomainParticipantSupport",
+    "--cpp-impl-override",       "DDS::Topic=::zzdds::detail::TopicSupport",
+    "--cpp-impl-override",       "DDS::DataWriter=::zzdds::detail::DataWriterSupport",
+    "--cpp-impl-override",       "DDS::DataReader=::zzdds::detail::DataReaderSupport",
+    "--cpp-impl-override",       "DDS::Publisher=::zzdds::detail::PublisherSupport",
+    "--cpp-impl-override",       "DDS::Subscriber=::zzdds::detail::SubscriberSupport",
+    "--cpp-impl-override",       "DDS::ContentFilteredTopic=::zzdds::detail::ContentFilteredTopicSupport",
+    "--cpp-impl-override",       "DDS::DomainParticipant=::zzdds::detail::DomainParticipantSupport",
     // Keeps each attached condition alive while it stays attached.
-    "--cpp-impl-override",   "DDS::WaitSet=::zzdds::detail::WaitSetSupport",
-    "--cpp-impl-include",    "zzdds_cpp.hpp",
+    "--cpp-impl-override",       "DDS::WaitSet=::zzdds::detail::WaitSetSupport",
+    "--cpp-impl-include",        "zzdds_cpp.hpp",
     // Wrappers of deleted entities are dropped and retired (src/c_abi/extensions.zig).
-    "--handle-retire-hook",  "zzdds_handle_retire",
-    "--handle-retire-query", "zzdds_handle_retire_is_retired",
+    "--handle-retire-hook",      "zzdds_handle_retire",
+    "--handle-retire-query",     "zzdds_handle_retire_is_retired",
+    // A listener that throws, or whose arguments cannot be built, is reported
+    // (docs/design/concurrency/listeners.md#binding-boundary-and-ownership).
+    "--listener-failure-report", "zzdds_listener_invocation_failed",
 };
 
 fn typesupportModule(b: *std.Build, package: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, codec: *std.Build.Module) *std.Build.Module {
@@ -1432,7 +1435,7 @@ pub fn build(b: *std.Build) void {
         // the generated C frees, which go through zidl-cdr's allocator
         // (--zig-generate-c-api-cdr-allocator above).
         const gen_dcps_java = b.addRunArtifact(zidl_exe);
-        gen_dcps_java.addArgs(&.{ "-b", "java", "--generate-interfaces", "--java-jni-library", "zzdds_jni", "--java-package", "io.zzdds.dcps", "--handle-retire-hook", "zzdds_handle_retire", "--handle-retire-query", "zzdds_handle_retire_is_retired", "--java-jni-onload-hook", "zzdds_java_on_load", "--java-jni-cdr-allocator", "-o" });
+        gen_dcps_java.addArgs(&.{ "-b", "java", "--generate-interfaces", "--java-jni-library", "zzdds_jni", "--java-package", "io.zzdds.dcps", "--handle-retire-hook", "zzdds_handle_retire", "--handle-retire-query", "zzdds_handle_retire_is_retired", "--listener-failure-report", "zzdds_listener_invocation_failed", "--java-jni-onload-hook", "zzdds_java_on_load", "--java-jni-cdr-allocator", "-o" });
         const gen_java_dir = gen_dcps_java.addOutputDirectoryArg("zzdds-java-binding");
         if (xtypes) gen_dcps_java.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
         gen_dcps_java.addFileArg(dcps_idl);
@@ -1446,13 +1449,14 @@ pub fn build(b: *std.Build) void {
         // its `DDS::*` references instead of a bare (nonexistent) `DDS.Foo`.
         const gen_zzdds_ext_java = b.addRunArtifact(zidl_exe);
         gen_zzdds_ext_java.addArgs(&.{
-            "-b",                             "java",
-            "--generate-interfaces",          "--java-jni-library",
-            "zzdds_jni",                      "--java-package",
-            "io.zzdds.ext",                   "--java-import-package",
-            "DDS=io.zzdds.dcps",              "--handle-retire-hook",
-            "zzdds_handle_retire",            "--handle-retire-query",
-            "zzdds_handle_retire_is_retired", "-o",
+            "-b",                               "java",
+            "--generate-interfaces",            "--java-jni-library",
+            "zzdds_jni",                        "--java-package",
+            "io.zzdds.ext",                     "--java-import-package",
+            "DDS=io.zzdds.dcps",                "--handle-retire-hook",
+            "zzdds_handle_retire",              "--handle-retire-query",
+            "zzdds_handle_retire_is_retired",   "--listener-failure-report",
+            "zzdds_listener_invocation_failed", "-o",
         });
         const gen_zzdds_ext_java_dir = gen_zzdds_ext_java.addOutputDirectoryArg("zzdds-ext-java-binding");
         gen_zzdds_ext_java.addFileArg(b.path("idl/zzdds.idl"));

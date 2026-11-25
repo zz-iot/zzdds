@@ -148,6 +148,77 @@ public class JavaSmoke {
         return ref.get() == null;
     }
 
+    // A reader listener that throws, reached through notify_datareaders from
+    // its subscriber's on_data_on_readers: the bridge reports the failure and
+    // notify_datareaders returns ERROR, with nothing thrown past the bridge.
+    // TRANSIENT_LOCAL, so the sample written before the reader exists reaches
+    // it once matched.
+    static void checkFailingChildListener(Dcps.DDS.DomainParticipant dpWriter, Dcps.DDS.Publisher publisher,
+                                          Dcps.DDS.DomainParticipant dpReader) throws Exception {
+        Dcps.DDS.Topic wTopic = dpWriter.create_topic("JavaSmokeFailingChild", "BindingSmokeStatus", null, null, 0);
+        Dcps.DDS.Topic rTopic = dpReader.create_topic("JavaSmokeFailingChild", "BindingSmokeStatus", null, null, 0);
+        check(wTopic != null && rTopic != null, "failing-child topics created");
+        Dcps.DDS.DataWriterQos wQos = new Dcps.DDS.DataWriterQos();
+        publisher.get_default_datawriter_qos(wQos);
+        wQos.get_reliability().set_kind(Dcps.DDS.ReliabilityQosPolicyKind.RELIABLE_RELIABILITY_QOS);
+        wQos.get_durability().set_kind(Dcps.DDS.DurabilityQosPolicyKind.TRANSIENT_LOCAL_DURABILITY_QOS);
+        Dcps.DDS.DataWriter rawWriter = publisher.create_datawriter(wTopic, wQos, null, 0);
+        check(rawWriter != null, "failing-child writer created");
+        Binding_smoke.BindingSmokeStatus sample = new Binding_smoke.BindingSmokeStatus();
+        sample.set_id(11);
+        sample.set_label("failing-child");
+        check(new BindingSmokeStatusDataWriter(rawWriter).write(sample, 0L) == 0, "failing-child write rc == 0");
+
+        final AtomicInteger notifyRc = new AtomicInteger(-1);
+        final AtomicInteger thrown = new AtomicInteger();
+        final CountDownLatch notified = new CountDownLatch(1);
+        Dcps.DDS.SubscriberListener subListener = new Dcps.DDS.SubscriberListener() {
+            public void on_requested_deadline_missed(Dcps.DDS.DataReader r, Dcps.DDS.RequestedDeadlineMissedStatus s) {}
+            public void on_requested_incompatible_qos(Dcps.DDS.DataReader r, Dcps.DDS.RequestedIncompatibleQosStatus s) {}
+            public void on_sample_rejected(Dcps.DDS.DataReader r, Dcps.DDS.SampleRejectedStatus s) {}
+            public void on_liveliness_changed(Dcps.DDS.DataReader r, Dcps.DDS.LivelinessChangedStatus s) {}
+            public void on_data_available(Dcps.DDS.DataReader r) {}
+            public void on_subscription_matched(Dcps.DDS.DataReader r, Dcps.DDS.SubscriptionMatchedStatus s) {}
+            public void on_sample_lost(Dcps.DDS.DataReader r, Dcps.DDS.SampleLostStatus s) {}
+            public void on_data_on_readers(Dcps.DDS.Subscriber sub) {
+                if (notified.getCount() == 0) return;
+                notifyRc.set(sub.notify_datareaders());
+                notified.countDown();
+            }
+        };
+        final int DATA_ON_READERS = 1 << 9, DATA_AVAILABLE = 1 << 10;
+        Dcps.DDS.Subscriber sub = dpReader.create_subscriber(null, subListener, DATA_ON_READERS);
+        check(sub != null, "failing-child subscriber created");
+        Dcps.DDS.DataReaderListener throwing = new Dcps.DDS.DataReaderListener() {
+            public void on_requested_deadline_missed(Dcps.DDS.DataReader r, Dcps.DDS.RequestedDeadlineMissedStatus s) {}
+            public void on_requested_incompatible_qos(Dcps.DDS.DataReader r, Dcps.DDS.RequestedIncompatibleQosStatus s) {}
+            public void on_sample_rejected(Dcps.DDS.DataReader r, Dcps.DDS.SampleRejectedStatus s) {}
+            public void on_liveliness_changed(Dcps.DDS.DataReader r, Dcps.DDS.LivelinessChangedStatus s) {}
+            public void on_data_available(Dcps.DDS.DataReader r) {
+                thrown.incrementAndGet();
+                throw new IllegalStateException("failing child listener");
+            }
+            public void on_subscription_matched(Dcps.DDS.DataReader r, Dcps.DDS.SubscriptionMatchedStatus s) {}
+            public void on_sample_lost(Dcps.DDS.DataReader r, Dcps.DDS.SampleLostStatus s) {}
+        };
+        Dcps.DDS.DataReaderQos rQos = new Dcps.DDS.DataReaderQos();
+        sub.get_default_datareader_qos(rQos);
+        rQos.get_reliability().set_kind(Dcps.DDS.ReliabilityQosPolicyKind.RELIABLE_RELIABILITY_QOS);
+        rQos.get_durability().set_kind(Dcps.DDS.DurabilityQosPolicyKind.TRANSIENT_LOCAL_DURABILITY_QOS);
+        Dcps.DDS.DataReader rawReader = sub.create_datareader(rTopic, rQos, throwing, DATA_AVAILABLE);
+        check(rawReader != null, "failing-child reader created");
+
+        check(notified.await(20, TimeUnit.SECONDS), "on_data_on_readers ran notify_datareaders within 20s");
+        check(thrown.get() == 1, "the throwing reader listener ran once");
+        check(notifyRc.get() == Dcps.DDS.RETCODE_ERROR.value,
+              "notify_datareaders returns ERROR for a child listener that threw (rc " + notifyRc.get() + ")");
+
+        check(sub.delete_contained_entities() == 0, "failing-child subscriber's delete_contained_entities rc == 0");
+        check(dpReader.delete_subscriber(sub) == 0, "failing-child subscriber deleted");
+        check(publisher.delete_datawriter(rawWriter) == 0, "failing-child writer deleted");
+        check(dpWriter.delete_topic(wTopic) == 0 && dpReader.delete_topic(rTopic) == 0, "failing-child topics deleted");
+    }
+
     static void checkRejectedRegistrations(Zzdds.zzdds.Publisher zdPublisher, Dcps.DDS.Topic topic,
                                            Dcps.DDS.DataWriterQos qos) throws Exception {
         final Rejection rej = new Rejection();
@@ -541,6 +612,8 @@ public class JavaSmoke {
         System.out.println("  one listener object runs one callback at a time across readers: OK");
         checkRejectedRegistrations(zdPublisher, topicWriter, writerQos);
         System.out.println("  rejected listener registrations are released: OK");
+        checkFailingChildListener(dpWriter, publisher, dpReader);
+        System.out.println("  a throwing child listener makes notify_datareaders return ERROR: OK");
 
         int deleteRc = publisher.delete_datawriter(rawWriter);
         check(deleteRc == 0, "delete_datawriter() rc == 0 (would be PRECONDITION_NOT_MET if any loan_raw call above leaked its outstanding-loan count)");
