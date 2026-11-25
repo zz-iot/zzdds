@@ -113,6 +113,23 @@ DDS_ReturnCode_t zzdds_waitset_attach_condition_with_release(
     zzdds_condition_release_fn release_fn,
     bool *out_accepted);
 
+/** zzdds_listener_invocation_failed's reasons. */
+#define ZZDDS_LISTENER_FAILED_EXCEPTION 1 /* the listener threw */
+#define ZZDDS_LISTENER_FAILED_ARGUMENTS 2 /* its arguments could not be built, so it was not called */
+
+/**
+ * For a binding's generated listener bridge, called on the callback's own
+ * thread before it returns: the listener call running there failed, for
+ * `reason` (ZZDDS_LISTENER_FAILED_*). The bridge still returns normally;
+ * no exception crosses into zzdds. When the call ends, zzdds logs the
+ * failure, at most once per interval process-wide with a count of the rest,
+ * and an explicit DDS_Subscriber_notify_datareaders whose child failed stops
+ * its batch there and returns DDS_RETCODE_ERROR. The failed call is not
+ * retried and the listener stays installed. Returns false, doing nothing,
+ * outside a listener call or for an unknown reason.
+ */
+bool zzdds_listener_invocation_failed(int reason);
+
 /**
  * A WaitSet's result for a binding (zzdds_waitset_wait_leased,
  * zzdds_waitset_get_conditions_leased): for each condition, the release_ctx

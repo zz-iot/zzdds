@@ -934,6 +934,18 @@ pub export fn zzdds_waitset_attach_condition_with_release(
     return impl.attachConditionWithRelease(c, release_ctx, release_fn, out_accepted);
 }
 
+/// For a binding's generated listener bridge: the listener call running on
+/// this thread failed (1: it threw; 2: its arguments could not be built).
+/// See zzdds_c.h.
+pub export fn zzdds_listener_invocation_failed(reason: c_int) callconv(.c) bool {
+    const why: listener_box_mod.Failure = switch (reason) {
+        1 => .exception,
+        2 => .arguments,
+        else => return false,
+    };
+    return listener_box_mod.reportFailure(why);
+}
+
 /// A leased WaitSet result (see `zzdds_waitset_wait_leased`): each
 /// condition's attachment release context, held, plus a handle for a
 /// condition attached without one.

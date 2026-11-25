@@ -6289,8 +6289,7 @@ pub const DomainParticipantImpl = struct {
         traversal.begin(group);
         defer traversal.end();
         if (group != null and !traversal.counted) return DDS.RETCODE_ALREADY_DELETED;
-        self.swapListener(if (a_listener) |l| l.* else DDS.noop_DomainParticipantListener, mask);
-        return DDS.RETCODE_OK;
+        return self.swapListener(if (a_listener) |l| l.* else DDS.noop_DomainParticipantListener, mask);
     }
 
     fn vtGetListener(ctx: *anyopaque) DDS.DomainParticipantListener {
@@ -6303,14 +6302,16 @@ pub const DomainParticipantImpl = struct {
     /// Installs `new_listener` and `mask`, retiring the registration it
     /// replaces (listener_box.zig's `Retired`): a dispatch already using
     /// that one keeps it alive until it returns.
-    fn swapListener(self: *Self, new_listener: DDS.DomainParticipantListener, mask: DDS.StatusMask) void {
-        const new_box = ListenerBox(DDS.DomainParticipantListener).create(self.alloc, new_listener) catch
-            @panic("zzdds: out of memory boxing listener");
+    fn swapListener(self: *Self, new_listener: DDS.DomainParticipantListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
+        // Owns the registration it was given (`adopt`): on failure the
+        // old one stays installed and this one is released.
+        const new_box = ListenerBox(DDS.DomainParticipantListener).adopt(self.alloc, new_listener) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         const upto = self.retired_listeners.install(&self.listener_mu, &self.listener_box, new_box);
         @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
         // From application code, returns once no callback uses what it
         // replaced (docs/design/concurrency/listeners.md#replacement-completion).
         self.retired_listeners.drain(self.alloc, &self.listener_mu, upto, !listener_lane.inCallbackChain());
+        return DDS.RETCODE_OK;
     }
 
     /// Call with no lock held. Returns a box the caller may safely read/

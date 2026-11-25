@@ -8,6 +8,19 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-25
+
+- `set_listener` returns OUT_OF_RESOURCES, keeping the listener it would have replaced,
+  when it cannot allocate the new registration or its listener's identity record, on
+  every entity. Before, it panicked. The registration it was given is released, as a
+  failed `create_*` releases its. A listener's identity record is now made when it is
+  registered, so its callbacks can no longer run unexcluded for want of one.
+- `zzdds_listener_invocation_failed` (`zzdds_c.h`) lets a binding's listener bridge
+  report that its listener threw or could not be given its arguments. zzdds logs such
+  failures at most once per 10 seconds, with a count of the rest, and
+  `Subscriber::notify_datareaders` returns ERROR when a reader's listener failed,
+  stopping there. The C++ and Java bridges do not call it yet.
+
 ## 2026-11-24
 
 - C++ and Java `WaitSet::wait` and `get_conditions` build their results from each

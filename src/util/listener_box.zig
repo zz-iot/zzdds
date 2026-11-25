@@ -22,6 +22,9 @@ const listener_lifecycle = @import("listener_lifecycle.zig");
 const listener_identity = @import("listener_identity.zig");
 const Mutex = @import("mutex.zig").Mutex;
 const Condvar = @import("condvar.zig").Condvar;
+const time = @import("time.zig");
+
+const log = std.log.scoped(.zzdds_listener);
 
 /// Releases a registration a `create_*` was given and will not install
 /// (`ListenerBox.adopt`), as a listener call like every other release: the
@@ -64,11 +67,100 @@ pub fn enterCall() void {
 
 pub fn leaveCall() void {
     calls -= 1;
+    const bit = depthBit(calls);
+    last_failed = failed_bits & bit != 0;
+    if (last_failed) {
+        failed_bits &= ~bit;
+        noteFailure(reasons[calls]);
+    }
 }
 
 /// Whether this thread is inside a listener call.
 pub fn inCall() bool {
     return calls > 0;
+}
+
+// ── Failed listener calls ────────────────────────────────────────────────────
+
+/// Why a listener call failed, as a binding's generated bridge reports it
+/// (`zzdds_listener_invocation_failed`; docs/design/concurrency/listeners.md#callback-failure-and-binding-unwind-policy).
+pub const Failure = enum(u8) {
+    /// The listener threw.
+    exception = 1,
+    /// The bridge could not build the listener's arguments, so it was not called.
+    arguments = 2,
+};
+
+/// Per depth of listener calls on this thread: whether the call at that
+/// depth failed, and why. Depths past 64 are not tracked: a failure there
+/// is logged at once, and no explicit delegation sees it.
+threadlocal var failed_bits: u64 = 0;
+threadlocal var reasons: [64]Failure = undefined;
+
+/// Whether the last listener call to end on this thread failed.
+threadlocal var last_failed: bool = false;
+
+fn depthBit(depth: u32) u64 {
+    return if (depth < 64) @as(u64, 1) << @intCast(depth) else 0;
+}
+
+/// Marks the listener call running on this thread failed, for when it
+/// ends. False outside a listener call.
+pub fn reportFailure(why: Failure) bool {
+    if (calls == 0) return false;
+    const depth = calls - 1;
+    const bit = depthBit(depth);
+    if (bit == 0) {
+        noteFailure(why);
+        return true;
+    }
+    failed_bits |= bit;
+    reasons[depth] = why;
+    return true;
+}
+
+/// For an explicit delegation (`notify_datareaders`): forgets the last
+/// call's outcome before running a child, so that `lastCallFailed` then
+/// tells whether the child failed. Calls nested in the child end before it.
+pub fn clearLastCall() void {
+    last_failed = false;
+}
+
+pub fn lastCallFailed() bool {
+    return last_failed;
+}
+
+/// Failures are logged at most once per interval, process-wide, with a count
+/// of those left unlogged since: a listener that fails every call does not
+/// flood the log. The reporting thread logs, after the call, with no lock held.
+const failure_log_interval_ns: i64 = 10 * std.time.ns_per_s;
+var failure_log_next_ns: std.atomic.Value(i64) = .init(std.math.minInt(i64));
+var failures_unlogged: std.atomic.Value(u64) = .init(0);
+var failures_logged: std.atomic.Value(u64) = .init(0);
+
+fn noteFailure(why: Failure) void {
+    const now = time.monotonicNs();
+    const due = failure_log_next_ns.load(.monotonic);
+    if (now < due or failure_log_next_ns.cmpxchgStrong(due, now + failure_log_interval_ns, .monotonic, .monotonic) != null) {
+        _ = failures_unlogged.fetchAdd(1, .monotonic);
+        return;
+    }
+    const more = failures_unlogged.swap(0, .monotonic);
+    _ = failures_logged.fetchAdd(1, .monotonic);
+    const what = switch (why) {
+        .exception => "a listener threw",
+        .arguments => "a listener's arguments could not be built, so it was not called",
+    };
+    if (more > 0)
+        log.warn("{s}; {d} more listener calls failed since the last report", .{ what, more })
+    else
+        log.warn("{s}", .{what});
+}
+
+/// For tests: how many failures were logged, and how many are waiting for
+/// the next report.
+pub fn failureLogCounts() struct { logged: u64, unlogged: u64 } {
+    return .{ .logged = failures_logged.load(.monotonic), .unlogged = failures_unlogged.load(.monotonic) };
 }
 
 // ── Waiting for a retired registration's callbacks ───────────────────────────
@@ -116,7 +208,8 @@ pub fn ListenerBox(comptime T: type) type {
 
         listener: T,
         state: std.atomic.Value(u64),
-        /// Created at first use (see `identity`).
+        /// Resolved by `adopt` for a listener with callbacks, else at first
+        /// use (see `identity`).
         ident: std.atomic.Value(?*listener_identity.Identity) = .init(null),
         /// The next older registration on the entity's `Retired` list,
         /// guarded by the entity's listener lock.
@@ -134,12 +227,31 @@ pub fn ListenerBox(comptime T: type) type {
         /// `create` for the registration a `create_*` was given, which the
         /// operation owns whether or not it installs it: when the box cannot
         /// be allocated, releases it. Every later failure drops the box's
-        /// hold (`releaseHold`), which releases it too.
+        /// hold (`releaseHold`), which releases it too. A `set_listener`
+        /// uses it the same way: on failure the old registration stays.
         pub fn adopt(alloc: std.mem.Allocator, listener: T) !*Self {
-            return create(alloc, listener) catch |err| {
+            const self = create(alloc, listener) catch |err| {
                 releaseGiven(listener);
                 return err;
             };
+            // Exclusion needs the identity record from the first callback
+            // on: resolved here, so no dispatch finds it missing. A
+            // listener with no callbacks never dispatches, so clearing one
+            // allocates nothing it could fail on.
+            if (hasCallbacks(listener) and self.identity() == null) {
+                self.releaseHold(alloc);
+                return error.OutOfMemory;
+            }
+            return self;
+        }
+
+        fn hasCallbacks(listener: T) bool {
+            inline for (@typeInfo(T).@"struct".field_names) |name| {
+                if (comptime std.mem.startsWith(u8, name, "on_") and @typeInfo(@FieldType(T, name)) == .optional) {
+                    if (@field(listener, name) != null) return true;
+                }
+            }
+            return false;
         }
 
         /// Takes a use: a dispatch through `.listener`, ended with
@@ -152,7 +264,8 @@ pub fn ListenerBox(comptime T: type) type {
 
         /// The listener's exclusion identity (listener_identity.zig): its
         /// `listener_identity`, else its `listener_data`, else this
-        /// registration. Null without memory to record it. Call while
+        /// registration. Null without memory to record it, which `adopt`
+        /// rules out for every registration that can dispatch. Call while
         /// holding a reference.
         pub fn identity(self: *Self) ?*listener_identity.Identity {
             if (self.ident.load(.acquire)) |id| return id;
@@ -328,6 +441,30 @@ fn countRelease(data: ?*anyopaque) callconv(.c) void {
     _ = n.fetchAdd(1, .seq_cst);
 }
 
+test "listener call failures: marked on the innermost call, seen only by its caller, logged at a limited rate" {
+    try testing.expect(!reportFailure(.exception));
+    enterCall();
+    enterCall();
+    try testing.expect(reportFailure(.arguments));
+    leaveCall();
+    // The inner call failed; the outer one, which handled that, did not.
+    try testing.expect(lastCallFailed());
+    clearLastCall();
+    leaveCall();
+    try testing.expect(!lastCallFailed());
+
+    const before = failureLogCounts();
+    for (0..2) |_| {
+        enterCall();
+        _ = reportFailure(.exception);
+        leaveCall();
+    }
+    const after = failureLogCounts();
+    // Three failures within one interval: at most one logged, the rest counted.
+    try testing.expect(after.logged - before.logged <= 1);
+    try testing.expect(after.unlogged >= 1);
+}
+
 test "ListenerBox: single installed reference releases immediately" {
     var released: std.atomic.Value(u32) = .init(0);
     const box = try ListenerBox(TestListener).create(testing.allocator, .{
@@ -346,6 +483,44 @@ test "ListenerBox.adopt releases the registration when its box cannot be allocat
         .release_listener_data = countRelease,
     }));
     try testing.expectEqual(@as(u32, 1), released.load(.seq_cst));
+}
+
+test "ListenerBox.adopt resolves a dispatching listener's identity, and releases the registration when it cannot" {
+    const CallbackListener = struct {
+        listener_data: ?*anyopaque = null,
+        on_x: ?*const fn (?*anyopaque) callconv(.c) void = null,
+        release_listener_data: ?*const fn (?*anyopaque) callconv(.c) void = null,
+    };
+    const Cb = struct {
+        fn f(_: ?*anyopaque) callconv(.c) void {}
+    };
+    var released: std.atomic.Value(u32) = .init(0);
+    const box = try ListenerBox(CallbackListener).adopt(testing.allocator, .{
+        .listener_data = &released,
+        .on_x = Cb.f,
+        .release_listener_data = countRelease,
+    });
+    try testing.expect(box.ident.load(.acquire) != null);
+    box.releaseHold(testing.allocator);
+    try testing.expectEqual(@as(u32, 1), released.load(.seq_cst));
+
+    // No memory for the identity record: the box is gone and the
+    // registration released, once.
+    const saved = listener_identity.global.alloc;
+    defer listener_identity.global.alloc = saved;
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    listener_identity.global.alloc = failing.allocator();
+    try testing.expectError(error.OutOfMemory, ListenerBox(CallbackListener).adopt(testing.allocator, .{
+        .listener_data = &released,
+        .on_x = Cb.f,
+        .release_listener_data = countRelease,
+    }));
+    try testing.expectEqual(@as(u32, 2), released.load(.seq_cst));
+
+    // A listener with no callbacks needs no record: clearing cannot fail.
+    const cleared = try ListenerBox(CallbackListener).adopt(testing.allocator, .{});
+    try testing.expectEqual(@as(?*listener_identity.Identity, null), cleared.ident.load(.acquire));
+    cleared.releaseHold(testing.allocator);
 }
 
 test "ListenerBox: release only fires once, after the last outstanding acquire" {
