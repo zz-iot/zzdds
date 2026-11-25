@@ -1391,3 +1391,68 @@ test "QueryCondition: the query is evaluated holding the lock set_query_paramete
     try testing.expect(qc.matchSample(&.{}, getter));
     try testing.expectEqual(@as(?bool, true), Getter.held);
 }
+
+// ── Leased results under allocation failure ──────────────────────────────────
+
+test "WaitSet: a failed allocation in a hooked attach, a wait or its result holds nothing and runs no hook" {
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const a = fa.allocator();
+    const gc = try GuardConditionImpl.init(testing.allocator);
+    defer gc.deinit();
+    const ws = try WaitSetImpl.init(a);
+    const Hook = struct {
+        var count: usize = 0;
+        fn f(_: ?*anyopaque) callconv(.c) void {
+            count += 1;
+        }
+    };
+    Hook.count = 0;
+    const never = std.math.maxInt(usize);
+
+    // The lease's allocation fails: nothing is attached.
+    fa.fail_index = fa.alloc_index;
+    var accepted = true;
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, ws.attachConditionWithRelease(gc.toCondition(), null, Hook.f, &accepted));
+    try testing.expect(!accepted);
+    fa.fail_index = never;
+    var seq: DDS.ConditionSeq = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().get_conditions(&seq));
+    try testing.expectEqual(@as(u32, 0), seq._length);
+
+    try testing.expectEqual(DDS.RETCODE_OK, ws.attachConditionWithRelease(gc.toCondition(), null, Hook.f, &accepted));
+    try testing.expect(accepted);
+    try testing.expectEqual(DDS.RETCODE_OK, gc.toDDSGuardCondition().set_trigger_value(true));
+
+    // The scan's append fails, leased and plain.
+    var found: std.ArrayListUnmanaged(dcps.waitset.LeasedCondition) = .empty;
+    defer found.deinit(a);
+    fa.fail_index = fa.alloc_index;
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, ws.waitLeased(&found, &DURATION_ZERO));
+    try testing.expectEqual(@as(usize, 0), found.items.len);
+    fa.fail_index = fa.alloc_index;
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, ws.toDDSWaitSet().wait(&seq, DURATION_ZERO));
+    try testing.expectEqual(@as(u32, 0), seq._length);
+
+    // The plain result's final copy fails after the scan found the condition.
+    fa.fail_index = fa.alloc_index + 1;
+    fa.resize_fail_index = fa.resize_index;
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, ws.toDDSWaitSet().wait(&seq, DURATION_ZERO));
+    try testing.expectEqual(@as(u32, 0), seq._length);
+    fa.fail_index = never;
+    fa.resize_fail_index = never;
+
+    // A leased get_conditions that cannot reserve its result.
+    fa.fail_index = fa.alloc_index;
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, ws.getConditionsLeased(&found));
+    fa.fail_index = never;
+
+    // The wait succeeds: its lease outlives the detach.
+    try testing.expectEqual(DDS.RETCODE_OK, ws.waitLeased(&found, &DURATION_ZERO));
+    try testing.expectEqual(@as(usize, 1), found.items.len);
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().detach_condition(gc.toCondition()));
+    try testing.expectEqual(@as(usize, 0), Hook.count);
+    dcps.waitset.releaseLeased(found.items);
+    try testing.expectEqual(@as(usize, 1), Hook.count);
+    ws.deinit();
+    try testing.expectEqual(@as(usize, 1), Hook.count);
+}

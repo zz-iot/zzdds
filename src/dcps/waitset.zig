@@ -363,22 +363,10 @@ pub const WaitSetImpl = struct {
 
     fn reallyDeinit(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        // Unregister from every still-attached condition before freeing
-        // self, so their own WakeupList doesn't keep a WakeupHandle
-        // pointing at this (about-to-be-freed) WaitSet — the symmetric
-        // counterpart of a condition's own deinit() detaching from every
-        // WaitSet that still has it attached (see the file-level doc
-        // comment). Safe to assume every remaining entry is still live: a
-        // condition that was itself torn down first already removed itself
-        // from `self.conditions` via WakeupHandle.invalidate.
-        // unregisterFromCondition() below only locks each condition's own
-        // WakeupList mutex, never self.mu, so iterating self.conditions.items
-        // directly here (read-only) is safe. Same exclusivity is what makes
-        // firing each entry's release hook safe here too, with no lock held.
-        for (self.conditions.items) |entry| {
-            unregisterFromCondition(self, entry.cond);
-            entry.fireRelease();
-        }
+        // `deinit` shut the WaitSet down first, which unregistered every
+        // attachment from its condition and moved it to `released`. Only
+        // their hooks remain, run here with no lock held.
+        std.debug.assert(self.conditions.items.len == 0);
         for (self.released.items) |entry| entry.fireRelease();
         self.ws_c_abi.free(self.alloc);
         self.conditions.deinit(self.alloc);
@@ -837,7 +825,6 @@ pub const WaitSetImpl = struct {
     fn vtDetach(ctx: *anyopaque, input: DDS.Condition) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (nil.isNil(input)) return DDS.RETCODE_BAD_PARAMETER;
-        if (self.closed.load(.acquire)) return DDS.RETCODE_ALREADY_DELETED;
         const cond = canonicalCondition(input);
         var removed: ?AttachedCondition = null;
         // A condition whose entity was deleted counts as detached already, as
