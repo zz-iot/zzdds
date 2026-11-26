@@ -600,10 +600,25 @@ pub const DataWriterImpl = struct {
     /// exactly -- `publishLoan` performs that check, since instance
     /// identity (needed for `max_samples_per_instance`) isn't known until
     /// then. See docs/design/raw-loan-api.md, "Write-side loan".
-    pub fn loanForWrite(self: *Self, size: usize) ![]u8 {
-        const buf = try self.alloc.alloc(u8, size);
+    ///
+    /// The buffer is `write_loan_alignment`-aligned, so a typed store into a
+    /// zidl reservation of elements up to 4 bytes wide is aligned too (the
+    /// CDR stream starts 4 bytes in, after the encapsulation header). See
+    /// docs/design/loaned-builders.md, decision 9.
+    pub fn loanForWrite(self: *Self, size: usize) ![]align(write_loan_alignment.toByteUnits()) u8 {
+        const buf = try self.alloc.alignedAlloc(u8, write_loan_alignment, size);
         _ = self.outstanding_loans.fetchAdd(1, .monotonic);
         return buf;
+    }
+
+    /// Alignment of every write-loan buffer (`loanForWrite`).
+    pub const write_loan_alignment: std.mem.Alignment = .@"8";
+
+    /// Frees a buffer `loanForWrite` returned, at the alignment it was
+    /// allocated with.
+    fn freeLoan(self: *Self, buf: []u8) void {
+        const aligned: []align(write_loan_alignment.toByteUnits()) u8 = @alignCast(buf);
+        self.alloc.free(aligned);
     }
 
     /// Publish a previously-loaned buffer (from `loanForWrite`) as a sample,
@@ -626,7 +641,7 @@ pub const DataWriterImpl = struct {
         used_len: usize,
     ) !history_mod.SequenceNumber {
         defer {
-            self.alloc.free(buf);
+            self.freeLoan(buf);
             _ = self.outstanding_loans.fetchSub(1, .monotonic);
         }
         return self.writeRaw(kind, source_timestamp, key_hash, buf[0..used_len]);
@@ -635,7 +650,7 @@ pub const DataWriterImpl = struct {
     /// Cancel a previously-loaned buffer (from `loanForWrite`) without
     /// publishing it -- frees the buffer and releases the loan.
     pub fn cancelLoan(self: *Self, buf: []u8) void {
-        self.alloc.free(buf);
+        self.freeLoan(buf);
         _ = self.outstanding_loans.fetchSub(1, .monotonic);
     }
 

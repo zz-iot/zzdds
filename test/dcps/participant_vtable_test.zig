@@ -522,6 +522,20 @@ test "publishLoan: a failed publish (RESOURCE_LIMITS) still fully releases the l
     try testing.expectEqual(@as(usize, 0), dw_impl.outstanding_loans.load(.monotonic));
 }
 
+test "loanForWrite: every buffer is 8-byte aligned, and frees at that alignment" {
+    var fx = try Fixture.init(58);
+    defer fx.deinit();
+    const dw_impl = wlMakeWriter(&fx, "WLTopicAlign", .{});
+
+    // Odd sizes, which a byte allocation would pack unaligned; the testing
+    // allocator also checks each free's alignment against its allocation.
+    for ([_]usize{ 1, 3, 5, 13, 29 }) |size| {
+        const buf = try dw_impl.loanForWrite(size);
+        try testing.expect(std.mem.isAligned(@intFromPtr(buf.ptr), 8));
+        dw_impl.cancelLoan(buf);
+    }
+}
+
 test "checkDeletePrecondition (DataWriter): PRECONDITION_NOT_MET while a loan is outstanding, OK once resolved" {
     var fx = try Fixture.init(53);
     defer fx.deinit();
