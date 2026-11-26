@@ -5,6 +5,9 @@ const build_options = @import("build_options");
 
 const DDS = @import("zzdds_generated").DDS;
 const ZZDDS = @import("zzdds_ext_generated").zzdds;
+const execution_runtime_mod = @import("../dcps/execution_runtime.zig");
+const ExecutionRuntimeImpl = execution_runtime_mod.ExecutionRuntimeImpl;
+const core_runtime = @import("../runtime/core.zig");
 const zidl_bindings = @import("zidl_bindings");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 
@@ -84,6 +87,10 @@ const FactoryOwner = struct {
     /// check or delete them. Under `mu`. They still exist, so the strict
     /// `closeIfEmpty` counts them.
     stacks_taken: usize = 0,
+    /// The runtime new participants run on (`set_default_runtime`), with
+    /// the factory's owner reference to it; null follows the process
+    /// default. Under `mu`.
+    selected_runtime: ?*ExecutionRuntimeImpl = null,
 
     /// Closes the factory to new participants if it has none. The check and
     /// the close are one step under `mu`, so a `create_participant` on
@@ -148,7 +155,37 @@ const FactoryOwner = struct {
         self.mu.unlock();
         for (stacks.items) |stack| stack.deinit();
         stacks.deinit(self.alloc);
+        self.mu.lock();
+        const selected = self.selected_runtime;
+        self.selected_runtime = null;
+        self.mu.unlock();
+        if (selected) |r| r.runtime().releaseOwner();
         self.lifetime.beginTeardown(self, destroy);
+    }
+
+    /// `set_default_runtime`: takes an owner reference to `rt` before
+    /// publishing it, and releases the previous selection's after.
+    fn selectRuntime(self: *@This(), rt: ?*ExecutionRuntimeImpl) DDS.ReturnCode_t {
+        if (!self.lifetime.acquire()) return DDS.RETCODE_ALREADY_DELETED;
+        defer self.lifetime.release(self, destroy);
+        if (rt) |r| if (!r.runtime().tryRetainOwner()) return DDS.RETCODE_ALREADY_DELETED;
+        self.mu.lock();
+        const old = self.selected_runtime;
+        self.selected_runtime = rt;
+        self.mu.unlock();
+        if (old) |o| o.runtime().releaseOwner();
+        return DDS.RETCODE_OK;
+    }
+
+    /// A reference to the selected runtime for one creation: a concurrent
+    /// `set_default_runtime` may drop the factory's own meanwhile. The
+    /// factory's reference keeps it running until this one is taken.
+    fn leaseSelectedRuntime(self: *@This()) ?*core_runtime.Runtime {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const r = self.selected_runtime orelse return null;
+        r.runtime().retainOwner();
+        return r.runtime();
     }
 
     fn destroy(ctx: *anyopaque) void {
@@ -176,6 +213,8 @@ const FactoryOwner = struct {
         defer if (listener_given) listener_box_mod.releaseGivenPtr(a_listener);
         if (!self.lifetime.acquire()) return error.FactoryDeleted;
         defer self.lifetime.release(self, destroy);
+        const lease = self.leaseSelectedRuntime();
+        defer if (lease) |rt| rt.releaseOwner();
         const stack = try ParticipantStack.init(self.alloc, domain_id, config);
         if (!self.lifetime.acquire()) {
             stack.deinit();
@@ -183,6 +222,8 @@ const FactoryOwner = struct {
         }
         stack.owner = self;
         errdefer stack.deinit();
+        // Held by the stack's factory from here, for its participant.
+        if (lease) |rt| stack.factory.selectRuntime(rt) catch unreachable;
 
         // Clone QoS under the lock so the snapshot owns its heap memory and
         // is safe to use after the lock is released.
@@ -345,11 +386,31 @@ pub const factory_vtable = ZZDDS.DomainParticipantFactory.Vtable{
     .create_participant_ex = factoryCreateParticipantEx,
     .set_default_participant_config = factorySetDefaultParticipantConfig,
     .get_default_participant_config = factoryGetDefaultParticipantConfig,
+    .set_default_runtime = factorySetDefaultRuntime,
+    .get_default_runtime = factoryGetDefaultRuntime,
     .deinit = factoryDeinit,
     .get_c_abi_handle = factoryGetCAbiHandleZzdds,
     .get_allocator = factoryGetAllocator,
     .as_DomainParticipantFactory = factoryAsDdsFactory,
 };
+
+fn factorySetDefaultRuntime(ctx: *anyopaque, rt: ZZDDS.ExecutionRuntime) DDS.ReturnCode_t {
+    if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
+    const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
+    if (rt.ptr == nil.NIL_PTR) return owner.selectRuntime(null);
+    if (rt.vtable != &ExecutionRuntimeImpl.vtable) return DDS.RETCODE_BAD_PARAMETER;
+    return owner.selectRuntime(@ptrCast(@alignCast(rt.ptr)));
+}
+
+/// Borrowed: valid while the factory selects it.
+fn factoryGetDefaultRuntime(ctx: *anyopaque) ZZDDS.ExecutionRuntime {
+    if (ctx == nil.NIL_PTR) return execution_runtime_mod.nil_execution_runtime;
+    const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
+    owner.mu.lock();
+    defer owner.mu.unlock();
+    const r = owner.selected_runtime orelse return execution_runtime_mod.nil_execution_runtime;
+    return r.toExecutionRuntime();
+}
 
 fn factoryGetAllocator(ctx: *anyopaque) std.mem.Allocator {
     if (ctx == nil.NIL_PTR) return std.heap.c_allocator;
@@ -796,6 +857,7 @@ pub const CAbiProvider = struct {
             ZZDDS.Subscriber => .{ .ptr = nils.NIL_PTR, .vtable = &subscriber_vtable },
             ZZDDS.DataWriter => .{ .ptr = nils.NIL_PTR, .vtable = &writer_vtable },
             ZZDDS.DataReader => .{ .ptr = nils.NIL_PTR, .vtable = &reader_vtable },
+            ZZDDS.ExecutionRuntime => execution_runtime_mod.nil_execution_runtime,
             else => @compileError("zzdds has no nil " ++ @typeName(I)),
         };
     }
@@ -822,6 +884,13 @@ pub const CAbiProvider = struct {
                 pub fn create(alloc: std.mem.Allocator) !ZZDDS.DomainParticipantFactory {
                     const default = alloc.vtable == std.heap.c_allocator.vtable;
                     return createFactoryWith(if (default) null else alloc);
+                }
+            },
+            ZZDDS.ExecutionRuntime => struct {
+                /// Nil (error.BadParameter) for an invalid config.
+                pub fn create(alloc: std.mem.Allocator, config: *const ZZDDS.RuntimeConfig) !ZZDDS.ExecutionRuntime {
+                    const rt = try ExecutionRuntimeImpl.create(alloc, config);
+                    return rt.toExecutionRuntime();
                 }
             },
             else => @compileError("zzdds has no constructors for " ++ @typeName(I)),

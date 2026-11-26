@@ -1039,10 +1039,14 @@ retires, until it is replaced) or disables the default. A WaitSet created withou
 runtime helps the default for each wait when it is an installed manual runtime, and never
 starts one. The default's options come from the process configuration's `default_runtime` (workers
 and inline turns; it is always hosted), and `default_runtime_policy` can disable it.
-Installing a runtime of one's own is still a Zig call: an installed runtime is an
+Installing a runtime as the process default is still a Zig call: an installed runtime is an
 unretained pointer, which the application keeps valid while it is installed and its
-waits run (the `ExecutionRuntime` binding API is designed in
-[factory construction](design/factory-construction.md), not built). Operations map the
+waits run. From any binding, an application creates a runtime of its own, hosted or
+manual, as zzdds.idl's `ExecutionRuntime`, drives a manual one with `drive`, and has a
+zzdds factory's participants run on it with `set_default_runtime`; the last of the
+handle, the selecting factories and their participants to let go finishes and frees it
+([first shipped subset](design/concurrency/extension-api.md#first-shipped-subset-versus-complete-design)).
+Operations map the
 contracts' effect states (commit and cancellation) and waits onto endpoint locks as
 [operation effects](design/concurrency/operation-effects.md) describes, for every
 operation it lists: waits, blocking writes, takes and WaitSets.

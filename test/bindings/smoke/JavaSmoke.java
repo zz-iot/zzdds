@@ -392,6 +392,47 @@ public class JavaSmoke {
         check(Dcps.DDS.DomainParticipantFactory.delete_instance() == ok, "delete_instance()");
     }
 
+    // A runtime of one's own: a manual one runs the factory's participants
+    // only in drive(). The factory's getter hands back the owner's object;
+    // closing the owner releases only its hold, so the factory keeps the
+    // runtime until it lets go, and the last participant's deletion
+    // finishes it.
+    static void checkExecutionRuntime(int domain) {
+        int ok = Dcps.DDS.RETCODE_OK.value;
+        Zzdds.zzdds.RuntimeConfig cfg = new Zzdds.zzdds.RuntimeConfig();
+        cfg.set_hosted_workers(0);
+        check(Zzdds.zzdds.ExecutionRuntime.create(cfg) == null, "ExecutionRuntime.create() refuses a hosted runtime without workers");
+        cfg.set_mode(Zzdds.zzdds.RuntimeMode.RUNTIME_MODE_MANUAL);
+        try (Zzdds.zzdds.DomainParticipantFactory own = Zzdds.zzdds.DomainParticipantFactory.create()) {
+            Zzdds.zzdds.ExecutionRuntime rt = Zzdds.zzdds.ExecutionRuntime.create(cfg);
+            check(rt != null, "ExecutionRuntime.create()");
+            check(rt.get_mode() == Zzdds.zzdds.RuntimeMode.RUNTIME_MODE_MANUAL, "the runtime is manual");
+            check(own.set_default_runtime(rt) == ok, "set_default_runtime()");
+            check(own.get_default_runtime() == rt, "get_default_runtime() returns the owner's object");
+            Dcps.DDS.DomainParticipant w = own.create_participant(domain, null, null, 0);
+            Dcps.DDS.DomainParticipant r = own.create_participant(domain, null, null, 0);
+            check(w != null && r != null, "participants on the runtime");
+            Dcps.DDS.Topic tw = w.create_topic("JavaRuntime", "JavaRuntimeType", null, null, 0);
+            Dcps.DDS.Topic tr = r.create_topic("JavaRuntime", "JavaRuntimeType", null, null, 0);
+            Dcps.DDS.DataWriter writer = w.create_publisher(null, null, 0).create_datawriter(tw, null, null, 0);
+            Dcps.DDS.DataReader reader = r.create_subscriber(null, null, 0).create_datareader(tr, null, null, 0);
+            check(writer != null && reader != null, "writer and reader on the runtime");
+            Zzdds.zzdds.DriveResult result = new Zzdds.zzdds.DriveResult();
+            Dcps.DDS.PublicationMatchedStatus status = new Dcps.DDS.PublicationMatchedStatus();
+            for (int i = 0; status.get_current_count() == 0; ++i) {
+                check(i < 1000, "the pair matched while driven within 20 s");
+                check(rt.drive(64, new Dcps.DDS.Duration_t(0, 20000000), result) == ok, "drive()");
+                check(writer.get_publication_matched_status(status) == ok, "get_publication_matched_status()");
+            }
+            check(rt.destroy() == Dcps.DDS.RETCODE_PRECONDITION_NOT_MET.value, "destroy() refuses while the runtime is in use");
+            rt.close();
+            check(own.get_default_runtime().get_state() == Zzdds.zzdds.RuntimeState.RUNTIME_STATE_RUNNING, "the factory keeps a closed owner's runtime");
+            check(own.set_default_runtime(null) == ok, "set_default_runtime(null)");
+            check(own.get_default_runtime() == null, "get_default_runtime() after deselecting");
+            check(w.delete_contained_entities() == ok && r.delete_contained_entities() == ok, "delete_contained_entities()");
+        }
+    }
+
     // A loan outlives the cascade that deletes its writer: closing the owner
     // deletes the writer, whose wrapper still returns the loan, freeing it.
     static void checkLoanOutlivesCascade(int domain) {
@@ -418,6 +459,8 @@ public class JavaSmoke {
         checkGeneratedConstruction();
         checkFactoryConstruction(0);
         checkLoanOutlivesCascade(0);
+        checkExecutionRuntime(0);
+        System.out.println("  a manual runtime of one's own runs participants in drive(): OK");
 
         Dcps.DDS.DomainParticipantFactory factory =
             io.zzdds.ext.Zzdds.zzdds.DomainParticipantFactory.create();

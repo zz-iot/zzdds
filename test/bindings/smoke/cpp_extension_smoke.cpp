@@ -244,6 +244,53 @@ int main() {
         CHECK(inst->delete_contained_entities() == ::DDS::RETCODE_OK);
     }
     CHECK(::DDS::DomainParticipantFactory::delete_instance() == ::DDS::RETCODE_OK);
+
+    // A runtime of one's own: a manual one runs the factory's participants
+    // only in drive(). The factory's getter hands back the owner's object,
+    // and dropping the owner releases only its hold: the factory keeps the
+    // runtime until it lets go, and the last participant's deletion
+    // finishes it.
+    {
+        auto own = zzdds::DomainParticipantFactory::create();
+        CHECK(own);
+        auto cfg = ::zzdds::RuntimeConfig::default_value();
+        cfg.mode = ::zzdds::RuntimeMode::RUNTIME_MODE_MANUAL;
+        auto rt = ::zzdds::ExecutionRuntime::create(cfg);
+        CHECK(rt);
+        CHECK(rt->get_mode() == ::zzdds::RuntimeMode::RUNTIME_MODE_MANUAL);
+        CHECK(own->set_default_runtime(rt) == ::DDS::RETCODE_OK);
+        CHECK(own->get_default_runtime() == rt);
+        auto w = own->create_participant(domain, ::DDS::DomainParticipantQos::default_value(), nullptr, 0);
+        auto r = own->create_participant(domain, ::DDS::DomainParticipantQos::default_value(), nullptr, 0);
+        CHECK(w && r);
+        auto tw = w->create_topic("CppRuntime", "CppRuntimeType", ::DDS::TopicQos::default_value(), nullptr, 0);
+        auto tr = r->create_topic("CppRuntime", "CppRuntimeType", ::DDS::TopicQos::default_value(), nullptr, 0);
+        auto writer = w->create_publisher(::DDS::PublisherQos::default_value(), nullptr, 0)
+                          ->create_datawriter(tw, ::DDS::DataWriterQos::default_value(), nullptr, 0);
+        auto reader = r->create_subscriber(::DDS::SubscriberQos::default_value(), nullptr, 0)
+                          ->create_datareader(std::static_pointer_cast<::zzdds::TopicImpl>(tr)->as_topic_description(),
+                                              ::DDS::DataReaderQos::default_value(), nullptr, 0);
+        CHECK(writer && reader);
+        ::zzdds::DriveResult result{};
+        ::DDS::PublicationMatchedStatus status{};
+        for (int i = 0; status.current_count == 0; ++i) {
+            CHECK(i < 1000); // 20 s
+            CHECK(rt->drive(64, ::DDS::Duration_t{0, 20000000u}, result) == ::DDS::RETCODE_OK);
+            CHECK(writer->get_publication_matched_status(status) == ::DDS::RETCODE_OK);
+        }
+        CHECK(rt->destroy() == ::DDS::RETCODE_PRECONDITION_NOT_MET);
+        std::weak_ptr<::zzdds::ExecutionRuntime> weak = rt;
+        rt.reset();
+        CHECK(weak.expired());
+        // The factory still holds it: a borrowed wrapper, which releases
+        // nothing when dropped.
+        CHECK(own->get_default_runtime()->get_state() == ::zzdds::RuntimeState::RUNTIME_STATE_RUNNING);
+        CHECK(own->set_default_runtime(nullptr) == ::DDS::RETCODE_OK);
+        CHECK(own->get_default_runtime() == nullptr);
+        CHECK(w->delete_contained_entities() == ::DDS::RETCODE_OK);
+        CHECK(r->delete_contained_entities() == ::DDS::RETCODE_OK);
+        CHECK(own->delete_contained_entities() == ::DDS::RETCODE_OK);
+    }
     std::printf("cpp_extension_smoke: OK\n");
     return 0;
 }

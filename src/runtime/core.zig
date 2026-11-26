@@ -107,6 +107,13 @@ pub fn inTurn() bool {
     return running_context != null;
 }
 
+/// Whether this thread is running a turn of `rt`: one of its hosted workers,
+/// or a driver or helper of it.
+pub fn inTurnOf(rt: *const Runtime) bool {
+    const c = running_context orelse return false;
+    return c.runtime == rt;
+}
+
 /// A callback with its state.
 pub const Hook = struct {
     ctx: *anyopaque,
@@ -444,6 +451,10 @@ pub const Runtime = struct {
     owners: std.atomic.Value(u32) = .init(1),
     state: std.atomic.Value(State) = .init(.running),
     driving: std.atomic.Value(bool) = .init(false),
+    /// Runs last in the release of the final owner, which touches the
+    /// runtime no more: it may free it once it stops. Set before publishing
+    /// the runtime.
+    on_final_release: ?Hook = null,
     test_hooks: if (builtin.is_test) TestHooks else void = if (builtin.is_test) .{} else {},
 
     /// Seams for deterministic tests of races; absent outside test builds.
@@ -507,6 +518,18 @@ pub const Runtime = struct {
     /// closes, armed timers are cancelled, and admitted work drains.
     pub fn releaseOwner(self: *Runtime) void {
         if (self.owners.fetchSub(1, .acq_rel) != 1) return;
+        self.retire();
+    }
+
+    /// Releases the final owner if `self` holds the only one; false, with
+    /// nothing changed, while another owner remains.
+    pub fn releaseSoleOwner(self: *Runtime) bool {
+        if (self.owners.cmpxchgStrong(1, 0, .acq_rel, .acquire) != null) return false;
+        self.retire();
+        return true;
+    }
+
+    fn retire(self: *Runtime) void {
         self.gate.lock();
         self.state.store(.retiring, .seq_cst);
         while (self.timers.pop()) |t| {
@@ -517,6 +540,26 @@ pub const Runtime = struct {
         self.gate.unlock();
         self.tryStop();
         self.backend.wakeAll();
+        if (self.on_final_release) |h| h.run(h.ctx);
+    }
+
+    /// Runs a retiring manual runtime until it stops: what its last owner's
+    /// release does when no driver remains to (docs/design/concurrency/
+    /// runtime.md#hosted-and-manual-driver-obligations). Not from a turn of
+    /// it, and not alongside `drive`.
+    pub fn drainRetired(self: *Runtime) void {
+        std.debug.assert(self.options.mode == .manual and !inTurnOf(self));
+        std.debug.assert(self.state.load(.acquire) != .running);
+        while (true) {
+            _ = self.backend.service(self.options.service_budget);
+            if (self.runNext()) continue;
+            self.tryStop();
+            if (self.state.load(.acquire) == .backend_stopped) return;
+            const token = self.backend.prepareWait();
+            if (self.workDue(self.clock.nowNs())) continue;
+            if (self.state.load(.acquire) == .backend_stopped) return;
+            self.backend.wait(self.nextDeadline(), token);
+        }
     }
 
     /// Enters BACKEND_STOPPED once retiring and nothing remains: no admission
