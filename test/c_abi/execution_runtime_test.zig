@@ -239,13 +239,49 @@ test "the last release of a manual runtime runs the work still queued on it" {
     ctx.deinit();
 }
 
+/// `FailingAllocator` behind a lock: a hosted runtime's workers allocate
+/// through it too, from their own threads.
+const LockedAllocator = struct {
+    child: std.mem.Allocator,
+    mu: zzdds.util.mutex.Mutex = .{},
+
+    fn allocator(self: *LockedAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, n: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *LockedAllocator = @ptrCast(@alignCast(ctx));
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.child.rawAlloc(n, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *LockedAllocator = @ptrCast(@alignCast(ctx));
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.child.rawResize(m, a, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *LockedAllocator = @ptrCast(@alignCast(ctx));
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.child.rawRemap(m, a, n, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *LockedAllocator = @ptrCast(@alignCast(ctx));
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.child.rawFree(m, a, ra);
+    }
+};
+
 test "a runtime that cannot be created frees what it allocated" {
     if (!supported) return error.SkipZigTest;
     for ([_]ZZDDS.RuntimeMode{ .RUNTIME_MODE_MANUAL, .RUNTIME_MODE_HOSTED }) |mode| {
         var fail_index: usize = 0;
         while (true) : (fail_index += 1) {
             var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
-            const rt = ZZDDS.ExecutionRuntime.create(failing.allocator(), config(mode, 2)) catch |err| {
+            var locked: LockedAllocator = .{ .child = failing.allocator() };
+            const rt = ZZDDS.ExecutionRuntime.create(locked.allocator(), config(mode, 2)) catch |err| {
                 try testing.expect(err == error.OutOfMemory or err == error.WorkersUnavailable or err == error.SystemResources);
                 continue;
             };
