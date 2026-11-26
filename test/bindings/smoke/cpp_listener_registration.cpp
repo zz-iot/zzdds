@@ -21,7 +21,8 @@
 // Also: a listener implementing DDS::DataReaderListener directly (not through
 // the generated DataReaderListenerBase) is installed, and an entity this
 // binding did not create is rejected with an error, not a crash. The test is
-// also built with -fno-rtti -fno-exceptions.
+// also built with -fno-rtti -fno-exceptions, which skips the throwing-listener
+// check.
 #include "zzdds_cpp.hpp"
 
 #include <atomic>
@@ -31,6 +32,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 
 #define CHECK(cond)                                                                   \
@@ -329,6 +331,98 @@ void check_failed_create_releases(const std::shared_ptr<::DDS::Publisher> &pub,
     CHECK(weak.expired());
 }
 
+#if defined(__cpp_exceptions)
+// A reader listener that throws, reached through notify_datareaders from its
+// subscriber's on_data_on_readers: the bridge catches it and reports the
+// failure, so notify_datareaders returns ERROR and nothing unwinds through the
+// core. The failure belongs to that call only: the next sample's
+// notify_datareaders, whose listener returns normally, returns OK.
+// TRANSIENT_LOCAL, so the sample written before the reader exists reaches it
+// once matched.
+struct FailingChild {
+    std::mutex mu;
+    std::condition_variable cv;
+    int notifies = 0;
+    ::DDS::ReturnCode_t rc[2] = {-1, -1};
+    std::atomic<int> calls{0};
+};
+FailingChild g_fail;
+
+class NotifyingSubscriberListener : public ::DDS::SubscriberListenerBase {
+public:
+    void on_data_on_readers(std::shared_ptr<::DDS::Subscriber> sub) override {
+        const auto rc = sub->notify_datareaders();
+        std::lock_guard<std::mutex> lock(g_fail.mu);
+        if (g_fail.notifies < 2) g_fail.rc[g_fail.notifies] = rc;
+        g_fail.notifies++;
+        g_fail.cv.notify_all();
+    }
+};
+
+class ThrowingOnceListener : public ::DDS::DataReaderListenerBase {
+public:
+    void on_data_available(std::shared_ptr<::DDS::DataReader>) override {
+        if (g_fail.calls.fetch_add(1) == 0) throw std::runtime_error("failing child listener");
+    }
+};
+
+void write_raw_sample(const std::shared_ptr<::DDS::DataWriter> &dw, uint8_t value) {
+    const ::DDS::OctetSeq payload{0x00, 0x01, 0x00, 0x00, value, 0, 0, 0};
+    const ::DDS::Time_t now{::DDS::TIME_INVALID_SEC, ::DDS::TIME_INVALID_NSEC};
+    CHECK(dw->write_raw(::DDS::OctetSeq(16, 0), ::DDS::HANDLE_NIL, payload,
+                        ::DDS::WriteKind::ALIVE_WRITE_KIND, now) == ::DDS::RETCODE_OK);
+}
+
+bool wait_notifies(int n) {
+    std::unique_lock<std::mutex> lock(g_fail.mu);
+    return g_fail.cv.wait_for(lock, std::chrono::seconds(20), [n] { return g_fail.notifies >= n; });
+}
+
+void check_failing_child_listener(const std::shared_ptr<::DDS::DomainParticipant> &dp_w,
+                                  const std::shared_ptr<::DDS::Publisher> &pub,
+                                  const std::shared_ptr<::DDS::DomainParticipant> &dp_r) {
+    auto topic_w = dp_w->create_topic("CppFailingChild", "CppFailingChildType",
+                                      ::DDS::TopicQos::default_value(), nullptr, 0);
+    auto topic_r = dp_r->create_topic("CppFailingChild", "CppFailingChildType",
+                                      ::DDS::TopicQos::default_value(), nullptr, 0);
+    CHECK(topic_w && topic_r);
+    auto wqos = ::DDS::DataWriterQos::default_value();
+    wqos.reliability.kind = ::DDS::ReliabilityQosPolicyKind::RELIABLE_RELIABILITY_QOS;
+    wqos.durability.kind = ::DDS::DurabilityQosPolicyKind::TRANSIENT_LOCAL_DURABILITY_QOS;
+    auto dw = pub->create_datawriter(topic_w, wqos, nullptr, 0);
+    CHECK(dw);
+    write_raw_sample(dw, 1);
+
+    auto sub = dp_r->create_subscriber(::DDS::SubscriberQos::default_value(),
+                                       std::make_shared<NotifyingSubscriberListener>(),
+                                       ::DDS::DATA_ON_READERS_STATUS);
+    CHECK(sub);
+    auto rqos = ::DDS::DataReaderQos::default_value();
+    rqos.reliability.kind = ::DDS::ReliabilityQosPolicyKind::RELIABLE_RELIABILITY_QOS;
+    rqos.durability.kind = ::DDS::DurabilityQosPolicyKind::TRANSIENT_LOCAL_DURABILITY_QOS;
+    auto dr = sub->create_datareader(
+        std::static_pointer_cast<::zzdds::TopicImpl>(topic_r)->as_topic_description(), rqos,
+        std::make_shared<ThrowingOnceListener>(), ::DDS::DATA_AVAILABLE_STATUS);
+    CHECK(dr);
+
+    CHECK(wait_notifies(1));
+    write_raw_sample(dw, 2);
+    CHECK(wait_notifies(2));
+    {
+        std::lock_guard<std::mutex> lock(g_fail.mu);
+        CHECK(g_fail.rc[0] == ::DDS::RETCODE_ERROR);
+        CHECK(g_fail.rc[1] == ::DDS::RETCODE_OK);
+    }
+    CHECK(g_fail.calls.load() >= 2);
+
+    CHECK(sub->delete_contained_entities() == ::DDS::RETCODE_OK);
+    CHECK(dp_r->delete_subscriber(sub) == ::DDS::RETCODE_OK);
+    CHECK(pub->delete_datawriter(dw) == ::DDS::RETCODE_OK);
+    CHECK(dp_w->delete_topic(topic_w) == ::DDS::RETCODE_OK);
+    CHECK(dp_r->delete_topic(topic_r) == ::DDS::RETCODE_OK);
+}
+#endif
+
 } // namespace
 
 int main() {
@@ -401,6 +495,9 @@ int main() {
 
     check_rejected_registrations(
         sub, std::static_pointer_cast<::zzdds::TopicImpl>(topic_r)->as_topic_description());
+#if defined(__cpp_exceptions)
+    check_failing_child_listener(dp_w, pub, dp_r);
+#endif
 
     // Deletion retires the wrapper before returning, even if native references
     // postpone freeing the handle. Its calls no longer reach the core.
