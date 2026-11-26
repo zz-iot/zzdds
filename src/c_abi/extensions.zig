@@ -833,6 +833,12 @@ comptime {
     if (@hasDecl(DDS, "exportCAbi")) {
         DDS.exportCAbi(CAbiProvider);
         ZZDDS.exportCAbi(CAbiProvider);
+        // zzdds_c.h's external-loop calls, which take generated C types.
+        @export(&zzdds_ExecutionRuntime_attach_external_loop, .{ .name = "zzdds_ExecutionRuntime_attach_external_loop" });
+        @export(&zzdds_ExecutionRuntime_service, .{ .name = "zzdds_ExecutionRuntime_service" });
+        @export(&zzdds_ExecutionRuntime_prepare_wait, .{ .name = "zzdds_ExecutionRuntime_prepare_wait" });
+        @export(&zzdds_ExecutionRuntime_now, .{ .name = "zzdds_ExecutionRuntime_now" });
+        @export(&zzdds_ExecutionRuntime_clock_changed, .{ .name = "zzdds_ExecutionRuntime_clock_changed" });
     }
 }
 
@@ -1026,6 +1032,43 @@ pub export fn zzdds_listener_invocation_failed(reason: c_int) callconv(.c) bool 
         else => return false,
     };
     return listener_box_mod.reportFailure(why);
+}
+
+// ── External loop (zzdds_c.h; docs/design/concurrency/runtime.md#external-loop-adapter)
+
+/// The zzdds runtime behind a C `zzdds_ExecutionRuntime` handle.
+fn externalRuntimeOf(handle: ?*anyopaque) ?*ExecutionRuntimeImpl {
+    return ExecutionRuntimeImpl.of(zidl_bindings.unboxAs(ZZDDS.ExecutionRuntime, handle orelse return null));
+}
+
+fn zzdds_ExecutionRuntime_attach_external_loop(runtime: ?*anyopaque, loop: ?*const execution_runtime_mod.ExternalLoop) callconv(.c) DDS.ReturnCode_t {
+    const rt = externalRuntimeOf(runtime) orelse return DDS.RETCODE_BAD_PARAMETER;
+    return rt.attachExternalLoop((loop orelse return DDS.RETCODE_BAD_PARAMETER).*);
+}
+
+fn zzdds_ExecutionRuntime_service(runtime: ?*anyopaque, max_turns: u32, result: ?*ZZDDS.DriveResultCAbi) callconv(.c) DDS.ReturnCode_t {
+    const rt = externalRuntimeOf(runtime) orelse return DDS.RETCODE_BAD_PARAMETER;
+    const out = result orelse return DDS.RETCODE_BAD_PARAMETER;
+    var r: ZZDDS.DriveResult = .{};
+    const rc = rt.service(max_turns, &r);
+    if (rc == DDS.RETCODE_OK) ZZDDS.DriveResultToCAbi(&r, out);
+    return rc;
+}
+
+fn zzdds_ExecutionRuntime_prepare_wait(runtime: ?*anyopaque, wait: ?*execution_runtime_mod.ExternalWait) callconv(.c) DDS.ReturnCode_t {
+    const rt = externalRuntimeOf(runtime) orelse return DDS.RETCODE_BAD_PARAMETER;
+    return rt.prepareWait(wait orelse return DDS.RETCODE_BAD_PARAMETER);
+}
+
+/// 0 for an invalid handle.
+fn zzdds_ExecutionRuntime_now(runtime: ?*anyopaque) callconv(.c) i64 {
+    const rt = externalRuntimeOf(runtime) orelse return 0;
+    return rt.now();
+}
+
+fn zzdds_ExecutionRuntime_clock_changed(runtime: ?*anyopaque) callconv(.c) void {
+    const rt = externalRuntimeOf(runtime) orelse return;
+    rt.clockChanged();
 }
 
 /// A leased WaitSet result (see `zzdds_waitset_wait_leased`): each

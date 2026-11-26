@@ -10,6 +10,13 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-26
 
+- An application's own event loop can drive a manual `ExecutionRuntime` in place of
+  `drive()` (`zzdds_c.h`'s `zzdds_ExecutionRuntime_attach_external_loop`). zzdds tells
+  the loop which sockets to wait on through its `watch` hook (always before a socket
+  closes), wakes it through its `wake` hook at most once per wait, and reports the next
+  timer deadline from `zzdds_ExecutionRuntime_prepare_wait`; the loop calls the bounded,
+  nonblocking `zzdds_ExecutionRuntime_service`. The loop may supply the runtime's clock.
+  This settles the last open concurrency design item, the external-loop platform ABI.
 - `zzdds::ExecutionRuntime` (zzdds.idl): an application creates a runtime of its own
   from any binding, hosted with its own worker threads or manual, running only in its
   `drive()` calls and the blocking calls that help it. `DomainParticipantFactory::

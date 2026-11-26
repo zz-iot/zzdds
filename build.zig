@@ -942,6 +942,26 @@ pub fn build(b: *std.Build) void {
         const c_runtime_smoke = b.addExecutable(.{ .name = "zzdds_c_runtime_smoke", .root_module = c_runtime_smoke_mod });
         binding_smoke_step.dependOn(&addTestRun(b, c_runtime_smoke, &dcps_test_domain).step);
 
+        // The same, driven by an application's own poll() loop.
+        const c_loop_smoke_mod = b.createModule(.{
+            .root_source_file = null,
+            .target = target,
+            .optimize = .Debug,
+            .link_libc = true,
+        });
+        c_loop_smoke_mod.addCSourceFiles(.{
+            .files = &.{"test/bindings/smoke/c_external_loop_smoke.c"},
+            .flags = &.{ "-std=c99", "-Wall" },
+        });
+        c_loop_smoke_mod.addIncludePath(gen_c_dir);
+        c_loop_smoke_mod.addIncludePath(gen_zzdds_c_dir);
+        c_loop_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+        c_loop_smoke_mod.addIncludePath(b.path("include"));
+        c_loop_smoke_mod.linkLibrary(zzdds_lib);
+        if (target.result.os.tag == .windows) c_loop_smoke_mod.linkSystemLibrary("ws2_32", .{});
+        const c_loop_smoke = b.addExecutable(.{ .name = "zzdds_c_external_loop_smoke", .root_module = c_loop_smoke_mod });
+        binding_smoke_step.dependOn(&addTestRun(b, c_loop_smoke, &dcps_test_domain).step);
+
         // Read view types over a live reader: a sample written and taken with
         // the generated take_view in one participant, its view pointing into
         // the loan until return_view.

@@ -92,6 +92,9 @@ pub const OwnedRuntime = struct {
         } else {
             self.runtime.drainRetired();
         }
+        if (poll_backend.supported) {
+            if (self.backend.external) |ext| if (ext.release) |release| release(ext.ctx);
+        }
         self.runtime.deinit();
         self.deinitBackend();
         self.threaded.deinit();

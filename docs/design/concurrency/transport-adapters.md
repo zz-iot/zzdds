@@ -7,7 +7,7 @@ The [runtime contract](runtime.md#transportruntime-ownership-and-backpressure) s
 ingress, output, capacity and close must guarantee. This document gives that contract a
 code shape and fixes the adapters that implement it in hosted, manual and MCU builds, so
 one protocol implementation runs over all of them. It does not select queue containers,
-pool sizes or the external-loop ABI ([open design item](../concurrency-broker-status.md#open-design-items)).
+pool sizes or the [external-loop ABI](runtime.md#external-loop-platform-abi).
 
 <a id="starting-point"></a>
 ## Starting point
@@ -158,8 +158,9 @@ assumes the wait is a futex.
 
 **Conforming approach.** The readiness adapter's wake is an `eventfd` on Linux, a pipe
 on other POSIX systems, and a loopback UDP socket connected to itself on Windows; it is
-registered with the sockets in the same `poll` set. An external loop receives the
-handles to wait on through the external-loop adapter, whose ABI is the open design item.
+registered with the sockets in the same `poll` set. An external loop is told which
+sockets to wait on, and woken, through the
+[external-loop ABI](runtime.md#external-loop-platform-abi)'s watch and wake hooks.
 Under Threaded, an `Io.Batch` of receives and a read on the wake descriptor implements
 the same wait, but it does not expose the handles an external loop needs.
 
@@ -325,5 +326,5 @@ hold, so neither is retained either.
 | Endpoint migration | The readiness adapter for UDP and then TCP, in hosted and manual mode; submissions with gather lists; channel slots; the per-socket threads and graveyards deleted |
 | Later | A completion adapter, and an MCU adapter with a real network stack |
 
-The external-loop adapter's handle and wake representation remain the open design item;
-the readiness adapter is the first backend that has handles to expose.
+The readiness adapter implements the [external-loop ABI](runtime.md#external-loop-platform-abi):
+watch hooks for its sockets and a wake hook in place of its wake descriptor.

@@ -70,7 +70,45 @@ pub const PollBackend = struct {
     /// Lent to each source's `service`, one at a time under `service_mu`.
     scratch: *[backend_mod.service_scratch_len]u8,
 
+    /// An application's event loop, when one drives the runtime
+    /// (docs/design/concurrency/runtime.md#external-loop-adapter). Set once,
+    /// before the loop relies on it, and never cleared.
+    external: ?External = null,
+    /// The loop has prepared to wait and not been woken since: the next wake
+    /// calls its hook. Woken once per wait, however many wakes arrive.
+    external_armed: std.atomic.Value(bool) = .init(false),
+    /// Serializes `watch` calls, so a socket's last report is its current
+    /// interest. Taken before `mu`, never inside it.
+    watch_mu: Mutex = .{},
+    /// Guarded by `watch_mu`: each watched socket's last reported interest.
+    watched: std.AutoHashMapUnmanaged(posix.socket_t, u32) = .empty,
+
     test_hooks: if (builtin.is_test) TestHooks else void = if (builtin.is_test) .{} else {},
+
+    /// Interest a `watch` call reports: what the loop waits on a socket for.
+    pub const watch_read: u32 = 1;
+    pub const watch_write: u32 = 2;
+
+    /// An application event loop's hooks: zzdds_c.h's `zzdds_ExternalLoop`.
+    /// None may call into zzdds.
+    pub const External = extern struct {
+        ctx: ?*anyopaque = null,
+        /// Ends the loop's current or next wait. Called from any thread.
+        wake: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
+        /// Starts, changes or (with 0) stops waiting on `handle` for
+        /// `watch_read`/`watch_write`. Called from the thread that changed
+        /// the socket, one call at a time, and with 0 before it closes.
+        watch: ?*const fn (ctx: ?*anyopaque, handle: posix.socket_t, events: u32) callconv(.c) void = null,
+        /// The runtime's scheduling clock, in monotonic nanoseconds; null
+        /// for the backend's own.
+        now_ns: ?*const fn (ctx: ?*anyopaque) callconv(.c) i64 = null,
+        /// Once the runtime has stopped, before it is freed: the loop's
+        /// last call from zzdds.
+        release: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
+
+        pub const watch_read_bit = watch_read;
+        pub const watch_write_bit = watch_write;
+    };
 
     /// Seams for deterministic tests of races; absent outside test builds.
     pub const TestHooks = struct {
@@ -145,8 +183,87 @@ pub const PollBackend = struct {
         self.service_sources.deinit(self.alloc);
         self.service_fds.deinit(self.alloc);
         self.alloc.destroy(self.scratch);
+        std.debug.assert(self.watched.count() == 0);
+        self.watched.deinit(self.alloc);
         self.mu.deinit();
         self.service_mu.deinit();
+        self.watch_mu.deinit();
+    }
+
+    /// Hands the wait to an application's loop: from now on its hooks hear
+    /// of wakes and of what to wait on. Every source registered so far is
+    /// reported first. Before any participant runs on the runtime, and once.
+    pub fn attachExternal(self: *PollBackend, ext: External) error{OutOfMemory}!void {
+        std.debug.assert(self.external == null and ext.wake != null and ext.watch != null);
+        self.watch_mu.lock();
+        defer self.watch_mu.unlock();
+        self.mu.lock();
+        const n = self.sources.items.len;
+        self.mu.unlock();
+        try self.watched.ensureTotalCapacity(self.alloc, @intCast(n + 1));
+        self.external = ext;
+        self.mu.lock();
+        const sources = self.alloc.dupe(*Source, self.sources.items) catch {
+            self.mu.unlock();
+            self.external = null;
+            return error.OutOfMemory;
+        };
+        self.mu.unlock();
+        defer self.alloc.free(sources);
+        for (sources) |src| self.reportWatchLocked(src);
+    }
+
+    /// Arms the loop's wake for its next wait: the first wake from now on
+    /// calls its hook. The caller rechecks for work after this.
+    pub fn armExternal(self: *PollBackend) void {
+        self.external_armed.store(true, .seq_cst);
+    }
+
+    /// Reports `src`'s current interest to the loop if it changed.
+    fn reportWatch(self: *PollBackend, src: *Source) void {
+        if (self.external == null) return;
+        self.watch_mu.lock();
+        defer self.watch_mu.unlock();
+        self.reportWatchLocked(src);
+    }
+
+    /// Under `watch_mu`. A registered source keeps its entry in `watched`,
+    /// reserved when it registered, whatever its interest, so a report
+    /// never allocates. One no longer registered is reported once with 0
+    /// and forgotten: a service still running when it was unregistered
+    /// cannot watch it again.
+    fn reportWatchLocked(self: *PollBackend, src: *Source) void {
+        const ext = self.external orelse return;
+        var events: u32 = 0;
+        self.mu.lock();
+        const registered = std.mem.indexOfScalar(*Source, self.sources.items, src) != null;
+        if (registered) {
+            const ev = waitEvents(src);
+            if (ev & sock.POLL.IN != 0) events |= watch_read;
+            if (ev & sock.POLL.OUT != 0) events |= watch_write;
+        }
+        self.mu.unlock();
+        const entry = self.watched.getEntry(src.handle) orelse {
+            // Unregistered and already reported.
+            if (!registered) return;
+            // Registered before the loop attached: `attachExternal`
+            // reserved its place.
+            self.watched.putAssumeCapacity(src.handle, events);
+            if (events != 0) ext.watch.?(ext.ctx, src.handle, events);
+            return;
+        };
+        const prev = entry.value_ptr.*;
+        if (registered) entry.value_ptr.* = events else self.watched.removeByPtr(entry.key_ptr);
+        if (prev != events) ext.watch.?(ext.ctx, src.handle, events);
+    }
+
+    /// Whether a resumed source waits to be serviced as if it had input: it
+    /// may hold input already read, with nothing left on its socket.
+    pub fn hasKicked(self: *PollBackend) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.sources.items) |src| if (src.kicked.load(.seq_cst)) return true;
+        return false;
     }
 
     pub fn backend(self: *PollBackend) ProgressBackend {
@@ -202,6 +319,9 @@ pub const PollBackend = struct {
         _ = self.seq.fetchAdd(1, .seq_cst);
         self.io.futexWake(u32, &self.seq.raw, n);
         if (self.polling.load(.seq_cst)) self.signal();
+        if (self.external) |ext| {
+            if (self.external_armed.swap(false, .seq_cst)) ext.wake.?(ext.ctx);
+        }
     }
 
     fn signal(self: *PollBackend) void {
@@ -241,8 +361,10 @@ pub const PollBackend = struct {
                     hook(self);
                 }
             }
+            // Relative: an application loop's clock (`External.now_ns`) is
+            // not the one the futex waits on.
             const timeout: std.Io.Timeout = if (deadline_ns) |d|
-                .{ .deadline = .{ .raw = .{ .nanoseconds = d }, .clock = .awake } }
+                .{ .duration = .{ .raw = .{ .nanoseconds = @max(d - vtNow(self), 0) }, .clock = .awake } }
             else
                 .none;
             // Cancelation only ends the wait early, which callers already allow.
@@ -307,7 +429,20 @@ pub const PollBackend = struct {
 
     fn vtRegister(ctx: *anyopaque, source: *Source) error{OutOfMemory}!void {
         const self = of(ctx);
-        {
+        // An attached loop's place for the socket, reserved first: once the
+        // source is registered, reporting it cannot fail.
+        if (self.external != null) {
+            self.watch_mu.lock();
+            defer self.watch_mu.unlock();
+            try self.watched.ensureUnusedCapacity(self.alloc, 1);
+            {
+                self.mu.lock();
+                defer self.mu.unlock();
+                try self.sources.append(self.alloc, source);
+                self.version += 1;
+            }
+            self.reportWatchLocked(source);
+        } else {
             self.mu.lock();
             defer self.mu.unlock();
             try self.sources.append(self.alloc, source);
@@ -327,19 +462,23 @@ pub const PollBackend = struct {
             source.output_armed = true;
             self.version += 1;
         }
+        self.reportWatch(source);
         // A poller already waiting starts waiting for the output.
         if (self.polling.load(.seq_cst)) self.signal();
     }
 
     fn vtPauseInput(ctx: *anyopaque, source: *Source) void {
         const self = of(ctx);
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (source.input_paused) return;
-        source.input_paused = true;
-        self.version += 1;
-        // A poller still waiting on it finds it ready at most once more,
-        // and its service holds the input.
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (source.input_paused) return;
+            source.input_paused = true;
+            self.version += 1;
+            // A poller still waiting on it finds it ready at most once more,
+            // and its service holds the input.
+        }
+        self.reportWatch(source);
     }
 
     fn vtResumeInput(ctx: *anyopaque, source: *Source) void {
@@ -353,17 +492,21 @@ pub const PollBackend = struct {
                 self.version += 1;
             }
         }
+        self.reportWatch(source);
         // Whoever waits services next, whether or not the socket has input.
         self.wakeN(1);
     }
 
     /// Under `service_mu`: whether `s` was armed, disarming it.
     fn disarmOutput(self: *PollBackend, s: *Source) bool {
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (!s.output_armed) return false;
-        s.output_armed = false;
-        self.version += 1;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (!s.output_armed) return false;
+            s.output_armed = false;
+            self.version += 1;
+        }
+        self.reportWatch(s);
         return true;
     }
 
@@ -380,6 +523,9 @@ pub const PollBackend = struct {
                 }
             }
         }
+        // Before its owner closes it, so the loop never waits on a reused
+        // descriptor.
+        self.reportWatch(source);
         if (self.polling.load(.seq_cst)) self.signal();
         if (servicing == self) {
             // This thread runs the service: once out of its list, `source`
@@ -486,7 +632,9 @@ pub const PollBackend = struct {
     // ── Clock ────────────────────────────────────────────────────────────────
 
     fn vtNow(ctx: *anyopaque) i64 {
-        return @intCast(std.Io.Clock.awake.now(of(ctx).io).nanoseconds);
+        const self = of(ctx);
+        if (self.external) |ext| if (ext.now_ns) |now| return now(ext.ctx);
+        return @intCast(std.Io.Clock.awake.now(self.io).nanoseconds);
     }
 
     fn vtSleep(ctx: *anyopaque, duration_ns: i64) void {

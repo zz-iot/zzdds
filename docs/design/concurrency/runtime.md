@@ -376,7 +376,10 @@ drive calls cannot bypass its retirement budget/affinity contract. Internal help
 continues under its existing restrictions. The adapter's wake hook only signals;
 it must not call drive or invoke DDS listeners synchronously.
 
-There is no live executor replacement in v1. Successful explicit detach requires
+There is no live executor replacement in v1, and no detach: the loop stays attached
+until the runtime stops, and its release hook then runs
+([platform ABI](#external-loop-platform-abi)). A detach added later must meet the
+rest of this paragraph. Successful explicit detach requires
 backend stop, no active service/notification invocation, and quiesced wake registration.
 Detach first prevents new hook claims and then completes their drain; it cannot report
 success while foreign hook state remains in use. A call that would wait for its own
@@ -530,6 +533,52 @@ and foreign-resource lifetime in the bootstrap contract.
 This is the accepted external-loop ownership obligation, not a mandatory shutdown
 call for ordinary DDS applications. A platform integration unable to honor it must
 use the simple driver's teardown contract or a hosted backend instead.
+
+<a id="external-loop-platform-abi"></a>
+### External-loop platform ABI
+
+Decided 2026-11-26 and implemented for the readiness backend. The bridge is the C ABI
+in `zzdds_c.h`, with the same `extern struct` in Zig
+(`dcps.execution_runtime.ExternalLoop`); it is not in the portable IDL, since it names
+platform sockets. C++ uses it directly; Java has no external loop in v1.
+
+* **Attachment.** `zzdds_ExecutionRuntime_attach_external_loop(runtime, &loop)` hands a
+  manual ExecutionRuntime with no other owner yet (no participant, no selecting factory)
+  and no armed timer to the loop, which is copied. It fails PRECONDITION_NOT_MET for a
+  hosted runtime, one in use or already attached, or while a drive runs; BAD_PARAMETER
+  without the required hooks; UNSUPPORTED without a socket backend. From then on `drive`
+  fails PRECONDITION_NOT_MET.
+* **Wake.** A `wake(ctx)` hook, callable from any thread, that only signals (an eventfd,
+  `uv_async_send`, `g_main_context_wakeup`, an RTOS task notification). It is called at
+  most once per `prepare_wait`: the first wake after each one calls it, so a wake is
+  never lost and coalesces.
+* **Sockets.** A `watch(ctx, socket, events)` hook starts, changes or (events 0) stops
+  waiting on a socket for `ZZDDS_WATCH_READ`/`ZZDDS_WATCH_WRITE`, as libcurl's
+  multi-socket API and D-Bus watches do. zzdds calls it on the thread that changed the
+  socket (the loop's own thread inside `service`, or an application thread in a DDS
+  call), one call at a time, and with 0 before the socket closes, so the loop never
+  waits on a reused descriptor. The socket type is `int`, or `SOCKET` on Windows.
+* **Service and wait.** `zzdds_ExecutionRuntime_service(runtime, max_turns, &result)`
+  runs due timers, ready sockets (zzdds polls its own, without waiting) and up to
+  `max_turns` turns, and never waits. `zzdds_ExecutionRuntime_prepare_wait(runtime,
+  &wait)` arms the wake, then reports immediate work, the earliest timer deadline and
+  the runtime state; the loop then waits on its own sources, the watched sockets, the
+  wake and the deadline.
+* **Clock.** Deadlines are absolute nanoseconds on the runtime's scheduling clock, which
+  `zzdds_ExecutionRuntime_now` reads. By default it is the platform monotonic clock; a
+  loop may supply its own `now_ns` (an RTOS tick count extended to 64 bits, a virtual
+  clock) and calls `zzdds_ExecutionRuntime_clock_changed` when it jumps, which wakes a
+  prepared loop to recompute. A supplied clock must advance with real time for blocking
+  DDS calls, which still wait inside zzdds.
+* **No detach.** The loop stays attached for the runtime's life. Its optional
+  `release(ctx)` hook runs once the runtime has stopped, before it is freed: the last
+  call zzdds makes to the loop. The last owner's release finishes the runtime as for
+  any ExecutionRuntime (draining it inside zzdds), so the loop owes no further service
+  once that release returns.
+* **No layout versioning before 1.0**, as for listener structs: the descriptor carries
+  no size or version field, and adapters are rebuilt with zzdds. The versioned
+  descriptor that [bootstrap validation](#bootstrap-validation-and-publication)
+  describes applies from 1.0.
 
 <a id="result-distinctions-and-validation"></a>
 ### Result distinctions and validation
