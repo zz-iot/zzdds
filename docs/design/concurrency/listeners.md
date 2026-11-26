@@ -299,7 +299,9 @@ was not called. The core marks the innermost listener call on that thread, per n
 depth, so a nested call's failure is its own and never its caller's. When the call ends,
 the core logs the failure, at most once per interval process-wide with a count of the
 rest, and an explicit `notify_datareaders` whose child failed stops its batch there and
-returns ERROR. No exception object crosses the ABI. An application-settable failure
+returns ERROR. No exception object crosses the ABI. zzdds generates its C++ and Java
+bindings with zidl's `--listener-failure-report zzdds_listener_invocation_failed`, which
+emits these calls in the bridges. An application-settable failure
 handler, replacing the default log, is a later `zzdds.idl` extension.
 
 Cleanup has one structured epilogue on every recoverable path: retire the active

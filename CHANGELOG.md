@@ -10,6 +10,10 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-26
 
+- The generated C++ and Java bindings now report a listener that throws, or whose
+  arguments cannot be built, through `zzdds_listener_invocation_failed` (zidl's
+  `--listener-failure-report`). Such a failure is logged, rate-limited, and makes
+  `Subscriber::notify_datareaders` return ERROR. The C++ listener test and the Java smoke test check it.
 - zidl is pinned to `v0.3.44-zig.0.17.1`, whose `--generate-views` gives the C, C++ and
   Zig typed readers `take_view`: a sample taken on loan and decoded in place, its strings
   and primitive sequences pointing into the loaned payload until the view is returned.
