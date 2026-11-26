@@ -152,7 +152,7 @@ test "a factory's release lets go of its selected runtime" {
 test "runtime config, drive and selection reject invalid arguments" {
     if (!supported) return error.SkipZigTest;
     try testing.expectError(error.BadParameter, ZZDDS.ExecutionRuntime.create(testing.allocator, config(.RUNTIME_MODE_HOSTED, 0)));
-    try testing.expectError(error.BadParameter, ZZDDS.ExecutionRuntime.create(testing.allocator, config(@enumFromInt(9), 1)));
+    try testing.expectError(error.BadParameter, ZZDDS.ExecutionRuntime.create(testing.allocator, config(@fromBackingInt(@intCast(9)), 1)));
     // BUILD_DEFAULT is hosted here.
     const hosted = try ZZDDS.ExecutionRuntime.create(testing.allocator, config(.RUNTIME_MODE_BUILD_DEFAULT, 1));
     try testing.expectEqual(ZZDDS.RuntimeMode.RUNTIME_MODE_HOSTED, hosted.get_mode());
