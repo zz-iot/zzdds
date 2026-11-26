@@ -1,0 +1,9 @@
+// Read view types (zidl --generate-views) over a live reader: a sample taken
+// on loan decodes in place, its string and primitive sequences pointing into
+// the loaned payload. Used by the C, C++ and Zig view smoke tests.
+@appendable struct ViewSmokeFrame {
+    @key unsigned long id;
+    string label;
+    sequence<octet> payload;
+    sequence<double> samples;
+};

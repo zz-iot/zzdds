@@ -543,7 +543,12 @@ pub fn build(b: *std.Build) void {
     // ── C language binding ────────────────────────────────────────────────────
 
     const binding_smoke_step = b.step("test-bindings", "Compile and run Zig/C/C++ binding smoke tests");
+    // Each test binary that opens real sockets gets its own domain (see
+    // addTestRun and test/support/domain.zig): the view smoke tests below,
+    // then the runtime and DCPS tests.
+    var dcps_test_domain: u32 = 1;
     const smoke_idl = b.path("test/bindings/smoke/binding_smoke.idl");
+    const view_smoke_idl = b.path("test/bindings/smoke/view_smoke.idl");
 
     const dds_adapter_mod = b.createModule(.{
         .root_source_file = b.path("test/bindings/smoke/zig_dds_adapter.zig"),
@@ -913,6 +918,37 @@ pub fn build(b: *std.Build) void {
         const c_alloc_smoke = b.addExecutable(.{ .name = "zzdds_c_allocator_smoke", .root_module = c_alloc_smoke_mod });
         binding_smoke_step.dependOn(&b.addRunArtifact(c_alloc_smoke).step);
 
+        // Read view types over a live reader: a sample written and taken with
+        // the generated take_view in one participant, its view pointing into
+        // the loan until return_view.
+        const gen_view_c = b.addRunArtifact(zidl_exe);
+        gen_view_c.addArgs(&.{ "-b", "c", "--generate-zzdds-wrappers", "--generate-views", "-o" });
+        const gen_view_c_dir = gen_view_c.addOutputDirectoryArg("zzdds-view-smoke-c");
+        gen_view_c.addFileArg(view_smoke_idl);
+        const c_view_smoke_mod = b.createModule(.{
+            .root_source_file = null,
+            .target = target,
+            .optimize = .Debug,
+            .link_libc = true,
+        });
+        c_view_smoke_mod.addCSourceFiles(.{
+            .files = &.{"test/bindings/smoke/c_view_smoke.c"},
+            .flags = &.{ "-std=c99", "-Wall" },
+        });
+        c_view_smoke_mod.addCSourceFile(.{
+            .file = gen_view_c_dir.path(b, "view_smoke_cdr.c"),
+            .flags = &.{ "-std=c99", "-Wall" },
+        });
+        c_view_smoke_mod.sanitize_thread = sanitize_thread;
+        c_view_smoke_mod.addIncludePath(gen_view_c_dir);
+        c_view_smoke_mod.addIncludePath(gen_c_dir);
+        c_view_smoke_mod.addIncludePath(gen_zzdds_c_dir);
+        c_view_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+        c_view_smoke_mod.addIncludePath(b.path("include"));
+        c_view_smoke_mod.linkLibrary(zzdds_lib);
+        const c_view_smoke = b.addExecutable(.{ .name = "zzdds_c_view_smoke", .root_module = c_view_smoke_mod });
+        binding_smoke_step.dependOn(&addTestRun(b, c_view_smoke, &dcps_test_domain).step);
+
         if (cpp_binding) {
             const gen_smoke_cpp = b.addRunArtifact(zidl_exe);
             gen_smoke_cpp.addArgs(&.{ "-b", "cpp", "--generate-zzdds-wrappers", "-o" });
@@ -1028,6 +1064,32 @@ pub fn build(b: *std.Build) void {
             cpp_smoke_mod.linkLibrary(zzdds_lib);
             const cpp_smoke = b.addExecutable(.{ .name = "zzdds_cpp_binding_smoke", .root_module = cpp_smoke_mod });
             binding_smoke_step.dependOn(&b.addRunArtifact(cpp_smoke).step);
+
+            // Read view types over a live reader, as c_view_smoke does: the
+            // generated take_view into a ViewLoan. Built like the binding smoke
+            // test above, from the same merged DCPS sources.
+            const gen_view_cpp = b.addRunArtifact(zidl_exe);
+            gen_view_cpp.addArgs(&.{ "-b", "cpp", "--generate-zzdds-wrappers", "--generate-views", "-o" });
+            const gen_view_cpp_dir = gen_view_cpp.addOutputDirectoryArg("zzdds-view-smoke-cpp");
+            gen_view_cpp.addFileArg(view_smoke_idl);
+            const cpp_view_smoke_mod = b.createModule(.{
+                .root_source_file = null,
+                .target = target,
+                .optimize = .Debug,
+                .link_libc = true,
+                .link_libcpp = true,
+            });
+            for ([_]std.Build.LazyPath{ b.path("test/bindings/smoke/cpp_view_smoke.cpp"), gen_view_cpp_dir.path(b, "view_smoke_cdr.cpp"), alloc_smoke_dcps_impl_cpp, alloc_smoke_zzdds_impl_cpp }) |file| {
+                cpp_view_smoke_mod.addCSourceFile(.{ .file = file, .flags = &.{ "-std=c++17", "-Wall" } });
+            }
+            cpp_view_smoke_mod.sanitize_thread = sanitize_thread;
+            cpp_view_smoke_mod.addIncludePath(gen_view_cpp_dir);
+            cpp_view_smoke_mod.addIncludePath(alloc_smoke_merged.getDirectory());
+            cpp_view_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+            cpp_view_smoke_mod.addIncludePath(b.path("include"));
+            cpp_view_smoke_mod.linkLibrary(zzdds_lib);
+            const cpp_view_smoke = b.addExecutable(.{ .name = "zzdds_cpp_view_smoke", .root_module = cpp_view_smoke_mod });
+            binding_smoke_step.dependOn(&addTestRun(b, cpp_view_smoke, &dcps_test_domain).step);
 
             // The tests below build the generated bindings and zzdds_cpp.hpp
             // twice: as usual, and with -fno-rtti -fno-exceptions, which they
@@ -1803,9 +1865,6 @@ pub fn build(b: *std.Build) void {
         "test/runtime/readiness_test.zig",
         "test/runtime/rtps_discovery_test.zig",
     };
-    // Shared with the DCPS tests below: the readiness and discovery tests
-    // open real sockets, so each binary needs its own domain.
-    var dcps_test_domain: u32 = 1;
     for (runtime_dcps_test_files) |src| {
         const t = b.addTest(.{
             .name = std.fs.path.stem(src),
@@ -1955,6 +2014,42 @@ pub fn build(b: *std.Build) void {
         emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests" } },
         }).step);
+    }
+
+    {
+        // Read view types over a live reader, in Zig: the generated take_view
+        // against the real stack (as c_view_smoke and cpp_view_smoke do).
+        const step = b.step("test-zig-view-take", "Check the generated Zig take_view over a live reader");
+        const gen = b.addRunArtifact(zidl_exe);
+        gen.addArgs(&.{ "-b", "zig", "--generate-zzdds-wrappers", "--generate-views", "-o" });
+        const dir = gen.addOutputDirectoryArg("zig-view-smoke");
+        gen.addFileArg(b.path("test/bindings/smoke/view_smoke.idl"));
+        const view_smoke_mod = b.createModule(.{
+            .root_source_file = dir.path(b, "view_smoke.zig"),
+            .target = target,
+            .imports = &.{
+                .{ .name = "zzdds", .module = zzdds_mod },
+                .{ .name = "zidl_cdr", .module = runtime.codec },
+                .{ .name = "zidl_bindings", .module = runtime.bindings },
+            },
+        });
+        const t = b.addTest(.{
+            .name = "view_take_test",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/dcps/view_take_test.zig"),
+                .target = target,
+                .link_libc = true,
+                .imports = &.{
+                    .{ .name = "zzdds", .module = zzdds_mod },
+                    .{ .name = "zzdds_generated", .module = generated_dcps_mod },
+                    .{ .name = "test_domain", .module = test_domain_mod },
+                    .{ .name = "view_smoke", .module = view_smoke_mod },
+                },
+            }),
+        });
+        const run = addTestRun(b, t, &dcps_test_domain);
+        step.dependOn(&run.step);
+        test_step.dependOn(&run.step);
     }
 
     {

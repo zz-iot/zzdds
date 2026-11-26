@@ -8,6 +8,14 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-26
+
+- zidl is pinned to `v0.3.44-zig.0.17.1`, whose `--generate-views` gives the C, C++ and
+  Zig typed readers `take_view`: a sample taken on loan and decoded in place, its strings
+  and primitive sequences pointing into the loaned payload until the view is returned.
+  The view smoke tests (`c_view_smoke`, `cpp_view_smoke` and `view_take_test`) check it
+  over a live reader. Part B of `docs/design/shmem-zero-copy.md`, phase 1.
+
 ## 2026-11-25
 
 - `set_listener` returns OUT_OF_RESOURCES, keeping the listener it would have replaced,
