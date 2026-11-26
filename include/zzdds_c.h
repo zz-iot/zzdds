@@ -394,6 +394,89 @@ bool zzdds_cft_match_sample(
     zzdds_field_get_fn get
 );
 
+/* ── External event loop ─────────────────────────────────────────────────
+ *
+ * A manual zzdds_ExecutionRuntime can be driven from an application's own
+ * event loop (epoll, kqueue, glib, libuv, asio, an RTOS scheduler) instead of
+ * zzdds_ExecutionRuntime_drive. The loop waits on the sockets zzdds reports
+ * through `watch`, on its own wake (signalled by `wake`) and until the
+ * deadline zzdds_ExecutionRuntime_prepare_wait reports, then calls
+ * zzdds_ExecutionRuntime_service:
+ *
+ *     for (;;) {
+ *         zzdds_ExternalWait w;
+ *         zzdds_ExecutionRuntime_prepare_wait(rt, &w);
+ *         if (w.state == zzdds_RuntimeState_RUNTIME_STATE_STOPPED) break;
+ *         if (!w.immediate_work)
+ *             wait for a watched socket, the wake, or w.deadline_ns
+ *             (absolute, on zzdds_ExecutionRuntime_now's clock);
+ *         zzdds_ExecutionRuntime_service(rt, 64, &result);
+ *     }
+ *
+ * A wake arriving after prepare_wait is never lost: the next one after each
+ * prepare_wait calls `wake` once. No hook may call into zzdds.
+ * See docs/design/concurrency/runtime.md#external-loop-adapter. */
+
+#ifdef _WIN32
+typedef uintptr_t zzdds_socket_t;  /* SOCKET */
+#else
+typedef int zzdds_socket_t;
+#endif
+
+/** zzdds_ExternalLoop.watch's interest bits; 0 stops watching. */
+#define ZZDDS_WATCH_READ  1u
+#define ZZDDS_WATCH_WRITE 2u
+
+typedef struct zzdds_ExternalLoop {
+    void *ctx;
+    /** Required. Ends the loop's current or next wait. Called from any thread;
+     *  it only signals (eventfd, uv_async_send, g_main_context_wakeup, an RTOS
+     *  task notification). */
+    void (*wake)(void *ctx);
+    /** Required. Starts, changes or (events 0) stops waiting on `socket` for
+     *  ZZDDS_WATCH_READ / ZZDDS_WATCH_WRITE. Called from the thread that
+     *  changed the socket, one call at a time, and with 0 before the socket
+     *  closes. */
+    void (*watch)(void *ctx, zzdds_socket_t socket, uint32_t events);
+    /** Optional. The runtime's scheduling clock in monotonic nanoseconds
+     *  (an RTOS tick count extended to 64 bits, a simulation's virtual clock).
+     *  NULL keeps zzdds's own. Call zzdds_ExecutionRuntime_clock_changed when
+     *  it jumps. */
+    int64_t (*now_ns)(void *ctx);
+    /** Optional. Called once the runtime has stopped, before it is freed:
+     *  the last call zzdds makes to this loop. */
+    void (*release)(void *ctx);
+} zzdds_ExternalLoop;
+
+typedef struct zzdds_ExternalWait {
+    /** Call zzdds_ExecutionRuntime_service again before waiting. */
+    bool immediate_work;
+    bool has_deadline;
+    /** The earliest timer, absolute, on zzdds_ExecutionRuntime_now's clock. */
+    int64_t deadline_ns;
+    zzdds_RuntimeState state;
+} zzdds_ExternalWait;
+
+/** Hands a manual runtime with no participants yet (and before any factory
+ *  selects it) to `loop`, which is copied. From then on the loop calls
+ *  zzdds_ExecutionRuntime_service, and drive returns PRECONDITION_NOT_MET.
+ *  There is no detach: `loop->release` runs once the runtime has stopped.
+ *  BAD_PARAMETER without `wake` or `watch`; PRECONDITION_NOT_MET for a hosted
+ *  runtime, one in use or already attached; UNSUPPORTED where the platform
+ *  has no socket backend. */
+DDS_ReturnCode_t zzdds_ExecutionRuntime_attach_external_loop(zzdds_ExecutionRuntime runtime, const zzdds_ExternalLoop *loop);
+/** Bounded and nonblocking: due timers, ready sockets, then up to max_turns
+ *  turns. PRECONDITION_NOT_MET unless attached, or while another service
+ *  runs; BAD_PARAMETER for zero turns. */
+DDS_ReturnCode_t zzdds_ExecutionRuntime_service(zzdds_ExecutionRuntime runtime, uint32_t max_turns, zzdds_DriveResult *result);
+/** Arms the loop's wake, then reports what to wait for. */
+DDS_ReturnCode_t zzdds_ExecutionRuntime_prepare_wait(zzdds_ExecutionRuntime runtime, zzdds_ExternalWait *wait);
+/** The runtime's scheduling clock, in nanoseconds: what deadlines are on. */
+int64_t zzdds_ExecutionRuntime_now(zzdds_ExecutionRuntime runtime);
+/** The loop's `now_ns` clock jumped or advanced: a waiting loop wakes to
+ *  recompute its deadline. */
+void zzdds_ExecutionRuntime_clock_changed(zzdds_ExecutionRuntime runtime);
+
 #ifdef __cplusplus
 }
 #endif

@@ -328,3 +328,224 @@ test "a runtime whose last owner goes in a turn's completion hook is finished by
     ctx.deinit();
     runtime.default_registry.global.reap(false);
 }
+
+// ── External loop ────────────────────────────────────────────────────────────
+
+const er = zzdds.dcps.execution_runtime;
+const sock = zzdds.util.sock;
+const socket_t = std.posix.socket_t;
+
+/// A test event loop: what zzdds asked it to watch, how often it was woken,
+/// and whether it was released. Single-threaded, like most loops.
+const TestLoop = struct {
+    watched: std.AutoHashMapUnmanaged(socket_t, u32) = .empty,
+    wakes: std.atomic.Value(u32) = .init(0),
+    released: u32 = 0,
+    clock_ns: ?i64 = null,
+    fds: std.ArrayListUnmanaged(sock.PollFd) = .empty,
+
+    fn adapter(self: *TestLoop) er.ExternalLoop {
+        return .{ .ctx = self, .wake = wake, .watch = watch, .now_ns = if (self.clock_ns != null) now else null, .release = release };
+    }
+    fn of(ctx: ?*anyopaque) *TestLoop {
+        return @ptrCast(@alignCast(ctx.?));
+    }
+    fn wake(ctx: ?*anyopaque) callconv(.c) void {
+        _ = of(ctx).wakes.fetchAdd(1, .seq_cst);
+    }
+    fn watch(ctx: ?*anyopaque, handle: socket_t, events: u32) callconv(.c) void {
+        const self = of(ctx);
+        if (events == 0) {
+            std.debug.assert(self.watched.remove(handle));
+        } else {
+            self.watched.put(testing.allocator, handle, events) catch @panic("OOM");
+        }
+    }
+    fn now(ctx: ?*anyopaque) callconv(.c) i64 {
+        return of(ctx).clock_ns.?;
+    }
+    fn release(ctx: ?*anyopaque) callconv(.c) void {
+        of(ctx).released += 1;
+    }
+
+    /// One round: prepare, wait on the watched sockets (bounded by the
+    /// deadline and `max_ms`), service.
+    fn round(self: *TestLoop, impl: *ExecutionRuntimeImpl, max_ms: i32) !void {
+        var w: er.ExternalWait = .{};
+        try testing.expectEqual(DDS.RETCODE_OK, impl.prepareWait(&w));
+        if (!w.immediate_work) {
+            var timeout = max_ms;
+            if (w.has_deadline) {
+                const left = w.deadline_ns - impl.now();
+                timeout = @intCast(std.math.clamp(@divFloor(left + std.time.ns_per_ms - 1, std.time.ns_per_ms), 0, max_ms));
+            }
+            self.fds.clearRetainingCapacity();
+            var it = self.watched.iterator();
+            while (it.next()) |e| {
+                var events: i16 = 0;
+                if (e.value_ptr.* & er.ExternalLoop.watch_read_bit != 0) events |= sock.POLL.IN;
+                if (e.value_ptr.* & er.ExternalLoop.watch_write_bit != 0) events |= sock.POLL.OUT;
+                try self.fds.append(testing.allocator, .{ .fd = sock.pollHandle(e.key_ptr.*), .events = events, .revents = 0 });
+            }
+            if (self.fds.items.len > 0) _ = sock.poll(self.fds.items, timeout);
+        }
+        var result: ZZDDS.DriveResult = .{};
+        try testing.expectEqual(DDS.RETCODE_OK, impl.service(64, &result));
+    }
+
+    fn deinit(self: *TestLoop) void {
+        self.watched.deinit(testing.allocator);
+        self.fds.deinit(testing.allocator);
+    }
+};
+
+test "an external loop drives a manual runtime's participants through the sockets it is told to watch" {
+    if (!supported) return error.SkipZigTest;
+    const rt = try ZZDDS.ExecutionRuntime.create(testing.allocator, config(.RUNTIME_MODE_MANUAL, 0));
+    const impl = ExecutionRuntimeImpl.of(rt).?;
+    var loop: TestLoop = .{};
+    defer loop.deinit();
+    try testing.expectEqual(DDS.RETCODE_OK, impl.attachExternalLoop(loop.adapter()));
+    // The loop drives it now.
+    var result: ZZDDS.DriveResult = .{};
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, rt.drive(1, no_wait, &result));
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, impl.attachExternalLoop(loop.adapter()));
+
+    const factory = try extensions.createFactory(null);
+    defer factory.vtable.deinit(factory.ptr);
+    try testing.expectEqual(DDS.RETCODE_OK, factory.set_default_runtime(rt));
+    var pair = try Pair.init(factory);
+    try testing.expect(loop.watched.count() > 0);
+    const deadline = monotonicNs() + 20 * std.time.ns_per_s;
+    while (!pair.matched()) {
+        try loop.round(impl, 20);
+        if (monotonicNs() > deadline) return error.Timeout;
+    }
+    try testing.expectEqual(DDS.RETCODE_OK, factory.set_default_runtime(er.nil_execution_runtime));
+    pair.deinit();
+    // Every socket was unwatched before it closed.
+    try testing.expectEqual(@as(u32, 0), loop.watched.count());
+    try testing.expectEqual(@as(u32, 0), loop.released);
+    rt.release();
+    try testing.expectEqual(@as(u32, 1), loop.released);
+}
+
+test "an external loop is woken once per wait, and only after it prepares" {
+    if (!supported) return error.SkipZigTest;
+    const rt = try ZZDDS.ExecutionRuntime.create(testing.allocator, config(.RUNTIME_MODE_MANUAL, 0));
+    const impl = ExecutionRuntimeImpl.of(rt).?;
+    var loop: TestLoop = .{};
+    defer loop.deinit();
+    try testing.expectEqual(DDS.RETCODE_OK, impl.attachExternalLoop(loop.adapter()));
+    const Noop = struct {
+        fn run(_: *runtime.Request, _: *runtime.Turn) runtime.Outcome {
+            return .done;
+        }
+    };
+    var ctx = runtime.Context.init(impl.runtime(), 8);
+    var reqs: [3]runtime.Request = .{ runtime.Request.init(Noop.run), runtime.Request.init(Noop.run), runtime.Request.init(Noop.run) };
+    // Not waiting: work arriving now is found by the next prepare.
+    try impl.runtime().submit(null, &ctx, &reqs[0]);
+    try testing.expectEqual(@as(u32, 0), loop.wakes.load(.seq_cst));
+    var w: er.ExternalWait = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, impl.prepareWait(&w));
+    try testing.expect(w.immediate_work);
+    var result: ZZDDS.DriveResult = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, impl.service(64, &result));
+    try testing.expectEqual(@as(u32, 1), result.turns);
+    // Prepared and idle: the next work wakes it, once.
+    try testing.expectEqual(DDS.RETCODE_OK, impl.prepareWait(&w));
+    try testing.expect(!w.immediate_work and !w.has_deadline);
+    try impl.runtime().submit(null, &ctx, &reqs[1]);
+    try impl.runtime().submit(null, &ctx, &reqs[2]);
+    try testing.expectEqual(@as(u32, 1), loop.wakes.load(.seq_cst));
+    try testing.expectEqual(DDS.RETCODE_OK, impl.service(64, &result));
+    try testing.expectEqual(@as(u32, 2), result.turns);
+    ctx.deinit();
+    rt.release();
+    try testing.expectEqual(@as(u32, 1), loop.released);
+}
+
+test "an external loop's clock is the runtime's, and its timers' deadlines are on it" {
+    if (!supported) return error.SkipZigTest;
+    const rt = try ZZDDS.ExecutionRuntime.create(testing.allocator, config(.RUNTIME_MODE_MANUAL, 0));
+    const impl = ExecutionRuntimeImpl.of(rt).?;
+    var loop: TestLoop = .{ .clock_ns = 1_000 };
+    defer loop.deinit();
+    try testing.expectEqual(DDS.RETCODE_OK, impl.attachExternalLoop(loop.adapter()));
+    try testing.expectEqual(@as(i64, 1_000), impl.now());
+
+    const Fired = struct {
+        var count: u32 = 0;
+        fn fire(_: *runtime.Timer, _: *runtime.Turn) void {
+            count += 1;
+        }
+    };
+    var ctx = runtime.Context.init(impl.runtime(), 8);
+    var timer = runtime.Timer.init(&ctx, Fired.fire);
+    try testing.expect(impl.runtime().armTimer(&timer, 5_000));
+    var w: er.ExternalWait = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, impl.prepareWait(&w));
+    try testing.expect(w.has_deadline and !w.immediate_work);
+    try testing.expectEqual(@as(i64, 5_000), w.deadline_ns);
+    // The clock jumps past it: a prepared loop is woken to look again.
+    loop.clock_ns = 6_000;
+    impl.clockChanged();
+    try testing.expectEqual(@as(u32, 1), loop.wakes.load(.seq_cst));
+    try testing.expectEqual(DDS.RETCODE_OK, impl.prepareWait(&w));
+    try testing.expect(w.immediate_work);
+    var result: ZZDDS.DriveResult = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, impl.service(64, &result));
+    try testing.expectEqual(@as(u32, 1), Fired.count);
+    ctx.deinit();
+    rt.release();
+}
+
+test "attaching an external loop checks the runtime and the loop" {
+    if (!supported) return error.SkipZigTest;
+    var loop: TestLoop = .{};
+    defer loop.deinit();
+    // Hosted runtimes have workers of their own.
+    const hosted = try ZZDDS.ExecutionRuntime.create(testing.allocator, config(.RUNTIME_MODE_HOSTED, 1));
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, ExecutionRuntimeImpl.of(hosted).?.attachExternalLoop(loop.adapter()));
+    try testing.expectEqual(DDS.RETCODE_OK, hosted.destroy());
+
+    const rt = try ZZDDS.ExecutionRuntime.create(testing.allocator, config(.RUNTIME_MODE_MANUAL, 0));
+    const impl = ExecutionRuntimeImpl.of(rt).?;
+    var no_wake = loop.adapter();
+    no_wake.wake = null;
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, impl.attachExternalLoop(no_wake));
+    // Not attached yet.
+    var result: ZZDDS.DriveResult = .{};
+    var w: er.ExternalWait = .{};
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, impl.service(1, &result));
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, impl.prepareWait(&w));
+    // A factory already relies on it.
+    const factory = try extensions.createFactory(null);
+    defer factory.vtable.deinit(factory.ptr);
+    try testing.expectEqual(DDS.RETCODE_OK, factory.set_default_runtime(rt));
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, impl.attachExternalLoop(loop.adapter()));
+    try testing.expectEqual(DDS.RETCODE_OK, factory.set_default_runtime(er.nil_execution_runtime));
+    try testing.expectEqual(DDS.RETCODE_OK, impl.attachExternalLoop(loop.adapter()));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, impl.service(0, &result));
+    try testing.expectEqual(DDS.RETCODE_OK, rt.destroy());
+    try testing.expectEqual(@as(u32, 1), loop.released);
+    try testing.expect(ExecutionRuntimeImpl.of(er.nil_execution_runtime) == null);
+}
+
+test "an external loop that cannot be attached for want of memory leaves the runtime as it was" {
+    if (!supported) return error.SkipZigTest;
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var locked: LockedAllocator = .{ .child = failing.allocator() };
+    const rt = try ZZDDS.ExecutionRuntime.create(locked.allocator(), config(.RUNTIME_MODE_MANUAL, 0));
+    const impl = ExecutionRuntimeImpl.of(rt).?;
+    var loop: TestLoop = .{};
+    defer loop.deinit();
+    failing.fail_index = failing.alloc_index;
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, impl.attachExternalLoop(loop.adapter()));
+    var result: ZZDDS.DriveResult = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, rt.drive(1, no_wait, &result));
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(DDS.RETCODE_OK, impl.attachExternalLoop(loop.adapter()));
+    try testing.expectEqual(DDS.RETCODE_OK, rt.destroy());
+}

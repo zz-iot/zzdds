@@ -16,6 +16,21 @@ const core = @import("../runtime/core.zig");
 const owned_mod = @import("../runtime/owned.zig");
 const default_registry = @import("../runtime/default_registry.zig");
 const writer_mod = @import("writer.zig");
+const poll_backend = @import("../runtime/poll_backend.zig");
+
+/// zzdds_c.h's `zzdds_ExternalLoop`: an application event loop's hooks.
+pub const ExternalLoop = poll_backend.PollBackend.External;
+
+/// zzdds_c.h's `zzdds_ExternalWait`: what the loop waits for.
+pub const ExternalWait = extern struct {
+    /// Service again before waiting.
+    immediate_work: bool = false,
+    has_deadline: bool = false,
+    /// The earliest timer, absolute, on the runtime's clock
+    /// (`zzdds_ExecutionRuntime_now`).
+    deadline_ns: i64 = 0,
+    state: ZZDDS.RuntimeState = .RUNTIME_STATE_RUNNING,
+};
 
 pub const ExecutionRuntimeImpl = struct {
     alloc: std.mem.Allocator,
@@ -48,6 +63,78 @@ pub const ExecutionRuntimeImpl = struct {
     /// The runtime factories and participants select.
     pub fn runtime(self: *Self) *core.Runtime {
         return &self.owned.runtime;
+    }
+
+    /// The runtime behind a zzdds `ExecutionRuntime` handle; null for nil
+    /// or one zzdds did not create.
+    pub fn of(rt: ZZDDS.ExecutionRuntime) ?*Self {
+        if (rt.ptr == nil.NIL_PTR or rt.vtable != &vtable) return null;
+        return @ptrCast(@alignCast(rt.ptr));
+    }
+
+    // ── External loop (docs/design/concurrency/runtime.md#external-loop-adapter)
+
+    /// Hands a manual runtime with no participants yet to an application's
+    /// event loop. From then on the loop calls `service` and `prepareWait`
+    /// in place of `drive`, waiting on the sockets `loop.watch` reports and
+    /// for `loop.wake`. There is no detach: `loop.release` runs once the
+    /// runtime has stopped.
+    pub fn attachExternalLoop(self: *Self, loop: ExternalLoop) DDS.ReturnCode_t {
+        if (!poll_backend.supported) return DDS.RETCODE_UNSUPPORTED;
+        if (loop.wake == null or loop.watch == null) return DDS.RETCODE_BAD_PARAMETER;
+        const rt = self.runtime();
+        // Only the handle: no participant or factory relies on it yet, and
+        // no timer is armed on the clock the loop may replace.
+        if (rt.ownerCount() != 1 or rt.armedTimerCount() != 0) return DDS.RETCODE_PRECONDITION_NOT_MET;
+        const Install = struct {
+            fn run(args: struct { *poll_backend.PollBackend, ExternalLoop }) bool {
+                args[0].attachExternal(args[1]) catch return false;
+                return true;
+            }
+        };
+        rt.attachExternal(.{ &self.owned.backend, loop }, Install.run) catch |err| return switch (err) {
+            error.PreconditionNotMet => DDS.RETCODE_PRECONDITION_NOT_MET,
+            error.InstallFailed => DDS.RETCODE_OUT_OF_RESOURCES,
+        };
+        return DDS.RETCODE_OK;
+    }
+
+    /// Bounded and nonblocking: due timers, ready sockets, then up to
+    /// `max_turns` turns.
+    pub fn service(self: *Self, max_turns: u32, result: *ZZDDS.DriveResult) DDS.ReturnCode_t {
+        const r = self.runtime().serviceExternal(max_turns) catch |err| return switch (err) {
+            error.InvalidBudget => DDS.RETCODE_BAD_PARAMETER,
+            error.PreconditionNotMet => DDS.RETCODE_PRECONDITION_NOT_MET,
+        };
+        result.* = .{ .turns = r.turns, .immediate_work = r.immediate_work, .state = stateOf(r.state), .retirement_pending = r.retirement_pending };
+        return DDS.RETCODE_OK;
+    }
+
+    /// Arms the loop's wake, then reports what it waits for: work found
+    /// missing here wakes it later.
+    pub fn prepareWait(self: *Self, wait: *ExternalWait) DDS.ReturnCode_t {
+        const rt = self.runtime();
+        if (!rt.external.load(.acquire)) return DDS.RETCODE_PRECONDITION_NOT_MET;
+        if (poll_backend.supported) self.owned.backend.armExternal();
+        const ws = rt.waitState();
+        wait.* = .{
+            .immediate_work = ws.immediate_work,
+            .has_deadline = ws.deadline_ns != null,
+            .deadline_ns = ws.deadline_ns orelse 0,
+            .state = stateOf(ws.state),
+        };
+        return DDS.RETCODE_OK;
+    }
+
+    /// The runtime's scheduling clock: the loop's `now_ns` when it has one.
+    pub fn now(self: *Self) i64 {
+        return self.runtime().clock.nowNs();
+    }
+
+    /// The loop's clock jumped or advanced: a waiting loop wakes to recompute
+    /// its deadline.
+    pub fn clockChanged(self: *Self) void {
+        self.runtime().backend.wakeAll();
     }
 
     pub fn toExecutionRuntime(self: *Self) ZZDDS.ExecutionRuntime {

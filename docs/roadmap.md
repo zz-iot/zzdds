@@ -1081,11 +1081,13 @@ ingress as UDP datagrams do, and a connection whose frame does not fit stops rea
 it does. Windows runs all of this too, over Winsock: the backend polls with `WSAPoll`,
 whose wake is a loopback UDP socket connected to itself, and sockets on it are made
 nonblocking, since Winsock has no `MSG_DONTWAIT`. UDP and TCP receive only on a backend,
-and listening (or, for TCP, sending) without one fails. Now specified as the
-[ManualDriver/external-loop contract](design/concurrency/runtime.md#manual-runtime-driving-and-external-loop-integration)
-(`drive(budget, max_wait)` plus prepare-to-wait integration) and the cooperative
-measurement profile in the concurrency architecture; implementation follows the
-concurrency task above.
+and listening (or, for TCP, sending) without one fails. An application's own event loop
+can drive a manual `ExecutionRuntime` in place of `drive()`, through the
+[external-loop C ABI](design/concurrency/runtime.md#external-loop-platform-abi): zzdds
+tells the loop which sockets to wait on and wakes it, and the loop calls a bounded
+`service` and waits until the deadline `prepare_wait` reports. Not yet built: an MCU
+adapter, which would wake the loop from network-driver callbacks, and a thread-affine
+ManualDriver.
 
 ### Completion-based transport adapter (io_uring)
 

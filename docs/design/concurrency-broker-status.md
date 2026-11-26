@@ -84,9 +84,10 @@ bounded independently of these wire simplifications.
 
 ## Open design items
 
-| Item | Required resolution | Boundary already fixed |
-| --- | --- | --- |
-| External-loop platform ABI | Define clock-domain conversion, wake representation and platform-specific adapter descriptor/version validation | One outer driver, atomic arm/recheck, attach before participants/I/O, no live executor replacement or premature detach in v1 |
+None. The last, the external-loop platform ABI, was decided on 2026-11-26: watch
+callbacks per socket, a wake callback, deadlines on the runtime's clock (which the loop
+may supply) and no layout versioning before 1.0
+([platform ABI](concurrency/runtime.md#external-loop-platform-abi)).
 
 Concrete queue/pool/container selection, internal cancellation batching and scheduling of
 built-in endpoints are implementation choices constrained by the contracts, not open public

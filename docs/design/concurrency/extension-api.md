@@ -244,12 +244,14 @@ needed. Generated language wrappers provide the established standalone construct
 | configure_core_default | Explicit default-selection kind and optional RuntimeRef | Result only |
 | observe_core_default | Core context | Selection state and optional RuntimeRef; no lazy creation |
 
-ExternalDriver must expose bounded nonblocking service, atomic prepare-to-wait,
-wake acknowledgment/recheck and explicit detach. Platform wait handles and clock
-representations belong in the platform adapter. The portable contract returns an
-opaque wake generation, immediate readiness, next deadline and retirement obligation;
-see [external-loop driving](runtime.md#manual-runtime-driving-and-external-loop-integration). A portable timestamp cannot be finalized before choosing
-the backend clock-domain bridge. Detach cannot abandon accepted cleanup.
+ExternalDriver must expose bounded nonblocking service, atomic prepare-to-wait and
+wake acknowledgment/recheck. Platform wait handles and clock representations belong in
+the platform adapter. The contract returns immediate readiness, next deadline and
+runtime state; see [external-loop driving](runtime.md#manual-runtime-driving-and-external-loop-integration).
+The shipped form is the C ABI the [platform ABI](runtime.md#external-loop-platform-abi)
+describes: `attach_external_loop`, `service` and `prepare_wait` on an ExecutionRuntime,
+deadlines on the runtime's clock, and no detach in v1, so nothing can abandon accepted
+cleanup.
 
 <a id="concurrency-extension-surface"></a>
 ## Concurrency extension surface
@@ -340,8 +342,10 @@ The binding surface shipped first, in zzdds.idl:
   participant created meanwhile takes its own. A RuntimeSelection struct holding a
   reference would need generated managed references.
 * **Deferred:** a per-participant runtime override in DomainParticipantConfig, participant
-  `get_runtime`, installing an explicit core default and observing it, ManualDriver, the
-  external-loop adapter, and RuntimeConfig resource limits and clock selection.
+  `get_runtime`, installing an explicit core default and observing it, ManualDriver,
+  external-loop detach, and RuntimeConfig resource limits and clock selection. The
+  external loop itself shipped as a C ABI on ExecutionRuntime
+  ([platform ABI](runtime.md#external-loop-platform-abi)).
 
 <a id="listener-group-reference-lifecycle"></a>
 ## Listener-group reference lifecycle
