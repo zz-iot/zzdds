@@ -26,6 +26,11 @@ ALLOWLIST = {
     # called from both of that pair's tests, so this is 2 new call sites for
     # 2 tests rather than 4.
     "test/dcps/loopback_test.zig": (5, "UDP loopback receive/discovery polling"),
+    # The generated Zig take_view over a live reader on the real stack (the
+    # Zig counterpart of the C and C++ view smoke tests): one poll for the
+    # same-participant reader to match before writing, one for the sample
+    # to arrive.
+    "test/dcps/view_take_test.zig": (2, "real-stack match and take_view polling"),
     # Real UDP loopback WLP tests: polling for SEDP match completion, and
     # polling get_liveliness_changed_status while the real background
     # checkTimers() thread (real wall-clock, not ManualClock -- WLP's
