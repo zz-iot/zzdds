@@ -210,7 +210,7 @@ pub const PollBackend = struct {
         };
         self.mu.unlock();
         defer self.alloc.free(sources);
-        for (sources) |src| self.reportWatchLocked(src, false);
+        for (sources) |src| self.reportWatchLocked(src);
     }
 
     /// Arms the loop's wake for its next wait: the first wake from now on
@@ -219,36 +219,51 @@ pub const PollBackend = struct {
         self.external_armed.store(true, .seq_cst);
     }
 
-    /// Reports `src`'s current interest to the loop if it changed; with
-    /// `removed`, that it is no longer watched.
-    fn reportWatch(self: *PollBackend, src: *Source, removed: bool) void {
+    /// Reports `src`'s current interest to the loop if it changed.
+    fn reportWatch(self: *PollBackend, src: *Source) void {
         if (self.external == null) return;
         self.watch_mu.lock();
         defer self.watch_mu.unlock();
-        self.reportWatchLocked(src, removed);
+        self.reportWatchLocked(src);
     }
 
-    fn reportWatchLocked(self: *PollBackend, src: *Source, removed: bool) void {
+    /// Under `watch_mu`. A registered source keeps its entry in `watched`,
+    /// reserved when it registered, whatever its interest, so a report
+    /// never allocates. One no longer registered is reported once with 0
+    /// and forgotten: a service still running when it was unregistered
+    /// cannot watch it again.
+    fn reportWatchLocked(self: *PollBackend, src: *Source) void {
         const ext = self.external orelse return;
         var events: u32 = 0;
-        if (!removed) {
-            self.mu.lock();
+        self.mu.lock();
+        const registered = std.mem.indexOfScalar(*Source, self.sources.items, src) != null;
+        if (registered) {
             const ev = waitEvents(src);
-            self.mu.unlock();
             if (ev & sock.POLL.IN != 0) events |= watch_read;
             if (ev & sock.POLL.OUT != 0) events |= watch_write;
         }
-        const prev = self.watched.get(src.handle) orelse 0;
-        if (prev == events) return;
-        if (events == 0) {
-            _ = self.watched.remove(src.handle);
-        } else {
-            // Without memory, the socket stays unwatched: the loop still
-            // wakes for everything else, and the source's owner sees no
-            // input until memory returns.
-            self.watched.put(self.alloc, src.handle, events) catch return;
-        }
-        ext.watch.?(ext.ctx, src.handle, events);
+        self.mu.unlock();
+        const entry = self.watched.getEntry(src.handle) orelse {
+            // Unregistered and already reported.
+            if (!registered) return;
+            // Registered before the loop attached: `attachExternal`
+            // reserved its place.
+            self.watched.putAssumeCapacity(src.handle, events);
+            if (events != 0) ext.watch.?(ext.ctx, src.handle, events);
+            return;
+        };
+        const prev = entry.value_ptr.*;
+        if (registered) entry.value_ptr.* = events else self.watched.removeByPtr(entry.key_ptr);
+        if (prev != events) ext.watch.?(ext.ctx, src.handle, events);
+    }
+
+    /// Whether a resumed source waits to be serviced as if it had input: it
+    /// may hold input already read, with nothing left on its socket.
+    pub fn hasKicked(self: *PollBackend) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.sources.items) |src| if (src.kicked.load(.seq_cst)) return true;
+        return false;
     }
 
     pub fn backend(self: *PollBackend) ProgressBackend {
@@ -414,13 +429,25 @@ pub const PollBackend = struct {
 
     fn vtRegister(ctx: *anyopaque, source: *Source) error{OutOfMemory}!void {
         const self = of(ctx);
-        {
+        // An attached loop's place for the socket, reserved first: once the
+        // source is registered, reporting it cannot fail.
+        if (self.external != null) {
+            self.watch_mu.lock();
+            defer self.watch_mu.unlock();
+            try self.watched.ensureUnusedCapacity(self.alloc, 1);
+            {
+                self.mu.lock();
+                defer self.mu.unlock();
+                try self.sources.append(self.alloc, source);
+                self.version += 1;
+            }
+            self.reportWatchLocked(source);
+        } else {
             self.mu.lock();
             defer self.mu.unlock();
             try self.sources.append(self.alloc, source);
             self.version += 1;
         }
-        self.reportWatch(source, false);
         // A poller already waiting starts polling the new source.
         if (self.polling.load(.seq_cst)) self.signal();
     }
@@ -435,7 +462,7 @@ pub const PollBackend = struct {
             source.output_armed = true;
             self.version += 1;
         }
-        self.reportWatch(source, false);
+        self.reportWatch(source);
         // A poller already waiting starts waiting for the output.
         if (self.polling.load(.seq_cst)) self.signal();
     }
@@ -451,7 +478,7 @@ pub const PollBackend = struct {
             // A poller still waiting on it finds it ready at most once more,
             // and its service holds the input.
         }
-        self.reportWatch(source, false);
+        self.reportWatch(source);
     }
 
     fn vtResumeInput(ctx: *anyopaque, source: *Source) void {
@@ -465,7 +492,7 @@ pub const PollBackend = struct {
                 self.version += 1;
             }
         }
-        self.reportWatch(source, false);
+        self.reportWatch(source);
         // Whoever waits services next, whether or not the socket has input.
         self.wakeN(1);
     }
@@ -479,7 +506,7 @@ pub const PollBackend = struct {
             s.output_armed = false;
             self.version += 1;
         }
-        self.reportWatch(s, false);
+        self.reportWatch(s);
         return true;
     }
 
@@ -498,7 +525,7 @@ pub const PollBackend = struct {
         }
         // Before its owner closes it, so the loop never waits on a reused
         // descriptor.
-        self.reportWatch(source, true);
+        self.reportWatch(source);
         if (self.polling.load(.seq_cst)) self.signal();
         if (servicing == self) {
             // This thread runs the service: once out of its list, `source`

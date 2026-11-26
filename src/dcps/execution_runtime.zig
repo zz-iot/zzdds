@@ -83,9 +83,8 @@ pub const ExecutionRuntimeImpl = struct {
         if (!poll_backend.supported) return DDS.RETCODE_UNSUPPORTED;
         if (loop.wake == null or loop.watch == null) return DDS.RETCODE_BAD_PARAMETER;
         const rt = self.runtime();
-        // Only the handle: no participant or factory relies on it yet, and
-        // no timer is armed on the clock the loop may replace.
-        if (rt.ownerCount() != 1 or rt.armedTimerCount() != 0) return DDS.RETCODE_PRECONDITION_NOT_MET;
+        // Only the handle may own it (no participant or factory relies on it
+        // yet), and no timer may be armed on the clock the loop may replace.
         const Install = struct {
             fn run(args: struct { *poll_backend.PollBackend, ExternalLoop }) bool {
                 args[0].attachExternal(args[1]) catch return false;
@@ -117,8 +116,10 @@ pub const ExecutionRuntimeImpl = struct {
         if (!rt.external.load(.acquire)) return DDS.RETCODE_PRECONDITION_NOT_MET;
         if (poll_backend.supported) self.owned.backend.armExternal();
         const ws = rt.waitState();
+        // A resumed source may hold input already read off its socket.
+        const kicked = poll_backend.supported and self.owned.backend.hasKicked();
         wait.* = .{
-            .immediate_work = ws.immediate_work,
+            .immediate_work = ws.immediate_work or kicked,
             .has_deadline = ws.deadline_ns != null,
             .deadline_ns = ws.deadline_ns orelse 0,
             .state = stateOf(ws.state),

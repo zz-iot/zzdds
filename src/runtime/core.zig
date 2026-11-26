@@ -461,6 +461,9 @@ pub const Runtime = struct {
     /// An application's event loop drives this manual runtime
     /// (`serviceExternal`) in place of `drive`. Set once, never cleared.
     external: std.atomic.Value(bool) = .init(false),
+    /// An attachment is checking that its caller holds the only owner
+    /// reference: `tryRetainOwner` waits for it to finish.
+    attaching: std.atomic.Value(bool) = .init(false),
     /// Runs last in the release of the final owner, which touches the
     /// runtime no more: it may free it once it stops. Set before publishing
     /// the runtime.
@@ -519,9 +522,21 @@ pub const Runtime = struct {
     /// Takes another owner reference unless the final one is already gone:
     /// once retirement begins, nothing attaches to this runtime again.
     pub fn tryRetainOwner(self: *Runtime) bool {
-        var n = self.owners.load(.acquire);
-        while (n != 0) n = self.owners.cmpxchgWeak(n, n + 1, .acq_rel, .acquire) orelse return true;
-        return false;
+        while (true) {
+            var n = self.owners.load(.seq_cst);
+            while (true) {
+                if (n == 0) return false;
+                n = self.owners.cmpxchgWeak(n, n + 1, .seq_cst, .seq_cst) orelse break;
+            }
+            // Raised before an attachment reads the count, and read here
+            // after raising it: one of the two sees the other. An attachment
+            // that saw only its caller's reference completes first, without
+            // this one, which cannot be the last (the caller holds another).
+            if (!self.attaching.load(.seq_cst)) return true;
+            const prev = self.owners.fetchSub(1, .seq_cst);
+            std.debug.assert(prev > 1);
+            while (self.attaching.load(.seq_cst)) std.atomic.spinLoopHint();
+        }
     }
 
     /// Releasing the final owner retires the runtime: ordinary admission
@@ -1032,9 +1047,11 @@ pub const Runtime = struct {
     /// (docs/design/concurrency/runtime.md#simple-driver-operation).
     pub fn drive(self: *Runtime, max_turns: u32, max_wait_ns: i64) DriveError!DriveResult {
         if (max_turns == 0) return error.InvalidBudget;
-        if (self.options.mode != .manual or self.external.load(.acquire)) return error.PreconditionNotMet;
+        if (self.options.mode != .manual) return error.PreconditionNotMet;
         if (self.driving.swap(true, .acq_rel)) return error.PreconditionNotMet;
         defer self.driving.store(false, .release);
+        // Checked after claiming the drive, which an attachment also claims.
+        if (self.external.load(.acquire)) return error.PreconditionNotMet;
         const outer_serving = serving_runtime;
         serving_runtime = self;
         defer serving_runtime = outer_serving;
@@ -1071,19 +1088,20 @@ pub const Runtime = struct {
     /// `install` hands the backend's wait to the loop; it runs only if the
     /// runtime can be attached, with no drive running meanwhile, and the
     /// runtime is attached only if it succeeds.
+    /// The caller must hold the only owner reference, and no timer may be
+    /// armed: the loop may replace the clock. Neither changes meanwhile:
+    /// `tryRetainOwner` waits until the attachment is done, and only an
+    /// owner arms timers.
     pub fn attachExternal(self: *Runtime, ctx: anytype, comptime install: fn (@TypeOf(ctx)) bool) error{ PreconditionNotMet, InstallFailed }!void {
         if (self.options.mode != .manual) return error.PreconditionNotMet;
         if (self.driving.swap(true, .acq_rel)) return error.PreconditionNotMet;
         defer self.driving.store(false, .release);
         if (self.external.load(.acquire)) return error.PreconditionNotMet;
+        self.attaching.store(true, .seq_cst);
+        defer self.attaching.store(false, .seq_cst);
+        if (self.owners.load(.seq_cst) != 1 or self.armedTimerCount() != 0) return error.PreconditionNotMet;
         if (!install(ctx)) return error.InstallFailed;
         self.external.store(true, .release);
-    }
-
-    /// Owner references held now, for a caller that must know none but its
-    /// own remains.
-    pub fn ownerCount(self: *const Runtime) u32 {
-        return self.owners.load(.acquire);
     }
 
     pub fn armedTimerCount(self: *Runtime) u32 {

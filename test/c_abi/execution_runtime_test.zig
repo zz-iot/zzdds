@@ -549,3 +549,107 @@ test "an external loop that cannot be attached for want of memory leaves the run
     try testing.expectEqual(DDS.RETCODE_OK, impl.attachExternalLoop(loop.adapter()));
     try testing.expectEqual(DDS.RETCODE_OK, rt.destroy());
 }
+
+/// A source on a real socket, registered with an external runtime's backend
+/// directly, as a transport registers one.
+const TestSource = struct {
+    fd: socket_t,
+    src: runtime.Source,
+    var serviced: u32 = 0;
+
+    fn init(self: *TestSource) !void {
+        self.fd = try sock.open(std.posix.AF.INET, std.posix.SOCK.DGRAM);
+        self.src = .{ .handle = self.fd, .ctx = self, .service = service, .writable = writable };
+    }
+    fn service(_: *anyopaque, _: u32, _: *[runtime.service_scratch_len]u8) u32 {
+        serviced += 1;
+        return 0;
+    }
+    fn writable(_: *anyopaque) void {}
+    fn deinit(self: *TestSource) void {
+        sock.close(self.fd);
+    }
+};
+
+test "a socket unregistered while a service runs is not watched again" {
+    if (!supported) return error.SkipZigTest;
+    const rt = try ZZDDS.ExecutionRuntime.create(testing.allocator, config(.RUNTIME_MODE_MANUAL, 0));
+    const impl = ExecutionRuntimeImpl.of(rt).?;
+    var loop: TestLoop = .{};
+    defer loop.deinit();
+    try testing.expectEqual(DDS.RETCODE_OK, impl.attachExternalLoop(loop.adapter()));
+    const backend = impl.owned.backend.backend();
+    var ts: TestSource = undefined;
+    try ts.init();
+    defer ts.deinit();
+    try backend.register(&ts.src);
+    backend.armOutput(&ts.src);
+    try testing.expectEqual(@as(?u32, er.ExternalLoop.watch_read_bit | er.ExternalLoop.watch_write_bit), loop.watched.get(ts.fd));
+    backend.unregister(&ts.src);
+    try testing.expectEqual(@as(?u32, null), loop.watched.get(ts.fd));
+    // What a service still running reports when it disarms the output: the
+    // socket is gone, so nothing.
+    ts.src.output_armed = false;
+    backend.pauseInput(&ts.src);
+    backend.resumeInput(&ts.src);
+    try testing.expectEqual(@as(?u32, null), loop.watched.get(ts.fd));
+    try testing.expectEqual(DDS.RETCODE_OK, rt.destroy());
+}
+
+test "a socket that cannot be watched for want of memory is not registered, and later reports never allocate" {
+    if (!supported) return error.SkipZigTest;
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var locked: LockedAllocator = .{ .child = failing.allocator() };
+    const rt = try ZZDDS.ExecutionRuntime.create(locked.allocator(), config(.RUNTIME_MODE_MANUAL, 0));
+    const impl = ExecutionRuntimeImpl.of(rt).?;
+    var loop: TestLoop = .{};
+    defer loop.deinit();
+    try testing.expectEqual(DDS.RETCODE_OK, impl.attachExternalLoop(loop.adapter()));
+    const backend = impl.owned.backend.backend();
+    var ts: TestSource = undefined;
+    try ts.init();
+    defer ts.deinit();
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, backend.register(&ts.src));
+    try testing.expectEqual(@as(usize, 0), impl.owned.backend.sourceCount());
+    try testing.expectEqual(@as(?u32, null), loop.watched.get(ts.fd));
+    failing.fail_index = std.math.maxInt(usize);
+    try backend.register(&ts.src);
+    // Paused, then resumed: its place is kept, so no report allocates.
+    failing.fail_index = failing.alloc_index;
+    backend.pauseInput(&ts.src);
+    try testing.expectEqual(@as(?u32, null), loop.watched.get(ts.fd));
+    backend.resumeInput(&ts.src);
+    try testing.expectEqual(@as(?u32, er.ExternalLoop.watch_read_bit), loop.watched.get(ts.fd));
+    failing.fail_index = std.math.maxInt(usize);
+    backend.unregister(&ts.src);
+    try testing.expectEqual(DDS.RETCODE_OK, rt.destroy());
+}
+
+test "input a resumed source already holds is work the loop does not wait for" {
+    if (!supported) return error.SkipZigTest;
+    const rt = try ZZDDS.ExecutionRuntime.create(testing.allocator, config(.RUNTIME_MODE_MANUAL, 0));
+    const impl = ExecutionRuntimeImpl.of(rt).?;
+    var loop: TestLoop = .{};
+    defer loop.deinit();
+    try testing.expectEqual(DDS.RETCODE_OK, impl.attachExternalLoop(loop.adapter()));
+    const backend = impl.owned.backend.backend();
+    var ts: TestSource = undefined;
+    try ts.init();
+    defer ts.deinit();
+    try backend.register(&ts.src);
+    backend.pauseInput(&ts.src);
+    // Resumed with nothing on the socket and no wake armed.
+    backend.resumeInput(&ts.src);
+    var w: er.ExternalWait = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, impl.prepareWait(&w));
+    try testing.expect(w.immediate_work);
+    var result: ZZDDS.DriveResult = .{};
+    const before = TestSource.serviced;
+    try testing.expectEqual(DDS.RETCODE_OK, impl.service(64, &result));
+    try testing.expect(TestSource.serviced > before);
+    try testing.expectEqual(DDS.RETCODE_OK, impl.prepareWait(&w));
+    try testing.expect(!w.immediate_work);
+    backend.unregister(&ts.src);
+    try testing.expectEqual(DDS.RETCODE_OK, rt.destroy());
+}
