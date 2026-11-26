@@ -380,7 +380,7 @@ test "the process config's default_runtime sets the implicit runtime's workers a
     {
         registry.mu.lock();
         defer registry.mu.unlock();
-        try testing.expectEqual(@as(usize, 3), registry.slot.implicit.hosted.workers.len);
+        try testing.expectEqual(@as(usize, 3), registry.slot.implicit.hosted.?.workers.len);
     }
     try set.nodes[0].delete(dp);
 }

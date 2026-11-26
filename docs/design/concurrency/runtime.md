@@ -133,9 +133,11 @@ or worker must not join itself or dispatch arbitrary nested application callback
 Hosted backends must provide progress for retirement after operational ownership ends.
 Manual backends must complete retirement on an eligible outer driver/unwind path or
 synchronously where safe; they cannot require the application to discover and invoke
-a hidden runtime-shutdown API after ordinary DDS teardown. The exact final servicing
-and foreign-hook integration is a required shutdown-interface decision, not proven
-by reference counting. Allocators and foreign binding infrastructure must remain valid
+a hidden runtime-shutdown API after ordinary DDS teardown. For an application's
+ExecutionRuntime, the release of the final owner finishes it: off the runtime's own
+turns, it drains a manual runtime's remaining work or joins a hosted one's workers, then
+frees it; on one of its turns, the default registry takes the runtime and finishes it
+from a later call, as it reclaims its own retired implicit runtimes. Allocators and foreign binding infrastructure must remain valid
 through outstanding cleanup; object ownership cannot extend externally borrowed
 resources by itself.
 

@@ -198,6 +198,56 @@ module zzdds {
         unsigned long        instance_state;
     };
 
+    // A runtime's lifecycle: RUNNING until its last owner goes, RETIRING
+    // while admitted work drains, then STOPPED.
+    enum RuntimeState {
+        RUNTIME_STATE_RUNNING,
+        RUNTIME_STATE_RETIRING,
+        RUNTIME_STATE_STOPPED
+    };
+
+    // What one ExecutionRuntime::drive call did.
+    struct DriveResult {
+        // Turns run.
+        unsigned long turns;
+        // Work was ready, or a timer due, when the call returned.
+        boolean       immediate_work;
+        RuntimeState  state;
+        // Retirement has begun and work is still draining.
+        boolean       retirement_pending;
+    };
+
+    // A runtime of one's own (docs/design/concurrency/runtime.md): hosted,
+    // with worker threads of its own, or manual, making progress only in
+    // drive() and in the blocking calls that help it. Participants created
+    // by a factory that selects it run on it
+    // (DomainParticipantFactory::set_default_runtime), each keeping it until
+    // deleted. The handle keeps it too: it retires once the handle is
+    // released and its last participant is deleted.
+    @standalone interface ExecutionRuntime {
+        // Nil when the config is invalid (no hosted workers, or a mode this
+        // build lacks) or the runtime cannot start.
+        @constructor ExecutionRuntime create(in RuntimeConfig config);
+        // Strict: PRECONDITION_NOT_MET while a participant or a factory
+        // still uses the runtime. Otherwise stops it and frees it.
+        @destructor DDS::ReturnCode_t destroy();
+        // Drops the handle's hold. What dropping (C++) or closing (Java)
+        // the owner runs.
+        @finalizer void release();
+
+        RuntimeState get_state();
+        // HOSTED or MANUAL, never BUILD_DEFAULT.
+        RuntimeMode get_mode();
+        // Runs up to max_turns turns of a manual runtime. When nothing is
+        // runnable, waits up to max_wait for work. PRECONDITION_NOT_MET on
+        // a hosted runtime or while another drive runs; BAD_PARAMETER for
+        // zero turns.
+        DDS::ReturnCode_t drive(
+            in    unsigned long   max_turns,
+            in    DDS::Duration_t max_wait,
+            inout DriveResult     result);
+    };
+
     // A factory of one's own, independent of the process-wide one
     // (DDS::DomainParticipantFactory::get_instance): needed for a custom
     // allocator or more than one factory in a process. Its creator owns it.
@@ -220,6 +270,16 @@ module zzdds {
             in DomainParticipantConfig config);
         DDS::ReturnCode_t get_default_participant_config(
             inout DomainParticipantConfig config);
+
+        // Selects the runtime participants created from now on run on; nil
+        // follows the process default. Existing participants keep theirs.
+        // The factory holds the selected runtime until another selection or
+        // its own deletion. ALREADY_DELETED if the runtime is retiring or
+        // stopped; BAD_PARAMETER for a runtime zzdds did not create.
+        DDS::ReturnCode_t set_default_runtime(
+            in ExecutionRuntime runtime);
+        // The selected runtime, or nil when following the process default.
+        ExecutionRuntime get_default_runtime();
     };
 
     @shared_c_abi_box interface DomainParticipant : DDS::DomainParticipant {

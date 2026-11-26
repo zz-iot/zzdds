@@ -359,6 +359,7 @@ pub fn build(b: *std.Build) void {
         \\pub const DomainParticipantFactory = Generated.DomainParticipantFactory;
         \\pub const DomainParticipantQos = Generated.DomainParticipantQos;
         \\pub const DomainParticipantFactoryQos = Generated.DomainParticipantFactoryQos;
+        \\pub const Duration_t = Generated.Duration_t;
         \\pub const DurabilityQosPolicyKind = Generated.DurabilityQosPolicyKind;
         \\pub const DurabilityQosPolicyKind_fromString = Generated.DurabilityQosPolicyKind_fromString;
         \\pub const HistoryQosPolicyKind = Generated.HistoryQosPolicyKind;
@@ -920,6 +921,26 @@ pub fn build(b: *std.Build) void {
         c_alloc_smoke_mod.linkLibrary(zzdds_lib);
         const c_alloc_smoke = b.addExecutable(.{ .name = "zzdds_c_allocator_smoke", .root_module = c_alloc_smoke_mod });
         binding_smoke_step.dependOn(&b.addRunArtifact(c_alloc_smoke).step);
+
+        // An application's own manual runtime, selected by a factory and
+        // driven from C.
+        const c_runtime_smoke_mod = b.createModule(.{
+            .root_source_file = null,
+            .target = target,
+            .optimize = .Debug,
+            .link_libc = true,
+        });
+        c_runtime_smoke_mod.addCSourceFiles(.{
+            .files = &.{"test/bindings/smoke/c_runtime_smoke.c"},
+            .flags = &.{ "-std=c99", "-Wall" },
+        });
+        c_runtime_smoke_mod.addIncludePath(gen_c_dir);
+        c_runtime_smoke_mod.addIncludePath(gen_zzdds_c_dir);
+        c_runtime_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+        c_runtime_smoke_mod.addIncludePath(b.path("include"));
+        c_runtime_smoke_mod.linkLibrary(zzdds_lib);
+        const c_runtime_smoke = b.addExecutable(.{ .name = "zzdds_c_runtime_smoke", .root_module = c_runtime_smoke_mod });
+        binding_smoke_step.dependOn(&addTestRun(b, c_runtime_smoke, &dcps_test_domain).step);
 
         // Read view types over a live reader: a sample written and taken with
         // the generated take_view in one participant, its view pointing into
@@ -1587,6 +1608,7 @@ pub fn build(b: *std.Build) void {
                     "DataWriterListenerExImpl.java",
                     "ContentFilteredTopicImpl.java",
                     "DomainParticipantFactoryImpl.java",
+                    "ExecutionRuntimeImpl.java",
                     "DomainParticipantImpl.java",
                     "PublisherImpl.java",
                     "SubscriberImpl.java",
@@ -1973,6 +1995,7 @@ pub fn build(b: *std.Build) void {
         "test/dcps/get_field_refresh_test.zig",
         "test/c_abi/typesupport_test.zig",
         "test/c_abi/bootstrap_test.zig",
+        "test/c_abi/execution_runtime_test.zig",
         "test/dcps/entity_routing_test.zig",
         "test/dcps/coherent_sets_test.zig",
         "test/dcps/wait_for_historical_test.zig",

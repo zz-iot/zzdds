@@ -320,18 +320,25 @@ The binding surface shipped first, in zzdds.idl:
   hosted workers, inline-turn budget) and a `DefaultRuntimePolicy` (implicit or disabled)
   for the core default. The implicit default is always hosted; a manual default must be
   an explicitly created runtime.
-* **Owner and ref.** `ExecutionRuntimeOwner` is the RuntimeOwner role (`get_runtime`,
-  `release`), and `create_runtime(RuntimeConfig)` returns one. `ExecutionRuntime` is the
-  RuntimeRef role (`get_state`, `get_mode`, `try_acquire_owner`). The names avoid
-  `java.lang.Runtime`.
-* **The ref drives.** The ref carries the simple driver's `drive(max_turns, max_wait,
-  inout DriveResult)`, which fails PRECONDITION_NOT_MET on a hosted runtime. A separate
-  ManualDriver, once thread affinity or the external-loop adapter need its creation-time
-  validation, is additive; the ref's `drive` stays as the simple form.
+* **One standalone object.** `ExecutionRuntime` is a `@standalone` interface: the
+  generated `create(RuntimeConfig)` returns one holding an operational owner lease, the
+  strict `destroy()` refuses (PRECONDITION_NOT_MET) while a participant or factory still
+  uses the runtime, and the `release()` finalizer drops the handle's lease. The name
+  avoids `java.lang.Runtime`. There is no separate owner type: the handle is the
+  application's lease, and getters return borrowed handles that release nothing.
+* **Retirement without a hidden stop call.** Whoever releases the last lease finishes
+  the runtime: drains a manual one's remaining work, joins a hosted one's workers, and
+  frees it. On one of the runtime's own turns it cannot, so the default registry takes
+  the runtime and finishes it from a later call.
+* **The handle drives.** `drive(max_turns, max_wait, inout DriveResult)` runs a manual
+  runtime and fails PRECONDITION_NOT_MET on a hosted one or while another drive runs. A
+  separate ManualDriver, once thread affinity or the external-loop adapter need its
+  creation-time validation, is additive; `drive` stays as the simple form.
 * **Factory selection.** `set_default_runtime(ExecutionRuntime)` and
   `get_default_runtime()` on the zzdds factory carry RuntimeSelection's two kinds, with a
-  nil runtime meaning FOLLOW_DEFAULT. A RuntimeSelection struct holding a reference would
-  need generated managed references.
+  nil runtime meaning FOLLOW_DEFAULT. The factory holds a lease on its selection; each
+  participant created meanwhile takes its own. A RuntimeSelection struct holding a
+  reference would need generated managed references.
 * **Deferred:** a per-participant runtime override in DomainParticipantConfig, participant
   `get_runtime`, installing an explicit core default and observing it, ManualDriver, the
   external-loop adapter, and RuntimeConfig resource limits and clock selection.

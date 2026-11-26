@@ -16,12 +16,8 @@
 const std = @import("std");
 const core = @import("core.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
-const IoBackend = @import("io_backend.zig").IoBackend;
-const poll_backend = @import("poll_backend.zig");
-const Hosted = @import("hosted.zig").Hosted;
-
-/// Waits on sockets too where the platform has the readiness backend.
-const Backend = if (poll_backend.supported) poll_backend.PollBackend else IoBackend;
+const owned_mod = @import("owned.zig");
+const OwnedRuntime = owned_mod.OwnedRuntime;
 
 const Runtime = core.Runtime;
 
@@ -41,14 +37,8 @@ pub const AcquireError = error{
     SystemResources,
 };
 
-/// A runtime the registry created, with its hosted workers. Must not move.
-const Generation = struct {
-    threaded: std.Io.Threaded,
-    backend: Backend,
-    runtime: Runtime,
-    hosted: Hosted,
-    next: ?*Generation = null,
-};
+/// A runtime the registry created. Must not move.
+const Generation = OwnedRuntime;
 
 pub const Registry = struct {
     mu: Mutex = .{},
@@ -209,8 +199,10 @@ pub const Registry = struct {
         while (link.*) |g| {
             const state = g.runtime.getState();
             // Stopped: its workers have nothing left to run, and no turn of
-            // it is on this thread.
-            if (state == .backend_stopped or (wait and state == .retiring)) {
+            // it is on this thread. A retiring manual one has no driver
+            // left: `free` drains it, unless this is one of its turns.
+            const drain = g.hosted == null and g.canFinishHere();
+            if (state == .backend_stopped or ((wait or drain) and state == .retiring)) {
                 link.* = g.next;
                 g.next = done;
                 done = g;
@@ -223,51 +215,25 @@ pub const Registry = struct {
     }
 
     fn start(self: *Registry) AcquireError!*Generation {
-        const g = try self.alloc.create(Generation);
-        errdefer self.alloc.destroy(g);
-        g.* = .{ .threaded = .init(self.alloc, .{}), .backend = undefined, .runtime = undefined, .hosted = undefined };
-        g.backend = if (poll_backend.supported)
-            Backend.init(self.alloc, g.threaded.io()) catch |err| {
-                g.threaded.deinit();
-                return err;
-            }
-        else
-            Backend.init(g.threaded.io());
-        g.runtime = Runtime.init(g.backend.clock(), g.backend.backend(), .{ .mode = .hosted, .inline_turns = self.inline_turns });
-        g.hosted = Hosted.init(self.alloc, g.threaded.io(), &g.runtime, self.workers) catch {
-            g.runtime.releaseOwner();
-            g.runtime.deinit();
-            deinitBackend(g);
-            g.threaded.deinit();
-            return error.OutOfMemory;
-        };
-        g.hosted.start() catch {
-            // The workers already started exit once it stops.
-            g.runtime.releaseOwner();
-            g.hosted.join();
-            g.runtime.deinit();
-            deinitBackend(g);
-            g.threaded.deinit();
-            return error.WorkersUnavailable;
-        };
-        return g;
+        return OwnedRuntime.create(self.alloc, .{ .mode = .hosted, .workers = self.workers, .inline_turns = self.inline_turns });
     }
 
-    fn deinitBackend(g: *Generation) void {
-        if (poll_backend.supported) g.backend.deinit();
+    /// Takes a retiring runtime that could not be finished where its last
+    /// owner went, to be reclaimed from a later call.
+    pub fn adopt(self: *Registry, g: *Generation) void {
+        self.mu.lock();
+        g.next = self.retired;
+        self.retired = g;
+        self.mu.unlock();
     }
 
-    /// Waits for each generation's workers to exit, then frees it. Each is
-    /// retiring or stopped.
+    /// Finishes and frees each generation. Each is retiring or stopped.
     fn free(self: *Registry, list: ?*Generation) void {
+        _ = self;
         var next = list;
         while (next) |g| {
             next = g.next;
-            g.hosted.join();
-            g.runtime.deinit();
-            deinitBackend(g);
-            g.threaded.deinit();
-            self.alloc.destroy(g);
+            g.finish();
         }
     }
 };

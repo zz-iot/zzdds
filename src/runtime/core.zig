@@ -107,6 +107,20 @@ pub fn inTurn() bool {
     return running_context != null;
 }
 
+/// The runtime this thread is serving: running one of its turns, completion
+/// hooks included, or inside its hosted worker loop, `drive`, `helpUntil` or
+/// `drainRetired`. A turn's own context is cleared before its hooks run, so
+/// it does not cover them.
+threadlocal var serving_runtime: ?*const Runtime = null;
+
+/// Whether this thread is serving `rt` (`serving_runtime`): its storage
+/// must outlive the call, and waiting for it to stop would wait on itself.
+pub fn inTurnOf(rt: *const Runtime) bool {
+    if (serving_runtime == rt) return true;
+    const c = running_context orelse return false;
+    return c.runtime == rt;
+}
+
 /// A callback with its state.
 pub const Hook = struct {
     ctx: *anyopaque,
@@ -444,6 +458,10 @@ pub const Runtime = struct {
     owners: std.atomic.Value(u32) = .init(1),
     state: std.atomic.Value(State) = .init(.running),
     driving: std.atomic.Value(bool) = .init(false),
+    /// Runs last in the release of the final owner, which touches the
+    /// runtime no more: it may free it once it stops. Set before publishing
+    /// the runtime.
+    on_final_release: ?Hook = null,
     test_hooks: if (builtin.is_test) TestHooks else void = if (builtin.is_test) .{} else {},
 
     /// Seams for deterministic tests of races; absent outside test builds.
@@ -507,6 +525,18 @@ pub const Runtime = struct {
     /// closes, armed timers are cancelled, and admitted work drains.
     pub fn releaseOwner(self: *Runtime) void {
         if (self.owners.fetchSub(1, .acq_rel) != 1) return;
+        self.retire();
+    }
+
+    /// Releases the final owner if `self` holds the only one; false, with
+    /// nothing changed, while another owner remains.
+    pub fn releaseSoleOwner(self: *Runtime) bool {
+        if (self.owners.cmpxchgStrong(1, 0, .acq_rel, .acquire) != null) return false;
+        self.retire();
+        return true;
+    }
+
+    fn retire(self: *Runtime) void {
         self.gate.lock();
         self.state.store(.retiring, .seq_cst);
         while (self.timers.pop()) |t| {
@@ -517,6 +547,29 @@ pub const Runtime = struct {
         self.gate.unlock();
         self.tryStop();
         self.backend.wakeAll();
+        if (self.on_final_release) |h| h.run(h.ctx);
+    }
+
+    /// Runs a retiring manual runtime until it stops: what its last owner's
+    /// release does when no driver remains to (docs/design/concurrency/
+    /// runtime.md#hosted-and-manual-driver-obligations). Not from a turn of
+    /// it, and not alongside `drive`.
+    pub fn drainRetired(self: *Runtime) void {
+        std.debug.assert(self.options.mode == .manual and !inTurnOf(self));
+        std.debug.assert(self.state.load(.acquire) != .running);
+        const outer_serving = serving_runtime;
+        serving_runtime = self;
+        defer serving_runtime = outer_serving;
+        while (true) {
+            _ = self.backend.service(self.options.service_budget);
+            if (self.runNext()) continue;
+            self.tryStop();
+            if (self.state.load(.acquire) == .backend_stopped) return;
+            const token = self.backend.prepareWait();
+            if (self.workDue(self.clock.nowNs())) continue;
+            if (self.state.load(.acquire) == .backend_stopped) return;
+            self.backend.wait(self.nextDeadline(), token);
+        }
     }
 
     /// Enters BACKEND_STOPPED once retiring and nothing remains: no admission
@@ -755,6 +808,9 @@ pub const Runtime = struct {
     /// Runs one turn of `req`, which the caller has claimed RUNNING and counted
     /// busy, then finishes the turn and releases the context.
     fn runTurn(self: *Runtime, ctx: *Context, req: *Request) void {
+        const outer_serving = serving_runtime;
+        serving_runtime = self;
+        defer serving_runtime = outer_serving;
         if (builtin.is_test) {
             if (self.test_hooks.before_run) |hook| {
                 self.test_hooks.before_run = null;
@@ -976,6 +1032,9 @@ pub const Runtime = struct {
         if (self.options.mode != .manual) return error.PreconditionNotMet;
         if (self.driving.swap(true, .acq_rel)) return error.PreconditionNotMet;
         defer self.driving.store(false, .release);
+        const outer_serving = serving_runtime;
+        serving_runtime = self;
+        defer serving_runtime = outer_serving;
 
         var now = self.clock.nowNs();
         const wait_deadline = now +| @max(max_wait_ns, 0);
@@ -1033,6 +1092,9 @@ pub const Runtime = struct {
     /// `done`'s last result.
     pub fn helpUntil(self: *Runtime, deadline_ns: ?i64, ctx: anytype, comptime done: fn (@TypeOf(ctx)) bool) bool {
         std.debug.assert(self.helpsHere());
+        const outer_serving = serving_runtime;
+        serving_runtime = self;
+        defer serving_runtime = outer_serving;
         // Counted before `done` is first checked, under `gate` as
         // `wakeHelpers` reads it: a change made before a waker's check is
         // seen by that first check. Atomic for `wakeForWork`, which reads it
@@ -1096,6 +1158,8 @@ pub const Runtime = struct {
     /// the runtime stops.
     pub fn serveUntilStopped(self: *Runtime) void {
         std.debug.assert(self.options.mode == .hosted);
+        serving_runtime = self;
+        defer serving_runtime = null;
         while (true) {
             const now = self.clock.nowNs();
             self.fireDueTimers(now);

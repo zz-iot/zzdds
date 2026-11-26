@@ -10,6 +10,16 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-26
 
+- `zzdds::ExecutionRuntime` (zzdds.idl): an application creates a runtime of its own
+  from any binding, hosted with its own worker threads or manual, running only in its
+  `drive()` calls and the blocking calls that help it. `DomainParticipantFactory::
+  set_default_runtime` makes a zzdds factory's new participants run on it, and
+  `get_default_runtime` returns the selection. The handle, each selecting factory and
+  each participant hold the runtime; the last to let go finishes it (draining a manual
+  one, joining a hosted one's workers) and frees it, so no stop call is needed. `destroy`
+  refuses while anything else uses it. Before, only Zig could supply a runtime, by
+  installing it as the process default. zidl is pinned to `v0.3.45-zig.0.17.1`, whose C++
+  and Java bindings convert an operation's enum result.
 - The generated C++ and Java bindings now report a listener that throws, or whose
   arguments cannot be built, through `zzdds_listener_invocation_failed` (zidl's
   `--listener-failure-report`). Such a failure is logged, rate-limited, and makes
