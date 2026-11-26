@@ -269,14 +269,15 @@ if (SensorFrameDataReader_take_view(&reader, &view, &info, &loan) == DDS_RETCODE
   3. serializes into it, reserving the large members;
   4. returns the reservations.
 
-  The application fills and commits each reservation, then publishes.
+  The application fills each reservation, then publishes, which commits
+  them. `loaned-builders.md` designs this in full.
 
   ```c
   SensorFrameBuilder b = { .stamp = now, .points_count = n };
-  if (SensorFrameDataWriter_loan_builder(&writer, &b) == DDS_RETCODE_OK) {
-      fill_points(zidl_cdr_reservation_data(b.writer, &b.points), n);
-      zidl_cdr_commit_primitives(b.writer, &b.points);
-      SensorFrameDataWriter_publish_builder(&writer, &b);
+  SensorFrameWriteLoan loan;
+  if (SensorFrameDataWriter_loan_builder(&writer, &b, &loan) == DDS_RETCODE_OK) {
+      fill_points(SensorFrameWriteLoan_data(&loan, &b.points), n);
+      SensorFrameDataWriter_publish_builder(&writer, &b, &loan);
   }
   ```
 
@@ -293,7 +294,7 @@ if (SensorFrameDataReader_take_view(&reader, &view, &info, &loan) == DDS_RETCODE
 
 1. **Read view types over today's heap loans** (zidl codegen, and the zzdds
    typed wrappers in C, C++ and Zig). This removes the decode copy.
-2. **Loaned builders** for writes, with reservations.
+2. **Loaned builders** for writes, with reservations (`loaned-builders.md`).
 3. **Writer history adopts loaned buffers** (heap): removes copy 1 for every
    writer. It is also the seam the shared segment slots into.
 4. **The shared-memory inbox transport, with payloads inline.** RTPS over
