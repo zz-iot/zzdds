@@ -107,9 +107,16 @@ pub fn inTurn() bool {
     return running_context != null;
 }
 
-/// Whether this thread is running a turn of `rt`: one of its hosted workers,
-/// or a driver or helper of it.
+/// The runtime this thread is serving: running one of its turns, completion
+/// hooks included, or inside its hosted worker loop, `drive`, `helpUntil` or
+/// `drainRetired`. A turn's own context is cleared before its hooks run, so
+/// it does not cover them.
+threadlocal var serving_runtime: ?*const Runtime = null;
+
+/// Whether this thread is serving `rt` (`serving_runtime`): its storage
+/// must outlive the call, and waiting for it to stop would wait on itself.
 pub fn inTurnOf(rt: *const Runtime) bool {
+    if (serving_runtime == rt) return true;
     const c = running_context orelse return false;
     return c.runtime == rt;
 }
@@ -550,6 +557,9 @@ pub const Runtime = struct {
     pub fn drainRetired(self: *Runtime) void {
         std.debug.assert(self.options.mode == .manual and !inTurnOf(self));
         std.debug.assert(self.state.load(.acquire) != .running);
+        const outer_serving = serving_runtime;
+        serving_runtime = self;
+        defer serving_runtime = outer_serving;
         while (true) {
             _ = self.backend.service(self.options.service_budget);
             if (self.runNext()) continue;
@@ -798,6 +808,9 @@ pub const Runtime = struct {
     /// Runs one turn of `req`, which the caller has claimed RUNNING and counted
     /// busy, then finishes the turn and releases the context.
     fn runTurn(self: *Runtime, ctx: *Context, req: *Request) void {
+        const outer_serving = serving_runtime;
+        serving_runtime = self;
+        defer serving_runtime = outer_serving;
         if (builtin.is_test) {
             if (self.test_hooks.before_run) |hook| {
                 self.test_hooks.before_run = null;
@@ -1019,6 +1032,9 @@ pub const Runtime = struct {
         if (self.options.mode != .manual) return error.PreconditionNotMet;
         if (self.driving.swap(true, .acq_rel)) return error.PreconditionNotMet;
         defer self.driving.store(false, .release);
+        const outer_serving = serving_runtime;
+        serving_runtime = self;
+        defer serving_runtime = outer_serving;
 
         var now = self.clock.nowNs();
         const wait_deadline = now +| @max(max_wait_ns, 0);
@@ -1076,6 +1092,9 @@ pub const Runtime = struct {
     /// `done`'s last result.
     pub fn helpUntil(self: *Runtime, deadline_ns: ?i64, ctx: anytype, comptime done: fn (@TypeOf(ctx)) bool) bool {
         std.debug.assert(self.helpsHere());
+        const outer_serving = serving_runtime;
+        serving_runtime = self;
+        defer serving_runtime = outer_serving;
         // Counted before `done` is first checked, under `gate` as
         // `wakeHelpers` reads it: a change made before a waker's check is
         // seen by that first check. Atomic for `wakeForWork`, which reads it
@@ -1139,6 +1158,8 @@ pub const Runtime = struct {
     /// the runtime stops.
     pub fn serveUntilStopped(self: *Runtime) void {
         std.debug.assert(self.options.mode == .hosted);
+        serving_runtime = self;
+        defer serving_runtime = null;
         while (true) {
             const now = self.clock.nowNs();
             self.fireDueTimers(now);

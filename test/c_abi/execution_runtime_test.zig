@@ -263,3 +263,32 @@ test "a runtime's C handle is boxed once, on its own allocator" {
     try testing.expectEqual(testing.allocator.ptr, rt.vtable.get_allocator(rt.ptr).ptr);
     rt.vtable.deinit(rt.ptr);
 }
+
+// A turn's completion hook runs after the turn has released its context, but
+// still on the thread serving the runtime: a final release there is on the
+// runtime's own turn, so the registry finishes it after the drive returns.
+test "a runtime whose last owner goes in a turn's completion hook is finished by the registry" {
+    if (!supported) return error.SkipZigTest;
+    const rt = try ZZDDS.ExecutionRuntime.create(testing.allocator, config(.RUNTIME_MODE_MANUAL, 0));
+    const impl: *ExecutionRuntimeImpl = @ptrCast(@alignCast(rt.ptr));
+    const core_rt = impl.runtime();
+    const Hooked = struct {
+        var handle: ZZDDS.ExecutionRuntime = undefined;
+        fn run(_: *runtime.Request, _: *runtime.Turn) runtime.Outcome {
+            return .done;
+        }
+        fn done(_: *runtime.Request) void {
+            handle.release();
+        }
+    };
+    Hooked.handle = rt;
+    var ctx = runtime.Context.init(core_rt, 4);
+    var req = runtime.Request.init(Hooked.run);
+    req.on_done = Hooked.done;
+    try core_rt.submit(null, &ctx, &req);
+    _ = try core_rt.drive(1, 0);
+    // The drive returned on storage the release did not free.
+    try testing.expect(core_rt.getState() != .running);
+    ctx.deinit();
+    runtime.default_registry.global.reap(false);
+}

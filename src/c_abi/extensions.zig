@@ -168,8 +168,21 @@ const FactoryOwner = struct {
     fn selectRuntime(self: *@This(), rt: ?*ExecutionRuntimeImpl) DDS.ReturnCode_t {
         if (!self.lifetime.acquire()) return DDS.RETCODE_ALREADY_DELETED;
         defer self.lifetime.release(self, destroy);
+        return self.storeSelection(rt);
+    }
+
+    /// With the caller's `lifetime` reference. A factory whose deletion
+    /// began meanwhile has already let go of its selection, so it takes no
+    /// new one: `deinit` closes `lifetime` before clearing the selection
+    /// under `mu`, where this checks.
+    fn storeSelection(self: *@This(), rt: ?*ExecutionRuntimeImpl) DDS.ReturnCode_t {
         if (rt) |r| if (!r.runtime().tryRetainOwner()) return DDS.RETCODE_ALREADY_DELETED;
         self.mu.lock();
+        if (self.lifetime.tearingDown()) {
+            self.mu.unlock();
+            if (rt) |r| r.runtime().releaseOwner();
+            return DDS.RETCODE_ALREADY_DELETED;
+        }
         const old = self.selected_runtime;
         self.selected_runtime = rt;
         self.mu.unlock();
@@ -2000,6 +2013,25 @@ const StackLifetimeWatch = struct {
         self.child.rawFree(ptr.?[0..n], std.mem.Alignment.fromByteUnits(alignment), @returnAddress());
     }
 };
+
+// A `set_default_runtime` that got in before the factory's deletion began
+// and stores after it cleared the selection: it must not keep the runtime.
+test "a runtime selected while the factory is being deleted is let go" {
+    const testing = std.testing;
+    if (!@import("../runtime/root.zig").poll_backend.supported) return error.SkipZigTest;
+    var cfg = ZZDDS.RuntimeConfig.default();
+    cfg.mode = .RUNTIME_MODE_MANUAL;
+    const rt = try ExecutionRuntimeImpl.create(testing.allocator, &cfg);
+    const factory = try createFactory(null);
+    const owner: *FactoryOwner = @ptrCast(@alignCast(factory.ptr));
+    // The setter's reference, taken before deletion began.
+    try testing.expect(owner.lifetime.acquire());
+    owner.deinit();
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, owner.storeSelection(rt));
+    owner.lifetime.release(owner, FactoryOwner.destroy);
+    // Only the handle holds it.
+    try testing.expectEqual(DDS.RETCODE_OK, rt.toExecutionRuntime().destroy());
+}
 
 // Observe reclamation without dereferencing retired storage.
 test "C factory stack survives until deferred participant cleanup completes" {
