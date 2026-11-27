@@ -36,12 +36,12 @@ pub fn guidFromBytes(b: []const u8) Guid {
 /// Serialize a `Disc.*` PL_CDR struct to a heap slice (encap header + params +
 /// sentinel), owned by the caller.
 pub fn emitPlCdr(comptime T: type, alloc: std.mem.Allocator, value: T) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(alloc);
-    var w = zidl_cdr.PlCdrWriter.init(&buf, alloc);
-    try w.writeEncapHeader();
-    try T.serializePlCdr(&w, value);
-    return buf.toOwnedSlice(alloc);
+    return zidl_cdr.serializeAlloc(.all, .xcdr1, .little, alloc, value, struct {
+        fn write(w: anytype, v: T) !void {
+            try w.writePlEncapHeader();
+            try T.serializePlCdr(w, v);
+        }
+    }.write);
 }
 
 /// Convert a decoded `@pl_repeated sequence<Locator_t>` member (an

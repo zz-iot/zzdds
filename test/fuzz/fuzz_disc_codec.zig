@@ -42,13 +42,15 @@ fn tryDecode(comptime T: type, alloc: std.mem.Allocator, data: []const u8, mode:
 
     // Round-trip: re-encode the lenient decode and confirm it decodes again.
     if (mode != .lenient) return;
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(alloc);
-    var w = zidl_cdr.PlCdrWriter.init(&buf, alloc);
-    w.writeEncapHeader() catch return;
-    T.serializePlCdr(&w, out) catch return;
+    const bytes = zidl_cdr.serializeAlloc(.all, .xcdr1, .little, alloc, out, struct {
+        fn write(w: anytype, v: T) !void {
+            try w.writePlEncapHeader();
+            try T.serializePlCdr(w, v);
+        }
+    }.write) catch return;
+    defer alloc.free(bytes);
 
-    var r2 = zidl_cdr.CdrReader.init(buf.items) catch return;
+    var r2 = zidl_cdr.CdrReader.init(bytes) catch return;
     var out2: T = .{};
     defer deinitIf(T, &out2, alloc);
     T.deserializeFromPlCdr(&out2, &r2, alloc, .lenient) catch return;

@@ -110,9 +110,10 @@ zidl::setCppAllocator(&static_pool_allocator);   // C++ wrapper objects (std::pm
   default-constructed on every `take()` in the steady-state loop, whose
   `std::pmr::string`/`std::pmr::vector` fields need this registration to
   avoid falling back to libstdc++'s default heap resource.
-- **`zidl_cdr_set_allocator`** routes the CDR writer's buffer growth, which
-  runs on every `write()` call (each call starts a fresh `ZidlCdrWriter` at
-  length 0). It plays no role in the C++/pmr decode path — `ZidlCdrReader`
+- **`zidl_cdr_set_allocator`** routes zidl-cdr's own allocations: the one
+  exact buffer a timestamped write or `register_instance` serializes into. A
+  plain `write()` counts the sample, then serializes straight into a zzdds
+  write loan, so it allocates nothing here. It plays no role in the C++/pmr decode path — `ZidlCdrReader`
   reads from a caller-supplied stack buffer directly, and the `std::pmr`
   containers' own growth bypasses it entirely.
 

@@ -61,40 +61,36 @@ fn onPublicationMatched(state: *State, dw: DDS.DataWriter, status: DDS.Publicati
 
 // ── Raw-loan CDR helpers ─────────────────────────────────────────────────────
 
-/// Serialize `value` into a fresh, owned buffer. The caller frees it. This
-/// mirrors what the generated typed `write()` wrapper does internally
-/// (`loaned_ping_gen.LoanedPingDataWriter.write`) -- zidl-cdr's `CdrWriter`
-/// is always `std.ArrayList`-backed (dynamic growth), so there's no way yet
-/// to serialize directly into the fixed buffer `loan_raw()` hands back the
-/// way C's `zidl_cdr_writer_init_fixed` can (see the spec doc's "Zig-specific
-/// caveat" section) -- a real, discovered gap in zidl-cdr today, not an
-/// oversight in this example. The bytes still end up published via the real
-/// `loan_raw`/`publish_loan_raw` ops below, just via one extra memcpy.
-fn serializeToOwnedBuffer(alloc: std.mem.Allocator, xcdr2: bool, value: loaned_ping_gen.LoanedPing) !std.ArrayList(u8) {
-    var buf = std.ArrayList(u8).empty;
-    errdefer buf.deinit(alloc);
-    if (xcdr2) {
-        var w = zidl_cdr.CdrWriter(.xcdr2).init(&buf, alloc);
-        try w.writeEncapHeaderDelimited();
-        try loaned_ping_gen.LoanedPing.serialize(&w, value);
-    } else {
-        var w = zidl_cdr.CdrWriter(.xcdr1).init(&buf, alloc);
-        try w.writeEncapHeader();
-        try loaned_ping_gen.LoanedPing.serialize(&w, value);
-    }
-    return buf;
+/// Write `value` (with its encapsulation header) to any CDR writer: run once
+/// counting, to size the loan, and once into the loaned buffer itself.
+fn writeSample(w: anytype, xcdr2: bool, value: loaned_ping_gen.LoanedPing) !void {
+    if (xcdr2) try w.writeEncapHeaderDelimited() else try w.writeEncapHeader();
+    try loaned_ping_gen.LoanedPing.serialize(w, value);
+}
+
+/// Loan a buffer of exactly the sample's size and serialize straight into
+/// it: count first, then write with a fixed writer over the loan. This is
+/// what the generated typed `write()` wrapper does internally.
+fn loanAndSerialize(dw: DDS.DataWriter, xcdr2: bool, value: loaned_ping_gen.LoanedPing) !DDS.OctetSeq {
+    const version: zidl_cdr.XcdrVersion = if (xcdr2) .xcdr2 else .xcdr1;
+    var counter = zidl_cdr.RuntimeWriter.initCounting(version, .little);
+    try writeSample(&counter, xcdr2, value);
+
+    var cdr_payload = DDS.OctetSeq{};
+    if (dw.loan_raw(@intCast(counter.len), &cdr_payload) != DDS.RETCODE_OK) return error.LoanFailed;
+    errdefer _ = dw.return_loan_raw(&cdr_payload);
+    var w = zidl_cdr.RuntimeWriter.initFixed(cdr_payload._buffer.?[0..counter.len], version, .little);
+    try writeSample(&w, xcdr2, value);
+    // A sample changed between the passes is an error, not a torn write.
+    if (w.len != counter.len) return error.LengthMismatch;
+    return cdr_payload;
 }
 
 /// Publish one sample via the real write-loan path: loan_raw(size) ->
-/// memcpy the serialized bytes in -> publish_loan_raw. Returns an error on
-/// any non-OK return code from either call.
-fn publishLoaned(dw: DDS.DataWriter, alloc: std.mem.Allocator, xcdr2: bool, value: loaned_ping_gen.LoanedPing) !void {
-    var buf = try serializeToOwnedBuffer(alloc, xcdr2, value);
-    defer buf.deinit(alloc);
-
-    var cdr_payload = DDS.OctetSeq{};
-    if (dw.loan_raw(@intCast(buf.items.len), &cdr_payload) != DDS.RETCODE_OK) return error.LoanFailed;
-    @memcpy(cdr_payload._buffer.?[0..buf.items.len], buf.items);
+/// serialize into the loan -> publish_loan_raw. Returns an error on any
+/// non-OK return code from either call.
+fn publishLoaned(dw: DDS.DataWriter, xcdr2: bool, value: loaned_ping_gen.LoanedPing) !void {
+    var cdr_payload = try loanAndSerialize(dw, xcdr2, value);
 
     var key_hash_bytes = loaned_ping_gen.LoanedPing.computeKeyHash(&value);
     const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
@@ -107,14 +103,8 @@ fn publishLoaned(dw: DDS.DataWriter, alloc: std.mem.Allocator, xcdr2: bool, valu
 /// "borrow, inspect, release without consuming" pattern. Proves
 /// `return_loan_raw()` genuinely prevents the sample from ever reaching the
 /// wire (the subscriber must never see `CANCELLED_SEQ_NUM`).
-fn loanAndCancel(dw: DDS.DataWriter, alloc: std.mem.Allocator, xcdr2: bool, value: loaned_ping_gen.LoanedPing) !void {
-    var buf = try serializeToOwnedBuffer(alloc, xcdr2, value);
-    defer buf.deinit(alloc);
-
-    var cdr_payload = DDS.OctetSeq{};
-    if (dw.loan_raw(@intCast(buf.items.len), &cdr_payload) != DDS.RETCODE_OK) return error.LoanFailed;
-    @memcpy(cdr_payload._buffer.?[0..buf.items.len], buf.items);
-
+fn loanAndCancel(dw: DDS.DataWriter, xcdr2: bool, value: loaned_ping_gen.LoanedPing) !void {
+    var cdr_payload = try loanAndSerialize(dw, xcdr2, value);
     if (dw.return_loan_raw(&cdr_payload) != DDS.RETCODE_OK) return error.ReturnLoanFailed;
 }
 
@@ -212,7 +202,7 @@ pub fn main(init: std.process.Init) !void {
     // ── Write-loan phase: publish SAMPLE_COUNT pings via loan_raw/publish_loan_raw ──
     var seq: i32 = 0;
     while (seq < SAMPLE_COUNT) : (seq += 1) {
-        publishLoaned(dw, alloc, xcdr2, .{ .seq_num = seq }) catch {
+        publishLoaned(dw, xcdr2, .{ .seq_num = seq }) catch {
             std.debug.print("FAIL: publishLoaned() failed at sequence={d}\n", .{seq});
             std.process.exit(1);
         };
@@ -220,7 +210,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ── Cancel phase: loan a buffer, then return it unpublished ──────────
-    loanAndCancel(dw, alloc, xcdr2, .{ .seq_num = CANCELLED_SEQ_NUM }) catch {
+    loanAndCancel(dw, xcdr2, .{ .seq_num = CANCELLED_SEQ_NUM }) catch {
         std.debug.print("FAIL: loanAndCancel() failed\n", .{});
         std.process.exit(1);
     };

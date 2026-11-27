@@ -98,6 +98,10 @@ samples in order.`
 
 ## A real gap found building the Zig port
 
+**Resolved** (zidl 0.3.46): zidl-cdr's writers now count, then write into a
+fixed buffer, and the Zig publisher serializes straight into the loaned
+buffer. The original finding follows.
+
 `zidl-rt`'s `CdrWriter` (`zidl/packages/zidl-rt/src/cdr.zig`) is always
 `std.ArrayList(u8)`-backed (dynamic growth) — there is no fixed-capacity /
 counting-mode writer the way C's `zidl_cdr.c` has

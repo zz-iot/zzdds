@@ -1428,10 +1428,9 @@ test "decodeEndpointT: RTI Connext's vendor PID 0x8021 does not alias PID_PRESEN
     // This exercises the real generated codec through zzdds's own decode path
     // — if a future zidl (or IDL) change reopens the aliasing, this fails.
     const a = testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(a);
-    var w = zidl_cdr.PlCdrWriter.init(&buf, a);
-    try w.writeEncapHeader();
+    var storage: [512]u8 = undefined;
+    var w = zidl_cdr.RuntimeWriter.initFixed(&storage, .xcdr1, .little);
+    try w.writePlEncapHeader();
     {
         const h = try w.reservePlParam(PidTable.ENDPOINT_GUID);
         for (0..16) |_| try w.writeU8(0x11);
@@ -1452,7 +1451,7 @@ test "decodeEndpointT: RTI Connext's vendor PID 0x8021 does not alias PID_PRESEN
     try w.writeRawParam(0x8021, &.{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00 });
     try w.writePlSentinel();
 
-    var ep = try decodeEndpointT(Disc.DiscoveredWriterData, a, buf.items);
+    var ep = try decodeEndpointT(Disc.DiscoveredWriterData, a, w.bytes());
     defer ep.deinit();
     try testing.expectEqualStrings("Square", ep.data.topicName);
     try testing.expectEqualStrings("ShapeType", ep.data.typeName);
@@ -1478,10 +1477,9 @@ test "decodeEndpointT: a peer's PID_UNICAST_LOCATOR/PID_MULTICAST_LOCATOR entrie
     // so this is the only path that exercises the wire Locator_t → transport
     // Locator conversion (wireLocatorsOwned) against real interop traffic.
     const a = testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(a);
-    var w = zidl_cdr.PlCdrWriter.init(&buf, a);
-    try w.writeEncapHeader();
+    var storage: [512]u8 = undefined;
+    var w = zidl_cdr.RuntimeWriter.initFixed(&storage, .xcdr1, .little);
+    try w.writePlEncapHeader();
     {
         const h = try w.reservePlParam(PidTable.ENDPOINT_GUID);
         for (0..16) |_| try w.writeU8(0x22);
@@ -1495,7 +1493,7 @@ test "decodeEndpointT: a peer's PID_UNICAST_LOCATOR/PID_MULTICAST_LOCATOR entrie
     try w.writeRawParam(PidTable.MULTICAST_LOCATOR, &mc1);
     try w.writePlSentinel();
 
-    var ep = try decodeEndpointT(Disc.DiscoveredWriterData, a, buf.items);
+    var ep = try decodeEndpointT(Disc.DiscoveredWriterData, a, w.bytes());
     defer ep.deinit();
     try testing.expectEqual(@as(usize, 2), ep.unicast.len);
     try testing.expectEqual(Locator{ .udp_v4 = .{ .addr = .{ 192, 168, 1, 10 }, .port = 7412 } }, ep.unicast[0]);
@@ -1508,10 +1506,9 @@ test "decodeEndpointT / typeInfoBlob: a decoded PID_TYPE_INFORMATION blob round-
     // Encode-side injection (encodeWriterData) is covered elsewhere; nothing
     // exercised decoding one back out via typeInfoBlob until now.
     const a = testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(a);
-    var w = zidl_cdr.PlCdrWriter.init(&buf, a);
-    try w.writeEncapHeader();
+    var storage: [512]u8 = undefined;
+    var w = zidl_cdr.RuntimeWriter.initFixed(&storage, .xcdr1, .little);
+    try w.writePlEncapHeader();
     {
         const h = try w.reservePlParam(PidTable.ENDPOINT_GUID);
         for (0..16) |_| try w.writeU8(0x33);
@@ -1521,7 +1518,7 @@ test "decodeEndpointT / typeInfoBlob: a decoded PID_TYPE_INFORMATION blob round-
     try w.writeRawParam(0x0075, &blob); // PID_TYPE_INFORMATION
     try w.writePlSentinel();
 
-    var ep = try decodeEndpointT(Disc.DiscoveredWriterData, a, buf.items);
+    var ep = try decodeEndpointT(Disc.DiscoveredWriterData, a, w.bytes());
     defer ep.deinit();
     try testing.expectEqualSlices(u8, &blob, typeInfoBlob(ep.data.unknown_params));
 }

@@ -18,13 +18,13 @@
 #include <stdio.h>
 
 int main(void) {
+    uint8_t storage[8];
     ZidlCdrWriter writer;
-    if (zidl_cdr_writer_init(&writer, ZIDL_XCDR1) != ZIDL_CDR_OK ||
-        zidl_cdr_write_u32(&writer, 42u) != ZIDL_CDR_OK) {
+    zidl_cdr_writer_init_fixed(&writer, storage, sizeof storage, ZIDL_XCDR1);
+    if (zidl_cdr_write_u32(&writer, 42u) != ZIDL_CDR_OK || writer.len != 4) {
         fprintf(stderr, "FAIL: zidl-cdr writer through libzzdds\n");
         return 1;
     }
-    zidl_cdr_writer_deinit(&writer);
 
     zzdds_DomainParticipantFactory factory = zzdds_DomainParticipantFactory_create();
     if (factory == NULL) {
