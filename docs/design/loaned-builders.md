@@ -1,8 +1,9 @@
 # Loaned builders: typed writes filled in place
 
-Status: proposed. Phase 2 of `shmem-zero-copy.md` (part B, the write side of
-loaned view types). Builds on the write loans of `raw-loan-api.md` and zidl's
-write reservations (zidl `docs/design/bulk-cdr-zero-copy.md`, zidl #99).
+Status: accepted (#217); the zzdds groundwork is built, the zidl codegen is
+not. Phase 2 of `shmem-zero-copy.md` (part B, the write side of loaned view
+types). Builds on the write loans of `raw-loan-api.md` and zidl's write
+reservations (zidl `docs/design/bulk-cdr-zero-copy.md`, zidl #99).
 
 ## Goal
 
@@ -152,7 +153,7 @@ From the write loans:
 | Publish or cancel on a loan that is not outstanding | `PRECONDITION_NOT_MET` |
 | Publish failing in the writer | `publish_loan_raw`'s code; the loan is consumed |
 
-## Decisions (proposed)
+## Decisions
 
 1. **The builder mirrors the view.** The same classification picks the
    reservations, including members of nested structs. Other members are

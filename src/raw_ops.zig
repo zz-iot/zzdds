@@ -285,6 +285,71 @@ pub fn writeRawWithTimestamp(
     _ = try impl.writeRaw(ck, rtps_ts, key_hash, data);
 }
 
+/// A write loan from `loanRaw`: `data` to serialize one sample into, in
+/// place, then hand to exactly one of `publishLoanRaw` or `returnLoanRaw`.
+/// While one is out, its writer cannot be deleted. `data` is
+/// `DataWriterImpl.write_loan_alignment`-aligned. The native face of
+/// `DataWriter.loan_raw` (docs/design/raw-loan-api.md, "Write-side loan"),
+/// for zidl's loaned builders (docs/design/loaned-builders.md).
+pub const WriteLoan = struct {
+    data: []align(DataWriterImpl.write_loan_alignment.toByteUnits()) u8,
+    _seq: DDS.OctetSeq,
+};
+
+/// The errors of the write-loan operations, from their return codes.
+pub const WriteLoanError = error{ OutOfResources, Timeout, AlreadyDeleted, NotEnabled, BadParameter, PreconditionNotMet, Unexpected };
+
+fn writeLoanError(rc: DDS.ReturnCode_t) WriteLoanError!void {
+    return switch (rc) {
+        DDS.RETCODE_OK => {},
+        DDS.RETCODE_OUT_OF_RESOURCES => error.OutOfResources,
+        DDS.RETCODE_TIMEOUT => error.Timeout,
+        DDS.RETCODE_ALREADY_DELETED => error.AlreadyDeleted,
+        DDS.RETCODE_NOT_ENABLED => error.NotEnabled,
+        DDS.RETCODE_BAD_PARAMETER => error.BadParameter,
+        DDS.RETCODE_PRECONDITION_NOT_MET => error.PreconditionNotMet,
+        else => error.Unexpected,
+    };
+}
+
+/// Borrows a `size`-byte buffer from the writer, as `DataWriter.loan_raw`.
+/// No RESOURCE_LIMITS check here: `publishLoanRaw` makes it, as `write`.
+pub fn loanRaw(writer: DDS.DataWriter, size: usize) WriteLoanError!WriteLoan {
+    if (size > std.math.maxInt(u32)) return error.OutOfResources;
+    var seq: DDS.OctetSeq = .{};
+    try writeLoanError(writer.vtable.loan_raw(writer.ptr, @intCast(size), &seq));
+    const buf = seq._buffer orelse return error.Unexpected;
+    return .{ .data = @alignCast(buf[0..seq._maximum]), ._seq = seq };
+}
+
+/// Publishes the first `len` bytes of a loan as a sample of the instance
+/// with `key_hash`, at the current time, as `DataWriter.publish_loan_raw`.
+/// The loan ends whatever this returns: a failed publish, like a failed
+/// `write`, leaves nothing to retry.
+pub fn publishLoanRaw(writer: DDS.DataWriter, loan: *WriteLoan, len: usize, kind: WriteKind, key_hash: [16]u8) WriteLoanError!void {
+    if (len > loan.data.len) {
+        returnLoanRaw(writer, loan);
+        return error.BadParameter;
+    }
+    var kh = key_hash;
+    const kh_seq: DDS.OctetSeq = .{ ._length = 16, ._maximum = 16, ._buffer = &kh };
+    loan._seq._length = @intCast(len);
+    const dds_kind: DDS.WriteKind = switch (kind) {
+        .alive => .ALIVE_WRITE_KIND,
+        .dispose => .DISPOSE_WRITE_KIND,
+        .unregister => .UNREGISTER_WRITE_KIND,
+    };
+    const rc = writer.vtable.publish_loan_raw(writer.ptr, &loan._seq, &kh_seq, DDS.HANDLE_NIL, dds_kind);
+    loan.data = &.{};
+    return writeLoanError(rc);
+}
+
+/// Ends a loan unpublished, as `DataWriter.return_loan_raw`.
+pub fn returnLoanRaw(writer: DDS.DataWriter, loan: *WriteLoan) void {
+    _ = writer.vtable.return_loan_raw(writer.ptr, &loan._seq);
+    loan.data = &.{};
+}
+
 /// register_instance: the handle of the key hash's instance on this writer,
 /// registering it if it is not; HANDLE_NIL if it cannot be. `key_cdr`, the
 /// instance's key-only CDR with its encapsulation header, is its key for

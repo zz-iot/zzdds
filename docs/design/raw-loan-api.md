@@ -307,10 +307,12 @@ loan operation's own semantics at all.
 
 No contract needed. `zidl_cdr.c`'s primitive-write implementation goes through `memcpy`
 exclusively — never a raw pointer-cast typed store — so CDR's relative-to-offset-0
-alignment scheme is safe regardless of the loaned buffer's absolute base address. Will
-still document a courtesy minimum (e.g. 8-byte) since every real allocator already
-provides it for free, closing the door on ever needing this for a future raw-native-struct
-loan variant (see "Deferred" below).
+alignment scheme is safe regardless of the loaned buffer's absolute base address.
+
+Write loans are nonetheless allocated 8-byte aligned (`DataWriterImpl.write_loan_alignment`),
+for zidl's loaned builders: an application filling a reservation in place uses typed stores,
+and with an 8-byte-aligned loan every element up to 4 bytes wide is aligned in memory.
+See `loaned-builders.md`, decision 9.
 
 ## Lifetime, isolation, and pool pressure (read-loan side)
 

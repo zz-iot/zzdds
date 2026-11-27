@@ -522,6 +522,88 @@ test "publishLoan: a failed publish (RESOURCE_LIMITS) still fully releases the l
     try testing.expectEqual(@as(usize, 0), dw_impl.outstanding_loans.load(.monotonic));
 }
 
+test "loanForWrite: every buffer is 8-byte aligned, and frees at that alignment" {
+    var fx = try Fixture.init(58);
+    defer fx.deinit();
+    const dw_impl = wlMakeWriter(&fx, "WLTopicAlign", .{});
+
+    // Odd sizes, which a byte allocation would pack unaligned; the testing
+    // allocator also checks each free's alignment against its allocation.
+    for ([_]usize{ 1, 3, 5, 13, 29 }) |size| {
+        const buf = try dw_impl.loanForWrite(size);
+        try testing.expect(std.mem.isAligned(@intFromPtr(buf.ptr), 8));
+        dw_impl.cancelLoan(buf);
+    }
+}
+
+fn wlMakeWriterHandle(fx: *Fixture, name: [:0]const u8, qos: DDS.DataWriterQos) DDS.DataWriter {
+    const topic = fx.dp.create_topic(name, "T", .{}, null, 0);
+    const publisher = fx.dp.create_publisher(.{}, null, 0);
+    return publisher.create_datawriter(topic, qos, null, 0);
+}
+
+// The native publish's delivered bytes are checked in intraprocess_test.zig.
+test "loanRaw/publishLoanRaw (native): a loan is counted while out, and publishing ends it" {
+    var fx = try Fixture.init(59);
+    defer fx.deinit();
+    const dw = wlMakeWriterHandle(&fx, "WLTopicNativePublish", .{});
+    const dw_impl: *zzdds.dcps.DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    var loan = try zzdds.loanRaw(dw, 8);
+    try testing.expectEqual(@as(usize, 8), loan.data.len);
+    try testing.expectEqual(@as(usize, 1), dw_impl.outstanding_loans.load(.monotonic));
+    @memcpy(loan.data[0..5], &[_]u8{ 0x00, 0x01, 0x00, 0x00, 0x01 });
+    try zzdds.publishLoanRaw(dw, &loan, 5, .alive, WL_KEY);
+    try testing.expectEqual(@as(usize, 0), dw_impl.outstanding_loans.load(.monotonic));
+    try testing.expectEqual(DDS.RETCODE_OK, dw_impl.checkDeletePrecondition());
+}
+
+test "returnLoanRaw (native): ends the loan and publishes nothing" {
+    var fx = try Fixture.init(60);
+    defer fx.deinit();
+    const dw = wlMakeWriterHandle(&fx, "WLTopicNativeReturn", .{});
+    const dw_impl: *zzdds.dcps.DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    var loan = try zzdds.loanRaw(dw, 4);
+    const before = dw_impl.proto_writer.cacheLen();
+    zzdds.returnLoanRaw(dw, &loan);
+    try testing.expectEqual(@as(usize, 0), dw_impl.outstanding_loans.load(.monotonic));
+    try testing.expectEqual(before, dw_impl.proto_writer.cacheLen());
+    try testing.expectEqual(DDS.RETCODE_OK, dw_impl.checkDeletePrecondition());
+}
+
+test "publishLoanRaw (native): a length past the loan is BadParameter, and still ends the loan" {
+    var fx = try Fixture.init(61);
+    defer fx.deinit();
+    const dw = wlMakeWriterHandle(&fx, "WLTopicNativeTooLong", .{});
+    const dw_impl: *zzdds.dcps.DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    var loan = try zzdds.loanRaw(dw, 4);
+    const before = dw_impl.proto_writer.cacheLen();
+    try testing.expectError(error.BadParameter, zzdds.publishLoanRaw(dw, &loan, 5, .alive, WL_KEY));
+    try testing.expectEqual(@as(usize, 0), dw_impl.outstanding_loans.load(.monotonic));
+    try testing.expectEqual(before, dw_impl.proto_writer.cacheLen());
+}
+
+test "publishLoanRaw (native): a failed publish (RESOURCE_LIMITS) is OutOfResources, and ends the loan" {
+    var fx = try Fixture.init(62);
+    defer fx.deinit();
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.resource_limits.max_samples = 1;
+    dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const dw = wlMakeWriterHandle(&fx, "WLTopicNativeFail", dw_qos);
+    const dw_impl: *zzdds.dcps.DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    const PAYLOAD: [5]u8 = .{ 0x00, 0x01, 0x00, 0x00, 0x01 };
+    _ = try dw_impl.writeRaw(.alive, time_mod.RtpsTimestamp.now(), WL_KEY, &PAYLOAD);
+
+    var loan = try zzdds.loanRaw(dw, 5);
+    @memcpy(loan.data, &PAYLOAD);
+    try testing.expectError(error.OutOfResources, zzdds.publishLoanRaw(dw, &loan, 5, .alive, WL_KEY));
+    try testing.expectEqual(@as(usize, 0), dw_impl.outstanding_loans.load(.monotonic));
+}
+
 test "checkDeletePrecondition (DataWriter): PRECONDITION_NOT_MET while a loan is outstanding, OK once resolved" {
     var fx = try Fixture.init(53);
     defer fx.deinit();

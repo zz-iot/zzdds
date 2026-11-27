@@ -246,6 +246,39 @@ test "intraprocess: BEST_EFFORT single sample delivered synchronously" {
     try testing.expectEqualSlices(u8, &PAYLOAD_A, samples[0]);
 }
 
+test "intraprocess: a Zig write loan, filled in place, delivers exactly the bytes published" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, "IPTopic", "IPType");
+    defer fx.deinit();
+
+    var dw_qos = DDS.DataWriterQos{};
+    var dr_qos = DDS.DataReaderQos{};
+    dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(fx.topic_r.ptr))).toTopicDescription();
+    const dr = fx.sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
+    const dw = fx.pub_w.create_datawriter(fx.topic_w, dw_qos, null, 0);
+    fx.settle();
+
+    // A loan larger than the sample: the bytes past the length published,
+    // set to a marker, must not be delivered.
+    var loan = try zzdds.loanRaw(dw, PAYLOAD_A.len + 3);
+    try testing.expect(std.mem.isAligned(@intFromPtr(loan.data.ptr), 8));
+    @memcpy(loan.data[0..PAYLOAD_A.len], &PAYLOAD_A);
+    @memset(loan.data[PAYLOAD_A.len..], 0xEE);
+    try zzdds.publishLoanRaw(dw, &loan, PAYLOAD_A.len, .alive, std.mem.zeroes([16]u8));
+    try testing.expectEqual(@as(usize, 0), loan.data.len);
+    fx.settle();
+
+    const samples = try drainSamples(alloc, @ptrCast(@alignCast(dr.ptr)));
+    defer {
+        for (samples) |s| alloc.free(s);
+        alloc.free(samples);
+    }
+    try testing.expectEqual(@as(usize, 1), samples.len);
+    try testing.expectEqualSlices(u8, &PAYLOAD_A, samples[0]);
+}
+
 test "intraprocess: BEST_EFFORT three samples in order" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc, "IPTopic", "IPType");

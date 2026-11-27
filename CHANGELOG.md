@@ -10,6 +10,11 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-26
 
+- Write loans (`loan_raw`) are 8-byte aligned, so a typed store into a zidl reservation
+  of elements up to 4 bytes wide is aligned. Zig gains the write loans beside `writeRaw`:
+  `zzdds.loanRaw` returns a `WriteLoan` whose `data` is filled in place, ended by
+  `publishLoanRaw` (with the length used) or `returnLoanRaw`. Groundwork for zidl's
+  loaned builders (`docs/design/loaned-builders.md`, now accepted).
 - An application's own event loop can drive a manual `ExecutionRuntime` in place of
   `drive()` (`zzdds_c.h`'s `zzdds_ExecutionRuntime_attach_external_loop`). zzdds tells
   the loop which sockets to wait on through its `watch` hook (always before a socket
