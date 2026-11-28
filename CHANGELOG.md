@@ -8,6 +8,15 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-28
+
+- zidl v0.3.47: loaned builders (`docs/design/loaned-builders.md`). With
+  `--generate-views`, zidl generates a builder per struct, the write twin of its view: a
+  typed write whose primitive sequences are filled in place in a write loan
+  (`loan_builder`, then `publish_builder` or `cancel_builder`) instead of copied in by the
+  serializer. The C, C++ and Zig view smoke tests write through builders, cancelled and
+  published, and read the published sample back with `take_view`.
+
 ## 2026-11-27
 
 - zidl v0.3.46. Generated code and zzdds's own encoders count a sample, then write it

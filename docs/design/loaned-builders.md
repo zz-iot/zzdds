@@ -1,7 +1,8 @@
 # Loaned builders: typed writes filled in place
 
-Status: accepted (#217); the zzdds groundwork is built, the zidl codegen is
-not. Phase 2 of `shmem-zero-copy.md` (part B, the write side of loaned view
+Status: built. Accepted in #217; the zzdds groundwork is #219, the zidl
+codegen zidl #112 (v0.3.47), and the view smoke tests write through builders
+over a live writer and reader. Phase 2 of `shmem-zero-copy.md` (part B, the write side of loaned view
 types). Builds on the write loans of `raw-loan-api.md` and zidl's write
 reservations (zidl `docs/design/bulk-cdr-zero-copy.md`, zidl #99).
 

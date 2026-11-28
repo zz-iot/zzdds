@@ -1,7 +1,8 @@
 //! Read view types over a live reader (zidl --generate-views), in Zig: a
 //! writer and a reader in one participant on the real stack, a sample written
 //! and taken with the generated take_view, whose view points into the loaned
-//! payload until ViewSample.deinit ends the loan.
+//! payload until ViewSample.deinit ends the loan. Then the write twin, a
+//! builder: filled in place in a write loan and published, or cancelled.
 
 const std = @import("std");
 const testing = std.testing;
@@ -16,6 +17,16 @@ const TIMEOUT_NS: i64 = 10 * std.time.ns_per_s;
 fn within(loaned: []const u8, s: []const u8) bool {
     const p = @intFromPtr(s.ptr);
     return p >= @intFromPtr(loaned.ptr) and p + s.len <= @intFromPtr(loaned.ptr) + loaned.len;
+}
+
+/// take_view, waiting up to TIMEOUT_NS for a sample.
+fn takeViewWithin(reader: gen.ViewSmokeFrameDataReader) !gen.ViewSmokeFrameDataReader.ViewSample {
+    const deadline = time_mod.nanoTimestamp() + TIMEOUT_NS;
+    while (true) {
+        if (try reader.take_view()) |s| return s;
+        try testing.expect(time_mod.nanoTimestamp() < deadline);
+        time_mod.sleepNs(10 * std.time.ns_per_ms);
+    }
 }
 
 test "take_view decodes a live sample in place, and its deinit ends the loan" {
@@ -60,7 +71,8 @@ test "take_view decodes a live sample in place, and its deinit ends the loan" {
     var payload: [64]u8 = undefined;
     for (&payload, 0..) |*b, i| b.* = @intCast(i * 3);
     var samples = [_]f64{ 1.5, -2.25, 1e300 };
-    try gen.ViewSmokeFrameDataWriter.init(dw, alloc).write(.{
+    const writer = gen.ViewSmokeFrameDataWriter.init(dw, alloc);
+    try writer.write(.{
         .id = 3,
         .label = "view smoke",
         .payload = .{ ._length = 64, ._maximum = 64, ._buffer = &payload },
@@ -68,12 +80,7 @@ test "take_view decodes a live sample in place, and its deinit ends the loan" {
     }, 0);
 
     const reader = gen.ViewSmokeFrameDataReader.init(dr, alloc);
-    const take_deadline = time_mod.nanoTimestamp() + TIMEOUT_NS;
-    var sample = while (true) {
-        if (try reader.take_view()) |s| break s;
-        try testing.expect(time_mod.nanoTimestamp() < take_deadline);
-        time_mod.sleepNs(10 * std.time.ns_per_ms);
-    };
+    var sample = try takeViewWithin(reader);
     try testing.expect(sample.info.valid_data);
 
     // Decoded in place: the string and sequences point into the loan.
@@ -90,5 +97,37 @@ test "take_view decodes a live sample in place, and its deinit ends the loan" {
     sample.deinit();
 
     // Taken, so nothing is left.
+    try testing.expect(try reader.take_view() == null);
+
+    // A builder's loan ended unpublished publishes nothing.
+    {
+        var cancelled = try writer.loan_builder(.{ .id = 5, .label = "cancelled", .payload = .{ .count = 8 } });
+        cancelled.deinit();
+    }
+
+    // One filled in place and published reads back as if written.
+    var built = try writer.loan_builder(.{
+        .id = 4,
+        .label = "builder smoke",
+        .payload = .{ .count = 32 },
+        .samples = .{ .count = 2 },
+    });
+    defer built.deinit();
+    for (built.builder.payload.asNative(u8).?, 0..) |*b, i| b.* = @intCast(255 - i);
+    const built_samples = [_]f64{ 3.0, -0.5 };
+    try built.builder.samples.copyFrom(f64, &built_samples);
+    try built.publish();
+
+    var built_sample = try takeViewWithin(reader);
+    defer built_sample.deinit();
+    try testing.expect(built_sample.info.valid_data);
+    try testing.expectEqual(@as(u32, 4), built_sample.view.id);
+    try testing.expectEqualStrings("builder smoke", built_sample.view.label);
+    const octets = built_sample.view.payload.asNative(u8).?;
+    try testing.expectEqual(@as(usize, 32), octets.len);
+    for (octets, 0..) |b, i| try testing.expectEqual(@as(u8, @intCast(255 - i)), b);
+    var built_out: [2]f64 = undefined;
+    built_sample.view.samples.copyTo(std.mem.sliceAsBytes(&built_out));
+    try testing.expectEqualSlices(f64, &built_samples, &built_out);
     try testing.expect(try reader.take_view() == null);
 }
