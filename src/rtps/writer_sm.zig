@@ -30,6 +30,8 @@ const SCRATCH_SIZE = msg.builder.SCRATCH_SIZE;
 const IoVec = msg.builder.IoVec;
 
 pub const HistoryCache = history_mod.HistoryCache;
+pub const Payload = history_mod.Payload;
+pub const PayloadLoan = history_mod.PayloadLoan;
 pub const CacheChange = history_mod.CacheChange;
 pub const ChangeKind = history_mod.ChangeKind;
 pub const InstanceHandle = history_mod.InstanceHandle;
@@ -2164,18 +2166,23 @@ pub const StatefulWriter = struct {
     ) !SequenceNumber {
         self.mu.lock();
         defer self.mu.unlock();
-        return self.writeLocked(kind, source_timestamp, instance_handle, key_hash, data);
+        return self.writeLocked(kind, source_timestamp, instance_handle, key_hash, .{ .copy = data });
     }
 
+    /// Stores a change, copying or adopting its payload, and sends it (or
+    /// holds it for its coherent set). A loan is the history's either way.
     fn writeLocked(
         self: *Self,
         kind: ChangeKind,
         source_timestamp: RtpsTimestamp,
         instance_handle: InstanceHandle,
         key_hash: [16]u8,
-        data: []const u8,
+        payload: Payload,
     ) !SequenceNumber {
-        const sn = try self.cache.addWriterChange(kind, self.guid, source_timestamp, instance_handle, key_hash, data);
+        const sn = switch (payload) {
+            .copy => |data| try self.cache.addWriterChange(kind, self.guid, source_timestamp, instance_handle, key_hash, data),
+            .loan => |l| try self.cache.addLoanedWriterChange(kind, self.guid, source_timestamp, instance_handle, key_hash, l.buf, l.len),
+        };
         if (self.coherent_active) {
             self.coherent_pending_sns.append(self.alloc, sn) catch |err| {
                 // Roll back the cache entry so the orphaned SN is never advertised
@@ -2195,20 +2202,36 @@ pub const StatefulWriter = struct {
 
     /// `write`, for a change `admitWrite` admitted: uses its room, or gives
     /// it back if the write fails. Closed if the writer has closed since.
+    /// A loaned payload is adopted, or freed if the write fails.
     pub fn writeAdmitted(
         self: *Self,
         adm: *WriteAdmission,
         kind: ChangeKind,
         source_timestamp: RtpsTimestamp,
         key_hash: [16]u8,
-        data: []const u8,
+        payload: Payload,
     ) !SequenceNumber {
         self.mu.lock();
         defer self.mu.unlock();
         std.debug.assert(adm.held);
         self.leaveLocked(adm);
-        if (self.writes_closed) return error.Closed;
-        return self.writeLocked(kind, source_timestamp, adm.instance, key_hash, data);
+        if (self.writes_closed) {
+            self.cache.dropPayload(payload);
+            return error.Closed;
+        }
+        return self.writeLocked(kind, source_timestamp, adm.instance, key_hash, payload);
+    }
+
+    /// A buffer for a payload to serialize in place, then hand to
+    /// `writeAdmitted` as a loan, which adopts it, or to `returnPayload`.
+    /// Needs no lock: it only allocates, from the history's allocator.
+    pub fn loanPayload(self: *const Self, size: usize) error{OutOfMemory}!PayloadLoan {
+        return self.cache.loanPayload(size);
+    }
+
+    /// Frees a `loanPayload` buffer never written.
+    pub fn returnPayload(self: *const Self, buf: PayloadLoan) void {
+        self.cache.returnPayload(buf);
     }
 
     /// Makes room in the history for `n` changes, written later with

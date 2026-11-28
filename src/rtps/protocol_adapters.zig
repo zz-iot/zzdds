@@ -151,6 +151,8 @@ pub const RtpsProtocolWriter = struct {
         .set_write_limits = vtSetWriteLimits,
         .admit_write = vtAdmitWrite,
         .write_admitted = vtWriteAdmitted,
+        .loan_payload = vtLoanPayload,
+        .return_payload = vtReturnPayload,
         .release_admission = vtReleaseAdmission,
         .begin_coherent_set = vtBeginCoherentSet,
         .coherent_window_count = vtCoherentWindowCount,
@@ -270,10 +272,20 @@ pub const RtpsProtocolWriter = struct {
         kind: history_mod.ChangeKind,
         source_timestamp: history_mod.RtpsTimestamp,
         key_hash: [16]u8,
-        data: []const u8,
+        payload: history_mod.Payload,
     ) anyerror!history_mod.SequenceNumber {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.writer.writeAdmitted(adm, kind, source_timestamp, key_hash, data);
+        return self.writer.writeAdmitted(adm, kind, source_timestamp, key_hash, payload);
+    }
+
+    fn vtLoanPayload(ctx: *anyopaque, size: usize) error{OutOfMemory}!history_mod.PayloadLoan {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.writer.loanPayload(size);
+    }
+
+    fn vtReturnPayload(ctx: *anyopaque, buf: history_mod.PayloadLoan) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writer.returnPayload(buf);
     }
 
     fn vtReleaseAdmission(ctx: *anyopaque, adm: *protocol.WriteAdmission) void {

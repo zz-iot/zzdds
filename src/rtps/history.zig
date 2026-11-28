@@ -3,6 +3,8 @@
 //! Stores CacheChange records for writer and reader state machines.
 //!
 //!   Writer side: call `addWriterChange` — the cache assigns the next SN.
+//!   `addLoanedWriterChange` adopts a buffer from `loanPayload` instead of
+//!   copying the payload.
 //!   Reader side: call `addReaderChange` — uses the remote writer's SN.
 //!
 //!   KEEP_LAST (depth N): retains at most N changes; oldest is freed when full.
@@ -20,6 +22,33 @@ pub const SequenceNumber = sn_mod.SequenceNumber;
 pub const RtpsTimestamp = time_mod.RtpsTimestamp;
 
 // ── CacheChange ───────────────────────────────────────────────────────────────
+
+/// Alignment of a payload loan (`HistoryCache.loanPayload`): 8, so a typed
+/// store into a zidl reservation of elements up to 4 bytes wide is aligned
+/// (the CDR stream starts 4 bytes in, after the encapsulation header). See
+/// docs/design/loaned-builders.md, decision 9.
+pub const payload_loan_alignment: std.mem.Alignment = .@"8";
+
+/// A buffer from `HistoryCache.loanPayload`.
+pub const PayloadLoan = []align(payload_loan_alignment.toByteUnits()) u8;
+
+/// A change's payload, as a writer hands it to its history.
+pub const Payload = union(enum) {
+    /// Bytes the history copies; the caller keeps them.
+    copy: []const u8,
+    /// A buffer from `loanPayload`, whose first `len` bytes are the payload.
+    /// The history adopts it, or frees it if the write fails: either way the
+    /// caller gives it up.
+    loan: struct { buf: PayloadLoan, len: usize },
+
+    /// The payload's bytes.
+    pub fn bytes(self: Payload) []const u8 {
+        return switch (self) {
+            .copy => |d| d,
+            .loan => |l| l.buf[0..l.len],
+        };
+    }
+};
 
 /// Opaque 16-byte instance handle.
 /// For keyed types: MD5 of serialized key fields (§9.6.3.3).
@@ -75,6 +104,9 @@ pub const CacheChange = struct {
     key_hash: [16]u8,
     /// Serialized payload (encap header + CDR). Empty for NOT_ALIVE_* changes.
     data: []const u8,
+    /// The alignment `data` was allocated at, which freeing it needs: a
+    /// copy's is 1, an adopted loan's `payload_loan_alignment`.
+    data_alignment: std.mem.Alignment = .@"1",
     /// When non-null, this change is part of a coherent set.
     /// Value = the writer SN of the set's first sample; emitted as PID_COHERENT_SET.
     coherent_set_sn: ?SequenceNumber = null,
@@ -152,8 +184,34 @@ pub const HistoryCache = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        for (self.changes.items) |*ch| self.alloc.free(ch.data);
+        for (self.changes.items) |ch| self.freeData(ch);
         self.changes.deinit(self.alloc);
+    }
+
+    /// Frees a change's payload, at the alignment it was allocated with.
+    fn freeData(self: *Self, ch: CacheChange) void {
+        if (ch.data.len == 0) return;
+        self.alloc.rawFree(@constCast(ch.data), ch.data_alignment, @returnAddress());
+    }
+
+    /// A buffer to serialize a payload into, in place, for
+    /// `addLoanedWriterChange` to adopt, or `returnPayload` to free. Needs no
+    /// lock: it only allocates.
+    pub fn loanPayload(self: *const Self, size: usize) error{OutOfMemory}!PayloadLoan {
+        return self.alloc.alignedAlloc(u8, payload_loan_alignment, size);
+    }
+
+    /// Frees a `loanPayload` buffer never added. Needs no lock.
+    pub fn returnPayload(self: *const Self, buf: PayloadLoan) void {
+        self.alloc.free(buf);
+    }
+
+    /// Frees what a payload owns: a loan, never added.
+    pub fn dropPayload(self: *const Self, payload: Payload) void {
+        switch (payload) {
+            .copy => {},
+            .loan => |l| self.returnPayload(l.buf),
+        }
     }
 
     // ── Writer-side ───────────────────────────────────────────────────────────
@@ -174,7 +232,40 @@ pub const HistoryCache = struct {
         errdefer self.alloc.free(data_copy);
         // Before the trim, so a failure leaves the instance's last change.
         try self.changes.ensureTotalCapacity(self.alloc, self.changes.items.len + self.reserved + 1);
-        return self.addOwnedLocked(kind, writer_guid, source_timestamp, instance_handle, key_hash, data_copy);
+        return self.addOwnedLocked(kind, writer_guid, source_timestamp, instance_handle, key_hash, data_copy, .@"1");
+    }
+
+    /// `addWriterChange`, adopting the first `used_len` bytes of `buf` (from
+    /// `loanPayload`) instead of copying them. Takes `buf` whatever it
+    /// returns: on failure it is freed.
+    pub fn addLoanedWriterChange(
+        self: *Self,
+        kind: ChangeKind,
+        writer_guid: Guid,
+        source_timestamp: RtpsTimestamp,
+        instance_handle: InstanceHandle,
+        key_hash: [16]u8,
+        buf: PayloadLoan,
+        used_len: usize,
+    ) !SequenceNumber {
+        const data = try self.fitLoan(buf, used_len);
+        errdefer self.alloc.free(data);
+        // Before the trim, so a failure leaves the instance's last change.
+        try self.changes.ensureTotalCapacity(self.alloc, self.changes.items.len + self.reserved + 1);
+        return self.addOwnedLocked(kind, writer_guid, source_timestamp, instance_handle, key_hash, data, payload_loan_alignment);
+    }
+
+    /// `buf`'s first `used_len` bytes as an allocation of their own, since a free
+    /// needs the allocated length: `buf` itself when it is that long, else
+    /// shrunk in place, else copied. Frees `buf` on failure.
+    fn fitLoan(self: *Self, buf: PayloadLoan, used_len: usize) error{OutOfMemory}!PayloadLoan {
+        std.debug.assert(used_len <= buf.len);
+        if (used_len == buf.len) return buf;
+        if (self.alloc.resize(buf, used_len)) return buf[0..used_len];
+        defer self.alloc.free(buf);
+        const exact = try self.alloc.alignedAlloc(u8, payload_loan_alignment, used_len);
+        @memcpy(exact, buf[0..used_len]);
+        return exact;
     }
 
     /// Makes room for `n` changes, added later with `addReservedWriterChange`.
@@ -203,10 +294,11 @@ pub const HistoryCache = struct {
         uses_reservation: bool,
     ) SequenceNumber {
         if (uses_reservation) self.reserved -= 1;
-        return self.addOwnedLocked(kind, writer_guid, source_timestamp, instance_handle, key_hash, data);
+        return self.addOwnedLocked(kind, writer_guid, source_timestamp, instance_handle, key_hash, data, .@"1");
     }
 
-    /// Adds a change owning `data`, into capacity already made.
+    /// Adds a change owning `data`, allocated at `data_alignment`, into
+    /// capacity already made.
     fn addOwnedLocked(
         self: *Self,
         kind: ChangeKind,
@@ -215,6 +307,7 @@ pub const HistoryCache = struct {
         instance_handle: InstanceHandle,
         key_hash: [16]u8,
         data: []u8,
+        data_alignment: std.mem.Alignment,
     ) SequenceNumber {
         const sn = self.next_sn;
         self.next_sn += 1;
@@ -227,6 +320,7 @@ pub const HistoryCache = struct {
             .instance_handle = instance_handle,
             .key_hash = key_hash,
             .data = data,
+            .data_alignment = data_alignment,
         });
         return sn;
     }
@@ -256,6 +350,7 @@ pub const HistoryCache = struct {
 
         var owned = ch;
         owned.data = data_copy;
+        owned.data_alignment = .@"1";
 
         self.trimForKeepLast(ch.instance_handle);
         try self.changes.append(self.alloc, owned);
@@ -285,8 +380,7 @@ pub const HistoryCache = struct {
         var i: usize = 0;
         while (i < self.changes.items.len) {
             if (self.changes.items[i].sequence_number == sn) {
-                const ch = self.changes.orderedRemove(i);
-                self.alloc.free(ch.data);
+                self.freeData(self.changes.orderedRemove(i));
                 return;
             }
             i += 1;
@@ -299,8 +393,7 @@ pub const HistoryCache = struct {
         var i: usize = 0;
         while (i < self.changes.items.len) {
             if (self.changes.items[i].sequence_number <= up_to_sn) {
-                const ch = self.changes.orderedRemove(i);
-                self.alloc.free(ch.data);
+                self.freeData(self.changes.orderedRemove(i));
             } else {
                 i += 1;
             }
@@ -313,7 +406,7 @@ pub const HistoryCache = struct {
     pub fn removeWriterChangesUpTo(self: *Self, up_to_sn: SequenceNumber) void {
         var n: usize = 0;
         while (n < self.changes.items.len and self.changes.items[n].sequence_number <= up_to_sn) : (n += 1) {
-            self.alloc.free(self.changes.items[n].data);
+            self.freeData(self.changes.items[n]);
         }
         self.changes.replaceRangeAssumeCapacity(0, n, &.{});
     }
@@ -374,8 +467,7 @@ pub const HistoryCache = struct {
             var i: usize = 0;
             while (i < self.changes.items.len) : (i += 1) {
                 if (std.mem.eql(u8, &self.changes.items[i].instance_handle, &ih)) {
-                    const evicted = self.changes.orderedRemove(i);
-                    self.alloc.free(evicted.data);
+                    self.freeData(self.changes.orderedRemove(i));
                     count -= 1;
                     break;
                 }
@@ -527,4 +619,46 @@ test "HistoryCache addReaderChange deduplication" {
     try cache.addReaderChange(ch);
     try cache.addReaderChange(ch); // duplicate — should be ignored
     try testing.expectEqual(@as(usize, 1), cache.len());
+}
+
+test "HistoryCache adopts a loaned payload, with no copy, and frees it at its alignment" {
+    // KEEP_LAST 1: the second change evicts the first, freeing the loan the
+    // way the testing allocator checks, at the alignment it was made with.
+    var cache = HistoryCache.init(testing.allocator, .keep_last, 1);
+    defer cache.deinit();
+    const g = makeGuid(1);
+
+    const buf = try cache.loanPayload(7);
+    try testing.expect(std.mem.isAligned(@intFromPtr(buf.ptr), payload_loan_alignment.toByteUnits()));
+    @memcpy(buf, "adopted");
+    const sn = try cache.addLoanedWriterChange(.alive, g, ZERO_TS, NIL_IH, NIL_KH, buf, buf.len);
+    const ch = cache.getChange(sn).?;
+    try testing.expectEqual(@intFromPtr(buf.ptr), @intFromPtr(ch.data.ptr));
+    try testing.expectEqualStrings("adopted", ch.data);
+
+    _ = try cache.addWriterChange(.alive, g, ZERO_TS, NIL_IH, NIL_KH, "copied");
+    try testing.expectEqual(@as(?*const CacheChange, null), cache.getChange(sn));
+}
+
+test "HistoryCache adopts the used part of a longer loan" {
+    var cache = HistoryCache.init(testing.allocator, .keep_all, 0);
+    defer cache.deinit();
+    const buf = try cache.loanPayload(64);
+    @memcpy(buf[0..4], "used");
+    const sn = try cache.addLoanedWriterChange(.alive, makeGuid(1), ZERO_TS, NIL_IH, NIL_KH, buf, 4);
+    try testing.expectEqualStrings("used", cache.getChange(sn).?.data);
+    // An empty one too: nothing to keep, and nothing to free later.
+    const empty = try cache.loanPayload(8);
+    const sn_empty = try cache.addLoanedWriterChange(.not_alive_unregistered, makeGuid(1), ZERO_TS, NIL_IH, NIL_KH, empty, 0);
+    try testing.expectEqual(@as(usize, 0), cache.getChange(sn_empty).?.data.len);
+}
+
+test "HistoryCache frees a loan it fails to add" {
+    // The loan is allocation 0; the change list's growth, allocation 1, fails.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    var cache = HistoryCache.init(failing.allocator(), .keep_all, 0);
+    defer cache.deinit();
+    const buf = try cache.loanPayload(16);
+    try testing.expectError(error.OutOfMemory, cache.addLoanedWriterChange(.alive, makeGuid(1), ZERO_TS, NIL_IH, NIL_KH, buf, buf.len));
+    try testing.expectEqual(@as(usize, 0), cache.len());
 }

@@ -10,6 +10,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-11-28
 
+- A published write loan is the sample's payload in the writer's history: the history
+  adopts the buffer instead of copying it (phase 3 of `docs/design/shmem-zero-copy.md`).
+  Write loans come from the history (`ProtocolWriter.loanPayload`). Generated C and C++
+  writes, and every loaned builder, already serialize into a loan, so they now make no copy
+  after serializing. `write_raw` still copies the caller's bytes.
+
 - zidl v0.3.47: loaned builders (`docs/design/loaned-builders.md`). With
   `--generate-views`, zidl generates a builder per struct, the write twin of its view: a
   typed write whose primitive sequences are filled in place in a write loan

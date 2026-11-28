@@ -2517,7 +2517,7 @@ test "admitWrite: room once acknowledgments free it, a timeout otherwise" {
     pureAck(w, a, 1, 1);
     pureAck(w, b, 1, 1);
     try w.admitWrite(&adm, true, 0);
-    _ = try w.writeAdmitted(&adm, .alive, ZERO_TS, NIL_KH, "four");
+    _ = try w.writeAdmitted(&adm, .alive, ZERO_TS, NIL_KH, .{ .copy = "four" });
     try testing.expectEqual(@as(usize, 3), cacheLen(w));
 }
 
@@ -2560,7 +2560,7 @@ test "admitWrite: under KEEP_LAST a change that replaces its instance's oldest t
 
     var same: WriteAdmission = .{ .instance = instance(1) };
     try w.admitWrite(&same, false, null);
-    _ = try w.writeAdmitted(&same, .alive, ZERO_TS, NIL_KH, "b");
+    _ = try w.writeAdmitted(&same, .alive, ZERO_TS, NIL_KH, .{ .copy = "b" });
     var other: WriteAdmission = .{ .instance = instance(2) };
     try testing.expectError(error.OutOfResources, w.admitWrite(&other, false, null));
 }
@@ -2669,10 +2669,24 @@ test "closeWrites: refuses new writes and commits of admitted ones" {
     var admitted: WriteAdmission = .{ .instance = NIL_IH };
     try w.admitWrite(&admitted, true, null);
     w.closeWrites();
-    try testing.expectError(error.Closed, w.writeAdmitted(&admitted, .alive, ZERO_TS, NIL_KH, "late"));
+    try testing.expectError(error.Closed, w.writeAdmitted(&admitted, .alive, ZERO_TS, NIL_KH, .{ .copy = "late" }));
     try testing.expectEqual(@as(usize, 0), cacheLen(w));
     var later: WriteAdmission = .{ .instance = NIL_IH };
     try testing.expectError(error.Closed, w.admitWrite(&later, true, null));
+}
+
+test "closeWrites: a refused write frees its loan" {
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(testing.allocator, makeGuid(0x72, WRITER_EID), rec.makeTransport(), .keep_all, 0, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    defer w.deinit();
+
+    var admitted: WriteAdmission = .{ .instance = NIL_IH };
+    try w.admitWrite(&admitted, true, null);
+    const buf = try w.loanPayload(8);
+    w.closeWrites();
+    // The testing allocator reports the loan if it is not freed.
+    try testing.expectError(error.Closed, w.writeAdmitted(&admitted, .alive, ZERO_TS, NIL_KH, .{ .loan = .{ .buf = buf, .len = buf.len } }));
+    try testing.expectEqual(@as(usize, 0), cacheLen(w));
 }
 
 test "closeWrites: ends a write waiting for room" {
