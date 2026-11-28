@@ -1,7 +1,8 @@
 /* Read view types over a live reader (zidl --generate-views): a writer and a
  * reader in one participant, a sample written and taken with take_view. The
  * view's string and primitive sequences point into the loaned payload until
- * return_view, which ends the loan. Compiled and run by
+ * return_view, which ends the loan. Then the write twin, a builder: filled in
+ * place in a write loan and published, or cancelled. Compiled and run by
  * `zig build test-bindings -Dc-binding=true`. */
 
 /* nanosleep is POSIX, which strict C99 hides without this. */
@@ -41,6 +42,15 @@ static uint32_t test_domain(void) {
 static int within(const DDS_OctetSeq *payload, const void *p) {
     const uint8_t *b = (const uint8_t *)p;
     return b >= payload->_buffer && b < payload->_buffer + payload->_length;
+}
+
+/* take_view, waiting up to TIMEOUT_MS for a sample. */
+static DDS_ReturnCode_t take_view_within(ViewSmokeFrameDataReader *reader, ViewSmokeFrameView *view, DDS_SampleInfo *info, DDS_OctetSeqSeq *loan_payloads, DDS_SampleInfoSeq *loan_infos) {
+    for (int waited = 0;; waited += POLL_MS) {
+        DDS_ReturnCode_t rc = ViewSmokeFrameDataReader_take_view(reader, view, info, loan_payloads, loan_infos);
+        if (rc != DDS_RETCODE_NO_DATA || waited >= TIMEOUT_MS) return rc;
+        sleep_ms(POLL_MS);
+    }
 }
 
 int main(void) {
@@ -98,13 +108,7 @@ int main(void) {
     DDS_SampleInfo info;
     DDS_OctetSeqSeq loan_payloads = { 0, 0, NULL, false };
     DDS_SampleInfoSeq loan_infos = { 0, 0, NULL, false };
-    DDS_ReturnCode_t rc;
-    for (int waited = 0;; waited += POLL_MS) {
-        rc = ViewSmokeFrameDataReader_take_view(&reader, &view, &info, &loan_payloads, &loan_infos);
-        if (rc != DDS_RETCODE_NO_DATA) break;
-        assert(waited < TIMEOUT_MS);
-        sleep_ms(POLL_MS);
-    }
+    DDS_ReturnCode_t rc = take_view_within(&reader, &view, &info, &loan_payloads, &loan_infos);
     assert(rc == DDS_RETCODE_OK && info.valid_data);
 
     /* Decoded in place: the string and sequences point into the loan. */
@@ -121,6 +125,43 @@ int main(void) {
     ViewSmokeFrameDataReader_return_view(&reader, &view, &loan_payloads, &loan_infos);
 
     /* Taken, so nothing is left. */
+    assert(ViewSmokeFrameDataReader_take_view(&reader, &view, &info, &loan_payloads, &loan_infos) == DDS_RETCODE_NO_DATA);
+
+    /* A builder's loan cancelled publishes nothing. */
+    ViewSmokeFrameBuilder builder;
+    memset(&builder, 0, sizeof builder);
+    builder.id = 5u;
+    builder.label = "cancelled";
+    builder.payload.count = 8;
+    ViewSmokeFrameWriteLoan wloan;
+    assert(ViewSmokeFrameDataWriter_loan_builder(&writer, &builder, &wloan) == DDS_RETCODE_OK);
+    assert(ViewSmokeFrameDataWriter_cancel_builder(&writer, &wloan) == DDS_RETCODE_OK);
+
+    /* One filled in place and published reads back as if written. */
+    memset(&builder, 0, sizeof builder);
+    builder.id = 4u;
+    builder.label = "builder smoke";
+    builder.payload.count = 32;
+    builder.samples.count = 2;
+    assert(ViewSmokeFrameDataWriter_loan_builder(&writer, &builder, &wloan) == DDS_RETCODE_OK);
+    uint8_t *octets = ViewSmokeFrameWriteLoan_data(&wloan, &builder.payload);
+    assert(octets != NULL);
+    for (int i = 0; i < 32; ++i) octets[i] = (uint8_t)(255 - i);
+    double built[2] = { 3.0, -0.5 };
+    void *doubles = ViewSmokeFrameWriteLoan_data(&wloan, &builder.samples);
+    assert(doubles != NULL);
+    memcpy(doubles, built, sizeof built); /* 8-byte elements may be unaligned */
+    assert(ViewSmokeFrameDataWriter_publish_builder(&writer, &builder, &wloan) == DDS_RETCODE_OK);
+
+    rc = take_view_within(&reader, &view, &info, &loan_payloads, &loan_infos);
+    assert(rc == DDS_RETCODE_OK && info.valid_data);
+    assert(view.id == 4u && strcmp(view.label, "builder smoke") == 0);
+    bytes = ZIDL_CDR_VIEW_AS(&view.payload, uint8_t);
+    assert(view.payload.count == 32 && bytes != NULL);
+    for (int i = 0; i < 32; ++i) assert(bytes[i] == (uint8_t)(255 - i));
+    assert(view.samples.count == 2 && zidl_cdr_view_copy(&view.samples, samples_out) == 0);
+    assert(memcmp(samples_out, built, sizeof built) == 0);
+    ViewSmokeFrameDataReader_return_view(&reader, &view, &loan_payloads, &loan_infos);
     assert(ViewSmokeFrameDataReader_take_view(&reader, &view, &info, &loan_payloads, &loan_infos) == DDS_RETCODE_NO_DATA);
 
     assert(DDS_DomainParticipant_delete_contained_entities(dp) == DDS_RETCODE_OK);

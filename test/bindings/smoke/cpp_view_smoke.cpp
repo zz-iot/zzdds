@@ -1,7 +1,9 @@
 // Read view types over a live reader (zidl --generate-views): a writer and a
 // reader in one participant, a sample written and taken with take_view into a
 // ViewLoan, whose view holds the decoded members in place until reset() ends
-// the loan. Compiled and run by `zig build test-bindings -Dcpp-binding=true`.
+// the loan. Then the write twin, a builder: filled in place in a BuilderLoan
+// and published, or cancelled. Compiled and run by
+// `zig build test-bindings -Dcpp-binding=true`.
 
 #include "view_smoke.hpp"
 #include "zzdds_c.h"
@@ -70,14 +72,16 @@ int main() {
     assert(writer.write(sample) == DDS_RETCODE_OK);
 
     ViewSmokeFrameDataReader reader(dr);
+    // take_view, waiting up to kTimeoutMs for a sample.
+    auto take_view_within = [&reader](ViewSmokeFrameDataReader::ViewLoan &out) {
+        for (int waited = 0;; waited += kPollMs) {
+            const DDS_ReturnCode_t rc = reader.take_view(out);
+            if (rc != DDS_RETCODE_NO_DATA || waited >= kTimeoutMs) return rc;
+            sleep_ms(kPollMs);
+        }
+    };
     ViewSmokeFrameDataReader::ViewLoan loan;
-    DDS_ReturnCode_t rc;
-    for (int waited = 0;; waited += kPollMs) {
-        rc = reader.take_view(loan);
-        if (rc != DDS_RETCODE_NO_DATA) break;
-        assert(waited < kTimeoutMs);
-        sleep_ms(kPollMs);
-    }
+    DDS_ReturnCode_t rc = take_view_within(loan);
     assert(rc == DDS_RETCODE_OK && loan.active() && loan.info().valid_data);
 
     const ViewSmokeFrameView &view = loan.view();
@@ -104,6 +108,43 @@ int main() {
 
     // Taken, so nothing is left.
     assert(reader.take_view(moved) == DDS_RETCODE_NO_DATA && !moved.active());
+
+    // A builder's loan cancelled, or destroyed active, publishes nothing.
+    ViewSmokeFrameBuilder cancelled{};
+    cancelled.id = 5u;
+    cancelled.label = "cancelled";
+    cancelled.payload.resize(8);
+    ViewSmokeFrameDataWriter::BuilderLoan built;
+    assert(writer.loan_builder(cancelled, built) == DDS_RETCODE_OK && built.active());
+    assert(writer.cancel_builder(built) == DDS_RETCODE_OK && !built.active());
+    {
+        ViewSmokeFrameDataWriter::BuilderLoan dropped;
+        assert(writer.loan_builder(cancelled, dropped) == DDS_RETCODE_OK && dropped.active());
+    }
+
+    // One filled in place and published reads back as if written.
+    ViewSmokeFrameBuilder builder{};
+    builder.id = 4u;
+    builder.label = "builder smoke";
+    builder.payload.resize(32);
+    builder.samples.resize(2);
+    assert(writer.loan_builder(builder, built) == DDS_RETCODE_OK && built.active());
+    uint8_t *octets = built.builder().payload.as_native();  // octets: always aligned
+    assert(octets != nullptr);
+    for (int i = 0; i < 32; ++i) octets[i] = static_cast<uint8_t>(255 - i);
+    const std::vector<double> built_samples = {3.0, -0.5};
+    built.builder().samples.copy_from(built_samples.data());
+    assert(writer.publish_builder(built) == DDS_RETCODE_OK && !built.active());
+
+    rc = take_view_within(moved);
+    assert(rc == DDS_RETCODE_OK && moved.active() && moved.info().valid_data);
+    const ViewSmokeFrameView &built_view = moved.view();
+    assert(built_view.id == 4u && built_view.label == "builder smoke");
+    assert(built_view.payload.size() == 32);
+    for (int i = 0; i < 32; ++i) assert(built_view.payload.as_native()[i] == static_cast<uint8_t>(255 - i));
+    assert(built_view.samples.to_vector() == built_samples);
+    moved.reset();
+    assert(reader.take_view(moved) == DDS_RETCODE_NO_DATA);
 
     assert(DDS_DomainParticipant_delete_contained_entities(dp) == DDS_RETCODE_OK);
     assert(DDS_DomainParticipantFactory_delete_participant(dds_factory, dp) == DDS_RETCODE_OK);
