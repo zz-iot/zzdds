@@ -488,6 +488,70 @@ test "loanForWrite/publishLoan: round trip tracks outstanding_loans, frees buffe
     try testing.expectEqual(before + 1, dw_impl.proto_writer.cacheLen());
 }
 
+/// The writer's history change `sn`, under its lock, for `check`.
+fn wlCheckChange(dw_impl: *zzdds.dcps.DataWriterImpl, sn: history_mod.SequenceNumber, check: anytype) !void {
+    const pw: *zzdds.rtps.protocol_adapters.RtpsProtocolWriter = @ptrCast(@alignCast(dw_impl.proto_writer.ctx));
+    pw.writer.mu.lock();
+    defer pw.writer.mu.unlock();
+    try check.run(pw.writer.cache.getChange(sn) orelse return error.TestUnexpectedResult);
+}
+
+test "publishLoan: the history adopts the loaned buffer, with no copy" {
+    var fx = try Fixture.init(59);
+    defer fx.deinit();
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const dw_impl = wlMakeWriter(&fx, "WLTopicAdopt", dw_qos);
+
+    const buf = try dw_impl.loanForWrite(8);
+    @memcpy(buf, &[_]u8{ 0x00, 0x01, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD });
+    const sn = try dw_impl.publishLoan(.alive, time_mod.RtpsTimestamp.now(), WL_KEY, buf, buf.len);
+    try wlCheckChange(dw_impl, sn, struct {
+        loaned: usize,
+        fn run(self: @This(), ch: *const history_mod.CacheChange) !void {
+            try testing.expectEqual(self.loaned, @intFromPtr(ch.data.ptr));
+            try testing.expectEqualSlices(u8, &.{ 0x00, 0x01, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD }, ch.data);
+        }
+    }{ .loaned = @intFromPtr(buf.ptr) });
+
+    // Only the bytes used are published; the rest of the loan is not kept.
+    const longer = try dw_impl.loanForWrite(32);
+    @memcpy(longer[0..5], &[_]u8{ 0x00, 0x01, 0x00, 0x00, 0x07 });
+    const sn2 = try dw_impl.publishLoan(.alive, time_mod.RtpsTimestamp.now(), WL_KEY, longer, 5);
+    try wlCheckChange(dw_impl, sn2, struct {
+        fn run(_: @This(), ch: *const history_mod.CacheChange) !void {
+            try testing.expectEqualSlices(u8, &.{ 0x00, 0x01, 0x00, 0x00, 0x07 }, ch.data);
+        }
+    }{});
+}
+
+test "publishLoan: an instance's key is taken from the loan before the history adopts it" {
+    var fx = try Fixture.init(60);
+    defer fx.deinit();
+    const dw_impl = wlMakeWriter(&fx, "WLTopicKey", .{});
+    const key: [16]u8 = @splat(0x5A);
+    const SAMPLE = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0x11, 0x22 };
+
+    // KEEP_LAST 1 (the default): the next write of the instance frees this
+    // change, so the instance's key must not point into it.
+    const buf = try dw_impl.loanForWrite(SAMPLE.len);
+    @memcpy(buf, &SAMPLE);
+    _ = try dw_impl.publishLoan(.alive, time_mod.RtpsTimestamp.now(), key, buf, buf.len);
+    _ = try dw_impl.writeRaw(.alive, time_mod.RtpsTimestamp.now(), key, &[_]u8{ 0x00, 0x01, 0x00, 0x00, 0x33, 0x44 });
+    {
+        dw_impl.instances_mu.lock();
+        defer dw_impl.instances_mu.unlock();
+        const kv = (dw_impl.instances.getByKey(key) orelse return error.TestUnexpectedResult).* orelse return error.TestUnexpectedResult;
+        // No projection on this type: the key is the first sample, whole.
+        try testing.expectEqualSlices(u8, &SAMPLE, kv.payload);
+    }
+
+    // A loan for an instance that has its key takes none.
+    const again = try dw_impl.loanForWrite(SAMPLE.len);
+    @memcpy(again, &SAMPLE);
+    _ = try dw_impl.publishLoan(.alive, time_mod.RtpsTimestamp.now(), key, again, again.len);
+}
+
 test "loanForWrite/cancelLoan: round trip tracks outstanding_loans, frees buffer, publishes nothing" {
     var fx = try Fixture.init(51);
     defer fx.deinit();

@@ -1,6 +1,7 @@
 # RTPS over shared memory, with payloads by reference, and loaned view types
 
-Status: accepted design, not built. Builds on the raw-loan API
+Status: accepted design; phases 1 to 3 are built (see Phasing), part A is
+not. Builds on the raw-loan API
 (`raw-loan-api.md`) and zidl's zero-copy bulk CDR views and reservations
 (zidl `docs/design/bulk-cdr-zero-copy.md`, zidl #98 and #99).
 
@@ -39,7 +40,7 @@ traced from the code:
 | # | Copy | Where |
 |---|------|-------|
 | 0 | Struct to CDR, into the write loan | generated `serialize` |
-| 1 | Loan into the writer's history cache | `history.zig` (`HistoryCache.add`) |
+| 1 | Loan into the writer's history cache. Gone since phase 3 for a write loan, which the history adopts; still made for `write_raw`'s caller-owned bytes | `history.zig` (`HistoryCache.addWriterChange`) |
 | - | None into the datagram: the builder passes payload slices to `sendmsg` (scatter-gather), in DATA_FRAGs of 16 KB by default | `message/builder.zig` |
 | 2-3 | Kernel send and receive | UDP |
 | 4 | Datagram into the participant's ingress queue | `participant.zig` (`queueIngress`) |
@@ -293,10 +294,19 @@ if (SensorFrameDataReader_take_view(&reader, &view, &info, &loan) == DDS_RETCODE
 ## Phasing
 
 1. **Read view types over today's heap loans** (zidl codegen, and the zzdds
-   typed wrappers in C, C++ and Zig). This removes the decode copy.
+   typed wrappers in C, C++ and Zig). This removes the decode copy. Built.
 2. **Loaned builders** for writes, with reservations (`loaned-builders.md`).
+   Built.
 3. **Writer history adopts loaned buffers** (heap): removes copy 1 for every
-   writer. It is also the seam the shared segment slots into.
+   writer. It is also the seam the shared segment slots into. Built: the
+   protocol writer lends the payload buffers (`loan_payload`), and
+   `write_admitted` adopts a loan instead of copying it. Each change records
+   the alignment its payload was allocated at, so the history frees an
+   adopted loan correctly. A loaned instance's key is taken before the hand-off,
+   since after it the history may free the payload before the write returns.
+   Copy 1 is then gone for every generated write that loans: all of them
+   once `publish_loan_raw` takes a source timestamp, and zidl's Zig writes
+   and timestamped C and C++ writes use loans (the next zidl release).
 4. **The shared-memory inbox transport, with payloads inline.** RTPS over
    shared memory first, proving the inboxes, wake-ups, drops and repair,
    liveness locks and sweeps, with no shared payloads yet. This already

@@ -523,6 +523,24 @@ pub const DataWriterImpl = struct {
         key_hash: [16]u8,
         data: []const u8,
     ) !history_mod.SequenceNumber {
+        return self.writeChange(kind, source_timestamp, key_hash, .{ .copy = data }, null);
+    }
+
+    /// `writeRaw`, for a payload the history copies or adopts. A loan is
+    /// consumed whatever this returns: adopted, or freed. So is `pre_key`, a
+    /// loan's key taken before the hand-off (`keyBeforeAdoption`).
+    fn writeChange(
+        self: *Self,
+        kind: history_mod.ChangeKind,
+        source_timestamp: history_mod.RtpsTimestamp,
+        key_hash: [16]u8,
+        payload: proto.Payload,
+        pre_key: ?KeyValue,
+    ) !history_mod.SequenceNumber {
+        // Until the protocol writer has the payload, a failure frees it.
+        var handed_off = false;
+        errdefer if (!handed_off) self.dropPayload(payload);
+        errdefer if (pre_key) |kv| self.alloc.free(kv.payload);
         if (!self.enabled.load(.acquire)) return error.NotEnabled;
         // Pinned for the write, which may wait: the writer's deletion closes
         // it to writes rather than freeing it under one.
@@ -559,7 +577,8 @@ pub const DataWriterImpl = struct {
                 return error.OutOfResources;
             };
             needs_key = registered.needs_key;
-            const sn = self.proto_writer.writeAdmitted(&adm, kind, source_timestamp, key_hash, data) catch |err| {
+            handed_off = true;
+            const sn = self.proto_writer.writeAdmitted(&adm, kind, source_timestamp, key_hash, payload) catch |err| {
                 if (registered.added) self.forgetInstance(key_hash);
                 return switch (err) {
                     error.Closed => error.AlreadyDeleted,
@@ -571,9 +590,20 @@ pub const DataWriterImpl = struct {
         };
         // Projected without the locks: the projection is the binding's code.
         // A write whose key cannot be kept still succeeds, and the next one
-        // tries again.
-        if (needs_key) self.keepKey(key_hash, KeyValue.ofSample(self.key_projection, self.alloc, data));
-        if (kind == .not_alive_disposed) self.keepKey(key_hash, KeyValue.ofKey(self.alloc, data));
+        // tries again. A loan's bytes are the history's now, which may have
+        // freed them already, so its key was taken before.
+        const kv: ?KeyValue = switch (payload) {
+            .copy => |data| if (needs_key)
+                KeyValue.ofSample(self.key_projection, self.alloc, data)
+            else if (kind == .not_alive_disposed)
+                KeyValue.ofKey(self.alloc, data)
+            else
+                null,
+            .loan => pre_key,
+        };
+        if (needs_key or kind == .not_alive_disposed) {
+            self.keepKey(key_hash, kv);
+        } else if (kv) |unused| self.alloc.free(unused.payload);
         self.last_sn.store(sn, .monotonic);
         const now_ns = self.timer_clock.nowNs();
         self.last_write_ns.store(now_ns, .monotonic);
@@ -605,33 +635,64 @@ pub const DataWriterImpl = struct {
     /// zidl reservation of elements up to 4 bytes wide is aligned too (the
     /// CDR stream starts 4 bytes in, after the encapsulation header). See
     /// docs/design/loaned-builders.md, decision 9.
-    pub fn loanForWrite(self: *Self, size: usize) ![]align(write_loan_alignment.toByteUnits()) u8 {
-        const buf = try self.alloc.alignedAlloc(u8, write_loan_alignment, size);
+    ///
+    /// The buffer comes from the history (`ProtocolWriter.loanPayload`),
+    /// which adopts it when published instead of copying it.
+    pub fn loanForWrite(self: *Self, size: usize) !proto.PayloadLoan {
+        const buf = try self.proto_writer.loanPayload(size);
         _ = self.outstanding_loans.fetchAdd(1, .monotonic);
         return buf;
     }
 
     /// Alignment of every write-loan buffer (`loanForWrite`).
-    pub const write_loan_alignment: std.mem.Alignment = .@"8";
+    pub const write_loan_alignment: std.mem.Alignment = proto.payload_loan_alignment;
 
-    /// Frees a buffer `loanForWrite` returned, at the alignment it was
-    /// allocated with.
+    /// Frees a buffer `loanForWrite` returned.
     fn freeLoan(self: *Self, buf: []u8) void {
-        const aligned: []align(write_loan_alignment.toByteUnits()) u8 = @alignCast(buf);
-        self.alloc.free(aligned);
+        self.proto_writer.returnPayload(@alignCast(buf));
+    }
+
+    /// Frees what a payload owns: a loan the protocol writer never got.
+    fn dropPayload(self: *Self, payload: proto.Payload) void {
+        switch (payload) {
+            .copy => {},
+            .loan => |l| self.proto_writer.returnPayload(l.buf),
+        }
+    }
+
+    /// The key a loaned change's instance may need, taken from its payload
+    /// before the history adopts it: once it has, an acknowledgement or a
+    /// KEEP_LAST trim on another thread may free the payload before the
+    /// write returns. An alive change's, when its instance has no key yet; a
+    /// dispose's key-only payload. Racing an unregister can only leave the
+    /// key to the next write, as a failed projection does.
+    fn keyBeforeAdoption(self: *Self, kind: history_mod.ChangeKind, key_hash: [16]u8, data: []const u8) ?KeyValue {
+        return switch (kind) {
+            .alive => if (self.instanceLacksKey(key_hash)) KeyValue.ofSample(self.key_projection, self.alloc, data) else null,
+            .not_alive_disposed => KeyValue.ofKey(self.alloc, data),
+            else => null,
+        };
+    }
+
+    /// Whether the instance is unregistered, or registered without a key.
+    fn instanceLacksKey(self: *Self, key_hash: [16]u8) bool {
+        self.instances_mu.lock();
+        defer self.instances_mu.unlock();
+        const value = self.instances.getByKey(key_hash) orelse return true;
+        return value.* == null;
     }
 
     /// Publish a previously-loaned buffer (from `loanForWrite`) as a sample,
     /// then release the loan. Runs `writeRaw`'s existing RESOURCE_LIMITS
-    /// handling unchanged. The buffer is freed and the loan released
-    /// whether or not the publish succeeds -- a failed publish, like a
-    /// failed plain `write()`, leaves nothing pending to retry. `buf` must
-    /// be the exact buffer previously returned by `loanForWrite` on this
-    /// same writer (required for `alloc.free` to be valid) -- `used_len`
-    /// (`<= buf.len`, the caller-populated byte count) is what actually
-    /// gets published, distinct from `buf.len` (the loaned capacity), so a
-    /// caller that loaned more than it ended up serializing doesn't leak
-    /// unwritten trailing bytes onto the wire.
+    /// handling unchanged. The history adopts the buffer as the change's
+    /// payload, with no copy; if the publish fails, it is freed. Either
+    /// way the loan is released -- a failed publish, like a failed plain
+    /// `write()`, leaves nothing pending to retry. `buf` must be the exact
+    /// buffer previously returned by `loanForWrite` on this same writer --
+    /// `used_len` (`<= buf.len`, the caller-populated byte count) is what
+    /// actually gets published, distinct from `buf.len` (the loaned
+    /// capacity), so a caller that loaned more than it ended up serializing
+    /// doesn't leak unwritten trailing bytes onto the wire.
     pub fn publishLoan(
         self: *Self,
         kind: history_mod.ChangeKind,
@@ -640,11 +701,10 @@ pub const DataWriterImpl = struct {
         buf: []u8,
         used_len: usize,
     ) !history_mod.SequenceNumber {
-        defer {
-            self.freeLoan(buf);
-            _ = self.outstanding_loans.fetchSub(1, .monotonic);
-        }
-        return self.writeRaw(kind, source_timestamp, key_hash, buf[0..used_len]);
+        defer _ = self.outstanding_loans.fetchSub(1, .monotonic);
+        const loan: proto.PayloadLoan = @alignCast(buf);
+        const pre_key = self.keyBeforeAdoption(kind, key_hash, loan[0..used_len]);
+        return self.writeChange(kind, source_timestamp, key_hash, .{ .loan = .{ .buf = loan, .len = used_len } }, pre_key);
     }
 
     /// Cancel a previously-loaned buffer (from `loanForWrite`) without

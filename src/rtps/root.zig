@@ -10,6 +10,7 @@ pub const reassembly = @import("reassembly.zig");
 pub const unmatched_cache = @import("unmatched_cache.zig");
 pub const writer_sm = @import("writer_sm.zig");
 pub const reader_sm = @import("reader_sm.zig");
+pub const protocol_adapters = @import("protocol_adapters.zig");
 
 pub const Guid = guid.Guid;
 pub const GuidPrefix = guid.GuidPrefix;

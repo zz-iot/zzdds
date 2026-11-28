@@ -36,6 +36,9 @@ pub const InstanceHandle = history_mod.InstanceHandle;
 pub const RtpsTimestamp = history_mod.RtpsTimestamp;
 pub const SequenceNumber = history_mod.SequenceNumber;
 pub const CacheChange = history_mod.CacheChange;
+pub const Payload = history_mod.Payload;
+pub const PayloadLoan = history_mod.PayloadLoan;
+pub const payload_loan_alignment = history_mod.payload_loan_alignment;
 pub const CoherentFlushMode = history_mod.CoherentFlushMode;
 pub const GroupCoherentSet = history_mod.GroupCoherentSet;
 pub const Locator = iface.Locator;
@@ -348,14 +351,23 @@ pub const ProtocolWriter = struct {
         admit_write: *const fn (ctx: *anyopaque, adm: *WriteAdmission, may_block: bool, timeout_ns: ?i64) error{ Timeout, OutOfResources, Closed }!void,
 
         /// `write`, for an admitted change; Closed if the writer has closed.
+        /// A loaned payload (from `loan_payload`) is adopted by the history,
+        /// or freed if the write fails.
         write_admitted: *const fn (
             ctx: *anyopaque,
             adm: *WriteAdmission,
             kind: ChangeKind,
             source_timestamp: RtpsTimestamp,
             key_hash: [16]u8,
-            data: []const u8,
+            payload: Payload,
         ) anyerror!SequenceNumber,
+
+        /// A buffer to serialize a payload into, in place, then hand to
+        /// write_admitted as a loan, or to return_payload.
+        loan_payload: *const fn (ctx: *anyopaque, size: usize) error{OutOfMemory}!PayloadLoan,
+
+        /// Frees a loan_payload buffer never written.
+        return_payload: *const fn (ctx: *anyopaque, buf: PayloadLoan) void,
 
         /// Give back an admission write_admitted did not use.
         release_admission: *const fn (ctx: *anyopaque, adm: *WriteAdmission) void,
@@ -535,9 +547,17 @@ pub const ProtocolWriter = struct {
         kind: ChangeKind,
         source_timestamp: RtpsTimestamp,
         key_hash: [16]u8,
-        data: []const u8,
+        payload: Payload,
     ) anyerror!SequenceNumber {
-        return self.vtable.write_admitted(self.ctx, adm, kind, source_timestamp, key_hash, data);
+        return self.vtable.write_admitted(self.ctx, adm, kind, source_timestamp, key_hash, payload);
+    }
+
+    pub fn loanPayload(self: ProtocolWriter, size: usize) error{OutOfMemory}!PayloadLoan {
+        return self.vtable.loan_payload(self.ctx, size);
+    }
+
+    pub fn returnPayload(self: ProtocolWriter, buf: PayloadLoan) void {
+        self.vtable.return_payload(self.ctx, buf);
     }
 
     pub fn releaseAdmission(self: ProtocolWriter, adm: *WriteAdmission) void {
