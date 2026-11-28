@@ -19,8 +19,9 @@
 //! Usage: gen_windows_def <output.def> <input.c|input.zig> [...]
 //!
 //! Parses each input file line by line for zidl's own generated shape:
-//! every top-level function it emits is a single physical line, starting
-//! in column 0 (never indented), of the form `RETURN NAME(ARGS) {`.
+//! every top-level function it emits starts in column 0 (never indented),
+//! of the form `RETURN NAME(ARGS) {`. A signature whose parameters run onto
+//! further lines (hand-written zidl_cdr.c) is joined into one line first.
 //! A `static` definition of that shape (zidl 0.3.28's `*_bounded_impl`
 //! helpers) is internal to its file and is not exported: listing it makes
 //! lld-link fail with an undefined symbol. Anything else not matching
@@ -80,6 +81,33 @@ fn extractZigExportName(line: []const u8) ?[]const u8 {
     return rest[0..end];
 }
 
+/// Each top-level C definition's name, with a signature whose parameter
+/// list continues on later lines joined back into one line first.
+fn collectCNames(alloc: std.mem.Allocator, data: []const u8, names: *std.StringHashMap(void)) !void {
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(alloc);
+    var line_it = std.mem.splitScalar(u8, data, '\n');
+    while (line_it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (pending.items.len != 0) {
+            try pending.append(alloc, ' ');
+            try pending.appendSlice(alloc, std.mem.trim(u8, line, " \t"));
+        } else if (line.len != 0 and (std.ascii.isAlphabetic(line[0]) or line[0] == '_') and
+            std.mem.count(u8, line, "(") > std.mem.count(u8, line, ")"))
+        {
+            try pending.appendSlice(alloc, line);
+        } else {
+            if (extractFunctionName(line)) |name| try names.put(try alloc.dupe(u8, name), {});
+            continue;
+        }
+        const open = std.mem.count(u8, pending.items, "(");
+        const close = std.mem.count(u8, pending.items, ")");
+        if (open > close and line.len != 0) continue;
+        if (extractFunctionName(pending.items)) |name| try names.put(try alloc.dupe(u8, name), {});
+        pending.clearRetainingCapacity();
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
@@ -106,10 +134,13 @@ pub fn main(init: std.process.Init) !void {
         var r = f.reader(io, &read_buf);
         const data = try r.interface.allocRemaining(arena, .unlimited);
 
-        const extract = if (std.mem.endsWith(u8, in_path, ".zig")) &extractZigExportName else &extractFunctionName;
+        if (!std.mem.endsWith(u8, in_path, ".zig")) {
+            try collectCNames(arena, data, &names);
+            continue;
+        }
         var line_it = std.mem.splitScalar(u8, data, '\n');
         while (line_it.next()) |line| {
-            if (extract(line)) |name| {
+            if (extractZigExportName(line)) |name| {
                 try names.put(name, {});
             }
         }
@@ -143,4 +174,32 @@ test "a Zig export fn is exported and anything else is not" {
     try testing.expectEqual(null, extractZigExportName("fn helper(w: *Writer) c_int {"));
     try testing.expectEqual(null, extractZigExportName("extern fn zidl_cdr_alloc(size: usize) ?[*]u8;"));
     try testing.expectEqual(null, extractZigExportName("    export fn nested() void {}"));
+}
+
+test "a definition whose parameters continue on later lines is exported" {
+    const testing = std.testing;
+    var names = std.StringHashMap(void).init(testing.allocator);
+    defer {
+        var it = names.keyIterator();
+        while (it.next()) |k| testing.allocator.free(k.*);
+        names.deinit();
+    }
+    try collectCNames(testing.allocator,
+        \\int zidl_cdr_serialize_alloc(int xcdr_version, int byte_order, ZidlCdrSerializeFn fn,
+        \\                             const void *ctx, uint8_t **out, size_t *out_len) {
+        \\    return 0;
+        \\}
+        \\void zidl_cdr_writer_init_fixed(ZidlCdrWriter *w, uint8_t *buf, size_t cap, int xcdr_version) {
+        \\}
+        \\int declared_only(int a,
+        \\                  int b);
+        \\static int hidden(int a,
+        \\                  int b) {
+        \\}
+    , &names);
+    try testing.expect(names.contains("zidl_cdr_serialize_alloc"));
+    try testing.expect(names.contains("zidl_cdr_writer_init_fixed"));
+    try testing.expect(!names.contains("declared_only"));
+    try testing.expect(!names.contains("hidden"));
+    try testing.expectEqual(@as(u32, 2), names.count());
 }

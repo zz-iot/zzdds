@@ -8,6 +8,15 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-11-27
+
+- zidl v0.3.46. Generated code and zzdds's own encoders count a sample, then write it
+  into one exact buffer, with no growable output: built-in topic samples, SEDP's PL_CDR
+  and the C/C++ write paths. A sample that changes between the two passes is an error,
+  not a torn write. Generated C/C++ key hashes stream into MD5 without allocating, and
+  the C/C++ key projection writes straight into zzdds's buffer. C ABI writes are about
+  twice as fast. The Zig raw-loan example serializes straight into the loaned buffer.
+
 ## 2026-11-26
 
 - Write loans (`loan_raw`) are 8-byte aligned, so a typed store into a zidl reservation

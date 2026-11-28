@@ -434,16 +434,23 @@ const BuiltinSubscriberState = struct {
 // DataReaderImpl.pushBuiltinCdr() (which fires listener callbacks) does not run
 // with participant.mu held.
 
+/// A built-in topic sample (XCDR1, little-endian): counted, then written into
+/// one exact allocation.
+fn builtinCdr(comptime T: type, alloc: std.mem.Allocator, v: T) ![]u8 {
+    return zidl_cdr.serializeAlloc(.all, .xcdr1, .little, alloc, v, struct {
+        fn write(w: anytype, value: T) !void {
+            try w.writeEncapHeader();
+            try T.serialize(w, value);
+        }
+    }.write);
+}
+
 fn pushBuiltinParticipantCdr(
     alloc: std.mem.Allocator,
     dr: *reader_mod.DataReaderImpl,
     data: *const disc.ParticipantData,
     handle: DDS.InstanceHandle_t,
 ) void {
-    var buf = std.ArrayListUnmanaged(u8).empty;
-    defer buf.deinit(alloc);
-    var w = zidl_cdr.CdrWriter(.xcdr1).init(&buf, alloc);
-    w.writeEncapHeader() catch return;
     const v = DDS.ParticipantBuiltinTopicData{
         .key = writer_mod.guidToBuiltinKey(data.guid),
         .user_data = .{ .value = .{
@@ -453,8 +460,9 @@ fn pushBuiltinParticipantCdr(
             ._release = false,
         } },
     };
-    DDS.ParticipantBuiltinTopicData.serialize(&w, v) catch return;
-    dr.pushBuiltinCdr(buf.items, guidKeyHash(data.guid), handle, .alive);
+    const bytes = builtinCdr(DDS.ParticipantBuiltinTopicData, alloc, v) catch return;
+    defer alloc.free(bytes);
+    dr.pushBuiltinCdr(bytes, guidKeyHash(data.guid), handle, .alive);
 }
 
 fn qosReliability(kind: u8) DDS.ReliabilityQosPolicy {
@@ -479,10 +487,6 @@ fn pushBuiltinPublicationCdr(
     data: *const disc.WriterData,
     handle: DDS.InstanceHandle_t,
 ) void {
-    var buf = std.ArrayListUnmanaged(u8).empty;
-    defer buf.deinit(alloc);
-    var w = zidl_cdr.CdrWriter(.xcdr1).init(&buf, alloc);
-    w.writeEncapHeader() catch return;
     const v = DDS.PublicationBuiltinTopicData{
         .key = writer_mod.guidToBuiltinKey(data.guid),
         .participant_key = writer_mod.guidToBuiltinKey(data.participant_guid),
@@ -521,8 +525,9 @@ fn pushBuiltinPublicationCdr(
             };
         } },
     };
-    DDS.PublicationBuiltinTopicData.serialize(&w, v) catch return;
-    dr.pushBuiltinCdr(buf.items, guidKeyHash(data.guid), handle, .alive);
+    const bytes = builtinCdr(DDS.PublicationBuiltinTopicData, alloc, v) catch return;
+    defer alloc.free(bytes);
+    dr.pushBuiltinCdr(bytes, guidKeyHash(data.guid), handle, .alive);
 }
 
 fn pushBuiltinSubscriptionCdr(
@@ -531,10 +536,6 @@ fn pushBuiltinSubscriptionCdr(
     data: *const disc.ReaderData,
     handle: DDS.InstanceHandle_t,
 ) void {
-    var buf = std.ArrayListUnmanaged(u8).empty;
-    defer buf.deinit(alloc);
-    var w = zidl_cdr.CdrWriter(.xcdr1).init(&buf, alloc);
-    w.writeEncapHeader() catch return;
     const v = DDS.SubscriptionBuiltinTopicData{
         .key = writer_mod.guidToBuiltinKey(data.guid),
         .participant_key = writer_mod.guidToBuiltinKey(data.participant_guid),
@@ -573,8 +574,9 @@ fn pushBuiltinSubscriptionCdr(
             };
         } },
     };
-    DDS.SubscriptionBuiltinTopicData.serialize(&w, v) catch return;
-    dr.pushBuiltinCdr(buf.items, guidKeyHash(data.guid), handle, .alive);
+    const bytes = builtinCdr(DDS.SubscriptionBuiltinTopicData, alloc, v) catch return;
+    defer alloc.free(bytes);
+    dr.pushBuiltinCdr(bytes, guidKeyHash(data.guid), handle, .alive);
 }
 
 /// A built-in reader's key for an entity: the entity's GUID.
@@ -594,16 +596,13 @@ fn pushBuiltinTopicCdr(
     v: DDS.TopicBuiltinTopicData,
     handle: DDS.InstanceHandle_t,
 ) void {
-    var buf = std.ArrayListUnmanaged(u8).empty;
-    defer buf.deinit(alloc);
-    var w = zidl_cdr.CdrWriter(.xcdr1).init(&buf, alloc);
-    w.writeEncapHeader() catch return;
-    DDS.TopicBuiltinTopicData.serialize(&w, v) catch return;
+    const bytes = builtinCdr(DDS.TopicBuiltinTopicData, alloc, v) catch return;
+    defer alloc.free(bytes);
     // A topic's key is its name's; its handle is the one
     // get_discovered_topics gives it, for its name and type.
     var key_hash = std.mem.zeroes([16]u8);
     @memcpy(key_hash[0..@sizeOf(DDS.BuiltinTopicKey_t)], std.mem.asBytes(&v.key));
-    dr.pushBuiltinCdr(buf.items, key_hash, handle, .alive);
+    dr.pushBuiltinCdr(bytes, key_hash, handle, .alive);
 }
 
 /// Deterministic BuiltinTopicKey_t derived from the topic name.

@@ -16,13 +16,14 @@ fn fixtureReader(bytes: []const u8) !rt.CdrReader {
 }
 
 fn encode(comptime T: type, value: T) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(testing.allocator);
-    var w = rt.CdrWriter(.xcdr2).init(&buf, testing.allocator);
-    try w.writeEncapHeader();
-    if (T == wire.AcceptReply or T == wire.RegisterRequest or T == wire.AdmissionReject or T == wire.PathChallenge) buf.items[1] = 0x0b;
-    try T.serialize(&w, value);
-    return buf.toOwnedSlice(testing.allocator);
+    const out = try rt.serializeAlloc(.all, .xcdr2, .little, testing.allocator, value, struct {
+        fn write(w: anytype, v: T) !void {
+            try w.writeEncapHeader();
+            try T.serialize(w, v);
+        }
+    }.write);
+    if (T == wire.AcceptReply or T == wire.RegisterRequest or T == wire.AdmissionReject or T == wire.PathChallenge) out[1] = 0x0b;
+    return out;
 }
 
 test "ACCEPT preserves independent recovery fields and optional cursor" {
@@ -60,12 +61,20 @@ test "snapshot end count and target roundtrip; truncation rejects" {
     try testing.expectError(error.EndOfStream, wire.ViewEnd.deserializeInto(&out, &short, testing.allocator));
 }
 
+fn xcdr1Bytes(comptime T: type, value: T) ![]u8 {
+    return rt.serializeAlloc(.all, .xcdr1, .little, testing.allocator, value, struct {
+        fn write(w: anytype, v: T) !void {
+            try w.writeEncapHeader();
+            try T.serialize(w, v);
+        }
+    }.write);
+}
+
 fn syncBytes(extra_required: ?bool, missing: bool, duplicate: bool) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(testing.allocator);
-    var w = rt.CdrWriter(.xcdr2).init(&buf, testing.allocator);
+    var storage: [128]u8 = undefined;
+    var w = rt.RuntimeWriter.initFixed(&storage, .xcdr2, .little);
     try w.writeEncapHeader();
-    buf.items[1] = 0x0b; // test-only mutable PL_CDR2_LE
+    storage[1] = 0x0b; // test-only mutable PL_CDR2_LE
     const dh = try w.reserveDheader();
     try w.writeEmheaderFixed(1, true, 3);
     try w.writeU64(5);
@@ -81,8 +90,8 @@ fn syncBytes(extra_required: ?bool, missing: bool, duplicate: bool) ![]u8 {
         try w.writeEmheaderFixed(101, mu, 2);
         try w.writeU32(1234);
     }
-    w.patchDheader(dh);
-    return buf.toOwnedSlice(testing.allocator);
+    try w.patchDheaderChecked(dh);
+    return testing.allocator.dupe(u8, w.bytes());
 }
 
 test "old body decoder skips new optional field and rejects new required field" {
@@ -507,23 +516,17 @@ test "native CDR1 service parameters and path hashes match independent fixtures"
             try T.deserializeInto(&decoded, &reader, testing.allocator);
             try testing.expectEqual(@as(u16, 1), decoded.descriptor_version);
             if (index == 0) {
-                var buf: std.ArrayList(u8) = .empty;
-                defer buf.deinit(testing.allocator);
-                var writer = rt.CdrWriter(.xcdr1).init(&buf, testing.allocator);
-                try writer.writeEncapHeader();
-                try T.serialize(&writer, decoded);
-                try testing.expectEqualSlices(u8, value, buf.items[4..]);
+                const again = try xcdr1Bytes(T, decoded);
+                defer testing.allocator.free(again);
+                try testing.expectEqualSlices(u8, value, again[4..]);
             } else {
                 // Compare all decoded fields with the independent LE encoding too.
                 const little = try hexBytes(@embedFile("broker_golden/service_" ++ name ++ "_le.hex"));
                 defer testing.allocator.free(little);
                 if (T != wire.ServiceOfferContext) {
-                    var buf: std.ArrayList(u8) = .empty;
-                    defer buf.deinit(testing.allocator);
-                    var writer = rt.CdrWriter(.xcdr1).init(&buf, testing.allocator);
-                    try writer.writeEncapHeader();
-                    try T.serialize(&writer, decoded);
-                    try testing.expectEqualSlices(u8, little, buf.items[4..]);
+                    const again = try xcdr1Bytes(T, decoded);
+                    defer testing.allocator.free(again);
+                    try testing.expectEqualSlices(u8, little, again[4..]);
                 }
             }
         }

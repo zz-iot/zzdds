@@ -1720,6 +1720,12 @@ pub fn build(b: *std.Build) void {
     });
 
     const test_step = b.step("test", "Run Zenzen DDS tests");
+    // The Windows .def scanner runs on the host only for Windows targets;
+    // its own tests run everywhere.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/gen_windows_def.zig"),
+        .target = b.graph.host,
+    }) })).step);
     const inspect_step = b.step("resource-inspect", "Build offline plan validation and explicit multi-library inspection example");
     var inspector: ?*std.Build.Step.Compile = null;
     if (resource_authoring and typesupport_enabled) {
